@@ -36,6 +36,7 @@
 #include "mgmp_savefile.h"
 #include "mgmp_session.h"
 #include "mgmp_signal.h"
+#include "mgmp_lan.h"
 #include "mgmp_logupload.h"
 
 namespace mgmp {
@@ -143,6 +144,7 @@ bool tex_load(Tex& t, const char* rel) {
 // state
 // ---------------------------------------------------------------------------
 enum class Win { None, Multi, Backup };
+enum class LanPhase { None, HostDial, HostCreate, JoinDial, JoinJoin };   // the LAN tab's create / join, step by step
 enum class Confirm { None, Overwrite, Load, Delete, Undo, Import };
 
 struct Menu {
@@ -181,6 +183,19 @@ struct Menu {
     char     pw_name[48] = {};
     char     pw_buf[40]  = {};
     uint32_t err_seen = 0;            // the signal client's refusal counter as of the last frame
+    // Local network play (the multiplayer window's second tab).
+    bool      lan_tab      = false;
+    char      lan_room[48] = {};      // the room to create
+    char      lan_pw[40]   = {};
+    LanPhase  lan_phase    = LanPhase::None;
+    double    lan_deadline = 0;       // the step in progress gives up at this time
+    bool      lan_dialed   = false;   // the signaling client was told to connect for this attempt
+    uint32_t  lan_err0     = 0;       // the refusal counter when the room request went out
+    char      lan_t_addr[64] = {};    // the lobby being joined
+    uint16_t  lan_t_port   = 0;
+    char      lan_t_id[16] = {};
+    bool      lan_t_pw     = false;
+    double    lan_next_search = 0;
     // The F2 log-upload panel.
     bool     log_open   = false;
     bool     log_inited = false;
@@ -650,11 +665,245 @@ void ensure_inited() {
 // ---------------------------------------------------------------------------
 // the multiplayer window (title screen)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// local network play (no server): the LAN tab of the multiplayer window
+//
+// Hosting starts the lobby that is built into the mod (mgmp_lan.h), connects the ordinary signaling client to it on
+// 127.0.0.1 and creates the room; joining connects the same client to the lobby that answered the search and joins. Both are
+// a few steps that wait for the signaling client, so they are a small state machine run once a frame (lan_tick), whether or
+// not the window is open.
+// ---------------------------------------------------------------------------
+
+// One step of "be connected to this lobby": 1 = connected, 0 = still working, -1 = it failed.
+int lan_connect_step(const char* addr, uint16_t port) {
+    char want[96];
+    _snprintf_s(want, sizeof(want), _TRUNCATE, "%s:%u", addr, (unsigned)port);
+    const SignalState st = signal_state();
+    if (st == SignalState::Connected && !strcmp(signal_server(), want)) return 1;
+    if (signal_request_pending() || st == SignalState::Connecting) return 0;
+    if (st == SignalState::Connected) {                  // connected to some other lobby: leave it first
+        g.lan_dialed = false;
+        signal_request_disconnect();
+        return 0;
+    }
+    if (!g.lan_dialed) {
+        signal_request_connect(addr, port, g.pname);
+        g.lan_dialed = true;
+        log_line("MENU", "LAN: connecting to %s as '%s'", want, g.pname);
+        return 0;
+    }
+    return -1;                                           // we dialled and it is Off/Failed/Closed again
+}
+
+void lan_fail(const char* why) {
+    log_line_lvl(LogLevel::Warn, "MENU", "!! LAN: %s", why);
+    say("%s", tr(Tx::LAN_FAILED));
+    g.lan_phase = LanPhase::None;
+    g.pw_ask = false; g.pw_sent = false; g.pw_buf[0] = 0;
+    if (signal_state() != SignalState::Off) signal_request_disconnect();
+}
+
+void lan_tick() {
+    if (g.lan_phase == LanPhase::None) {
+        // The lobby we host lives only as long as our own connection to it.
+        if (lan_host_running()) {
+            char want[48];
+            _snprintf_s(want, sizeof(want), _TRUNCATE, "127.0.0.1:%u", (unsigned)lan_host_port());
+            const SignalState st = signal_state();
+            const bool on_it = (st == SignalState::Connected || st == SignalState::Connecting) && !strcmp(signal_server(), want);
+            if (!on_it && !signal_request_pending()) lan_host_stop();
+        }
+        return;
+    }
+    if (now() > g.lan_deadline) { lan_fail("timed out"); return; }
+
+    switch (g.lan_phase) {
+    case LanPhase::HostDial: {
+        const int r = lan_connect_step("127.0.0.1", lan_host_port());
+        if (r < 0) { lan_fail("could not reach the local lobby"); break; }
+        if (r == 0) break;
+        g.lan_err0 = signal_error_seq();
+        signal_request_create(g.lan_room, g.lan_pw);
+        strncpy_s(g.room_name, sizeof(g.room_name), g.lan_room, _TRUNCATE);
+        log_line("MENU", "LAN: creating room '%s'%s", g.lan_room, g.lan_pw[0] ? " (password)" : "");
+        g.lan_phase = LanPhase::HostCreate;
+        g.lan_deadline = now() + 12.0;
+        break;
+    }
+    case LanPhase::HostCreate:
+        if (in_room()) { g.lan_phase = LanPhase::None; g.lan_pw[0] = 0; }
+        else if (signal_state() != SignalState::Connected) lan_fail("lost the local lobby");
+        else if (signal_error_seq() != g.lan_err0) lan_fail("the lobby refused the room");
+        break;
+    case LanPhase::JoinDial: {
+        const int r = lan_connect_step(g.lan_t_addr, g.lan_t_port);
+        if (r < 0) { lan_fail("could not reach the host's lobby"); break; }
+        if (r == 0) break;
+        g.lan_err0 = signal_error_seq();
+        if (g.lan_t_pw) {
+            // A room with a password: the same prompt as the online list's.
+            g.pw_ask = true; g.pw_wrong = false; g.pw_sent = false; g.pw_buf[0] = 0;
+            strncpy_s(g.pw_id, sizeof(g.pw_id), g.lan_t_id, _TRUNCATE);
+            strncpy_s(g.pw_name, sizeof(g.pw_name), g.room_name, _TRUNCATE);
+        } else {
+            signal_request_join(g.lan_t_id);
+        }
+        log_line("MENU", "LAN: joining room %s at %s:%u", g.lan_t_id, g.lan_t_addr, (unsigned)g.lan_t_port);
+        g.lan_phase = LanPhase::JoinJoin;
+        g.lan_deadline = now() + 15.0;
+        break;
+    }
+    case LanPhase::JoinJoin:
+        if (in_room()) { g.lan_phase = LanPhase::None; }
+        else if (signal_state() != SignalState::Connected) lan_fail("lost the host's lobby");
+        else if (g.lan_t_pw) {
+            // Typing the password takes as long as it takes; closing the prompt ends the attempt (the lobby stays connected).
+            if (g.pw_ask || g.pw_sent || signal_request_pending()) g.lan_deadline = now() + 15.0;
+            else g.lan_phase = LanPhase::None;
+        }
+        else if (signal_error_seq() != g.lan_err0) lan_fail("the room is gone or full");
+        break;
+    default: break;
+    }
+}
+
+// "192.168.1.5:27700" (a few, comma separated) -- what a friend types when the search finds nothing. Looked up every few seconds.
+const char* lan_addr_line() {
+    static char line[160];
+    static double at = -100;
+    if (now() - at > 3.0) {
+        at = now();
+        const std::vector<std::string> ips = lan_local_addresses();
+        std::string s;
+        for (size_t i = 0; i < ips.size() && i < 3; ++i) {
+            if (i) s += ", ";
+            s += ips[i] + ":" + std::to_string((unsigned)lan_host_port());
+        }
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "%s", s.c_str());
+    }
+    return line;
+}
+
+void draw_lan_tabs(ImDrawList* dl, const View& v, ImVec2 a, float W) {
+    (void)dl;
+    const float k = v.k;
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    const bool free = g.lan_phase == LanPhase::None;
+    if (paper_button("tab_online", ImVec2(X(70), Y(88)), ImVec2(X(W / 2 - 5), Y(144)), tr(Tx::LAN_TAB_ONLINE), 28 * k, free,
+                     g.lan_tab ? Tone::Normal : Tone::Good))
+        g.lan_tab = false;
+    if (paper_button("tab_lan", ImVec2(X(W / 2 + 5), Y(88)), ImVec2(X(W - 70), Y(144)), tr(Tx::LAN_TAB_LAN), 28 * k, free,
+                     g.lan_tab ? Tone::Good : Tone::Normal)) {
+        if (!g.lan_tab) { g.lan_tab = true; lan_search_start(); g.lan_next_search = now() + 8.0; }
+    }
+}
+
+void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
+    const float k = v.k;
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    const bool busy = signal_request_pending();
+    const bool free = g.lan_phase == LanPhase::None && !busy && !g.pw_ask;
+
+    // this player
+    text_at(dl, ImVec2(X(70), Y(198)), 28 * k, kInk, tr(Tx::PLAYER_NAME));
+    paper_input("##lan_name", ImVec2(X(290), Y(184)), ImVec2(X(W - 70), Y(244)), g.pname, sizeof(g.pname), tr(Tx::NAME_HINT), 28 * k);
+
+    // --- host ---------------------------------------------------------------
+    text_at(dl, ImVec2(X(50), Y(268)), 30 * k, kInk, tr(Tx::LAN_HOST_TITLE));
+    wrap_text(dl, X(50), Y(306), (W - 100) * k, 21 * k, 25 * k, kGrey, tr(Tx::LAN_HOST_HINT));
+    text_at(dl, ImVec2(X(50), Y(414)), 26 * k, kInk, tr(Tx::ROOM_NAME));
+    paper_input("##lan_room", ImVec2(X(190), Y(402)), ImVec2(X(W - 320), Y(454)), g.lan_room, sizeof(g.lan_room), tr(Tx::ROOM_NAME_HINT), 26 * k);
+    text_at(dl, ImVec2(X(50), Y(476)), 26 * k, kInk, tr(Tx::ROOM_PW));
+    paper_input("##lan_pw", ImVec2(X(190), Y(464)), ImVec2(X(W - 320), Y(516)), g.lan_pw, sizeof(g.lan_pw), tr(Tx::ROOM_PW_HINT), 26 * k,
+                ImGuiInputTextFlags_Password);
+    if (paper_button("lan_create", ImVec2(X(W - 300), Y(402)), ImVec2(X(W - 50), Y(516)), tr(Tx::LAN_CREATE), 28 * k, free, Tone::Good)) {
+        std::string err;
+        if (!lan_host_start(err)) {
+            say(tr(Tx::LAN_START_FAIL), err.c_str());
+        } else {
+            g.lan_phase = LanPhase::HostDial;
+            g.lan_deadline = now() + 12.0;
+            g.lan_dialed = false;
+            log_line("MENU", "LAN: hosting '%s' on port %u", g.lan_room, (unsigned)lan_host_port());
+        }
+    }
+
+    // --- join ---------------------------------------------------------------
+    text_at(dl, ImVec2(X(50), Y(548)), 30 * k, kInk, tr(Tx::LAN_JOIN_TITLE));
+    const LanSearch ls = lan_search_state();
+    if (paper_button("lan_search", ImVec2(X(W - 330), Y(536)), ImVec2(X(W - 50), Y(592)), tr(Tx::LAN_SEARCH_BTN), 24 * k,
+                     free && ls != LanSearch::Searching)) {
+        lan_search_start();
+        g.lan_next_search = now() + 8.0;
+    }
+    if (free && ls == LanSearch::Done && now() >= g.lan_next_search) { lan_search_start(); g.lan_next_search = now() + 8.0; }
+
+    const std::vector<LanRoom> found = lan_search_results();
+    if (ls == LanSearch::Searching) {
+        text_at(dl, ImVec2(X(50), Y(594)), 22 * k, kGrey, tr(Tx::LAN_SEARCHING));
+    } else if (!found.empty()) {
+        char msg[64]; _snprintf_s(msg, sizeof(msg), _TRUNCATE, tr(Tx::LAN_FOUND), (unsigned)found.size());
+        text_at(dl, ImVec2(X(50), Y(594)), 22 * k, kGreen, msg);
+    }
+
+    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(626), ly1 = Y(808);
+    rough_rect(dl, ImVec2(lx0, ly0), ImVec2(lx1, ly1), IM_COL32(255, 255, 250, 70), kInk, 2.2f, 93, 1.2f);
+    if (found.empty()) {
+        if (ls != LanSearch::Searching) wrap_text(dl, lx0 + 24 * k, ly0 + 40 * k, lx1 - lx0 - 48 * k, 22 * k, 27 * k, kInkSoft, tr(Tx::LAN_NONE));
+    } else {
+        text_at(dl, ImVec2(lx0 + 20 * k, ly0 + 8 * k), 20 * k, kGrey, tr(Tx::COL_ROOM));
+        text_at(dl, ImVec2(X(400), ly0 + 8 * k), 20 * k, kGrey, tr(Tx::COL_HOST));
+        text_at(dl, ImVec2(X(640), ly0 + 8 * k), 20 * k, kGrey, tr(Tx::COL_PLAYERS));
+        ImGui::SetCursorScreenPos(ImVec2(lx0, ly0 + 34 * k));
+        ImGui::BeginChild("##lan_rooms", ImVec2(lx1 - lx0, ly1 - ly0 - 38 * k), false,
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+        ImDrawList* cdl = ImGui::GetWindowDrawList();
+        const float rowh = 58 * k;
+        for (size_t i = 0; i < found.size(); ++i) {
+            const LanRoom& r = found[i];
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            float name_x = rp.x + 20 * k;
+            if (r.pw) { draw_lock(cdl, ImVec2(name_x + 14 * k, rp.y + rowh * 0.5f), 28 * k, kInk); name_x += 40 * k; }
+            text_at(cdl, ImVec2(name_x, rp.y + 14 * k), 26 * k, kInk, r.name.empty() ? r.id.c_str() : r.name.c_str());
+            text_at(cdl, ImVec2(X(400), rp.y + 5 * k), 24 * k, kInkSoft, r.host.c_str());
+            text_at(cdl, ImVec2(X(400), rp.y + 33 * k), 18 * k, kGrey, r.addr.c_str());
+            char cnt[16]; _snprintf_s(cnt, sizeof(cnt), _TRUNCATE, "%d/%d", r.players, r.cap);
+            text_at(cdl, ImVec2(X(640), rp.y + 14 * k), 26 * k, kInkSoft, cnt);
+            const bool full = r.players >= r.cap;
+            char bid[48]; _snprintf_s(bid, sizeof(bid), _TRUNCATE, "lanjoin_%s_%s", r.addr.c_str(), r.id.c_str());
+            if (paper_button(bid, ImVec2(X(730), rp.y + 5 * k), ImVec2(X(W - 70), rp.y + rowh - 5 * k),
+                             full ? tr(Tx::FULL) : tr(Tx::JOIN), 24 * k, !full && free, Tone::Good)) {
+                strncpy_s(g.lan_t_addr, sizeof(g.lan_t_addr), r.addr.c_str(), _TRUNCATE);
+                strncpy_s(g.lan_t_id, sizeof(g.lan_t_id), r.id.c_str(), _TRUNCATE);
+                g.lan_t_port = r.port;
+                g.lan_t_pw = r.pw;
+                strncpy_s(g.room_name, sizeof(g.room_name), r.name.empty() ? r.id.c_str() : r.name.c_str(), _TRUNCATE);
+                g.lan_phase = LanPhase::JoinDial;
+                g.lan_deadline = now() + 12.0;
+                g.lan_dialed = false;
+            }
+            ImGui::SetCursorScreenPos(rp);
+            ImGui::Dummy(ImVec2(lx1 - lx0, rowh));
+        }
+        ImGui::EndChild();
+    }
+
+    wrap_text(dl, X(50), Y(818), (W - 100) * k, 19 * k, 23 * k, kGrey, tr(Tx::LAN_MANUAL_HINT));
+    wrap_text(dl, X(50), Y(866), (W - 100) * k, 19 * k, 23 * k, kGrey, tr(Tx::LAN_FIREWALL));
+
+    if (paper_button("lan_back", ImVec2(X(70), Y(H - 84)), ImVec2(X(W - 70), Y(H - 24)), tr(Tx::BACK), 30 * k))
+        g.win = Win::None;
+}
+
 void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_out, bool compact);
 
 void draw_multi_window(const View& v) {
     ensure_inited();
-    const float W = 900, H = in_room() ? 860.0f : (signal_state() == SignalState::Connected ? 800.0f : 720.0f);
+    const SignalState st0 = signal_state();
+    const bool disconnected = st0 == SignalState::Off || st0 == SignalState::Failed || st0 == SignalState::Closed;
+    const float W = 900, H = in_room() ? 860.0f : (st0 == SignalState::Connected ? 800.0f : (disconnected && g.lan_tab ? 1000.0f : 720.0f));
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f + 20);
     const ImVec2 sz(W * v.k, H * v.k);
     if (!overlay_window_begin("##mgmp_multi", a, sz)) { ImGui::End(); return; }
@@ -672,6 +921,10 @@ void draw_multi_window(const View& v) {
 
     if (in_room()) {
         // Reopened while a room is open: show it instead of the connect form.
+        if (lan_host_running() && lan_addr_line()[0]) {
+            char al[200]; _snprintf_s(al, sizeof(al), _TRUNCATE, tr(Tx::LAN_YOUR_ADDR), lan_addr_line());
+            text_c(dl, X(W / 2), Y(100), 24 * k, kGreen, al);
+        }
         float y = 0;
         draw_room_info(dl, v, ImVec2(X(60), Y(130)), (W - 120) * k, y, false);
         if (room_is_host()) {
@@ -691,7 +944,9 @@ void draw_multi_window(const View& v) {
     }
 
     if (st == SignalState::Off || st == SignalState::Failed || st == SignalState::Closed) {
-        text_c(dl, X(W / 2), Y(130), 30 * k, kInkSoft, tr(Tx::CONNECT_FIRST));
+        draw_lan_tabs(dl, v, a, W);
+        if (g.lan_tab) { draw_lan_tab(dl, v, a, W, H); ImGui::End(); return; }
+        text_c(dl, X(W / 2), Y(178), 28 * k, kInkSoft, tr(Tx::CONNECT_FIRST));
 
         text_at(dl, ImVec2(X(70), Y(212)), 30 * k, kInk, tr(Tx::SERVER_ADDR));
         paper_input("##addr", ImVec2(X(290), Y(200)), ImVec2(X(W - 70), Y(262)), g.addr, sizeof(g.addr), "localhost", 30 * k);
@@ -724,8 +979,10 @@ void draw_multi_window(const View& v) {
         char msg[48]; _snprintf_s(msg, sizeof(msg), _TRUNCATE, tr(Tx::CONNECTING_SERVER), dots, "...");
         text_c(dl, X(W / 2), Y(280), 40 * k, kInk, msg);
         text_c(dl, X(W / 2), Y(340), 24 * k, kGrey, signal_status());
-        if (paper_button("cancel", ImVec2(X(W / 2 - 150), Y(H - 130)), ImVec2(X(W / 2 + 150), Y(H - 58)), tr(Tx::CANCEL), 34 * k))
+        if (paper_button("cancel", ImVec2(X(W / 2 - 150), Y(H - 130)), ImVec2(X(W / 2 + 150), Y(H - 58)), tr(Tx::CANCEL), 34 * k)) {
+            g.lan_phase = LanPhase::None;
             signal_request_disconnect();
+        }
         ImGui::End();
         return;
     }
@@ -2069,6 +2326,8 @@ void menu_draw() {
         g.title_dim  = g.title_dim < 0 ? 0 : (g.title_dim > 1 ? 1 : g.title_dim);
     }
 
+    lan_tick();
+
     if (title && g.title_a > 0.001f) {
         // Above the game's own four (which start at 65% of the height, 100 px
         // apart on the 1080 stage), in the same left column and the same face.
@@ -2120,7 +2379,7 @@ void menu_draw() {
     if (room_now && !prev_room) {
         if (g.win == Win::Multi) g.win = Win::None;
         say(tr(Tx::ENTERED_ROOM), signal_room());
-        g.create_pw[0] = 0; g.pw_buf[0] = 0; g.pw_ask = false;
+        g.create_pw[0] = 0; g.lan_pw[0] = 0; g.pw_buf[0] = 0; g.pw_ask = false;
         g.panel_open = true;      // show the player who is in it, once
         // ...and take them to the save screen, which is the next thing the game
         // needs from them. Bounded, in case the menu is still fading in.

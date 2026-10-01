@@ -68,6 +68,13 @@
 //     {"t":"error","msg":"..."}
 //     {"t":"pong"}
 //
+// LAN MODE (no server machine at all). The mod can run this very code inside the game process (build with MGMP_EMBEDDED):
+// the host starts it, connects to it on 127.0.0.1 and creates a room; friends on the same network connect to the host's
+// address. A room whose host is on the loopback address is advertised to each joiner as the address THAT joiner used to
+// reach the server -- the host's LAN address, whichever network adapter it is. Hosts on the local network can also be
+// found without typing an address: a UDP datagram "MGMP-DISCOVER 1" to port 27701 (broadcast) is answered, to the sender,
+// with {"t":"here","port":<tcp port>,"rooms":[{"id","name","host","players","cap","pw"}]}.
+//
 // ONE THREAD, select(). A lobby is a handful of idle sockets exchanging a few
 // hundred bytes, and a single-threaded loop means there is no locking to get
 // wrong and no interleaving to reason about -- every state change happens in
@@ -75,7 +82,7 @@
 //
 // BUILD: Windows  cmake --build build --config Release -> build\Release\mgmp_server.exe
 //        Linux    server/linux/build.sh  (or the CMakeLists beside this file) -> mgmp_server
-// RUN:   mgmp_server [--port 27700] [--logdir <path>] [--quiet]
+// RUN:   mgmp_server [--port 27700] [--logdir <path>] [--quiet] [--lan-discovery]
 // The same source builds on both; see the "platform" block below the includes.
 
 #include "json.hpp"
@@ -96,6 +103,9 @@
 #ifdef _WIN32
 // winsock2.h BEFORE windows.h, always: windows.h pulls in winsock.h otherwise,
 // and the two headers collide over every type they both declare.
+#ifndef FD_SETSIZE
+#define FD_SETSIZE 128          // the default 64 is the size of the client table; the listeners need room too
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -331,17 +341,25 @@ void stamp(char* out, size_t cap) {
     snprintf(out, cap, "%02u:%02u:%02u", lt.hour, lt.minute, lt.second);
 }
 
+void (*g_log_sink)(const char*) = nullptr;   // embedded in the mod: the lines go to its log instead of stdout
+
 void logf(const char* fmt, ...) {
-    if (g_quiet) return;
-    char ts[16];
-    stamp(ts, sizeof(ts));
-    printf("[%s] ", ts);
+    if (g_quiet && !g_log_sink) return;
     va_list ap;
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    if (g_log_sink) {
+        char buf[512];
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        g_log_sink(buf);
+    } else {
+        char ts[16];
+        stamp(ts, sizeof(ts));
+        printf("[%s] ", ts);
+        vprintf(fmt, ap);
+        printf("\n");
+        fflush(stdout);
+    }
     va_end(ap);
-    printf("\n");
-    fflush(stdout);
 }
 
 std::string lower(const std::string& s) {
@@ -425,6 +443,9 @@ struct Client {
 Client g_clients[kMaxClients];
 Room   g_rooms[kMaxRooms];
 SOCKET g_listen = INVALID_SOCKET;
+SOCKET g_udp    = INVALID_SOCKET;     // LAN discovery (only when asked for)
+uint16_t g_tcp_port = 0;
+constexpr uint16_t kDiscoveryPort = 27701;
 
 int find_room_by_id(const char* id) {
     for (int i = 0; i < kMaxRooms; ++i)
@@ -512,6 +533,22 @@ void send_rooms(SOCKET s) {
     send_json(s, o);
 }
 
+// The address a joiner should dial for this room. Normally what the host registered. A room whose host sits on the loopback
+// address (a host running this server in its own process, the LAN case) is advertised as the address the joiner itself used
+// to reach us: that IS the host machine, on whichever adapter the joiner can see.
+std::string addr_for(const Room& r, SOCKET s) {
+    const std::string a = r.addr;
+    if (a.compare(0, 4, "127.") != 0 && a != "::1" && a != "localhost") return a;
+    sockaddr_in la{};
+    socklen_t ll = sizeof(la);
+    if (getsockname(s, (sockaddr*)&la, &ll) == 0 && la.sin_family == AF_INET) {
+        char b[64] = {};
+        inet_ntop(AF_INET, &la.sin_addr, b, sizeof(b));
+        if (strncmp(b, "127.", 4) != 0 && b[0]) return b;
+    }
+    return a;
+}
+
 // The membership message. `event`/`who` are what the lobby shows as a line of
 // text; everything else is what it draws in the table. Both in one message
 // because they change together and a peer that got one without the other would
@@ -533,7 +570,7 @@ void broadcast_room(int ri, const char* event, const char* who) {
         o["t"]       = "room";
         o["id"]      = r.id;
         o["name"]    = r.name;
-        o["addr"]    = r.addr;
+        o["addr"]    = addr_for(r, g_clients[r.members[i]].sock);
         o["port"]    = (int)r.port;
         o["cap"]     = kRoomCap;
         o["locked"]  = r.locked;
@@ -937,7 +974,7 @@ void handle_line(int slot, const std::string& line) {
         o["id"]   = r.id;
         o["name"] = r.name;
         o["role"] = "client";
-        o["addr"] = r.addr;
+        o["addr"] = addr_for(r, c.sock);
         o["port"] = (int)r.port;
         o["cap"]  = kRoomCap;
         o["you"]  = c.name;
@@ -1020,6 +1057,23 @@ void on_readable(int slot) {
     }
 }
 
+// Answers one "MGMP-DISCOVER 1" datagram with this server's TCP port and its listed rooms (at most 8, so the answer fits one packet).
+void answer_discovery() {
+    char buf[64] = {};
+    sockaddr_in from{};
+    socklen_t fl = sizeof(from);
+    const int n = (int)recvfrom(g_udp, buf, sizeof(buf) - 1, 0, (sockaddr*)&from, &fl);
+    if (n < 15 || strncmp(buf, "MGMP-DISCOVER 1", 15) != 0) return;
+    json o = json::object();
+    o["t"]    = "here";
+    o["port"] = (int)g_tcp_port;
+    json rooms = json::array();
+    for (const json& r : rooms_array()) { if (rooms.size() >= 8) break; rooms.push_back(r); }
+    o["rooms"] = rooms;
+    const std::string out = o.dump(-1, ' ', false, json::error_handler_t::replace);
+    sendto(g_udp, out.c_str(), (int)out.size(), 0, (sockaddr*)&from, fl);
+}
+
 int accept_one() {
     sockaddr_in a{};
     socklen_t alen = sizeof(a);
@@ -1062,6 +1116,7 @@ void usage() {
            "  mgmp_server [--port <n>] [--logdir <path>] [--quiet]\n"
            "\n"
            "  --port <n>       TCP port to listen on (default 27700)\n"
+           "  --lan-discovery  also answer UDP discovery broadcasts (port 27701), for LAN use\n"
            "  --logdir <path>  where game logs uploaded from the mod's F2 panel are stored\n"
            "                   (default: a mgmp_logs folder beside this exe)\n"
            "  --quiet          no per-event output\n"
@@ -1072,62 +1127,55 @@ void usage() {
            "mod's mgmp.json and use the lobby panel in game.\n");
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
-    uint16_t port = 27700;
-
-    for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--quiet")) g_quiet = true;
-        else if (!strcmp(argv[i], "--logdir") && i + 1 < argc) g_logdir = argv[++i];
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
-        else { printf("unknown argument '%s'\n\n", argv[i]); usage(); return 2; }
-    }
-
-    if (!net_startup()) {
-        printf("network start-up failed\n");
-        return 1;
-    }
-    srand((unsigned)time(nullptr) ^ process_id());
-
-    if (g_logdir.empty()) {
-        g_logdir = exe_dir() + kSep + "mgmp_logs";
-    }
-    while (g_logdir.size() > 3 && (g_logdir.back() == '\\' || g_logdir.back() == '/')) g_logdir.pop_back();
-    ensure_dir(g_logdir);
-    count_stored();
-    logf("game logs from players are stored in %s (%d already there)", g_logdir.c_str(), g_stored);
-
+// Opens the TCP listener (and, when asked, the UDP discovery socket). False with a reason in `err`.
+bool open_listener(uint16_t port, bool discovery, std::string& err) {
     g_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (g_listen == INVALID_SOCKET) { printf("socket failed\n"); return 1; }
-
+    if (g_listen == INVALID_SOCKET) { err = "socket failed"; return false; }
     int reuse = 1;
+#ifndef _WIN32
     setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-
+#endif
     sockaddr_in a{};
     a.sin_family      = AF_INET;
     a.sin_addr.s_addr = INADDR_ANY;
     a.sin_port        = htons(port);
     if (bind(g_listen, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-        printf("bind %u failed (error %d) -- is another server already running?\n",
-               (unsigned)port, sock_error());
-        return 1;
+        char b[96];
+        snprintf(b, sizeof(b), "bind %u failed (error %d) -- is another server already running?", (unsigned)port, sock_error());
+        err = b;
+        close_socket(g_listen); g_listen = INVALID_SOCKET;
+        return false;
     }
-    if (listen(g_listen, 16) == SOCKET_ERROR) { printf("listen failed\n"); return 1; }
+    if (listen(g_listen, 16) == SOCKET_ERROR) { err = "listen failed"; close_socket(g_listen); g_listen = INVALID_SOCKET; return false; }
+    g_tcp_port = port;
 
-    logf("mgmp signaling server listening on 0.0.0.0:%u", (unsigned)port);
-    logf("rooms hold up to %d players; it does not relay game traffic", kRoomCap);
+    if (discovery) {
+        g_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_udp != INVALID_SOCKET) {
+#ifndef _WIN32
+            setsockopt(g_udp, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+#endif
+            sockaddr_in u{};
+            u.sin_family      = AF_INET;
+            u.sin_addr.s_addr = INADDR_ANY;
+            u.sin_port        = htons(kDiscoveryPort);
+            if (bind(g_udp, (sockaddr*)&u, sizeof(u)) == SOCKET_ERROR) {
+                logf("LAN discovery is off: UDP port %u is taken (error %d)", (unsigned)kDiscoveryPort, sock_error());
+                close_socket(g_udp); g_udp = INVALID_SOCKET;
+            }
+        }
+    }
+    return true;
+}
 
-    signal(SIGINT, [](int) { g_stop = 1; });
-    signal(SIGTERM, [](int) { g_stop = 1; });
-    logf("stop with Ctrl+C (or SIGTERM)");
-
+// The select loop: runs until g_stop.
+void serve_loop() {
     while (!g_stop) {
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(g_listen, &rd);
         SOCKET highest = g_listen;
+        if (g_udp != INVALID_SOCKET) { FD_SET(g_udp, &rd); if (g_udp > highest) highest = g_udp; }
         for (int i = 0; i < kMaxClients; ++i) {
             if (!g_clients[i].used) continue;
             FD_SET(g_clients[i].sock, &rd);
@@ -1156,6 +1204,7 @@ int main(int argc, char** argv) {
         if (rc == 0) continue;
 
         if (FD_ISSET(g_listen, &rd)) accept_one();
+        if (g_udp != INVALID_SOCKET && FD_ISSET(g_udp, &rd)) answer_discovery();
 
         for (int i = 0; i < kMaxClients; ++i) {
             if (!g_clients[i].used) continue;
@@ -1163,9 +1212,106 @@ int main(int argc, char** argv) {
             on_readable(i);
         }
     }
+}
 
+void close_all() {
     for (int i = 0; i < kMaxClients; ++i) if (g_clients[i].used) close_client(i);
-    close_socket(g_listen);
+    for (int i = 0; i < kMaxRooms; ++i) g_rooms[i] = Room{};
+    if (g_listen != INVALID_SOCKET) { close_socket(g_listen); g_listen = INVALID_SOCKET; }
+    if (g_udp != INVALID_SOCKET) { close_socket(g_udp); g_udp = INVALID_SOCKET; }
+}
+
+} // namespace
+
+#ifdef MGMP_EMBEDDED
+// ---- the embedded form: the mod runs the lobby inside the game process (LAN mode) ----------------------------------
+#include "../src/net/mgmp_lobby_server.h"
+
+namespace mgmp {
+namespace {
+HANDLE g_thread = nullptr;
+DWORD WINAPI lobby_thread(LPVOID) { serve_loop(); return 0; }
+}
+
+bool lobby_server_start(uint16_t port, void (*log)(const char*), char* err, size_t errsz) {
+    if (g_thread) return true;                    // already running
+    g_log_sink = log;
+    g_quiet = false;
+    g_stop = 0;
+    g_logdir.clear();                             // no log collection from a game process
+    if (!net_startup()) { _snprintf_s(err, errsz, _TRUNCATE, "network start-up failed"); return false; }
+    std::string why;
+    if (!open_listener(port, /*discovery=*/true, why)) {
+        _snprintf_s(err, errsz, _TRUNCATE, "%s", why.c_str());
+        net_shutdown();
+        return false;
+    }
+    srand((unsigned)time(nullptr) ^ process_id());
+    logf("LAN lobby listening on 0.0.0.0:%u (discovery on UDP %u)", (unsigned)port, (unsigned)kDiscoveryPort);
+    g_thread = CreateThread(nullptr, 0, lobby_thread, nullptr, 0, nullptr);
+    if (!g_thread) { close_all(); net_shutdown(); _snprintf_s(err, errsz, _TRUNCATE, "CreateThread failed"); return false; }
+    return true;
+}
+
+void lobby_server_stop() {
+    if (!g_thread) return;
+    g_stop = 1;
+    WaitForSingleObject(g_thread, 3000);
+    CloseHandle(g_thread);
+    g_thread = nullptr;
+    close_all();
+    net_shutdown();
+    logf("LAN lobby stopped");
+    g_log_sink = nullptr;
+}
+
+bool lobby_server_running() { return g_thread != nullptr; }
+uint16_t lobby_server_port() { return g_thread ? g_tcp_port : 0; }
+} // namespace mgmp
+
+#else
+
+int main(int argc, char** argv) {
+    uint16_t port = 27700;
+    bool discovery = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--quiet")) g_quiet = true;
+        else if (!strcmp(argv[i], "--lan-discovery")) discovery = true;
+        else if (!strcmp(argv[i], "--logdir") && i + 1 < argc) g_logdir = argv[++i];
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
+        else { printf("unknown argument '%s'\n\n", argv[i]); usage(); return 2; }
+    }
+
+    if (!net_startup()) {
+        printf("network start-up failed\n");
+        return 1;
+    }
+    srand((unsigned)time(nullptr) ^ process_id());
+
+    if (g_logdir.empty()) {
+        g_logdir = exe_dir() + kSep + "mgmp_logs";
+    }
+    while (g_logdir.size() > 3 && (g_logdir.back() == '\\' || g_logdir.back() == '/')) g_logdir.pop_back();
+    ensure_dir(g_logdir);
+    count_stored();
+    logf("game logs from players are stored in %s (%d already there)", g_logdir.c_str(), g_stored);
+
+    std::string err;
+    if (!open_listener(port, discovery, err)) { printf("%s\n", err.c_str()); return 1; }
+
+    logf("mgmp signaling server listening on 0.0.0.0:%u", (unsigned)port);
+    logf("rooms hold up to %d players; it does not relay game traffic", kRoomCap);
+
+    signal(SIGINT, [](int) { g_stop = 1; });
+    signal(SIGTERM, [](int) { g_stop = 1; });
+    logf("stop with Ctrl+C (or SIGTERM)");
+
+    serve_loop();
+
+    close_all();
     net_shutdown();
     return 0;
 }
+#endif
