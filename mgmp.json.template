@@ -1,0 +1,70 @@
+{
+  "game": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Mewgenics\\Mewgenics.exe",
+  "log": "mgmp_trace.log",
+
+  // THE LOBBY. Every instance launches neutral now: this block is how it finds
+  // the server that introduces players, and the role (host or client) is decided
+  // there -- whoever creates a room is the host, everyone who joins is a client.
+  // Both machines can therefore run this same file.
+  "signal": {
+    "enabled": true,
+    "addr": "127.0.0.1",   // the signaling server; 127.0.0.1 = this machine
+    "port": 27700,
+    "name": "",            // the lobby name; empty = the computer's name
+    "room": "",            // a room name to create-or-join automatically. Empty
+                           // = pick in the lobby panel. Setting it makes a
+                           // two-instance test one click from "launch".
+    "auto_connect": false, // connect to the server at startup
+    "legacy_role": false   // keep net.role working at launch (tools/net_test.ps1)
+  },
+
+  "net": {
+    // NOT USED AT STARTUP any more -- the lobby decides the role. Still parsed,
+    // and still means exactly what it always did, but only when
+    // signal.legacy_role above is true.
+    "role": "off",
+    // The game session's own TCP port: the host listens on it, clients dial it.
+    "addr": "127.0.0.1",
+    "port": 27600,
+    "control": "auto"
+  },
+
+  "ui": {
+    "enabled": true,
+    "visible": true,
+    "key": "F1",
+    // The "test release -- back up your saves" dialog shown at startup. Its "do not show again" box writes false here;
+    // set it back to true to see the dialog again.
+    "beta_notice": true,
+    // Developer tools (the panel's 999-damage and node-jump buttons, debug mode, roster_shrink, test_weaken, the UI
+    // harness, and the debug.* switches that make two peers play differently). OFF for players: with false they are
+    // ignored even if named below. Only turn it on for testing, and on BOTH machines.
+    "dev_tools": false
+  },
+
+  "debug": {
+    "follow": true,
+    "follow_delay_ms": 0,
+    "join_barrier": true,
+    "desync_halt": true,
+    "record": false,
+    "record_note": "",
+    "replay": "",
+    // Hook a Mewgenics.exe that is not the build this mod was made for. Off: the mod switches itself off on a patched
+    // game (struct layouts are not re-checked) instead of risking silent corruption.
+    "allow_unpinned_build": false,
+
+    // DEBUG MODE. Destructive, and the only feature that writes to your save
+    // directory by itself: on the way out of the process, slot_to is replaced
+    // with a copy of slot_from -- so the next launch starts from a known
+    // baseline. The game's slot N is steamcampaignNN.sav.
+    //
+    // mgmp_loader.exe --debug turns it on for ONE launch (and --no-debug turns
+    // it off, overriding this line); a launch with neither flag falls back to
+    // this value. A killed process never reaches the exit path, so nothing is
+    // restored then.
+    "debug_mode": false,
+    "slot_from": "steamcampaign01.sav",
+    "slot_to":   "steamcampaign02.sav"
+  }
+}

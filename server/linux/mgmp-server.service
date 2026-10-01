@@ -1,0 +1,28 @@
+# systemd unit for the mgmp signaling server.
+#
+#   sudo useradd --system --home /var/lib/mgmp --create-home --shell /usr/sbin/nologin mgmp
+#   sudo install -m 755 mgmp_server /usr/local/bin/mgmp_server
+#   sudo cp mgmp-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mgmp-server
+#   journalctl -u mgmp-server -f          # the server's own log
+#
+# Players' uploaded game logs land in /var/lib/mgmp/logs (one folder per upload).
+[Unit]
+Description=mgmp co-op mod signaling server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mgmp
+ExecStart=/usr/local/bin/mgmp_server --port 27700 --logdir /var/lib/mgmp/logs
+Restart=on-failure
+RestartSec=3
+# The server needs nothing but its port and its log folder.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mgmp
+
+[Install]
+WantedBy=multi-user.target
