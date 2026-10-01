@@ -1,320 +1,298 @@
-# CoMeow — co-op multiplayer for Mewgenics
+# CoMeow —《Mewgenics》联机合作 Mod
 
-> **Based on [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp).**
-> CoMeow is a continuation of that open-source project (MIT licensed), developed from its code base. The original
-> design, the reverse-engineering work and the lockstep architecture are SanTertrust's; many thanks for making it
-> public. The original copyright notice is kept in [LICENSE](LICENSE). Internally the project still uses the old name:
-> `mgmp.dll`, `mgmp.json`, `mgmp_server`.
->
-> **基于开源项目 [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp) 开发**（MIT 协议）。原项目的设计、逆向工作和
-> 锁步架构均来自 SanTertrust，感谢其开源。原版版权声明保留在 [LICENSE](LICENSE) 中。内部文件名仍沿用旧名
-> （`mgmp.dll`、`mgmp.json`、`mgmp_server`）。
+> **基于开源项目 [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp)（MIT 协议）开发。**
+> CoMeow 是该项目的延续，在它的代码基础上继续开发。原项目的设计、逆向工作和锁步架构均来自 SanTertrust，
+> 感谢其开源。原版版权声明保留在 [LICENSE](LICENSE) 中。内部文件名仍沿用旧名：`mgmp.dll`、`mgmp.json`、`mgmp_server`。
 
-**What CoMeow adds on top of mgmp / 在 mgmp 之上新增的内容**
+## 在 mgmp 之上新增的内容
 
-- A title-screen lobby: create or join rooms through a signaling server, room passwords, room search, host-side room locking.
-  标题界面的联机大厅：房间创建/加入、房间密码、房间搜索、房主锁房。
-- Each player brings their own cats (session clones, merged back after the run); the host decides the chapter and main-story items.
-  每名玩家带自己的猫（会话克隆，战后合并回原猫）；章节与主线道具由房主决定。
-- Enemy health and armor doubled in multiplayer. / 联机时敌人生命与护甲翻倍。
-- Save backup and restore from the title screen; handshake checkpoints for recovery.
-  标题界面的存档备份/恢复，以及握手检查点恢复。
-- F2 panel: upload the current game log and a description of the problem to a server that collects them.
-  F2 面板：把当前日志和问题描述上传到收集日志的服务器。
-- A signaling server that builds on Windows and Linux from one source (`server/`, Linux notes in `server/linux/README.md`).
-  同一份源码可在 Windows 和 Linux 上构建的信令服务器。
-- UI in ten languages. / 十种语言的界面。
+- **联机大厅**：在标题界面通过信令服务器创建或加入房间，支持房间密码、房间搜索，房主可以锁定房间。
+- **每名玩家带自己的猫**：采用会话克隆，战斗结束后合并回原来的猫；章节和主线道具由房主决定。
+- **联机难度**：联机时敌人的生命值和护甲翻倍。
+- **存档保护**：标题界面内置存档备份与恢复，另有握手检查点用于恢复。
+- **问题反馈**：游戏中按 **F2** 打开面板，把当前日志和问题描述上传到收集日志的服务器。
+- **服务器**：同一份源码可以在 Windows 和 Linux 上构建（见 `server/`，Linux 说明见 `server/linux/README.md`）。
+- **多语言界面**：支持十种语言。
 
-This is a **beta**: back up your saves before playing. / 当前为**测试版**，请先备份存档。
+当前为**测试版**，可能出现坏档等问题，请务必先备份存档。
 
-**Game art is not included.** The UI art and font under `assets/` are exported from your own copy of the game by
-`tools/export_ui_assets.py`; without them the mod falls back to flat shapes and a system font.
-游戏美术资源（`assets/`）不在仓库中，需用 `tools/export_ui_assets.py` 从你自己的游戏文件导出；缺少时 mod 会退回到简单图形和系统字体。
+**游戏美术资源不在本仓库中。** `assets/` 里的界面图片和字体需要用 `tools/export_ui_assets.py` 从你自己的游戏文件导出；
+缺少这些资源时，mod 会退回到简单图形和系统字体，功能不受影响。
 
 ---
 
-An unofficial mod that lets two people play one Mewgenics adventure together.
+这是一个非官方 mod，让两个人一起玩同一局《Mewgenics》的冒险。
 
-The host starts a run, the other player joins, and from then on you share
-everything: the same map, the same cats, the same gold, the same fights. Your
-cats are split between you — you each take turns with your own half — and the
-run continues until one of you wins it or loses it. Together.
+房主开始一局游戏，另一名玩家加入，之后你们共享一切：同一张地图、同样的猫、同样的金币、同样的战斗。猫会分给你们两人，
+各自操作自己那一半，直到你们赢下这一局，或者输掉它。一起。
 
-It is not an official feature and has nothing to do with the developers of
-Mewgenics. It is a hobby project built by reading the game's compiled code.
-
-Thanks [Claude](https://claude.ai/). The human didn't write even a single line of code.
+它不是官方功能，与《Mewgenics》的开发者没有任何关系。这是一个业余项目，通过阅读游戏的编译代码做出来。
 
 ---
 
-## Status
+## 当前状态
 
-**It works, and it has been played over the internet for a full run.**
+**它能用，而且上游版本已经通过网络完整打通过一局。**
 
-Here's [gameplay footage](https://youtu.be/IHc-92L6mGg) from a slightly older build.
+这里是上游较早版本的[游戏演示视频](https://youtu.be/IHc-92L6mGg)。
 
-There is still a probability of encountering desynchronization, so report host logs AND clients logs.
+仍有一定概率出现不同步，遇到问题请同时提供房主和客户端双方的日志。
 
-What that means in practice:
+实际使用中意味着：
 
-- Battles are properly synchronised. Both players see the same dice rolls, the
-  same damage numbers, the same enemy decisions.
-- The map, shops, level-ups, events and your inventory all stay in step.
-- You can see each other's mouse cursor, and see what your partner is aiming at
-  before they commit to it.
-- If someone's connection drops, they can rejoin — even in the middle of a
-  fight — and the mod replays the battle up to the current turn to catch them
-  up.
+- 战斗是严格同步的。双方看到同样的骰子结果、同样的伤害数字、同样的敌人决策。
+- 地图、商店、升级、事件和背包都保持同步。
+- 你能看到对方的鼠标指针，也能在对方出手之前看到他正在瞄准什么。
+- 如果有人掉线，可以重新加入，哪怕是在战斗中途，mod 会把这场战斗重放到当前回合来帮他追上。
 
-**Still rough:**
+**仍然比较粗糙的地方：**
 
-- **Connecting is manual.** There is no lobby or friends list. One of you needs
-  to be reachable on the internet, which usually means forwarding a port on
-  your router. See [Connecting](#connecting-to-each-other).
-- **Two players only, really.** The code was written with three and four
-  players in mind, but that has never actually been tested. Assume two.
-- **The house is not shared.** Breeding, furniture and everything you do at
-  home is yours alone. Only the adventure is co-op. This was a deliberate
-  decision, not an oversight. So, make sure to join the host **while they are in the Adventure mode**.
-- **It is pinned to one version of the game.** The mod tries hard to survive a
-  game update on its own, but a big patch may still break it until someone
-  updates it. See [When the game updates](#when-the-game-updates).
-- **Expect bugs.** This is a reverse-engineered mod hooking into a game that
-  was never designed to be played this way.
+- **直连仍需要网络可达。** 大厅服务器只负责让玩家互相找到对方，不转发游戏数据。游戏流量是玩家直连房主的，
+  所以房主需要能被对方访问到，通常意味着在路由器上转发端口。详见[互相连接](#互相连接)。
+- **实际上只支持两名玩家。** 代码是按三到四人设计的，但从未真正测试过，请按两人来用。
+- **家园不共享。** 繁育、家具以及你在家里做的一切都只属于你自己，只有冒险部分是合作的。这是有意为之的决定，不是疏忽。
+  所以请确保在**房主处于冒险模式时**加入房主。
+- **只适配一个游戏版本。** mod 会尽力在游戏更新后自己存活下来，但大型补丁仍可能让它失效，直到有人更新它。
+  详见[游戏更新之后](#游戏更新之后)。
+- **预计会有 bug。** 这是一个逆向出来的 mod，挂接在一个从未打算这样玩的游戏上。
 
 ---
 
-## What you need
+## 你需要什么
 
-- **Windows**, 64-bit.
-- **Mewgenics**, the same version on both machines, installed from the same
-  place. If one of you has a different build of the game, the mod will notice
-  and complain — that mismatch would eventually cause the two games to drift
-  apart. Currently supported `1.1.21239`.
-- A way to reach each other over the network (see below).
+- **Windows**，64 位。
+- **Mewgenics**，两台机器上的版本相同，并且来源相同。如果你们其中一人的游戏版本不同，mod 会发现并提示，
+  因为这种差异最终会让两边的游戏逐渐偏离。当前支持的版本是 `1.1.21239`。
+- 一种让双方能通过网络互相访问的方式（见下文）。
 
-To build it yourself you also need **Visual Studio 2022/2026** (or just the MSVC
-build tools) and **CMake 3.21+**.
+如果要自己构建，还需要 **Visual Studio 2022/2026**（或者只装 MSVC 构建工具）和 **CMake 3.21 及以上**。
 
 ---
 
-## Getting it running
+## 运行起来
 
-### Prebuilt
+### 预编译版本
 
-The easiest way. Download the archive from the [Releases](https://github.com/SanTertrust/mgmp/releases).
+CoMeow 暂时没有提供预编译包，请按下面的步骤自己构建。上游项目有它自己的发布页，但那是上游的版本，不含本项目的新功能。
 
-### 1. Build
+### 1. 构建
 
 ```powershell
 cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-That produces two files in `build\Release\`:
+会在 `build\Release\` 里生成下面这些文件：
 
-| file | what it is |
+| 文件 | 作用 |
 |---|---|
-| `mgmp_loader.exe` | what you run. Starts the game with the mod loaded. |
-| `mgmp.dll` | the mod itself. The loader puts it into the game. |
-| `mgmp.json` | your settings. Created automatically the first time. |
+| `mgmp_loader.exe` | 你运行的程序，启动游戏并加载 mod。 |
+| `mgmp.dll` | mod 本体，由加载器注入到游戏里。 |
+| `mgmp.json` | 你的设置，第一次运行时会自动创建。 |
 
-The three need to sit in the same folder. Everything else — Dear ImGui,
-MinHook — is compiled straight into `mgmp.dll`, so there is nothing else to
-install or copy around.
+这三个文件需要放在同一个文件夹里。其余的一切（Dear ImGui、MinHook）都直接编译进了 `mgmp.dll`，
+不需要再安装或拷贝别的东西。
 
-### 2. Point it at your game
+### 2. 告诉它游戏在哪里
 
-Open `mgmp.json` and set `game` to wherever Mewgenics actually is:
+打开 `mgmp.json`，把 `game` 设置成 Mewgenics 实际所在的位置：
 
 ```json
 "game": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Mewgenics\\Mewgenics.exe"
 ```
 
-(Windows paths in JSON need doubled backslashes.)
+（JSON 里的 Windows 路径需要把反斜杠写成两个。）
 
-### 3. Choose who hosts
+### 3. 启动游戏
 
-The **host** owns the run. Their save file is the one you both play.
+双方都运行 `mgmp_loader.exe`，它会根据配置启动 Mewgenics。
 
-In the host's `mgmp.json`:
+也可以直接把 `Mewgenics.exe` **拖放**到 `mgmp_loader.exe` 上。
 
-```json
-"net": { "role": "host", "addr": "0.0.0.0", "port": 27600 }
-```
+建议从命令行或 PowerShell 启动，因为它会输出日志，例如提示需要在 `Mewgenics.exe` 旁边放一个 `steam_appid.txt`。
 
-In the other player's:
+第一次进入标题界面时会弹出一个提示框，说明 mod 还在测试阶段，建议备份存档。勾选"不再提示"后，
+它会把 `ui.beta_notice` 写成 `false`；想再次看到，把它改回 `true` 即可。
 
-```json
-"net": { "role": "client", "addr": "<the host's IP address>", "port": 27600 }
-```
+### 4. 通过大厅联机
 
-Leave `role` as `"off"` to play alone with the mod loaded but dormant.
+标题界面会多出两个入口：**多人联机**和**存档备份**。
 
-### 4. Play
+1. 点击**多人联机**，填写服务器地址（默认是 `localhost`，也可以写成 `地址:端口`，默认端口 27700）和你的玩家名，
+   然后点击连接。服务器的搭建见下面的[服务器](#服务器)。
+2. 其中一人点击**创建房间**，可以选择设置密码，也可以留空做成公开房间。创建房间的人就是**房主**。
+3. 另一人在房间列表里找到这个房间并点击**加入**。有密码的房间前面有一把锁，排在公开房间之后，输入密码才能加入；
+   房间多的时候可以用搜索框按房间名或房主名查找。
+4. 房主先**锁定房间**，然后双方各自选择存档。房主决定最终使用哪一份存档，之后开始冒险。
 
-Both of you run `mgmp_loader.exe`. It will open the Mewgenics based on config.
+加入的一方不需要做别的。停在标题界面等着就行：房主的存档到达后，mod 会替你按下**开始游戏**、选好存档位，
+并载入房主的这一局。你自己的存档文件不会被改动，房主的这一局会放进另外一个 `mgmp_coop.sav`。
 
-You can also just **drag and drop** `Mewgenics.exe` into `mgmp_loader.exe`.
+连接到房主的客户端不能自己选择存档或开始冒险中的战斗，也不能做其他会改变猫数据的操作。
 
-I'd recommend launch it from a command line/powershell, because it logs stuff, such as needing the `steam_appid.txt` file near the `Mewgenics.exe`.
+之后就是正常玩：轮到你的猫时，由你操作；轮到队友的猫时，你来观战。由电脑控制的猫，两台机器会以完全相同的方式处理，
+不需要任何人输入。
 
-The host picks a save slot and starts playing. Clients connected to the host cannot select save or start battle in Adventure mode, nor can they perform other actions that alter cat data.
-
-The joining player does not have to do anything. Sit on the main menu — when
-the host's save arrives, the mod presses **Play** for you, picks the slot, and
-loads the host's run. Your own save files are never touched; the host's run goes
-into a separate `mgmp_coop.sav`.
-
-> **Set `net.role` in `mgmp.json`.** The panel's `host` / `join` buttons now
-> configure the session properly on their own, but launching with the role
-> already set is still the tested path, and it is the only one that installs
-> every hook at startup rather than partway through.
-
-From there you just play. When it is your cat's turn, you move it. When it is
-your partner's cat, you watch. Cats controlled by the computer are handled by
-both machines identically and need no input from anyone.
-
-If you would rather attach the mod to a copy of the game that is already
-running:
+如果你想把 mod 挂到一个已经在运行的游戏上：
 
 ```powershell
-.\mgmp_loader.exe --attach <process id>
+.\mgmp_loader.exe --attach <进程 ID>
 ```
 
----
-
-## Connecting to each other
-
-The mod talks over a plain TCP connection on port **27600** by default. There
-is no matchmaking server, no relay, and no Steam lobby — the joining player
-connects straight to the host's IP address.
-
-That means one of two things:
-
-- **On the same network** (same house, same Wi-Fi), it just works. The joining
-  player uses the host's local IP, something like `192.168.1.42`.
-- **Over the internet**, the host has to be reachable. In practice that means
-  forwarding TCP port 27600 on their router to their PC, and the joining player
-  using the host's public IP.
-
-If port forwarding is not an option, any tool that puts you both on one virtual
-network (Hamachi, Tailscale, ZeroTier, Radmin) works fine — from the mod's
-point of view that is just a LAN.
-
-There are **no timeouts anywhere**, on purpose. If your partner's game is slow
-to respond, yours waits instead of guessing. A game that visibly pauses is much
-better than two games quietly playing different stories.
+> **关于旧的启动方式。** 以前靠 `mgmp.json` 里的 `net.role` 在启动时直接指定房主或客户端，现在身份由大厅决定：
+> 创建房间的人是房主，加入的人是客户端。旧方式仍可用，需要同时把 `signal.legacy_role` 设为 `true`
+> （`tools/net_test.ps1` 这类测试脚本会用到）。
 
 ---
 
-## While you are playing
+## 互相连接
 
-### The debug panel
+### 大厅服务器与游戏连接是两回事
 
-Press **F1** to show or hide an overlay panel. It reports whether you are
-connected, which cats each player controls, how many turns have been agreed on,
-and a live log. If something looks wrong, this is the first place to look.
+- **大厅服务器**（默认端口 **27700**）只负责让玩家互相找到对方：列出房间、创建、加入、锁定。它不转发任何游戏数据。
+- **游戏连接**是普通的 TCP 连接，默认端口 **27600**，由加入的玩家直接连到房主。
 
-You can change the key, or turn the panel off entirely, in `mgmp.json` under
-`ui`.
+所以房主需要能被对方访问到，分为两种情况：
 
-### Seeing your partner
+- **在同一个网络里**（同一个家、同一个 Wi-Fi），直接就能用。
+- **通过互联网**，房主必须可达。实际上就是在路由器上把 TCP 27600 端口转发到房主的电脑。
 
-Their mouse cursor appears on your screen, and when they are choosing where to
-attack, you see the same targeting highlight they do. None of this affects the
-game — it is purely so you can tell what they are thinking.
+如果没法做端口转发，任何能把你们放进同一个虚拟网络的工具（Hamachi、Tailscale、ZeroTier、Radmin）都可以，
+对 mod 来说那就是一个局域网。
 
-One quirk: the cursor follows the board tile they are pointing at, not the
-exact pixel, if the two of you have panned the camera differently. The tile is
-always right.
+房间密码只保护"通过服务器加入房间"这一步，房主的直连端口本身没有认证，请知晓这一点。
 
-### If the two games disagree
-
-Every turn, both machines compare notes on the state of the battle. If they
-ever come out different, the mod **stops both games immediately** and writes
-what differed to the log, rather than letting you play on in two increasingly
-different worlds.
-
-If that happens, the log files are the interesting part — see below.
-
-### Logs
-
-Every session writes a timestamped log next to the loader
-(`mgmp_host_20260826-143000.log` and similar). If you want to report a problem,
-that file from *both* players is what makes it diagnosable. A single side's log
-can usually only show that something went wrong, not what.
+**所有环节都没有超时**，这是有意为之。如果队友的游戏响应慢，你的游戏会等待，而不是去猜。游戏明显地停顿一下，
+远好过两个游戏悄悄地演出两个不同的故事。
 
 ---
 
-## Settings
+## 服务器
 
-Everything lives in `mgmp.json`, beside the loader.
+服务器是单独的可执行文件，位于 `server/`，同一份源码可以在 Windows 和 Linux 上构建。
 
-| setting | what it does |
+```
+mgmp_server                                   # 默认端口 27700
+mgmp_server --port 27700 --logdir <日志目录>   # 指定端口和日志收集目录
+```
+
+- Linux 的构建、systemd 常驻、防火墙等说明见 [server/linux/README.md](server/linux/README.md)。
+- 服务器本身**没有认证也没有加密**，请在局域网或受信任的环境里使用，需要的话在前面套一层防火墙白名单。
+- 玩家在游戏里按 **F2** 上传的日志，会按"时间_玩家名_IP"为名保存在日志目录中，每次上传一个文件夹，
+  内含日志文件和一个记录玩家问题描述的 `info.txt`。有每个地址每小时的次数限制和总量上限。
+
+---
+
+## 游戏过程中
+
+### 日志上传面板（F2）
+
+按 **F2** 打开或关闭。填写服务器地址（默认 `localhost`）和对遇到的问题的描述（可选），点击**上传日志**，
+会把本次运行的日志和 `mgmp_boot.log` 发送到你填写的服务器。日志里包含玩家名、房间名等信息，只会发给你填的那台服务器。
+
+### 调试面板
+
+按 **F1** 显示或隐藏一个悬浮面板。它会显示你是否已连接、每名玩家控制哪些猫、已经达成一致的回合数，以及实时日志。
+如果哪里看起来不对，这里是第一个该看的地方。
+
+可以在 `mgmp.json` 的 `ui` 里更改按键，或者完全关闭这个面板。
+
+### 看到你的队友
+
+对方的鼠标指针会出现在你的屏幕上，当对方正在选择攻击位置时，你会看到和他一样的瞄准高亮。这一切都不影响游戏，
+纯粹是让你知道他在想什么。
+
+有一个小特点：如果你们两人的镜头平移得不一样，指针跟随的是他指向的棋盘格子，而不是精确的像素。格子永远是对的。
+
+### 存档备份
+
+标题界面的**存档备份**可以备份和恢复存档。联机前后都可以用，建议经常备份。
+
+### 如果两边的游戏出现分歧
+
+每个回合，两台机器都会互相核对战斗状态。一旦出现不一致，mod 会**立刻停止两边的游戏**，并把差异写进日志，
+而不是让你们在两个越来越不同的世界里继续玩下去。
+
+如果发生这种情况，有价值的是日志文件，见下文。
+
+### 日志
+
+每次会话都会在加载器旁边写一个带时间戳的日志（例如 `mgmp_host_20260826-143000.log`）。如果你要反馈问题，
+**双方**的这个文件才能让问题得到诊断；只有一方的日志通常只能说明出了问题，说明不了是什么问题。
+
+---
+
+## 设置
+
+所有设置都在加载器旁边的 `mgmp.json` 里。
+
+| 设置 | 作用 |
 |---|---|
-| `game` | full path to `Mewgenics.exe` |
-| `log` | log file name |
-| `net.role` | `off`, `host`, or `client` |
-| `net.addr` | who to connect to (client), or what to listen on (host) |
-| `net.port` | default `27600` |
-| `net.control` | which cats you control. Leave on `"auto"` — it splits them evenly by itself. |
-| `ui.enabled` | whether the debug panel exists at all |
-| `ui.visible` | whether it starts visible |
-| `ui.key` | key to toggle it, default `F1` |
+| `game` | `Mewgenics.exe` 的完整路径 |
+| `log` | 日志文件名 |
+| `signal.addr` / `signal.port` | 大厅服务器的地址和端口（默认 27700） |
+| `signal.name` | 大厅里显示的玩家名，留空则用电脑名 |
+| `signal.room` | 填了就自动创建或加入同名房间，留空则在大厅里手动选择 |
+| `signal.auto_connect` | 启动时是否自动连接服务器 |
+| `signal.legacy_role` | 是否保留启动时用 `net.role` 指定身份的旧方式 |
+| `net.role` | `off`、`host` 或 `client`（只有开启 `signal.legacy_role` 时才生效） |
+| `net.addr` / `net.port` | 游戏连接的地址和端口，默认 `27600` |
+| `net.control` | 你控制哪些猫。保持 `"auto"` 即可，它会自己平均分配。 |
+| `ui.enabled` | 调试面板是否存在 |
+| `ui.visible` | 面板是否一开始就显示 |
+| `ui.key` | 切换面板的按键，默认 `F1` |
+| `ui.beta_notice` | 是否显示首次运行的测试版提示框 |
+| `ui.dev_tools` | 开发者开关总闸，默认关闭，玩家请勿开启 |
 
-The `debug` block is for development and is best left alone. `record` in
-particular makes the mod log an enormous amount of detail about the game's
-random number generator, which is useful when chasing a bug and pure overhead
-otherwise.
+`debug` 部分是给开发用的，最好不要动。其中 `record` 会让 mod 记录大量关于游戏随机数生成器的细节，
+追查 bug 时有用，其余时候纯属额外开销。没有打开 `ui.dev_tools` 时，所有开发者开关都会被忽略。
 
-Only settings that are genuinely meant to be changed live in this file.
-Everything else is a compile-time constant in `src/core/mgmp_tuning.h`, each
-one with a note saying why it is not user-facing.
-
----
-
-## How it works, briefly
-
-Two players staying in sync is not one problem, it is two, and they need
-opposite solutions.
-
-**Battles are deterministic.** Given the same starting position, the game plays
-out identically every time, right down to the individual dice rolls — this was
-measured, not assumed. So the mod does not send the *result* of anything.
-It sends only what each player clicked, and both machines work out the
-consequences independently and arrive at the same place. This is called
-lockstep, and it is why battles cost almost no bandwidth.
-
-**Everything outside battle is not deterministic**, but it is saveable. The
-game already knows how to write a cat, an inventory and a run's history to
-disk. So for the map, shops, level-ups and events, the host simply decides and
-sends the result over.
-
-Both halves are checked constantly. Every turn of every battle, and every time
-you enter a map node, the two machines exchange a fingerprint of their state
-and compare it. Agreement is proven, not hoped for.
-
-The technical story — addresses, struct offsets, measurements and dead ends —
-lives in the comments of the source files, next to the code it explains.
+只有真正打算让你修改的设置才放在这个文件里，其余的都是 `src/core/mgmp_tuning.h` 里的编译期常量，
+每一个都附有说明，解释了为什么不对用户开放。
 
 ---
 
-## Project layout
+## 游戏更新之后
+
+mod 的挂接点是按固定的游戏版本测量出来的。它会用字节特征尽量在补丁后自己重新定位，但如果游戏的可执行文件和 mod 预期的版本不同，
+mod 会拒绝挂接，以免在结构已经变化的游戏上悄悄损坏数据，并在日志里说明原因。游戏大版本更新后，需要等 mod 适配新版本。
+
+---
+
+## 它是怎么工作的，简述
+
+让两个玩家保持同步不是一个问题，而是两个，并且需要相反的解决办法。
+
+**战斗是确定性的。** 给定同样的起始局面，游戏每次都会完全相同地演下去，连每一次骰子都一样，这是实测过的，不是假设。
+所以 mod 不发送任何事情的*结果*，只发送每个玩家点击了什么，两台机器各自独立算出后果，并得到同样的结果。
+这叫做锁步，也是战斗几乎不占带宽的原因。
+
+**战斗之外的一切不是确定性的**，但是可以存档。游戏本身就知道如何把一只猫、一份背包和一局的历史写到磁盘上。
+所以地图、商店、升级和事件，只需要由房主决定，再把结果发过去。
+
+这两部分都会被不断检查。每场战斗的每个回合，以及每次进入地图节点时，两台机器都会交换各自状态的指纹并比对。
+一致是被证明出来的，而不是靠碰运气。
+
+技术细节，包括地址、结构偏移、测量数据和走过的弯路，都写在源码的注释里，紧挨着它所解释的代码。
+
+---
+
+## 项目结构
 
 ```
-src/core/          loading, hooking, logging, config, crash reporting
-src/determinism/   random number tracking, recording and replay
-src/net/           the network transport and the message format
-src/session/       everything that actually keeps two games in step
-src/ui/            the debug panel and the on-screen overlay
+src/core/          加载、挂接、日志、配置、崩溃报告
+src/determinism/   随机数跟踪、录制与回放
+src/net/           网络传输、消息格式、大厅客户端与日志上传
+src/session/       真正让两个游戏保持同步的一切
+src/ui/            面向玩家的菜单、调试面板和屏幕上的覆盖层
 loader/            mgmp_loader.exe
-tests/             unit tests for the logic that can be tested alone
-tools/             Python and PowerShell helpers used while developing
-third_party/       Dear ImGui, MinHook, stb_image, nlohmann/json
+server/            大厅与日志收集服务器（Windows 和 Linux 同一份源码）
+tests/             可以单独测试的逻辑的单元测试
+tools/             开发过程中用到的 Python 和 PowerShell 辅助脚本
+third_party/       Dear ImGui、MinHook、stb_image、nlohmann/json
 ```
 
-Run the tests with:
+运行测试：
 
 ```powershell
 ctest --test-dir build --build-config Release
@@ -322,16 +300,12 @@ ctest --test-dir build --build-config Release
 
 ---
 
-## A note on what this is
+## 关于这是什么
 
-This mod contains no Mewgenics code, art or data. It is an independent program
-that attaches to a legally purchased copy of the game on your own machine. You
-need to own the game; nothing here will help you play it if you do not.
+这个 mod 不包含任何《Mewgenics》的代码、美术或数据。它是一个独立的程序，挂接到你自己机器上合法购买的游戏副本上。
+你需要拥有这款游戏；如果你没有，这里没有任何东西能帮你玩它。
 
-It is not affiliated with, endorsed by, or supported by the developers or
-publisher of Mewgenics. If it breaks your save, that is on you — back up your
-saves before using it. If you report a bug to the game's developers while this
-mod is loaded, please mention that it is loaded.
+它与《Mewgenics》的开发者或发行商没有任何隶属、认可或支持关系。如果它弄坏了你的存档，责任在你，使用前请先备份存档。
+如果你在加载了这个 mod 的情况下向游戏开发者反馈 bug，请说明加载了它。
 
-Mewgenics is by Tyler Glaiel and Edmund McMillen. It is a very good game and
-you should buy it.
+《Mewgenics》的作者是 Tyler Glaiel 和 Edmund McMillen。这是一款非常好的游戏，请购买正版。
