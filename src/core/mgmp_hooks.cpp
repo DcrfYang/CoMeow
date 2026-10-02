@@ -114,6 +114,7 @@ fn_trydepart  o_TryDepart     = nullptr;
 fn_iskitten   o_IsKitten      = nullptr;
 fn_loadchar   o_LoadChar      = nullptr;
 fn_this       o_EndRunDefeat  = nullptr;
+fn_two_ptr    o_GainCat       = nullptr;   // the event effect gain_cat_familiar(context, <unused>)
 fn_this       o_TimeDelay     = nullptr;
 fn_this       o_MapUpdate     = nullptr;
 fn_this_ptr   o_EnterNode     = nullptr;
@@ -1006,6 +1007,17 @@ void __fastcall h_EndRunDefeat(void* self) {
 // allowed to run; roster_normalize_shared() puts every cat back on its owner's
 // side afterwards (see mgmp_roster.cpp).
 
+// ui.block_new_cats: every "a new cat joins" event effect does nothing. It has to be the SAME on both peers -- one machine adding a
+// cat the other does not would split the rosters -- so the HOST's setting rules: a client takes it from the host's HELLO (session_block_new_cats).
+void* __fastcall h_GainCat(void* ctx, void* arg) {
+    if (session_block_new_cats()) {
+        static bool said = false;
+        if (!said) { said = true; log_line("EVENT", "ui.block_new_cats (the host's): the \"a new cat joins\" effect is skipped"); }
+        return nullptr;
+    }
+    return o_GainCat(ctx, arg);
+}
+
 void __fastcall h_SelectAct(void* self, int act) {
     if (!setup_on_select_act(act)) return;
     o_SelectAct(self, act);
@@ -1230,6 +1242,7 @@ const Binding kBindings[] = {
     { T_EquipmentClick, (void*)&h_EquipmentClick, (void**)&o_EquipmentClick },
     { T_EndRunFinalize, (void*)&h_EndRunFinalize, (void**)&o_EndRunFinalize },
     { T_EndRunDefeat,   (void*)&h_EndRunDefeat,   (void**)&o_EndRunDefeat },
+    { T_GainCat,        (void*)&h_GainCat,        (void**)&o_GainCat },
     { T_TryAbandon,     (void*)&h_TryAbandon,     (void**)&o_TryAbandon     },
     { T_SelectAct,        (void*)&h_SelectAct, (void**)&o_SelectAct },
     { T_ChapterLower,     (void*)&h_ChapterLower, (void**)&o_ChapterLower },

@@ -349,6 +349,8 @@ bool lockstep_cat_is_mine(uint64_t id, bool& mine) {
     for (auto v : hosts) if (v == id) { mine = peer == 0; return true; }
     return false;
 }
+bool catsync_cat_perished(uint64_t) { return false; }   // the roster asks whether a cat that left the lists is dead for good
+bool catsync_cat_exists(uint64_t) { return false; }     // ... and whether an unknown id in them is a real cat
 bool lockstep_owner_pos(uint64_t id, uint8_t& owner) {
     auto found = owner_notes.find(id);
     if (found != owner_notes.end()) { owner = found->second; return true; }

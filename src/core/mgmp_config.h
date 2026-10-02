@@ -24,6 +24,7 @@ struct Config {
     char     net_role[16]  = "off";
     char     net_addr[64]  = "127.0.0.1";   // client only
     uint16_t net_port      = 27600;
+    bool     net_steam     = true;     // net.steam: also offer / try Steam peer-to-peer as a way to reach the host (no open port needed)
 
     // net.control = "auto", or an array of cat indices into the battle's own
     // character list. auto derives the split from the roster and is the only
@@ -122,6 +123,10 @@ struct Config {
     // nothing.
     wchar_t  replay_path[512]  = {};
 
+    // debug.steam_test: "probe" | "host" | "join:<SteamID64>" -- the Steam P2P networking experiment (mgmp_steamtest.h).
+    // Developer only: ignored without ui.dev_tools.
+    char     steam_test[96]    = {};
+
     // --- debug mode ----------------------------------------------------------
     //
     // One switch for "this process is a test rig, not a play session". What it
@@ -157,6 +162,9 @@ struct Config {
     // ui.beta_notice: show the "this is a test release, back up your saves" dialog at startup. The dialog's "do not show
     // again" box writes false back into mgmp.json (config_set_beta_notice); set it to true there to see it again.
     bool     beta_notice = true;
+    // ui.block_new_cats: the event effect "a new cat joins the run" does nothing. Off by default (the game as it is); set from the main menu's
+    // mod settings. Part of the handshake's ruleset: both players must agree.
+    bool     block_new_cats = false;
     // debug.test_weaken: every enemy to 1 hp at the first usable turn (a test aid). Needs dev_tools, and both peers
     // must agree -- it is part of the ruleset the handshake compares.
     bool     test_weaken = false;
@@ -223,6 +231,10 @@ bool        config_set_debug_mode(bool on);
 // missing file is created). Returns false if the file could not be written -- the live value is changed regardless, so
 // the dialog still stays closed for this run.
 bool        config_set_beta_notice(bool on);
+// ui.block_new_cats, in memory and in mgmp.json (the same careful rewrite as beta_notice). False when the file could not be written.
+bool        config_set_block_new_cats(bool on);
+// The text rewrite behind both: `text` with ui.<key> set to `on` (added when absent), or an empty string for a file that is not an object.
+std::string config_rewrite_ui_bool(const std::string& text, const char* key, bool on);
 // The text rewrite behind it, exposed for tests: returns `text` with ui.beta_notice set to `on`, or an empty string if
 // the text is not an object it can edit.
 std::string config_rewrite_beta_notice(const std::string& text, bool on);

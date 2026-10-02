@@ -141,6 +141,13 @@ bool     catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len)
 // Returns false when the run's cats cannot be read right now (the caller keeps what it had);
 // otherwise true with `n` filled, at most `max`, in a stable order. Read-only, needs no session.
 bool catsync_local_briefs(CatBrief* out, uint32_t max, uint32_t& n);
+
+// Has the game marked this cat dead for good (corpse destroyed, or the `kill` event)? Read off its CatData; false when it cannot be
+// looked up. See kCatData_Killed in mgmp_addresses.h.
+bool catsync_cat_perished(uint64_t id);
+
+// Is there a cat with this id in the game's registry? (A cat gained during the run -- the gain_cat_familiar event -- is one.)
+bool catsync_cat_exists(uint64_t id);
 // Capture the four cats currently selected in this peer's local setup. The
 // returned images are owned by the caller and must be freed with free().
 bool catsync_export_party_setup(SetupMsg& out);
@@ -159,6 +166,17 @@ bool catsync_prepare_settlement(void* director);
 // after the native settlement and, as a safety net for saves the old behaviour left behind, before a new run's
 // clones are made. Returns how many clones were merged.
 unsigned catsync_merge_session_cats(const char* why);
+
+// WHICH ORIGINAL A CLONE CAME FROM, REMEMBERED (2026-10-02). The merge used to find an original by its seed among cats flagged "out on
+// adventure" -- fine from the warehouse, but a run resumed from a handshake save may no longer offer that evidence. The setup now
+// records clone -> original, the journal keeps the record (disk version 3), a restore reads it back, and the merge trusts it first
+// (after checking the seed still matches); the seed search stays as the fallback.
+struct CloneOriginNote { uint64_t clone = 0; uint64_t original = 0; };
+void     catsync_note_origin(uint64_t clone, uint64_t original);
+uint64_t catsync_origin_of(uint64_t clone);                    // 0 when not recorded
+uint32_t catsync_origin_export(CloneOriginNote* out, uint32_t max);
+void     catsync_origin_import(const CloneOriginNote* in, uint32_t count);
+void     catsync_origin_clear();                                   // tests: the table as it is on a fresh process
 // ORIGINALS THE OLD BEHAVIOUR LEFT "ON ADVENTURE" (2026-10-01). Before the merge existed, a joint run's originals kept
 // the on-adventure bit for good and their progress went to clones that were later overwritten -- the user's saves hold
 // seven or eight such cats, invisible in the House. When no run of this player is in progress (the chapter page of a

@@ -132,7 +132,8 @@ void search_thread() {
                     lr.pw      = r.value("pw", false);
                     if (lr.id.empty()) continue;
                     bool dup = false;
-                    for (const LanRoom& o : found) if (o.addr == lr.addr && o.port == lr.port && o.id == lr.id) { dup = true; break; }
+                    // the same room answered from two addresses of one machine (a virtual adapter besides the real one): keep the first
+                    for (const LanRoom& o : found) if (o.port == lr.port && o.id == lr.id && o.name == lr.name && o.host == lr.host) { dup = true; break; }
                     if (!dup) found.push_back(lr);
                 }
             } catch (...) {}

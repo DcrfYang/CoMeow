@@ -106,6 +106,7 @@ void certified(unsigned seq) {
 }
 namespace mgmp {
 unsigned imported_notes = 0;   // set by the import stub, asserted in main
+unsigned imported_origins = 0; // the clone -> original record the journal now carries (disk version 3)
 bool net_active(){return connected;}
 bool net_send_savewait(const SaveWaitMsg& m) {
     // Through the real codec, host -> every client.
@@ -122,6 +123,14 @@ uint32_t lockstep_owner_note_export(LockstepOwnerNote* out, uint32_t max) {
     return 2;
 }
 void lockstep_owner_note_import(const LockstepOwnerNote*, uint32_t count) { imported_notes += count; }
+uint32_t catsync_origin_export(CloneOriginNote* out, uint32_t max) {
+    if (max < 2) return 0;
+    out[0] = {0x70000001ull, 0x2daull}; out[1] = {0x71000001ull, 0x2fcull};
+    return 2;
+}
+void catsync_origin_import(const CloneOriginNote* in, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) if (in[i].clone && in[i].original) ++imported_origins;
+}
 NetRole net_role(){return current==0?NetRole::Host:NetRole::Client;}
 uint8_t net_self(){return (uint8_t)current;}
 uint8_t net_peer_count(){return (uint8_t)live;}
@@ -164,13 +173,26 @@ int main() {
     restart(); for(unsigned i=0;i<participants;++i)CHECK(states[i].released && states[i].seq==3);
     // The restore path imported the journal's owner notes on every peer.
     CHECK(imported_notes>=2*participants);
+    CHECK(imported_origins>=2*participants);   // the journal brought the clone -> original record back too
     // Journal format: a version-1 entry (no owner section) is still readable and
     // reports an empty table; a version-2 entry round-trips its notes.
     at(0,[]{
         Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.owner_count==2);
-        Bytes v2=encode_entry(e);
-        const uint32_t strip=4+e.owner_count*9;
-        Bytes v1(v2.begin(),v2.end()-8-strip);
+        CHECK(e.origin_count==2 && e.origins[0].clone==0x70000001ull && e.origins[0].original==0x2daull && e.origins[1].original==0x2fcull);   // disk version 3
+        Bytes v3=encode_entry(e);
+        // a version-2 file (owner notes, no origin record) is still read, with an empty origin table
+        {
+            const uint32_t strip3=4+e.origin_count*16;
+            Bytes v2(v3.begin(),v3.end()-8-strip3);
+            v2[4]=2; v2[5]=0; v2[6]=0; v2[7]=0;
+            uint64_t h2=savefile_hash(v2.data(),(uint32_t)v2.size());
+            for(int i=0;i<8;++i) v2.push_back((uint8_t)(h2>>(i*8)));
+            CHECK(checkpoint_io::atomic_write(file(L".pending"),v2));
+            Entry r2{}; CHECK(read_entry(file(L".pending"),r2,true));
+            CHECK(r2.owner_count==2 && r2.origin_count==0 && r2.database.size()==e.database.size());
+        }
+        const uint32_t strip=4+e.owner_count*9+4+e.origin_count*16;
+        Bytes v1(v3.begin(),v3.end()-8-strip);
         v1[4]=1; v1[5]=0; v1[6]=0; v1[7]=0;                 // disk version 1
         uint64_t h=savefile_hash(v1.data(),(uint32_t)v1.size());
         for(int i=0;i<8;++i) v1.push_back((uint8_t)(h>>(i*8)));

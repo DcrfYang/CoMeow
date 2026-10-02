@@ -55,6 +55,9 @@ add_library(mgmp SHARED
     src/net/mgmp_signal.cpp
     src/net/mgmp_lan.cpp
     src/net/mgmp_lobby_server.cpp
+    src/net/mgmp_upnp.cpp
+    src/net/mgmp_steamtest.cpp
+    src/net/mgmp_steambridge.cpp
     src/net/mgmp_logupload.cpp
     src/session/mgmp_lockstep.cpp
     src/session/mgmp_session.cpp

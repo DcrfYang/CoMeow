@@ -21,6 +21,7 @@
 #include "mgmp_setup.h"
 #include "mgmp_leave.h"
 #include "mgmp_signal.h"    // the lobby is what decides the role now
+#include "mgmp_steamtest.h"
 #include "mgmp_config.h"
 #include "mgmp_hooks.h"     // hooks_install_late, for a session started from the panel
 #include "mgmp_tuning.h"
@@ -53,7 +54,9 @@ struct State {
     uint32_t dropped_types = 0;
 
     Request  request = Request::None;
-    char     req_addr[64] = {};
+    bool     host_rules_known = false;      // a client has seen the host's HELLO
+    bool     host_block_new_cats = false;   // ... and this is the host's ui.block_new_cats
+    char     req_addr[192] = {};      // one address or a comma-separated list (see net_join)
     uint16_t req_port = 0;
     char     last_action[128] = {};
 };
@@ -158,6 +161,7 @@ Hello our_hello() {
     h.proto      = kProtoVersion;
     h.gpak_hash  = g.gpak_hash;
     h.build_hash = g.build_hash;
+    h.rules      = config().block_new_cats ? 1 : 0;    // meaningful from the host only
     _snprintf_s(h.name, sizeof(h.name), _TRUNCATE, "%s",
                 net_role() == NetRole::Host ? "host" : "client");
     return h;
@@ -263,6 +267,13 @@ void handle_hello(uint8_t from, const Hello& h) {
     }
     log_line("SESSION", "peer %u '%s' accepted (proto %u)",
              (unsigned)from, h.name[0] ? h.name : "?", h.proto);
+
+    // A client plays by the HOST's rules (ui.block_new_cats), whatever its own setting says.
+    if (net_role() == NetRole::Client && from == kHostPeer) {
+        g.host_block_new_cats = (h.rules & 1) != 0;
+        g.host_rules_known = true;
+        log_line("SESSION", "the host's rule: \"a new cat joins\" effects are %s", g.host_block_new_cats ? "BLOCKED" : "left as they are");
+    }
 
     if (net_role() != NetRole::Host) return;
 
@@ -390,6 +401,7 @@ void note_action(const char* fmt, ...) {
 bool begin(bool host, const char* addr, uint16_t port) {
     g.started       = true;
     g.dropped_types = 0;   // a fresh session gets a fresh set of warnings
+    g.host_rules_known = false;   // the host's rules arrive with its HELLO
 
     // BEFORE the socket, because five modules and six hooks read the role and
     // not the socket. A session started from the panel in a process launched
@@ -497,7 +509,7 @@ bool session_start() {
     // session -- reconnecting, or playing a second run with the same two
     // people, must not mean reconnecting to the signaling server as well.
     static bool signal_up = false;
-    if (!signal_up) { signal_up = true; signal_init(); }
+    if (!signal_up) { signal_up = true; signal_init(); steamtest_start(cfg.steam_test); }
 
     // AND THE ROLE IS NOT READ FROM THE FILE ANY MORE.
     //
@@ -525,6 +537,13 @@ bool session_start() {
     }
 
     return begin(host, cfg.net_addr, cfg.net_port);
+}
+
+// "a new cat joins" effects: the HOST decides. The host (or a game with no session) reads its own setting; a client reads the host's,
+// which came in its HELLO, and falls back to its own only before that has arrived.
+bool session_block_new_cats() {
+    if (net_role() == NetRole::Client && g.host_rules_known) return g.host_block_new_cats;
+    return config().block_new_cats;
 }
 
 void session_request_host(uint16_t port) {
@@ -582,6 +601,17 @@ void session_update() {
     // no session at all arrives with phase == Off, which is precisely the state
     // that return exists to skip.
     apply_request();
+
+    // The dial runs on a thread now: when it gives up on every address the session must not wait for a host that is not there.
+    // Torn down (not left half-started) so the next attempt -- the lobby's redial, or another room -- starts clean.
+    if (g.phase == Phase::Waiting && net_state() == NetState::Failed) {
+        char why[256];
+        _snprintf_s(why, sizeof(why), _TRUNCATE, "%s", net_error());
+        session_shutdown();
+        set_status("failed: %s", why);
+        note_action("!! could not connect: %s", why);
+        return;
+    }
 
     if (g.phase == Phase::Off || g.phase == Phase::Refused) return;
 

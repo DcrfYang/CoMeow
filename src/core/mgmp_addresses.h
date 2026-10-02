@@ -88,6 +88,7 @@ enum Target : int {
     T_IsKitten,          // CatData::is_kitten -- "no" in a room once the run is under way (a kitten cannot fight)
     T_LoadChar,          // Character: fill a freshly made character from its definition -- enemy health / armor x2, mgmp_balance.h
     T_EndRunDefeat,      // MewDirector end of a LOST / abandoned run (0x3B4750) -- the ownership filter and the clones' return
+    T_GainCat,           // the event effect gain_cat_familiar (0x929B80): a new cat joins the run -- ui.block_new_cats makes it do nothing
     T_COUNT
 };
 
@@ -549,6 +550,9 @@ static const TargetDesc kTargets[T_COUNT] = {
     // properties. ENDFINAL was hooked to keep a peer's session copies out of that walk; this one was not, so a lost
     // or abandoned run settled the OTHER players' copies in every registry too.
     { 0x003B4750, "ENDDEFEAT", "MewDirector end of a lost/abandoned run" },
+    // The event effect interpreter (0x9173A0) compares the effect name and calls this for gain_cat_familiar: it builds a cat and files
+    // its id in the party (or the familiars when the party is full). rcx = the event context.
+    { 0x00929B80, "GAINCAT", "event effect gain_cat_familiar" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -1031,6 +1035,12 @@ constexpr uintptr_t kLvl_CatData    = 0xA0;   // RVA 0x383645 and 0x3786F9 read 
 constexpr uintptr_t kCatData_Seed  = 0x00;   // Not the registry key: comparing this to run ids hid the Character link.
 constexpr uintptr_t kCatData_SaveId = 0xC48; // RVA 0x230101 stores Load's u64 key; 0xD7CEE copies it.
 constexpr uintptr_t kCatData_Flags = 0xBF8;   // u64 status bits, serialized with the cat (SerializeCatData RVA 0x22F6CD)
+// PERMANENT DEATH, read from the disassembly (2026-10-02). Character::OnCorpsePop (RVA 0x115E10, at 0x116443) -- the corpse of a player's cat
+// destroyed -- writes CatData+0x7AC = 1 and ORs 0x40000 into CatData+0xBF8, then the run's lists lose the id. The `kill` event effect
+// (handler 0x9350C0) sets +0x7AC alone. The native settlement (0x3B5430) turns +0x7AC into flag 0x20 on a cat still in the party, and
+// 0xD2D40 clears the byte. So "this cat is dead for good" is readable straight off its CatData while it is still registered.
+constexpr uintptr_t kCatData_Killed  = 0x7AC;   // u8
+constexpr uint64_t  kCatFlag_Perished = 0x40000;
 constexpr uint64_t  kCatFlag_OnAdventure = 0x80000; // set by set_party_and_go (0x3B1504) on the cats that leave; 0xD2D40 clears it
 constexpr uintptr_t kCatData_StatusEffects = 0x7B8; // RVA 0x22F301 appends; 0xFD44D restores each entry into battle.
 constexpr uintptr_t kCatStatusEffectSize = 0xB8; // RVA 0x237368 append stride and 0x617B9 destructor stride.

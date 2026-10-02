@@ -615,6 +615,41 @@ void copies_at_home_do_not_make_the_original_ambiguous() {
     entries.clear(); peer_position = 0; catsync_forget();
 }
 
+void recorded_origin_beats_the_seed_search() {
+    // 2026-10-02: setup records which original each clone came from; the merge trusts the record first and keeps the seed search as the fallback.
+    auto fresh = [] {
+        entries.clear(); peer_position = 1; peer_count = 2; initialize(); counter = 0x300; depart_all(4);
+        SetupMsg m{}; CHECK(catsync_prepare_party_setup(m, 1)); free_msg_cats(m);
+        for (unsigned i = 0; i < 4; ++i) settle_clone(0x71000001ull + i, 70 + (int32_t)i);
+    };
+    // the setup recorded all four
+    fresh();
+    CHECK(catsync_origin_of(0x71000001ull) == party[0] && catsync_origin_of(0x71000004ull) == party[3]);
+    CloneOriginNote saved[8]{}; const uint32_t ns = catsync_origin_export(saved, 8);
+    CHECK(ns == 4);
+    // a twin with the clone's seed that is ALSO out on adventure makes the seed search ambiguous; the record is not
+    { void* twin = allocate(0xC58); put(twin, kCatData_SaveId, uint64_t(99)); put(twin, 0, party[1] * 10); put(twin, kCatData_Flags, uint64_t(kAway)); entries[99].cat = twin; }
+    CHECK(catsync_merge_session_cats("t") == 4);
+    CHECK(get<int32_t>(entries[party[1]].cat, 0x70C) == 71 && flags_of(party[1]) == kHome);          // by the record, not a new cat
+    CHECK(!adopted_with_stat(71) && get<int32_t>(entries[99].cat, 0x70C) != 71);                     // and the twin was left alone
+    CHECK(catsync_origin_of(0x71000002ull) == 0);                                                    // forgotten once returned
+    // after a restart (a resumed run) the record comes back from the journal and still works, even if the original lost its flag
+    fresh(); catsync_origin_clear(); catsync_origin_import(saved, ns);
+    put(entries[party[0]].cat, kCatData_Flags, uint64_t(kHome));
+    CHECK(catsync_merge_session_cats("t") == 4 && get<int32_t>(entries[party[0]].cat, 0x70C) == 70 && !adopted_with_stat(70));
+    // a record that no longer fits (the cat at that id is another cat now) is ignored: the seed search takes over
+    fresh(); catsync_origin_clear(); catsync_note_origin(0x71000001ull, 12345);
+    CHECK(catsync_merge_session_cats("t") == 4 && get<int32_t>(entries[party[0]].cat, 0x70C) == 70);   // found by seed
+    // the death of a clone that is still flagged out (it left the run's lists): the original comes home dead
+    fresh();
+    put(entries[0x71000003ull].cat, 0x7AC, uint8_t(1)); put(entries[0x71000003ull].cat, kCatData_Flags, uint64_t(kAway | 0x40000));
+    static uint64_t alive[3] = {0x71000001ull, 0x71000002ull, 0x71000004ull};      // the game took the dead cat out of the run's lists
+    put(director, kDir_CatIdCount, uint32_t(3)); put(director, kDir_CatIdData, (const uint64_t*)alive);
+    CHECK(catsync_merge_session_cats("t") == 4);
+    CHECK((flags_of(party[2]) & 0x20) && (flags_of(party[2]) & 0x40000) && !(flags_of(party[2]) & kCatFlag_OnAdventure));   // 0x20 added, departure bit gone
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
 void stuck_originals_are_released() {
     // Cats the old behaviour left "on adventure" for good come home when no run of this player is in progress;
     // the run's own party (just departed) and the session range are never touched.
@@ -641,7 +676,7 @@ void merge_refusals_and_rollback() {
     };
     // the original is not on adventure: it may have been played on its own -- never write over it. The clone is kept
     // as a NEW cat of its own instead (its slot is about to be re-used, so leaving it would lose it).
-    fresh(); put(entries[party[0]].cat, kCatData_Flags, uint64_t(kHome));
+    fresh(); catsync_origin_clear(); put(entries[party[0]].cat, kCatData_Flags, uint64_t(kHome));      // (no record: the seed search alone)
     CHECK(catsync_merge_session_cats("t") == 4 && flags_of(0x71000001ull) == 0 && get<int32_t>(entries[party[0]].cat, 0x70C) != 90);
     CHECK(adopted_with_stat(90) && flags_of(party[0]) == kHome);
     // the game put the flags of the retired clone back (live: the departure box starts from the party/mirror lists):
@@ -649,7 +684,7 @@ void merge_refusals_and_rollback() {
     { size_t before = entries.size(); put(entries[0x71000001ull].cat, kCatData_Flags, uint64_t(kHome));
       CHECK(catsync_merge_session_cats("again") == 0 && flags_of(0x71000001ull) == 0 && entries.size() == before); }
     // two ordinary cats with the clone's seed: ambiguous, so no match -- the clone becomes a new cat
-    fresh(); { void* twin = allocate(0xC58); put(twin, kCatData_SaveId, uint64_t(99)); put(twin, 0, party[1] * 10); put(twin, kCatData_Flags, uint64_t(kAway)); entries[99].cat = twin; }
+    fresh(); catsync_origin_clear(); { void* twin = allocate(0xC58); put(twin, kCatData_SaveId, uint64_t(99)); put(twin, 0, party[1] * 10); put(twin, kCatData_Flags, uint64_t(kAway)); entries[99].cat = twin; }
     CHECK(catsync_merge_session_cats("t") == 4 && flags_of(0x71000002ull) == 0 && adopted_with_stat(91));
     // no original at all: kept as a new cat, with every bit of the progress it carries
     fresh(); entries[party[2]].cat = nullptr; entries.erase(party[2]);
@@ -962,7 +997,7 @@ int main() {
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
     in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals();
-    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
+    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);
     std::free(ids->data);

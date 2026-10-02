@@ -92,7 +92,11 @@ void net_msg_release(NetMsg& m);
 
 // port is the TCP port; host binds it, client dials <addr>:<port>.
 bool net_host(uint16_t port);
+// `addr` may be a comma-separated list (up to four) of addresses to try in order. Returns at once (the dial runs on a thread):
+// the state is Connecting, then Connected or Failed (see net_error, net_dial_seq).
 bool net_join(const char* addr, uint16_t port);
+uint32_t net_dial_seq();              // goes up by one each time a dial gives up on every address
+int      net_dial_error();            // the last WSA error of that failure (10060 timed out, 10061 refused, 10051/10065 no route)
 void net_shutdown();
 
 NetState    net_state();

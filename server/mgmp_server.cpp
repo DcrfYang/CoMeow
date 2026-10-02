@@ -39,6 +39,11 @@
 //                                                  the room password's DIGEST -- the
 //                                                  mod sends a SHA-256 hex string, the
 //                                                  server never sees the password)
+//                                                  optional "lan":["192.168.1.5",..] (also on join): this peer's own private
+//                                                  addresses. A joiner that reaches the server from the SAME public
+//                                                  address as the host is behind the same router, where the host's public
+//                                                  address does not work (no NAT loopback): it is told the host's private
+//                                                  address instead (one on its own /24 if there is one)
 //     {"t":"join","room":"AB12","pw":"<digest>"}  join an existing room; a room with a password
 //                                                  refuses a missing or wrong digest with
 //                                                  {"t":"error","code":"password"}
@@ -67,6 +72,15 @@
 //     {"t":"closed","msg":"the host left the room"}
 //     {"t":"error","msg":"..."}
 //     {"t":"pong"}
+//     {"t":"reach","ok":true|false,"addr","port"}   the host only, a moment after "create" (and again on request): the server dialled
+//                                                  the host's address + game port from outside. ok=false = the game port is not open
+//     "alts":[..] in "joined"/"room": further addresses to try if `addr` does not answer, in order (same-router joiners: the
+//                                                  host's other private addresses, then its public one)
+//     client -> server  {"t":"reach"}               host only: probe again (e.g. after a UPnP mapping); rate limited
+//     "steam":"<SteamID64>" on create / join: this peer can be reached through Steam's peer-to-peer network (no open port needed).
+//                                                  "joined"/"room" then carry the host's as "hsteam" and what the probe found as
+//                                                  "hreach" (0 not known, 1 the game port is open, 2 it is not), so a joiner picks
+//                                                  its carrier: direct TCP first when the port is open, Steam first when it is not
 //
 // LAN MODE (no server machine at all). The mod can run this very code inside the game process (build with MGMP_EMBEDDED):
 // the host starts it, connects to it on 127.0.0.1 and creates a room; friends on the same network connect to the host's
@@ -74,6 +88,9 @@
 // reach the server -- the host's LAN address, whichever network adapter it is. Hosts on the local network can also be
 // found without typing an address: a UDP datagram "MGMP-DISCOVER 1" to port 27701 (broadcast) is answered, to the sender,
 // with {"t":"here","port":<tcp port>,"rooms":[{"id","name","host","players","cap","pw"}]}.
+//
+// An empty create "name" is an automatic name: the player's own, or that with -2, -3 .. when a room already has it. Every accepted
+// connection has TCP keepalive on (60 s idle, 10 s apart, 3 tries), so a peer that vanished without a FIN loses its slot and room.
 //
 // ONE THREAD, select(). A lobby is a handful of idle sockets exchanging a few
 // hundred bytes, and a single-threaded loop means there is no locking to get
@@ -108,6 +125,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef int socklen_t;
@@ -115,7 +133,9 @@ typedef int socklen_t;
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -201,6 +221,25 @@ bool interrupted() {
     return false;
 #else
     return errno == EINTR;
+#endif
+}
+
+// A peer whose machine, proxy or NAT vanished without a FIN would hold its slot -- and its room, hidden once locked -- for ever
+// (measured: two connections and a locked room outlived their game processes by seven hours). TCP keepalive finds such a peer:
+// probes after 60 s of silence, every 10 s, giving up after three, so a dead one is reaped within about 90 s.
+void set_keepalive(SOCKET s) {
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&on, sizeof(on));
+#ifdef _WIN32
+    tcp_keepalive ka{};
+    ka.onoff = 1; ka.keepalivetime = 60000; ka.keepaliveinterval = 10000;
+    DWORD got = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &got, nullptr, nullptr);
+#else
+    int idle = 60, intvl = 10, cnt = 3;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 #endif
 }
 
@@ -410,6 +449,8 @@ struct Room {
     bool        locked    = false;   // hidden from the lists, refuses joins
     bool        has_pw    = false;   // a password was set at creation (room list shows a padlock)
     char        pw[72]    = {};      // the digest the joiner must present
+    char        lan[4][16] = {};     // the host's private addresses (see addr_for)
+    int         nlan      = 0;
 };
 
 // An upload in progress: the files are written as the chunks arrive and the folder is deleted if it never completes.
@@ -436,6 +477,13 @@ struct Client {
     bool     helloed = false;
     bool     away    = false;       // playing on its own for a while; see "away"
     int      pw_fails = 0;          // wrong passwords tried on this connection
+    uint32_t gen        = 0;        // which connection this slot holds (slots are reused)
+    int      probes_made = 0;       // reachability probes started for this connection
+    char     steam[24]   = {};      // the peer's SteamID64 (digits), when it said so
+    int      reach       = 0;       // the probe's verdict on this peer's game port: 0 unknown, 1 open, 2 not reachable
+    uint64_t last_probe  = 0;
+    char     lan[4][16] = {};       // this peer's private addresses, as it told us (create / join)
+    int      nlan     = 0;
     char     rbuf[kLineMax] = {};
     uint32_t rlen    = 0;
 };
@@ -533,20 +581,88 @@ void send_rooms(SOCKET s) {
     send_json(s, o);
 }
 
+// The private IPv4 addresses a peer lists in "lan": at most 4, each a valid dotted address in a private range (10/8, 172.16/12,
+// 192.168/16, 169.254/16). Anything else is dropped.
+int parse_lan(const json& j, char out[4][16]) {
+    int n = 0;
+    auto it = j.find("lan");
+    if (it == j.end() || !it->is_array()) return 0;
+    for (const json& e : *it) {
+        if (n >= 4) break;
+        if (!e.is_string()) continue;
+        const std::string s = e.get<std::string>();
+        in_addr a{};
+        if (s.size() > 15 || inet_pton(AF_INET, s.c_str(), &a) != 1) continue;
+        const unsigned char* b = (const unsigned char*)&a;
+        const bool priv = b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254);
+        if (!priv) continue;
+        copy_str(out[n++], 16, s);
+    }
+    return n;
+}
+
+// The first three octets of a dotted address ("192.168.1"): two addresses with the same prefix share a /24.
+bool same_24(const char* a, const char* b) {
+    const char* pa = strrchr(a, '.');
+    const char* pb = strrchr(b, '.');
+    if (!pa || !pb || pa - a != pb - b) return false;
+    return strncmp(a, b, (size_t)(pa - a)) == 0;
+}
+
 // The address a joiner should dial for this room. Normally what the host registered. A room whose host sits on the loopback
 // address (a host running this server in its own process, the LAN case) is advertised as the address the joiner itself used
 // to reach us: that IS the host machine, on whichever adapter the joiner can see.
-std::string addr_for(const Room& r, SOCKET s) {
+void probe_schedule(int slot, uint64_t delay_ms);   // reachability probe, below
+
+// "steam": a SteamID64 as a string of digits (at most 20); anything else clears it.
+void parse_steam(const json& j, Client& c) {
+    const std::string s = json_str(j, "steam");
+    bool ok = !s.empty() && s.size() <= 20;
+    for (char ch : s) if (ch < '0' || ch > '9') ok = false;
+    if (ok) copy_str(c.steam, sizeof(c.steam), s); else c.steam[0] = 0;
+}
+
+std::string route_for(const Room& r, const Client& rc, std::vector<std::string>* alts) {
     const std::string a = r.addr;
-    if (a.compare(0, 4, "127.") != 0 && a != "::1" && a != "localhost") return a;
+    if (a.compare(0, 4, "127.") != 0 && a != "::1" && a != "localhost") {
+        // A recipient that came from the host's own public address sits behind the same router; that address will not
+        // loop back, so it gets the host's private one (on its own /24 when the host has one there).
+        if (r.nlan > 0 && r.count > 0) {
+            const Client& host = g_clients[r.members[0]];
+            if (&rc != &host && rc.ip[0] && strcmp(rc.ip, host.ip) == 0) {
+                int best = 0;
+                bool found = false;
+                for (int i = 0; i < rc.nlan && !found; ++i)
+                    for (int k = 0; k < r.nlan && !found; ++k)
+                        if (same_24(rc.lan[i], r.lan[k])) { best = k; found = true; }
+                if (alts) {                      // every other way to reach the host, the public address last
+                    for (int k = 0; k < r.nlan; ++k) if (k != best) alts->push_back(r.lan[k]);
+                    alts->push_back(a);
+                }
+                return r.lan[best];
+            }
+        }
+        return a;
+    }
     sockaddr_in la{};
     socklen_t ll = sizeof(la);
-    if (getsockname(s, (sockaddr*)&la, &ll) == 0 && la.sin_family == AF_INET) {
+    if (getsockname(rc.sock, (sockaddr*)&la, &ll) == 0 && la.sin_family == AF_INET) {
         char b[64] = {};
         inet_ntop(AF_INET, &la.sin_addr, b, sizeof(b));
         if (strncmp(b, "127.", 4) != 0 && b[0]) return b;
     }
     return a;
+}
+
+// "addr" and "alts" of a message to `rc` about room `r`.
+void put_route(json& o, const Room& r, const Client& rc) {
+    std::vector<std::string> alts;
+    o["addr"] = route_for(r, rc, &alts);
+    if (!alts.empty()) o["alts"] = alts;
+    if (r.count > 0) {
+        const Client& host = g_clients[r.members[0]];
+        if (host.steam[0]) { o["hsteam"] = host.steam; o["hreach"] = host.reach; }
+    }
 }
 
 // The membership message. `event`/`who` are what the lobby shows as a line of
@@ -570,7 +686,7 @@ void broadcast_room(int ri, const char* event, const char* who) {
         o["t"]       = "room";
         o["id"]      = r.id;
         o["name"]    = r.name;
-        o["addr"]    = addr_for(r, g_clients[r.members[i]].sock);
+        put_route(o, r, g_clients[r.members[i]]);
         o["port"]    = (int)r.port;
         o["cap"]     = kRoomCap;
         o["locked"]  = r.locked;
@@ -887,7 +1003,13 @@ void handle_line(int slot, const std::string& line) {
     if (t == "create") {
         if (c.room >= 0) { send_error(c.sock, "you are already in a room"); return; }
         std::string name = json_str(j, "name");
-        if (name.empty()) name = c.name;
+        const bool auto_name = name.empty();
+        if (auto_name) {
+            // "leave empty for an automatic name" must always work: the player's own name, or that with -2, -3.. when it is taken
+            // (a locked room is not in the list, so the player cannot see what the clash is with)
+            name = c.name;
+            for (int n = 2; n < 100 && find_room_by_name(name.c_str()) >= 0; ++n) name = std::string(c.name) + "-" + std::to_string(n);
+        }
         if (find_room_by_name(name.c_str()) >= 0) {
             send_error(c.sock, "a room with that name already exists");
             return;
@@ -916,6 +1038,10 @@ void handle_line(int slot, const std::string& line) {
         copy_str(r.addr, sizeof(r.addr),
                  override_addr.empty() ? std::string(c.ip) : override_addr);
         r.port    = c.listen_port;
+        c.nlan    = parse_lan(j, c.lan);
+        parse_steam(j, c);
+        r.nlan    = c.nlan;
+        memcpy(r.lan, c.lan, sizeof(r.lan));
         r.members[0] = slot;
         r.count      = 1;
         c.room       = ri;
@@ -936,6 +1062,7 @@ void handle_line(int slot, const std::string& line) {
         o["pw"]      = r.has_pw;
         send_json(c.sock, o);
         broadcast_room(ri, "create", c.name);
+        probe_schedule(slot, 1500);
         return;
     }
 
@@ -965,6 +1092,8 @@ void handle_line(int slot, const std::string& line) {
         }
 
         c.room = ri;
+        c.nlan = parse_lan(j, c.lan);
+        parse_steam(j, c);
         r.members[r.count++] = slot;
 
         logf("room %s: '%s' joined (%d/%d)", r.id, c.name, r.count, kRoomCap);
@@ -974,13 +1103,23 @@ void handle_line(int slot, const std::string& line) {
         o["id"]   = r.id;
         o["name"] = r.name;
         o["role"] = "client";
-        o["addr"] = addr_for(r, c.sock);
+        put_route(o, r, c);
         o["port"] = (int)r.port;
         o["cap"]  = kRoomCap;
         o["you"]  = c.name;
         o["pw"]   = r.has_pw;
         send_json(c.sock, o);
         broadcast_room(ri, "join", c.name);
+        return;
+    }
+
+    if (t == "reach") {
+        // The host asks for another probe (its UPnP mapping may have just come up). Not more often than every 8 seconds.
+        if (c.room < 0 || g_rooms[c.room].members[0] != slot) return;
+        const uint64_t now = tick_ms();
+        if (now - c.last_probe < 8000) return;
+        c.last_probe = now;
+        probe_schedule(slot, 300);
         return;
     }
 
@@ -1057,6 +1196,139 @@ void on_readable(int slot) {
     }
 }
 
+// ---- reachability probe -----------------------------------------------------------------------------------------------
+//
+// A host whose router does not forward the game port finds that out when the first friend's connection times out, which looks
+// like a bug in the mod. So after a room is created the server dials the host's address and game port from the outside and
+// says whether it got through: {"t":"reach","ok":true|false,"addr":..,"port":..}. The host's mod warns if not (and asks again
+// with {"t":"reach"} once its UPnP mapping is up). It ONLY ever dials the address the host itself connected from, so it cannot
+// be pointed at anyone else; a host on a private or loopback address (a lobby on the same LAN) is not probed at all.
+// Non-blocking connects inside the same select loop: no thread, no wait.
+struct Probe {
+    bool     used = false;
+    int      slot = -1;            // the host's client slot
+    uint32_t gen  = 0;             // that client's connection id: a reused slot must not receive an old probe's answer
+    SOCKET   s    = INVALID_SOCKET;
+    uint64_t start_at = 0;
+    uint64_t deadline = 0;
+    int      tries_left = 1;       // a game that is slow to open its port gets a second look
+};
+constexpr int kMaxProbes = 16;
+constexpr uint64_t kProbeConnectMs = 4000;
+Probe g_probes[kMaxProbes];
+uint32_t g_gen = 0;
+bool g_probe_all = false;      // --probe-all: probe hosts on private/loopback addresses too (tests)
+
+bool set_nonblocking(SOCKET s) {
+#ifdef _WIN32
+    u_long m = 1;
+    return ioctlsocket(s, FIONBIO, &m) == 0;
+#else
+    const int f = fcntl(s, F_GETFL, 0);
+    return f >= 0 && fcntl(s, F_SETFL, f | O_NONBLOCK) == 0;
+#endif
+}
+
+bool connect_pending() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EINPROGRESS;
+#endif
+}
+
+bool private_or_loopback(const char* ip) {
+    in_addr a{};
+    if (inet_pton(AF_INET, ip, &a) != 1) return true;
+    const unsigned char* b = (const unsigned char*)&a;
+    return b[0] == 127 || b[0] == 10 || b[0] == 0 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
+           (b[0] == 169 && b[1] == 254);
+}
+
+void probe_free(Probe& p) {
+    if (p.s != INVALID_SOCKET) { close_socket(p.s); p.s = INVALID_SOCKET; }
+    p.used = false;
+}
+
+void probe_answer(Probe& p, bool ok) {
+    if (p.slot >= 0 && g_clients[p.slot].used && g_clients[p.slot].gen == p.gen) {
+        g_clients[p.slot].reach = ok ? 1 : 2;
+        const Client& c = g_clients[p.slot];
+        json o = json::object();
+        o["t"]    = "reach";
+        o["ok"]   = ok;
+        o["addr"] = c.ip;
+        o["port"] = (int)c.listen_port;
+        send_json(c.sock, o);
+        logf("  reach: %s:%u is %s from outside", c.ip, (unsigned)c.listen_port, ok ? "open" : "NOT reachable");
+        if (c.room >= 0 && c.steam[0]) broadcast_room(c.room, nullptr, nullptr);     // joiners choose their carrier by it
+    }
+    probe_free(p);
+}
+
+// Ask for a probe of this host in `delay_ms`. At most 6 per connection, one at a time.
+void probe_schedule(int slot, uint64_t delay_ms) {
+#ifdef MGMP_EMBEDDED
+    (void)slot; (void)delay_ms;
+#else
+    Client& c = g_clients[slot];
+    if (!c.used || (!g_probe_all && private_or_loopback(c.ip)) || c.probes_made >= 6) return;
+    for (Probe& p : g_probes) if (p.used && p.slot == slot) return;
+    for (Probe& p : g_probes) {
+        if (p.used) continue;
+        p = Probe{};
+        p.used = true; p.slot = slot; p.gen = c.gen;
+        p.start_at = tick_ms() + delay_ms;
+        ++c.probes_made;
+        return;
+    }
+#endif
+}
+
+// Starts the due probes and expires the slow ones. Called every loop turn.
+void probe_tick() {
+    const uint64_t now = tick_ms();
+    for (Probe& p : g_probes) {
+        if (!p.used) continue;
+        if (p.slot < 0 || !g_clients[p.slot].used || g_clients[p.slot].gen != p.gen) { probe_free(p); continue; }
+        if (p.s == INVALID_SOCKET) {
+            if (now < p.start_at) continue;
+            const Client& c = g_clients[p.slot];
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_port   = htons(c.listen_port);
+            if (inet_pton(AF_INET, c.ip, &a.sin_addr) != 1) { probe_free(p); continue; }
+            p.s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (p.s == INVALID_SOCKET || !set_nonblocking(p.s)) { probe_free(p); continue; }
+            p.deadline = now + kProbeConnectMs;
+            if (connect(p.s, (sockaddr*)&a, sizeof(a)) == 0) { probe_answer(p, true); continue; }
+            if (!connect_pending()) {                      // refused at once
+                close_socket(p.s); p.s = INVALID_SOCKET;
+                if (p.tries_left-- > 0) p.start_at = now + 2500; else probe_answer(p, false);
+            }
+        } else if (now > p.deadline) {
+            close_socket(p.s); p.s = INVALID_SOCKET;
+            if (p.tries_left-- > 0) p.start_at = now + 1000; else probe_answer(p, false);
+        }
+    }
+}
+
+// After select(): the probes whose socket became writable (connected) or errored.
+void probe_poll(fd_set* wr, fd_set* ex) {
+    for (Probe& p : g_probes) {
+        if (!p.used || p.s == INVALID_SOCKET) continue;
+        if (!FD_ISSET(p.s, wr) && !FD_ISSET(p.s, ex)) continue;
+        int err = 0;
+        socklen_t el = sizeof(err);
+        getsockopt(p.s, SOL_SOCKET, SO_ERROR, (char*)&err, &el);
+        const bool ok = (err == 0) && FD_ISSET(p.s, wr);
+        if (ok) { probe_answer(p, true); continue; }
+        close_socket(p.s); p.s = INVALID_SOCKET;
+        const uint64_t now = tick_ms();
+        if (p.tries_left-- > 0) p.start_at = now + 2500; else probe_answer(p, false);
+    }
+}
+
 // Answers one "MGMP-DISCOVER 1" datagram with this server's TCP port and its listed rooms (at most 8, so the answer fits one packet).
 void answer_discovery() {
     char buf[64] = {};
@@ -1096,6 +1368,7 @@ int accept_one() {
     c.used = true;
     c.sock = s;
     c.room = -1;
+    c.gen  = ++g_gen;
 
     char ip[64] = {};
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -1105,6 +1378,7 @@ int accept_one() {
     // else: every send here is small, and five seconds is already far past the
     // point where the peer is simply gone.
     set_send_timeout(s, 5000);
+    set_keepalive(s);
 
     logf("connection from %s (slot %d)", c.ip, slot);
     return slot;
@@ -1116,6 +1390,7 @@ void usage() {
            "  mgmp_server [--port <n>] [--logdir <path>] [--quiet]\n"
            "\n"
            "  --port <n>       TCP port to listen on (default 27700)\n"
+           "  --probe-all      also check the game port of hosts on private addresses (testing)\n"
            "  --lan-discovery  also answer UDP discovery broadcasts (port 27701), for LAN use\n"
            "  --logdir <path>  where game logs uploaded from the mod's F2 panel are stored\n"
            "                   (default: a mgmp_logs folder beside this exe)\n"
@@ -1182,10 +1457,19 @@ void serve_loop() {
             if (g_clients[i].sock > highest) highest = g_clients[i].sock;
         }
 
+        fd_set wr, ex;
+        FD_ZERO(&wr);
+        FD_ZERO(&ex);
+        for (const Probe& p : g_probes) {
+            if (!p.used || p.s == INVALID_SOCKET) continue;
+            FD_SET(p.s, &wr); FD_SET(p.s, &ex);
+            if (p.s > highest) highest = p.s;
+        }
+
         timeval tv{};
         tv.tv_sec  = 0;
         tv.tv_usec = 100000;   // 100 ms: nothing here is latency-critical
-        const int rc = select((int)highest + 1, &rd, nullptr, nullptr, &tv);
+        const int rc = select((int)highest + 1, &rd, &wr, &ex, &tv);
         if (rc == SOCKET_ERROR) {
             if (interrupted()) continue;     // SIGINT/SIGTERM land here; the loop condition sees g_stop
             logf("!! select failed (error %d)", sock_error());
@@ -1201,7 +1485,9 @@ void serve_loop() {
                     close_client(i);
                 }
         }
+        probe_tick();
         if (rc == 0) continue;
+        probe_poll(&wr, &ex);
 
         if (FD_ISSET(g_listen, &rd)) accept_one();
         if (g_udp != INVALID_SOCKET && FD_ISSET(g_udp, &rd)) answer_discovery();
@@ -1215,6 +1501,7 @@ void serve_loop() {
 }
 
 void close_all() {
+    for (Probe& p : g_probes) probe_free(p);
     for (int i = 0; i < kMaxClients; ++i) if (g_clients[i].used) close_client(i);
     for (int i = 0; i < kMaxRooms; ++i) g_rooms[i] = Room{};
     if (g_listen != INVALID_SOCKET) { close_socket(g_listen); g_listen = INVALID_SOCKET; }
@@ -1279,6 +1566,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) g_quiet = true;
         else if (!strcmp(argv[i], "--lan-discovery")) discovery = true;
+        else if (!strcmp(argv[i], "--probe-all")) g_probe_all = true;
         else if (!strcmp(argv[i], "--logdir") && i + 1 < argc) g_logdir = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
         else { printf("unknown argument '%s'\n\n", argv[i]); usage(); return 2; }

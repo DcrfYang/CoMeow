@@ -337,6 +337,7 @@ void config_load(const wchar_t* dll_dir) {
 
     if (const json* net = member(j, "net")) {
         read_str (*net, "role", g_cfg.net_role, sizeof(g_cfg.net_role));
+        read_bool(*net, "steam", g_cfg.net_steam);
         read_str (*net, "addr", g_cfg.net_addr, sizeof(g_cfg.net_addr));
         uint32_t port = g_cfg.net_port;
         read_uint(*net, "port", port, 1, 65535);
@@ -369,6 +370,7 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*ui, "test_harness", g_cfg.ui_test);
         read_bool(*ui, "dev_tools", g_cfg.dev_tools);
         read_bool(*ui, "beta_notice", g_cfg.beta_notice);
+        read_bool(*ui, "block_new_cats", g_cfg.block_new_cats);
     }
 
     if (const json* d = member(j, "debug")) {
@@ -378,6 +380,7 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*d, "record",          g_cfg.record);
         read_str (*d, "record_note",     g_cfg.record_note, sizeof(g_cfg.record_note));
         read_path(*d, "replay", dll_dir, g_cfg.replay_path, 512);
+        read_str (*d, "steam_test", g_cfg.steam_test, sizeof(g_cfg.steam_test));
         // Capped rather than trusted: a stray extra digit here would look
         // exactly like the mod having hung.
         read_uint(*d, "follow_delay_ms", g_cfg.net_follow_delay_ms, 0, 600000);
@@ -402,9 +405,9 @@ void config_load(const wchar_t* dll_dir) {
     if (!g_cfg.dev_tools) {
         const bool named = g_cfg.debug_mode || g_cfg.roster_shrink || g_cfg.ui_test || g_cfg.test_weaken || g_cfg.record ||
                            g_cfg.replay_path[0] || g_cfg.net_follow_delay_ms || !g_cfg.net_follow || !g_cfg.net_join_barrier ||
-                           !g_cfg.net_desync_halt;
+                           !g_cfg.net_desync_halt || g_cfg.steam_test[0];
         g_cfg.debug_mode = false; g_cfg.roster_shrink = 0; g_cfg.ui_test = false; g_cfg.test_weaken = false;
-        g_cfg.record = false; g_cfg.replay_path[0] = 0; g_cfg.net_follow_delay_ms = 0;
+        g_cfg.record = false; g_cfg.replay_path[0] = 0; g_cfg.net_follow_delay_ms = 0; g_cfg.steam_test[0] = 0;
         g_cfg.net_follow = true; g_cfg.net_join_barrier = true; g_cfg.net_desync_halt = true;
         if (named) warn("debug.* developer switches are ignored: set ui.dev_tools = true to use them");
     }
@@ -517,7 +520,7 @@ size_t skip_blank(const std::string& t, size_t from) {
 
 } // namespace
 
-std::string config_rewrite_beta_notice(const std::string& text, bool on) {
+std::string config_rewrite_ui_bool(const std::string& text, const char* key, bool on) {
     const char* val = on ? "true" : "false";
     const std::vector<StrTok> toks = string_tokens(text);
     const auto is = [&](const StrTok& k, const char* name) {
@@ -527,7 +530,7 @@ std::string config_rewrite_beta_notice(const std::string& text, bool on) {
 
     // 1. The key exists: replace its value (up to the next whitespace, comma, brace or comment).
     for (const StrTok& k : toks) {
-        if (!is(k, "beta_notice")) continue;
+        if (!is(k, key)) continue;
         size_t i = skip_blank(text, k.e);
         if (i >= text.size() || text[i] != ':') continue;
         i = skip_blank(text, i + 1);
@@ -546,7 +549,7 @@ std::string config_rewrite_beta_notice(const std::string& text, bool on) {
         if (i >= text.size() || text[i] != '{') continue;
         const size_t after = skip_blank(text, i + 1);
         const bool empty = after < text.size() && text[after] == '}';
-        return text.substr(0, i + 1) + "\n    \"beta_notice\": " + val + (empty ? "\n  " : ",") + text.substr(i + 1);
+        return text.substr(0, i + 1) + "\n    \"" + key + "\": " + val + (empty ? "\n  " : ",") + text.substr(i + 1);
     }
 
     // 3. Neither: add a whole "ui" block after the file's opening brace.
@@ -554,11 +557,12 @@ std::string config_rewrite_beta_notice(const std::string& text, bool on) {
     if (open >= text.size() || text[open] != '{') return std::string();
     const size_t after = skip_blank(text, open + 1);
     const bool empty = after < text.size() && text[after] == '}';
-    return text.substr(0, open + 1) + "\n  \"ui\": { \"beta_notice\": " + val + " }" + (empty ? "\n" : ",") + text.substr(open + 1);
+    return text.substr(0, open + 1) + "\n  \"ui\": { \"" + key + "\": " + val + " }" + (empty ? "\n" : ",") + text.substr(open + 1);
 }
 
-bool config_set_beta_notice(bool on) {
-    g_cfg.beta_notice = on;
+std::string config_rewrite_beta_notice(const std::string& text, bool on) { return config_rewrite_ui_bool(text, "beta_notice", on); }
+
+static bool write_ui_bool(const char* key, bool on) {
     if (!g_dir[0]) return false;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\mgmp.json", g_dir);
@@ -570,8 +574,8 @@ bool config_set_beta_notice(bool on) {
         if (in) { existed = true; text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()); }
     }
     std::string out;
-    if (existed) out = config_rewrite_beta_notice(text, on);
-    else         out = std::string("{\n  \"ui\": { \"beta_notice\": ") + (on ? "true" : "false") + " }\n}\n";
+    if (existed) out = config_rewrite_ui_bool(text, key, on);
+    else         out = std::string("{\n  \"ui\": { \"") + key + "\": " + (on ? "true" : "false") + " }\n}\n";
     if (out.empty()) return false;   // a file we cannot edit safely (not an object): leave it alone
 
     // Write to a sibling and swap it in, so a crash mid-write cannot leave a half-written mgmp.json.
@@ -585,5 +589,9 @@ bool config_set_beta_notice(bool on) {
     if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp); return false; }
     return true;
 }
+
+bool config_set_beta_notice(bool on) { g_cfg.beta_notice = on; return write_ui_bool("beta_notice", on); }
+
+bool config_set_block_new_cats(bool on) { g_cfg.block_new_cats = on; return write_ui_bool("block_new_cats", on); }
 
 } // namespace mgmp

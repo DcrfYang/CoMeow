@@ -4,6 +4,7 @@
 #include "mgmp_net.h"
 #include "mgmp_savefile.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_catsync.h"     // the clone -> original record rides in the journal
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
@@ -20,8 +21,10 @@ using checkpoint_io::Bytes;
 // entries have no section and import nothing; the roster exchange still
 // notes the cats, so old runs resume exactly as they did before.
 constexpr uint32_t kMaxJournalOwners = 64;
+constexpr uint32_t kMaxJournalOrigins = 32;
 struct Entry { CheckpointMsg certificate{}; Bytes database;
-               LockstepOwnerNote owners[kMaxJournalOwners]{}; uint32_t owner_count=0; };
+               LockstepOwnerNote owners[kMaxJournalOwners]{}; uint32_t owner_count=0;
+               CloneOriginNote origins[kMaxJournalOrigins]{}; uint32_t origin_count=0; };
 struct State {
     bool on=false, host=false, failed=false, configured=false, selected=false;
     bool released=false, loadIssued=false, dirty=false, arrived=false, preparing=false;
@@ -64,7 +67,9 @@ constexpr uint32_t kCheckpointCompatibility = 39;
 // encode_entry). Version 1 files stay readable -- a missing section is simply
 // an empty table. The compatibility generation is NOT bumped: certificates
 // and save semantics are unchanged.
-constexpr uint32_t kDiskMagic=0x384b5043, kDiskVersion=1, kDiskVersionOwners=2;
+// kDiskVersionOrigins 3 appends, after the owner notes, [u32 count][count x (u64 clone id, u64 original id)] -- which cat each session clone
+// was made from, so a resumed run can still return it to that cat. Versions 1 and 2 are still read (no origin record: the seed search).
+constexpr uint32_t kDiskMagic=0x384b5043, kDiskVersion=1, kDiskVersionOwners=2, kDiskVersionOrigins=3;
 
 void status(const char* text) {
     if(strcmp(g.status,text)!=0) {
@@ -117,8 +122,8 @@ bool disk_exists(const std::wstring& path) { return GetFileAttributesW(path.c_st
 Bytes encode_entry(const Entry& e) {
     uint8_t meta[512]; uint32_t n=enc_checkpoint(meta,sizeof(meta),e.certificate,kDiskCandidates);
     if(!n || e.database.size()>kMaxSaveBytes) return {};
-    Bytes out(36+n+e.database.size()+4+(size_t)e.owner_count*9+8); Writer w(out.data(),(uint32_t)out.size());
-    w.u32v(kDiskMagic); w.u32v(kDiskVersionOwners); w.u32v(kCheckpointCompatibility);
+    Bytes out(36+n+e.database.size()+4+(size_t)e.owner_count*9+4+(size_t)e.origin_count*16+8); Writer w(out.data(),(uint32_t)out.size());
+    w.u32v(kDiskMagic); w.u32v(kDiskVersionOrigins); w.u32v(kCheckpointCompatibility);
     w.u64v(compatibility_build); w.u64v(compatibility_gpak); w.u32v(n);
     w.raw(meta,n); w.u32v((uint32_t)e.database.size());
     if(!e.database.empty()) w.raw(e.database.data(),(uint32_t)e.database.size());
@@ -127,6 +132,9 @@ Bytes encode_entry(const Entry& e) {
     for(uint32_t i=0;i<e.owner_count;++i) {
         w.u64v(e.owners[i].save_id); w.u8v(e.owners[i].owner_pos);
     }
+    // The origin section: [u32 count][count x (u64 clone, u64 original)].
+    w.u32v(e.origin_count);
+    for(uint32_t i=0;i<e.origin_count;++i) { w.u64v(e.origins[i].clone); w.u64v(e.origins[i].original); }
     w.u64v(savefile_hash(out.data(),w.len));
     if(!w.ok) return {}; out.resize(w.len); return out;
 }
@@ -136,7 +144,7 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
     if(hash!=savefile_hash(bytes.data(),(uint32_t)bytes.size()-8)) return false;
     Reader r(bytes.data(),(uint32_t)bytes.size()-8);
     uint32_t magic=r.u32v(); uint32_t version=r.u32v();
-    if(magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners) ||
+    if(magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins) ||
        r.u32v()!=kCheckpointCompatibility) return false;
     if(r.u64v()!=compatibility_build || r.u64v()!=compatibility_gpak) return false;
     uint32_t n=r.u32v(); if(!r.ok || n>512 || n>r.len-r.pos) return false;
@@ -154,8 +162,8 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
         for(unsigned i=0;i<m.count;++i) if(!m.hashes[i]) return false;
     }
     out.certificate=m; out.database.assign(r.buf+r.pos,r.buf+r.pos+size);
-    out.owner_count=0;
-    if(version==kDiskVersionOwners) {
+    out.owner_count=0; out.origin_count=0;
+    if(version==kDiskVersionOwners || version==kDiskVersionOrigins) {
         Reader o(r.buf+r.pos+size,tail-size);
         uint32_t count=o.u32v();
         if(!o.ok || count>kMaxJournalOwners || count*9>o.len-o.pos) return false;
@@ -164,8 +172,18 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
             if(!o.ok || !id) return false;
             out.owners[i].save_id=id; out.owners[i].owner_pos=pos;
         }
-        if(o.pos!=o.len) return false;   // exact consumption, no trailing bytes
         out.owner_count=count;
+        if(version==kDiskVersionOrigins) {
+            const uint32_t oc=o.u32v();
+            if(!o.ok || oc>kMaxJournalOrigins || (size_t)oc*16>o.len-o.pos) return false;
+            for(uint32_t i=0;i<oc;++i) {
+                uint64_t c=o.u64v(), orig=o.u64v();
+                if(!o.ok || !c || !orig) return false;
+                out.origins[i].clone=c; out.origins[i].original=orig;
+            }
+            out.origin_count=oc;
+        }
+        if(o.pos!=o.len) return false;   // exact consumption, no trailing bytes
     }
     return true;
 }
@@ -181,7 +199,7 @@ bool entry_is_foreign(const std::wstring& path) {
     Reader r(bytes.data(),(uint32_t)bytes.size()-8);
     const uint32_t magic=r.u32v(); const uint32_t version=r.u32v(); const uint32_t compat=r.u32v();
     const uint64_t build=r.u64v(); const uint64_t gpak=r.u64v();
-    if(!r.ok || magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners)) return false;
+    if(!r.ok || magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins)) return false;
     return compat!=kCheckpointCompatibility || build!=compatibility_build || gpak!=compatibility_gpak;
 }
 bool marker(uint8_t mode) {
@@ -482,6 +500,10 @@ void apply_select(const CheckpointMsg& m) {
             lockstep_owner_note_import(e.owners,e.owner_count);
             log_line("CHECKPOINT","restored %u owner note(s) from the journal",e.owner_count);
         }
+        if(e.origin_count) {
+            catsync_origin_import(e.origins,e.origin_count);
+            log_line("CHECKPOINT","restored %u clone-origin note(s) from the journal",e.origin_count);
+        }
     } else if(g.mode!=0 || m.seq) { fail("recovery refused: unfinished local save cannot start a fresh session"); return; }
     log_line("CHECKPOINT", "%s run=%016llx seq=%llu key=%ls", m.mode?"RESTORE":"NEW", m.run, m.seq, g.key.c_str());
     g.run=m.run; g.seq=m.seq;
@@ -671,6 +693,7 @@ void checkpoint_on_map(uint64_t map_hash) {
     // The staged entry snapshots the ownership table too: the journal is what
     // a future restore imports it back from (2026-09-28).
     g.pending.owner_count=lockstep_owner_note_export(g.pending.owners,kMaxJournalOwners);
+    g.pending.origin_count=catsync_origin_export(g.pending.origins,kMaxJournalOrigins);
     if(!checkpoint_io::atomic_write(file(L".pending"),encode_entry(g.pending))) { fail("checkpoint staging failed; previous saves retained"); return; }
     log_line("CHECKPOINT", "STAGED run=%016llx seq=%llu map=%016llx local-hash=%016llx bytes=%u", g.run, g.tx.seq, g.tx.map, hash, size);
     g.capture=false;

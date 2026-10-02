@@ -19,6 +19,9 @@
 
 #include "mgmp_signal.h"
 #include "mgmp_config.h"
+#include "mgmp_lan.h"
+#include "mgmp_upnp.h"
+#include "mgmp_steambridge.h"
 #include "mgmp_log.h"
 #include "mgmp_session.h"
 
@@ -106,7 +109,12 @@ struct State {
     char     room[16]  = {};
     char     role[8]   = {};
     char     host_addr[64] = {};
+    char     host_cands[192] = {};      // host_addr, then the fallbacks the server named (comma separated)
     uint16_t host_port = 0;
+    char     host_steam[24] = {};       // the host's SteamID64 (digits) when it can be reached through Steam
+    int      host_reach = 0;            // the server's probe of the HOST's game port: 0 unknown, 1 open, 2 not reachable
+    int      reach = 0;                 // the server's probe of OUR game port (hosts): 0 not known, 1 open, 2 not reachable
+    UpnpState upnp_prev = UpnpState::Idle;
     char     event[160] = {};
     bool     server_pw = false;        // the server's welcome said it knows room passwords
     bool     room_pw   = false;        // the room we are in has one
@@ -226,6 +234,17 @@ bool send_line(const std::string& line) {
     }
     LeaveCriticalSection(&g.send_cs);
     return ok;
+}
+
+// This machine's private addresses, so the server can hand a same-router peer an address that works (see mgmp_server.cpp, "lan").
+void add_lan_addresses(json& o) {
+    if (config().net_steam) {                         // our SteamID64, so a peer can reach us through Steam without any open port
+        const uint64_t id = steam_bridge_id();
+        if (id) o["steam"] = std::to_string((unsigned long long)id);
+    }
+    json a = json::array();
+    for (const std::string& s : lan_local_addresses()) { if (a.size() >= 4) break; a.push_back(s); }
+    if (!a.empty()) o["lan"] = a;
 }
 
 bool send_obj(const json& o) { return send_line(o.dump(-1, ' ', false, json::error_handler_t::replace)); }
@@ -450,7 +469,13 @@ void forget_room() {
     g.room[0]      = 0;
     g.role[0]      = 0;
     g.host_addr[0] = 0;
+    g.host_cands[0] = 0;
+    g.host_steam[0] = 0;
+    g.host_reach   = 0;
+    steam_bridge_host_stop();
     g.host_port    = 0;
+    g.reach        = 0;
+    upnp_stop();                 // the router mapping lives only as long as the room
     g.peer_count   = 0;
     g.locked       = false;
     g.room_pw      = false;
@@ -501,6 +526,15 @@ void store_peers(const json& arr) {
     }
 }
 
+// True for a loopback / private / link-local address (or "localhost"): a lobby on this machine or this network.
+bool is_private_host(const char* a) {
+    if (!_stricmp(a, "localhost")) return true;
+    in_addr ia{};
+    if (inet_pton(AF_INET, a, &ia) != 1) return false;           // a name: assume a server on the internet
+    const unsigned char* b = (const unsigned char*)&ia;
+    return b[0] == 127 || b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254);
+}
+
 // The room is real; tell the session layer what that means. This is the single
 // place a lobby decision becomes a game session, and it goes through the same
 // two requests the panel's manual buttons use -- so the runtime-role path is
@@ -510,12 +544,29 @@ void adopt_room(const char* role) {
 
     if (_stricmp(role, "host") == 0) {
         session_request_host(config().net_port);
+        g.reach = 0;
+        // A host on the internet needs its game port reachable: ask the router to forward it. Not for a lobby on the local
+        // network (nobody outside is meant to come in).
+        if (!is_private_host(g.addr)) {
+            upnp_start(config().net_port);
+            if (config().net_steam) steam_bridge_host_start(config().net_port);   // Steam peers reach the same game port, bridged
+        }
         set_status("room %s -- you are the HOST (listening on port %u)",
                    g.room, (unsigned)config().net_port);
         log_line("SIGNAL", "room %s: we are the host -- hosting on port %u",
                  g.room, (unsigned)config().net_port);
     } else {
-        session_request_join(g.host_addr, g.host_port);
+        {   // The order to try: the server's (the host's own network first for a player behind its router, then its public
+            // address), with Steam last -- unless the server found the host's port closed, when Steam goes first.
+            std::string list = g.host_cands[0] ? g.host_cands : g.host_addr;
+            if (config().net_steam && g.host_steam[0] && steam_bridge_id()) {
+                const std::string st = std::string("steam:") + g.host_steam;
+                list = (g.host_reach == 2 && !is_private_host(g.host_addr)) ? st + "," + list : list + "," + st;
+                log_line("SIGNAL", "the host can also be reached through Steam (%s)%s", g.host_steam,
+                         g.host_reach == 2 ? " -- its game port is closed, so Steam goes first" : "");
+            }
+            session_request_join(list.c_str(), g.host_port);
+        }
         set_status("room %s -- joining the host at %s:%u", g.room, g.host_addr,
                    (unsigned)g.host_port);
         log_line("SIGNAL", "room %s: we are a client -- dialling %s:%u", g.room,
@@ -559,6 +610,15 @@ void handle_line(const char* line) {
         strncpy_s(g.room, sizeof(g.room), jstr(j, "id").c_str(), _TRUNCATE);
         strncpy_s(g.host_addr, sizeof(g.host_addr), jstr(j, "addr").c_str(), _TRUNCATE);
         g.host_port  = (uint16_t)jint(j, "port", 0);
+        {   // `alts`: other addresses to try if the first does not answer (a player behind the host's own router)
+            std::string cands = g.host_addr;
+            auto al = j.find("alts");
+            if (al != j.end() && al->is_array())
+                for (const json& e : *al) if (e.is_string() && cands.size() < 150) { cands += ","; cands += e.get<std::string>(); }
+            strncpy_s(g.host_cands, sizeof(g.host_cands), cands.c_str(), _TRUNCATE);
+            strncpy_s(g.host_steam, sizeof(g.host_steam), jstr(j, "hsteam").c_str(), _TRUNCATE);
+            g.host_reach = jint(j, "hreach", 0);
+        }
         g.auto_done  = true;
         g.locked     = false;
         { auto pw = j.find("pw"); g.room_pw = pw != j.end() && pw->is_boolean() && pw->get<bool>(); }
@@ -580,6 +640,10 @@ void handle_line(const char* line) {
             g.locked = locked;
             auto pw = j.find("pw");
             if (pw != j.end() && pw->is_boolean()) g.room_pw = pw->get<bool>();
+        }
+        {   // the probe finishing is announced to the room with a plain membership message
+            const std::string hs = jstr(j, "hsteam");
+            if (!hs.empty()) { strncpy_s(g.host_steam, sizeof(g.host_steam), hs.c_str(), _TRUNCATE); g.host_reach = jint(j, "hreach", g.host_reach); }
         }
         const std::string ev  = jstr(j, "event");
         const std::string who = jstr(j, "who");
@@ -626,6 +690,15 @@ void handle_line(const char* line) {
     }
 
     if (t == "pong") return;
+
+    if (t == "reach") {
+        auto ok = j.find("ok");
+        const bool open = ok != j.end() && ok->is_boolean() && ok->get<bool>();
+        g.reach = open ? 1 : 2;
+        log_line_lvl(open ? LogLevel::Info : LogLevel::Warn, "SIGNAL", "%sthe server %s our game port %s:%d from outside",
+                     open ? "" : "!! ", open ? "reached" : "could NOT reach", jstr(j, "addr").c_str(), jint(j, "port", 0));
+        return;
+    }
 
     log_line_lvl(LogLevel::Warn, "SIGNAL", "!! unknown message type '%s' from the server",
                  t.c_str());
@@ -731,6 +804,7 @@ void apply_request() {
             json o = json::object();
             o["t"] = "create"; o["name"] = req.arg;
             if (req.pw[0]) o["pw"] = req.pw;
+            add_lan_addresses(o);
             send_obj(o);
             break;
         }
@@ -740,6 +814,7 @@ void apply_request() {
             json o = json::object();
             o["t"] = "join"; o["room"] = req.arg;
             if (req.pw[0]) o["pw"] = req.pw;
+            add_lan_addresses(o);
             send_obj(o);
             break;
         }
@@ -765,6 +840,7 @@ void apply_request() {
 // ---------------------------------------------------------------------------
 
 void signal_init() {
+    if (config().net_steam) steam_bridge_init();      // idle until the game has initialised Steam
     const Config& cfg = config();
 
     InitializeCriticalSection(&g.ring_cs);
@@ -802,6 +878,19 @@ void signal_shutdown() {
 
 void signal_update() {
     apply_request();
+
+    // The router mapping: renewed while it stands, and the moment it comes up the server is asked to look at our port again.
+    upnp_update();
+    {
+        const UpnpState us = upnp_state();
+        if (us != g.upnp_prev) {
+            g.upnp_prev = us;
+            if (us == UpnpState::Mapped && state() == SignalState::Connected && g.room[0] && !_stricmp(g.role, "host")) {
+                g.reach = 0;
+                send_cmd("reach");
+            }
+        }
+    }
 
     if (state() == SignalState::Connected) {
         if (g.want_lock >= 0 && g.room[0]) {
@@ -902,7 +991,18 @@ const char* signal_server()     { return g.server; }
 const char* signal_name()       { return g.name; }
 const char* signal_room()       { return g.room; }
 const char* signal_role()       { return g.role; }
-const char* signal_host_addr()  { return g.host_addr; }
+// The whole list, Steam included, in the order to try -- what a redial uses too.
+const char* signal_host_addr()  {
+    static char list[256];
+    std::string s = g.host_cands[0] ? g.host_cands : g.host_addr;
+    if (!s.empty() && config().net_steam && g.host_steam[0] && steam_bridge_id()) {
+        const std::string st = std::string("steam:") + g.host_steam;
+        s = (g.host_reach == 2 && !is_private_host(g.host_addr)) ? st + "," + s : s + "," + st;
+    }
+    strncpy_s(list, sizeof(list), s.c_str(), _TRUNCATE);
+    return list;
+}
+int         signal_reach()      { return g.reach; }
 uint16_t    signal_host_port()  { return g.host_port; }
 const char* signal_last_event() { return g.event; }
 

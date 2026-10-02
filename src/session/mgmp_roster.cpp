@@ -18,6 +18,7 @@
                               // append, which is how a party GROWS safely (2026-09-23)
 #include "mgmp_net.h"         // net_role, net_active, net_send_party
 #include "mgmp_proto.h"       // PartyMsg, kMaxPartyIds
+#include "mgmp_catsync.h"      // catsync_cat_perished
 #include "mgmp_lockstep.h"    // lockstep_cat_is_mine -- WHO a cat belongs to, the one
                               // reader that works on the map (see roster_party_tick,
                               // 4+4 steps 1-2: each peer publishes only its own half)
@@ -1343,6 +1344,7 @@ static bool swap_capture() {
             const int encoded=session_cat_owner(all[i]);
             if(encoded>=0 && encoded<net_peer_count())owner=(uint8_t)encoded;
             else if(bootstrap)owner=i<pn?0:1;
+            else if(all[i]<0x70000000u)owner=0;     // a cat the game brought in during the run: the host's
             else return false;
         }
         if(owner>=net_peer_count())return false;
@@ -1361,6 +1363,132 @@ static bool swap_capture() {
     if(!mem_read((void*)addr_of_data(D_MewDirectorPtr),&g_swap.director,8))return false;
     for(unsigned i=0;i<pn+fn;++i)lockstep_note_owner(all[i],owners[i]);
     g_swap.captured=true;return true;
+}
+
+// A CAT THE GAME ITSELF TOOK OUT OF THE RUN MUST LEAVE THE FROZEN LAYOUT TOO (2026-10-02).
+//
+// Measured Host/Client, two machines: a client cat died in a battle and its corpse was destroyed. The HOST's game removed it from
+// its lists (the host's familiars went 4 -> 3) -- and so did the client's own game while the shared layout was up during the
+// battle. Then the map tick came and swap_apply_now wrote the client's FROZEN local layout back (party/mirror [71000001..4]):
+// the dead cat was in the run again on the client alone, "revived", shown in the panel and fielded in the next battle, while the
+// host's digest said "peer lists 7 cats, this peer 8". The frozen layout is captured once per run and nothing but
+// roster_adopt_host_shared ever edited it.
+//
+// So before the local layout is written back, whatever the live lists no longer hold is dropped from the frozen one. The test is
+// a plain set difference (frozen minus live), which holds whichever layout the live lists are in, and it refuses to act on
+// anything that does not look like the same director with readable, non-empty lists (a torn-down scene reads as "no verdict",
+// not as "everyone died"). It never empties this peer's own side.
+static void erase_id(uint32_t* a, uint32_t& n, uint32_t id) {
+    for (uint32_t i = 0; i < n; ++i) {
+        if (a[i] != id) continue;
+        for (uint32_t j = i + 1; j < n; ++j) a[j - 1] = a[j];
+        a[--n] = 0;
+        return;
+    }
+}
+
+static bool has_id(const uint32_t* a, uint32_t n, uint32_t id) {
+    for (uint32_t i = 0; i < n; ++i) if (a[i] == id) return true;
+    return false;
+}
+
+
+// THE CATS THE GAME BROUGHT IN (2026-10-02): the gain_cat_familiar event builds a cat and appends its id to the party (or, with four
+// already, to the familiars). That id is an ordinary one, not a session id, and the frozen layout had never heard of it -- so the next
+// write-back of the local roster simply left it out of the lists, with the cat still flagged "out on adventure": gone for good. Whatever
+// the live lists hold that the layout does not is learned here, on the side its owner belongs to (an ordinary id: the host).
+static void swap_learn_new(const uint32_t* live, uint32_t nlive) {
+    uint32_t added[kSwapIds]{}, na = 0;
+    for (uint32_t i = 0; i < nlive; ++i) {
+        const uint32_t id = live[i];
+        if (!id || id == UINT32_MAX) continue;
+        if (has_id(g_swap.party_before, g_swap.pn, id) || has_id(g_swap.fam_before, g_swap.fn, id)) continue;
+        if (has_id(added, na, id)) continue;
+        if (!catsync_cat_exists(id) || catsync_cat_perished(id)) continue;     // a real, living cat of the registry only
+        added[na++] = id;
+    }
+    for (uint32_t i = 0; i < na; ++i) {
+        const uint32_t id = added[i];
+        uint8_t owner = kNoPeer;
+        if (!lockstep_owner_pos(id, owner)) {
+            const int enc = session_cat_owner(id);
+            owner = enc >= 0 ? (uint8_t)enc : (id < 0x70000000u ? 0 : kNoPeer);
+        }
+        if (owner >= net_peer_count()) continue;
+        if (g_swap.pn + g_swap.fn >= kSwapIds) break;
+        // the shared layout: the host's cats in the party while it has room, everyone else's (and an overflowing host cat) in the familiars
+        if (owner == 0 && g_swap.pn < 4) g_swap.party_before[g_swap.pn++] = id;
+        else g_swap.fam_before[g_swap.fn++] = id;
+        // this peer's own view: its own cats in the party (four at most), the rest in the familiars
+        if (owner == net_peer_pos() && g_swap.ln < 4) g_swap.local[g_swap.ln++] = id;
+        else if (g_swap.on < kSwapIds) g_swap.others[g_swap.on++] = id;
+        lockstep_note_owner(id, owner);
+        log_line("ROSTER", "!! the game brought a cat into the run: %x (owner %u) -- learned by the frozen layout, so the local roster keeps it "
+                           "(party %u, familiars %u, own %u, others %u)", id, (unsigned)owner, g_swap.pn, g_swap.fn, g_swap.ln, g_swap.on);
+    }
+    if (na) memcpy(g_swap.mirror_before, g_swap.party_before, sizeof(g_swap.mirror_before));
+}
+
+static void swap_forget_gone() {
+    if (!g_swap.captured || g_swap.pn + g_swap.fn == 0) return;
+    uintptr_t dir = 0;
+    if (!mem_read((void*)addr_of_data(D_MewDirectorPtr), &dir, 8) || !dir || dir != g_swap.director) return;
+    uintptr_t pd = 0, fd = 0; uint32_t pn = 0, fn = 0;
+    if (!swap_director(&pd, &fd, &pn, &fn) || pn == 0 || pn + fn > kSwapIds || (fn && !fd)) return;
+    uint32_t live[kSwapIds]{};
+    if (!swap_read_ids(pd, live, pn) || !swap_read_ids(fd, live + pn, fn)) return;
+    const uint32_t nlive = pn + fn;
+
+    // What the lists looked like, once per change: this is the line to read if a cat ever comes back from the dead again.
+    {
+        static uint64_t last_sig = 0;
+        uint64_t sig = 1469598103934665603ull * (pn * 31 + fn + 1);
+        for (uint32_t i = 0; i < nlive; ++i) sig = (sig ^ live[i]) * 1099511628211ull;
+        if (sig != last_sig) {
+            last_sig = sig;
+            char lv[200] = {}, fz[200] = {};
+            int lo = 0, fo = 0;
+            for (uint32_t i = 0; i < nlive && lo < 170; ++i) lo += _snprintf_s(lv + lo, sizeof(lv) - lo, _TRUNCATE, "%s%x", i == pn ? " | " : (i ? " " : ""), live[i]);
+            for (uint32_t i = 0; i < g_swap.pn + g_swap.fn && fo < 170; ++i)
+                fo += _snprintf_s(fz + fo, sizeof(fz) - fo, _TRUNCATE, "%s%x", i == g_swap.pn ? " | " : (i ? " " : ""),
+                                  i < g_swap.pn ? g_swap.party_before[i] : g_swap.fam_before[i - g_swap.pn]);
+            log_line("ROSTER", "post-battle lists: live party | familiars = [%s], frozen shared layout = [%s]", lv, fz);
+        }
+    }
+
+    uint32_t gone[kSwapIds]{}, ng = 0;
+    for (uint32_t i = 0; i < g_swap.pn + g_swap.fn; ++i) {
+        const uint32_t id = i < g_swap.pn ? g_swap.party_before[i] : g_swap.fam_before[i - g_swap.pn];
+        if (!id || has_id(live, nlive, id)) continue;
+        // ONLY A CAT THE GAME MARKED DEAD FOR GOOD. Both peers run the same battle, so both lose such a cat from their lists and the
+        // frozen layout may follow. A cat that merely left the lists on THIS peer (the CatHole event, leave_party_temporarily, runs on
+        // the peer whose cat it is) is still in the other peer's lists: dropping it here would split the two rosters, so it stays in
+        // the layout and is written back as before.
+        if (catsync_cat_perished(id)) { if (ng < kSwapIds) gone[ng++] = id; }
+        else log_line("ROSTER", "cat %x left the live lists but is not marked dead (an event took it out?) -- kept in the frozen layout", id);
+    }
+    swap_learn_new(live, nlive);
+    if (!ng || ng >= g_swap.pn + g_swap.fn) return;                      // nothing gone, or "everything" = not a verdict
+    uint32_t local_left = g_swap.ln;
+    for (uint32_t i = 0; i < ng; ++i) if (has_id(g_swap.local, g_swap.ln, gone[i])) --local_left;
+    if (local_left == 0) return;                                          // never leave this peer with no cat of its own
+
+    char text[128] = {};
+    int off = 0;
+    // Every array that holds the layout loses the id: the shared party (the mirror is a copy of it), the shared familiars, and
+    // the two local-view lists.
+    for (uint32_t i = 0; i < ng; ++i) {
+        off += _snprintf_s(text + off, sizeof(text) - off, _TRUNCATE, "%s%x", i ? " " : "", gone[i]);
+        erase_id(g_swap.party_before, g_swap.pn, gone[i]);
+        erase_id(g_swap.fam_before, g_swap.fn, gone[i]);
+        erase_id(g_swap.local, g_swap.ln, gone[i]);
+        erase_id(g_swap.others, g_swap.on, gone[i]);
+    }
+    memcpy(g_swap.mirror_before, g_swap.party_before, sizeof(g_swap.mirror_before));
+    log_line_lvl(LogLevel::Warn, "ROSTER",
+                 "!! the game took %u cat(s) out of the run [%s] (destroyed corpse): dropped from this peer's frozen layout too, "
+                 "so the local roster is not written back with them -- party %u, familiars %u, own %u, others %u",
+                 ng, text, g_swap.pn, g_swap.fn, g_swap.ln, g_swap.on);
 }
 
 static void swap_apply_now() {
@@ -1406,6 +1534,7 @@ void roster_party_swap_on_map() {
     if (g_swap_blocked && !g_swap_node_entered) return;
     g_swap_blocked = false;
     g_swap_post = true;
+    swap_forget_gone();
     swap_apply_now();
 }
 
@@ -1426,6 +1555,7 @@ void roster_party_swap_watch() {
     g_swap_list_seen = false;
     g_swap_blocked = false;
     g_swap_post = true;
+    swap_forget_gone();
     swap_apply_now();
 }
 
@@ -1469,6 +1599,7 @@ bool roster_normalize_shared(const char* why) {
             const int encoded = session_cat_owner(all[i]);
             if (encoded >= 0) owner = (uint8_t)encoded;
         }
+        if (owner == kNoPeer && all[i] < 0x70000000u) owner = 0;        // a cat the game brought in during the run: the host's
         if (owner >= net_peer_count()) refuse = "a cat with no known owner";
         else if (owner == 0) { if (npn >= 4) refuse = "more than four host cats"; else party[npn++] = all[i]; }
         else fam[nfn++] = all[i];
@@ -1507,6 +1638,7 @@ static uint8_t shared_owner(uint32_t id) {
     if (!lockstep_owner_pos(id, owner)) {
         const int encoded = session_cat_owner(id);
         if (encoded >= 0) owner = (uint8_t)encoded;
+        else if (id < 0x70000000u) owner = 0;      // an ordinary id in the run: a cat the game brought in (an event) -- the host's
     }
     return owner;
 }
@@ -1520,7 +1652,9 @@ bool roster_adopt_host_shared(const uint64_t* cats, uint32_t cn, const uint64_t*
     for (uint32_t i = 0; i < fn && !refuse; ++i) {
         if (!fam[i] || fam[i] >= UINT32_MAX) { refuse = "a bad familiar id"; break; }
         const uint8_t owner = shared_owner((uint32_t)fam[i]);
-        if (owner == 0 || owner >= net_peer_count()) refuse = "a familiar not owned by a client";
+        // A familiar is normally a client's cat. A HOST cat the game filed there because the party was already full (a gained cat)
+        // is fine too -- only a host cat with a session id has no business in the familiars.
+        if (owner >= net_peer_count() || (owner == 0 && fam[i] >= 0x70000000ull)) refuse = "a familiar not owned by a client";
         else fams[nfn++] = (uint32_t)fam[i];
     }
     for (uint32_t i = 0; i < cn && !refuse; ++i) {

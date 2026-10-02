@@ -81,6 +81,7 @@ int main() {
         Hello h{};
         h.gpak_hash = 0xDEADBEEFCAFEF00DULL;
         h.build_hash = 0x0123456789ABCDEFULL;
+        h.rules = 1;
         strcpy_s(h.name, "host");
         uint32_t n = enc_hello(buf, sizeof(buf), h);
         Reader r(buf, n); r.u8v();
@@ -90,6 +91,8 @@ int main() {
         check(o.gpak_hash == h.gpak_hash, "gpak hash survives the high bit");
         check(o.build_hash == h.build_hash, "build hash");
         check(strcmp(o.name, "host") == 0, "name");
+        check(o.rules == 1, "the host's rule bits ride in the HELLO (proto 51)");
+        check(kProtoVersion >= 51, "the rule bits require protocol 51 or later");
     }
 
     printf("\n-- Welcome carries all four xoshiro words --\n");

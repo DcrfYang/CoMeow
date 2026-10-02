@@ -229,6 +229,14 @@ int main() {
         check(config_rewrite_beta_notice("[1,2]", false).empty() && config_rewrite_beta_notice("", false).empty(),
               "text that is not an object is refused");
 
+        check(!load("{}").block_new_cats, "ui.block_new_cats defaults off");
+        check(load(R"({ "ui": { "block_new_cats": true } })").block_new_cats, "and is read from ui.block_new_cats");
+        const std::string e = config_rewrite_ui_bool(R"({ "ui": { "beta_notice": false } })", "block_new_cats", true);
+        check(e.find("\"block_new_cats\": true") != std::string::npos && e.find("\"beta_notice\": false") != std::string::npos,
+              "block_new_cats is added to the ui block beside the other keys");
+        const std::string f = config_rewrite_ui_bool(e, "block_new_cats", false);
+        check(f.find("\"block_new_cats\": false") != std::string::npos && f.find("true") == std::string::npos, "and replaced in place afterwards");
+
         // end to end through the file; the loader reads the result back
         load("{\n  // keep me\n  \"net\": { \"port\": 27611 },\n  \"ui\": { \"key\": \"F4\" }\n}\n");
         check(config_set_beta_notice(false), "config_set_beta_notice writes the file");

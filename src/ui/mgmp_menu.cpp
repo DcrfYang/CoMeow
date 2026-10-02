@@ -37,6 +37,8 @@
 #include "mgmp_session.h"
 #include "mgmp_signal.h"
 #include "mgmp_lan.h"
+#include "mgmp_upnp.h"
+#include "mgmp_steambridge.h"
 #include "mgmp_logupload.h"
 
 namespace mgmp {
@@ -143,7 +145,7 @@ bool tex_load(Tex& t, const char* rel) {
 // ---------------------------------------------------------------------------
 // state
 // ---------------------------------------------------------------------------
-enum class Win { None, Multi, Backup };
+enum class Win { None, Multi, Backup, Settings };
 enum class LanPhase { None, HostDial, HostCreate, JoinDial, JoinJoin };   // the LAN tab's create / join, step by step
 enum class Confirm { None, Overwrite, Load, Delete, Undo, Import };
 
@@ -196,6 +198,7 @@ struct Menu {
     char      lan_t_id[16] = {};
     bool      lan_t_pw     = false;
     double    lan_next_search = 0;
+    bool      room_connected = false;   // this client has been linked to the host at least once in the room it is in
     // The F2 log-upload panel.
     bool     log_open   = false;
     bool     log_inited = false;
@@ -790,10 +793,10 @@ void draw_lan_tabs(ImDrawList* dl, const View& v, ImVec2 a, float W) {
     auto X = [&](float x) { return a.x + x * k; };
     auto Y = [&](float y) { return a.y + y * k; };
     const bool free = g.lan_phase == LanPhase::None;
-    if (paper_button("tab_online", ImVec2(X(70), Y(88)), ImVec2(X(W / 2 - 5), Y(144)), tr(Tx::LAN_TAB_ONLINE), 28 * k, free,
+    if (paper_button("tab_online", ImVec2(X(70), Y(118)), ImVec2(X(W / 2 - 5), Y(170)), tr(Tx::LAN_TAB_ONLINE), 28 * k, free,
                      g.lan_tab ? Tone::Normal : Tone::Good))
         g.lan_tab = false;
-    if (paper_button("tab_lan", ImVec2(X(W / 2 + 5), Y(88)), ImVec2(X(W - 70), Y(144)), tr(Tx::LAN_TAB_LAN), 28 * k, free,
+    if (paper_button("tab_lan", ImVec2(X(W / 2 + 5), Y(118)), ImVec2(X(W - 70), Y(170)), tr(Tx::LAN_TAB_LAN), 28 * k, free,
                      g.lan_tab ? Tone::Good : Tone::Normal)) {
         if (!g.lan_tab) { g.lan_tab = true; lan_search_start(); g.lan_next_search = now() + 8.0; }
     }
@@ -807,18 +810,17 @@ void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
     const bool free = g.lan_phase == LanPhase::None && !busy && !g.pw_ask;
 
     // this player
-    text_at(dl, ImVec2(X(70), Y(198)), 28 * k, kInk, tr(Tx::PLAYER_NAME));
-    paper_input("##lan_name", ImVec2(X(290), Y(184)), ImVec2(X(W - 70), Y(244)), g.pname, sizeof(g.pname), tr(Tx::NAME_HINT), 28 * k);
+    text_at(dl, ImVec2(X(70), Y(204)), 28 * k, kInk, tr(Tx::PLAYER_NAME));
+    paper_input("##lan_name", ImVec2(X(290), Y(190)), ImVec2(X(W - 70), Y(250)), g.pname, sizeof(g.pname), tr(Tx::NAME_HINT), 28 * k);
 
     // --- host ---------------------------------------------------------------
-    text_at(dl, ImVec2(X(50), Y(268)), 30 * k, kInk, tr(Tx::LAN_HOST_TITLE));
-    wrap_text(dl, X(50), Y(306), (W - 100) * k, 21 * k, 25 * k, kGrey, tr(Tx::LAN_HOST_HINT));
-    text_at(dl, ImVec2(X(50), Y(414)), 26 * k, kInk, tr(Tx::ROOM_NAME));
-    paper_input("##lan_room", ImVec2(X(190), Y(402)), ImVec2(X(W - 320), Y(454)), g.lan_room, sizeof(g.lan_room), tr(Tx::ROOM_NAME_HINT), 26 * k);
-    text_at(dl, ImVec2(X(50), Y(476)), 26 * k, kInk, tr(Tx::ROOM_PW));
-    paper_input("##lan_pw", ImVec2(X(190), Y(464)), ImVec2(X(W - 320), Y(516)), g.lan_pw, sizeof(g.lan_pw), tr(Tx::ROOM_PW_HINT), 26 * k,
+    text_at(dl, ImVec2(X(50), Y(270)), 30 * k, kInk, tr(Tx::LAN_HOST_TITLE));
+    text_at(dl, ImVec2(X(50), Y(328)), 26 * k, kInk, tr(Tx::ROOM_NAME));
+    paper_input("##lan_room", ImVec2(X(190), Y(316)), ImVec2(X(W - 320), Y(368)), g.lan_room, sizeof(g.lan_room), tr(Tx::ROOM_NAME_HINT), 26 * k);
+    text_at(dl, ImVec2(X(50), Y(390)), 26 * k, kInk, tr(Tx::ROOM_PW));
+    paper_input("##lan_pw", ImVec2(X(190), Y(378)), ImVec2(X(W - 320), Y(430)), g.lan_pw, sizeof(g.lan_pw), tr(Tx::ROOM_PW_HINT), 26 * k,
                 ImGuiInputTextFlags_Password);
-    if (paper_button("lan_create", ImVec2(X(W - 300), Y(402)), ImVec2(X(W - 50), Y(516)), tr(Tx::LAN_CREATE), 28 * k, free, Tone::Good)) {
+    if (paper_button("lan_create", ImVec2(X(W - 300), Y(316)), ImVec2(X(W - 50), Y(430)), tr(Tx::LAN_CREATE), 28 * k, free, Tone::Good)) {
         std::string err;
         if (!lan_host_start(err)) {
             say(tr(Tx::LAN_START_FAIL), err.c_str());
@@ -831,9 +833,9 @@ void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
     }
 
     // --- join ---------------------------------------------------------------
-    text_at(dl, ImVec2(X(50), Y(548)), 30 * k, kInk, tr(Tx::LAN_JOIN_TITLE));
+    text_at(dl, ImVec2(X(50), Y(462)), 30 * k, kInk, tr(Tx::LAN_JOIN_TITLE));
     const LanSearch ls = lan_search_state();
-    if (paper_button("lan_search", ImVec2(X(W - 330), Y(536)), ImVec2(X(W - 50), Y(592)), tr(Tx::LAN_SEARCH_BTN), 24 * k,
+    if (paper_button("lan_search", ImVec2(X(W - 330), Y(450)), ImVec2(X(W - 50), Y(504)), tr(Tx::LAN_SEARCH_BTN), 24 * k,
                      free && ls != LanSearch::Searching)) {
         lan_search_start();
         g.lan_next_search = now() + 8.0;
@@ -842,13 +844,13 @@ void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
 
     const std::vector<LanRoom> found = lan_search_results();
     if (ls == LanSearch::Searching) {
-        text_at(dl, ImVec2(X(50), Y(594)), 22 * k, kGrey, tr(Tx::LAN_SEARCHING));
+        text_at(dl, ImVec2(X(50), Y(508)), 22 * k, kGrey, tr(Tx::LAN_SEARCHING));
     } else if (!found.empty()) {
         char msg[64]; _snprintf_s(msg, sizeof(msg), _TRUNCATE, tr(Tx::LAN_FOUND), (unsigned)found.size());
-        text_at(dl, ImVec2(X(50), Y(594)), 22 * k, kGreen, msg);
+        text_at(dl, ImVec2(X(50), Y(508)), 22 * k, kGreen, msg);
     }
 
-    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(626), ly1 = Y(808);
+    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(540), ly1 = Y(724);
     rough_rect(dl, ImVec2(lx0, ly0), ImVec2(lx1, ly1), IM_COL32(255, 255, 250, 70), kInk, 2.2f, 93, 1.2f);
     if (found.empty()) {
         if (ls != LanSearch::Searching) wrap_text(dl, lx0 + 24 * k, ly0 + 40 * k, lx1 - lx0 - 48 * k, 22 * k, 27 * k, kInkSoft, tr(Tx::LAN_NONE));
@@ -890,8 +892,7 @@ void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
         ImGui::EndChild();
     }
 
-    wrap_text(dl, X(50), Y(818), (W - 100) * k, 19 * k, 23 * k, kGrey, tr(Tx::LAN_MANUAL_HINT));
-    wrap_text(dl, X(50), Y(866), (W - 100) * k, 19 * k, 23 * k, kGrey, tr(Tx::LAN_FIREWALL));
+    wrap_text(dl, X(50), Y(736), (W - 100) * k, 19 * k, 23 * k, kGrey, tr(Tx::LAN_FIREWALL));
 
     if (paper_button("lan_back", ImVec2(X(70), Y(H - 84)), ImVec2(X(W - 70), Y(H - 24)), tr(Tx::BACK), 30 * k))
         g.win = Win::None;
@@ -903,7 +904,7 @@ void draw_multi_window(const View& v) {
     ensure_inited();
     const SignalState st0 = signal_state();
     const bool disconnected = st0 == SignalState::Off || st0 == SignalState::Failed || st0 == SignalState::Closed;
-    const float W = 900, H = in_room() ? 860.0f : (st0 == SignalState::Connected ? 800.0f : (disconnected && g.lan_tab ? 1000.0f : 720.0f));
+    const float W = 900, H = in_room() ? (lan_host_running() ? 886.0f : 860.0f) : (st0 == SignalState::Connected ? 800.0f : (disconnected && g.lan_tab ? 880.0f : 760.0f));
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f + 20);
     const ImVec2 sz(W * v.k, H * v.k);
     if (!overlay_window_begin("##mgmp_multi", a, sz)) { ImGui::End(); return; }
@@ -921,12 +922,14 @@ void draw_multi_window(const View& v) {
 
     if (in_room()) {
         // Reopened while a room is open: show it instead of the connect form.
+        float top = 130;
         if (lan_host_running() && lan_addr_line()[0]) {
             char al[200]; _snprintf_s(al, sizeof(al), _TRUNCATE, tr(Tx::LAN_YOUR_ADDR), lan_addr_line());
-            text_c(dl, X(W / 2), Y(100), 24 * k, kGreen, al);
+            text_c(dl, X(W / 2), Y(116), 24 * k, kGreen, al);     // the title ends at about 108
+            top = 156;
         }
         float y = 0;
-        draw_room_info(dl, v, ImVec2(X(60), Y(130)), (W - 120) * k, y, false);
+        draw_room_info(dl, v, ImVec2(X(60), Y(top)), (W - 120) * k, y, false);
         if (room_is_host()) {
             const bool locked = room_locked();
             const bool can = locked ? room_can_unlock() : true;
@@ -946,20 +949,19 @@ void draw_multi_window(const View& v) {
     if (st == SignalState::Off || st == SignalState::Failed || st == SignalState::Closed) {
         draw_lan_tabs(dl, v, a, W);
         if (g.lan_tab) { draw_lan_tab(dl, v, a, W, H); ImGui::End(); return; }
-        text_c(dl, X(W / 2), Y(178), 28 * k, kInkSoft, tr(Tx::CONNECT_FIRST));
+        text_c(dl, X(W / 2), Y(186), 26 * k, kInkSoft, tr(Tx::CONNECT_FIRST));
 
-        text_at(dl, ImVec2(X(70), Y(212)), 30 * k, kInk, tr(Tx::SERVER_ADDR));
-        paper_input("##addr", ImVec2(X(290), Y(200)), ImVec2(X(W - 70), Y(262)), g.addr, sizeof(g.addr), "localhost", 30 * k);
-        text_at(dl, ImVec2(X(70), Y(302)), 30 * k, kInk, tr(Tx::PLAYER_NAME));
-        paper_input("##name", ImVec2(X(290), Y(290)), ImVec2(X(W - 70), Y(352)), g.pname, sizeof(g.pname), tr(Tx::NAME_HINT), 30 * k);
-        text_c(dl, X(W / 2), Y(372), 22 * k, kGrey, tr(Tx::ADDR_HINT));
+        text_at(dl, ImVec2(X(70), Y(252)), 30 * k, kInk, tr(Tx::SERVER_ADDR));
+        paper_input("##addr", ImVec2(X(290), Y(240)), ImVec2(X(W - 70), Y(302)), g.addr, sizeof(g.addr), "localhost", 30 * k);
+        text_at(dl, ImVec2(X(70), Y(342)), 30 * k, kInk, tr(Tx::PLAYER_NAME));
+        paper_input("##name", ImVec2(X(290), Y(330)), ImVec2(X(W - 70), Y(392)), g.pname, sizeof(g.pname), tr(Tx::NAME_HINT), 30 * k);
 
         const char* err = signal_error();
         if (st == SignalState::Failed && err[0]) {
-            text_c(dl, X(W / 2), Y(430), 26 * k, kRed, tr(Tx::NET_FAILED));
-            text_c(dl, X(W / 2), Y(468), 22 * k, kRed, err);
+            text_c(dl, X(W / 2), Y(470), 26 * k, kRed, tr(Tx::NET_FAILED));
+            text_c(dl, X(W / 2), Y(508), 22 * k, kRed, err);
         } else if (st == SignalState::Closed) {
-            text_c(dl, X(W / 2), Y(430), 26 * k, kAmber, tr(Tx::SERVER_LOST));
+            text_c(dl, X(W / 2), Y(470), 26 * k, kAmber, tr(Tx::SERVER_LOST));
         }
 
         if (paper_button("connect", ImVec2(X(70), Y(H - 130)), ImVec2(X(W / 2 - 10), Y(H - 58)), tr(Tx::CONNECT), 34 * k, !busy, Tone::Good)) {
@@ -978,7 +980,6 @@ void draw_multi_window(const View& v) {
         const int dots = (int)(now() * 3.0) % 4;
         char msg[48]; _snprintf_s(msg, sizeof(msg), _TRUNCATE, tr(Tx::CONNECTING_SERVER), dots, "...");
         text_c(dl, X(W / 2), Y(280), 40 * k, kInk, msg);
-        text_c(dl, X(W / 2), Y(340), 24 * k, kGrey, signal_status());
         if (paper_button("cancel", ImVec2(X(W / 2 - 150), Y(H - 130)), ImVec2(X(W / 2 + 150), Y(H - 58)), tr(Tx::CANCEL), 34 * k)) {
             g.lan_phase = LanPhase::None;
             signal_request_disconnect();
@@ -1011,7 +1012,6 @@ void draw_multi_window(const View& v) {
                 order[n++] = i;
     if (n == 0) {
         text_c(dl, X(W / 2), Y(300), 30 * k, kInkSoft, total == 0 ? tr(Tx::NO_ROOMS) : tr(Tx::NO_MATCH));
-        if (total == 0) text_c(dl, X(W / 2), Y(346), 24 * k, kGrey, tr(Tx::NO_ROOMS_HINT));
     } else {
         text_at(dl, ImVec2(lx0 + 20 * k, ly0 + 10 * k), 22 * k, kGrey, tr(Tx::COL_ROOM));
         text_at(dl, ImVec2(X(420), ly0 + 10 * k), 22 * k, kGrey, tr(Tx::COL_HOST));
@@ -1253,11 +1253,6 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
     _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::ROOM_LINE), signal_room(), host ? tr(Tx::ROLE_HOST) : tr(Tx::ROLE_PLAYER));
     text_at(dl, ImVec2(o.x, y), 22 * k, kInkSoft, line);
     y += 34 * k;
-    if (!host && signal_host_addr()[0]) {
-        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::HOST_ADDR), signal_host_addr(), (unsigned)signal_host_port());
-        text_at(dl, ImVec2(o.x, y), 22 * k, kGrey, line);
-        y += 34 * k;
-    }
 
     // Players.
     y += 8 * k;
@@ -1325,16 +1320,20 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
         text_at(dl, ImVec2(o.x + 6 * k, y + 4 * k), 24 * k, kGrey, tr(Tx::FETCHING_PLAYERS));
         y += 44 * k;
     }
-    if (host && n < 2 && !room_locked()) {
-        text_at(dl, ImVec2(o.x, y), 22 * k, kGrey, tr(Tx::TELL_ROOM));
-        y += 34 * k;
-    }
 
     // The lock: until it is on nobody may pick a save; while it is on the room is hidden and closed.
     text_at(dl, ImVec2(o.x, y), 22 * k, room_locked() ? kGreen : kAmber,
             room_locked() ? tr(Tx::LOCKED_LINE)
                           : (host ? tr(Tx::UNLOCKED_HOST) : tr(Tx::UNLOCKED_CLIENT)));
     y += 34 * k;
+
+    // The host's game port is closed to the outside (the server tried it): the one thing a host must be told. Not while the
+    // router mapping is still being set up -- that may fix it a moment from now.
+    if (host && signal_reach() == 2 && upnp_state() != UpnpState::Working && !steam_bridge_ready()) {
+        char warn[300];
+        _snprintf_s(warn, sizeof(warn), _TRUNCATE, tr(Tx::REACH_WARN), (unsigned)config().net_port);
+        y = wrap_text(dl, o.x, y, w, 21 * k, 25 * k, kAmber, warn) + 8 * k;
+    }
 
     // Session line.
     y += 2 * k;
@@ -1347,14 +1346,6 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
     if (net_state() == NetState::Failed && net_error()[0]) {
         text_at(dl, ImVec2(o.x, y), 20 * k, kRed, net_error());
         y += 30 * k;
-    }
-    const NetStats ns = net_stats();
-    _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::PACKETS), ns.sent, ns.received);
-    text_at(dl, ImVec2(o.x, y), 22 * k, kGrey, line);
-    y += 32 * k;
-    if (!compact && session_status()[0]) {
-        text_at(dl, ImVec2(o.x, y), 20 * k, kGrey, session_status());
-        y += 28 * k;
     }
     y_out = y;
 }
@@ -2089,9 +2080,54 @@ void draw_room_notice(const View& v) {
 
 // The first-run notice: this is a test release, back your saves up. Shown over the title screen until dismissed;
 // "do not show again" writes ui.beta_notice = false into mgmp.json.
+// ---------------------------------------------------------------------------
+// the mod settings window (title screen)
+// ---------------------------------------------------------------------------
+void draw_settings_window(const View& v) {
+    const float W = 900, H = 460;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f + 20);
+    const ImVec2 sz(W * v.k, H * v.k);
+    if (!overlay_window_begin("##mgmp_settings", a, sz)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    const float k = v.k;
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(46), 52 * k, kInk, tr(Tx::MENU_SETTINGS));
+
+    // "Disable the new-cat effects": a box and its words. Not while a room is open -- the two players must agree on it.
+    const bool locked = in_room() || net_active();
+    const bool on = config().block_new_cats;
+    const ImVec2 b0(X(70), Y(160)), b1(X(70 + 48), Y(160 + 48));
+    const char* lab = tr(Tx::SET_BLOCK_CATS);
+    const float lw = text_size(30 * k, lab).x;
+    ImGui::SetCursorScreenPos(b0);
+    ImGui::PushID("set_block_cats");
+    const bool clicked = ImGui::InvisibleButton("##c", ImVec2(b1.x - b0.x + 18 * k + lw, b1.y - b0.y)) && !locked;
+    const bool hov = ImGui::IsItemHovered() && !locked;
+    ImGui::PopID();
+    if (hov) g.hovering_button = true;
+    if (clicked) {
+        const bool saved = config_set_block_new_cats(!on);
+        log_line("MENU", "ui.block_new_cats = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+    }
+    rough_rect(dl, b0, b1, hov ? kPaperHi : IM_COL32(255, 255, 250, locked ? 120 : 200), kInk, 2.4f, 331, 1.2f);
+    if (on) {
+        dl->AddLine(ImVec2(b0.x + 10 * k, b0.y + 25 * k), ImVec2(b0.x + 21 * k, b0.y + 37 * k), locked ? kGrey : kInk, 5 * k);
+        dl->AddLine(ImVec2(b0.x + 21 * k, b0.y + 37 * k), ImVec2(b0.x + 39 * k, b0.y + 11 * k), locked ? kGrey : kInk, 5 * k);
+    }
+    text_at(dl, ImVec2(b1.x + 18 * k, b0.y + 8 * k), 30 * k, locked ? kGrey : kInk, lab);
+    wrap_text(dl, X(70), Y(232), (W - 140) * k, 24 * k, 31 * k, kInkSoft, tr(Tx::SET_BLOCK_CATS_NOTE));
+    if (locked) text_at(dl, ImVec2(X(70), Y(322)), 24 * k, kAmber, tr(Tx::SET_IN_ROOM));
+
+    if (paper_button("set_back", ImVec2(X(W / 2 - 150), Y(H - 90)), ImVec2(X(W / 2 + 150), Y(H - 30)), tr(Tx::BACK), 32 * k))
+        g.win = Win::None;
+    ImGui::End();
+}
+
 void draw_beta_notice(const View& v) {
     const float k = v.k;
-    const float W = 860, H = 470;
+    const float W = 900, H = 640;
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
     const ImVec2 sz(W * k, H * k);
     if (!modal_begin("##mgmp_beta")) return;
@@ -2100,7 +2136,7 @@ void draw_beta_notice(const View& v) {
     auto X = [&](float x) { return a.x + x * k; };
     auto Y = [&](float y) { return a.y + y * k; };
     text_c(dl, X(W / 2), Y(40), 44 * k, kInk, tr(Tx::BETA_TITLE));
-    wrap_text(dl, X(70), Y(122), (W - 140) * k, 28 * k, 42 * k, kInk, tr(Tx::BETA_TEXT));
+    wrap_text(dl, X(70), Y(112), (W - 140) * k, 26 * k, 37 * k, kInk, tr(Tx::BETA_TEXT));
 
     // the "do not show again" box
     const ImVec2 b0(X(70), Y(H - 150)), b1(X(70 + 44), Y(H - 150 + 44));
@@ -2331,13 +2367,15 @@ void menu_draw() {
     if (title && g.title_a > 0.001f) {
         // Above the game's own four (which start at 65% of the height, 100 px
         // apart on the 1080 stage), in the same left column and the same face.
-        if (menu_entry(v, "##e_multi", tr(Tx::MENU_MULTI), 480)) { g.win = (g.win == Win::Multi) ? Win::None : Win::Multi; g.next_list = 0; }
-        if (menu_entry(v, "##e_backup", tr(Tx::MENU_BACKUP), 585)) {
+        if (menu_entry(v, "##e_multi", tr(Tx::MENU_MULTI), 375)) { g.win = (g.win == Win::Multi) ? Win::None : Win::Multi; g.next_list = 0; }
+        if (menu_entry(v, "##e_settings", tr(Tx::MENU_SETTINGS), 585)) g.win = (g.win == Win::Settings) ? Win::None : Win::Settings;
+        if (menu_entry(v, "##e_backup", tr(Tx::MENU_BACKUP), 480)) {
             g.win = (g.win == Win::Backup) ? Win::None : Win::Backup;
             if (g.win == Win::Backup) refresh_backup_view();
         }
         if (g.win == Win::Multi)  draw_multi_window(v);
         if (g.win == Win::Backup) draw_backup_window(v);
+        if (g.win == Win::Settings) draw_settings_window(v);
     } else {
         g.win = Win::None;
     }
@@ -2352,6 +2390,10 @@ void menu_draw() {
                 g.pw_ask = true; g.pw_wrong = g.pw_sent; g.pw_buf[0] = 0;
             } else if (!strcmp(code, "server")) {
                 say("%s", tr(Tx::PW_SERVER_OLD));
+            } else if (strcmp(code, "password") != 0 && signal_error()[0]) {
+                // Anything else the server refused (a room name that is taken, a full room ..): the player had to read the log to
+                // find out why the click did nothing.
+                say(tr(Tx::SERVER_SAID), signal_error());
             }
             g.pw_sent = false;
         }
@@ -2387,6 +2429,23 @@ void menu_draw() {
     }
     if (!room_now && prev_room) { g.room_name[0] = 0; say(tr(Tx::LEFT_ROOM)); }
     prev_room = room_now;
+
+    // The dial to the host gave up on every address. A player who never got through is told why and walked out of the room
+    // (staying would leave them on a save screen with nobody to play with); a redial after the host's boss fight is not a
+    // first connection and keeps trying quietly.
+    {
+        static uint32_t dial_seen = 0;
+        const uint32_t sq = net_dial_seq();
+        if (!in_room()) g.room_connected = false;
+        else if (net_state() == NetState::Connected || net_state() == NetState::Ready) g.room_connected = true;
+        if (sq != dial_seen) {
+            dial_seen = sq;
+            if (in_room() && !room_is_host() && !g.room_connected) {
+                say(tr(Tx::DIAL_FAILED), (unsigned)config().net_port);
+                signal_request_leave();
+            }
+        }
+    }
 
     draw_toast(v);
     draw_cursor(v);

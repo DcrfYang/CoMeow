@@ -2,6 +2,7 @@
 
 #include "mgmp_net.h"
 #include "mgmp_log.h"
+#include "mgmp_steambridge.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -492,44 +493,146 @@ bool net_host(uint16_t port) {
     return true;
 }
 
+// --- dialling the host ------------------------------------------------------------------------------------------------
+//
+// OFF THE GAME THREAD, with a timeout per address, and over a LIST of addresses. A blocking connect() to a host that does not
+// answer (a router that does not forward the port, a firewall that drops) holds the frame for twenty seconds; the lobby may
+// now hand several candidates -- the host's private address first for a player behind the same router, then the others -- and
+// the first that answers wins. net_join returns at once with the state Connecting; the thread leaves it Connected, or Failed
+// with the last error, and bumps net_dial_seq so the menu can say so.
+
+constexpr DWORD kDialMs = 5000;     // per address
+constexpr int   kMaxCands = 6;
+constexpr DWORD kSteamDialMs = 15000;   // a Steam connection may need to find a route or a relay
+
+struct DialJob {
+    char     cands[kMaxCands][64] = {};
+    int      n = 0;
+    uint16_t port = 0;
+};
+DialJob g_dial;
+HANDLE  g_dial_thread = nullptr;
+volatile LONG g_dial_seq = 0;
+volatile LONG g_dial_err = 0;
+
+// One address: a non-blocking connect that is waited for in 100 ms slices (so a shutdown is noticed). 0 = connected, else a WSA error.
+int dial_one(const char* addr, uint16_t port, SOCKET& out) {
+    out = INVALID_SOCKET;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return WSAGetLastError();
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(port);
+    if (inet_pton(AF_INET, addr, &a.sin_addr) != 1) { closesocket(s); return WSAEINVAL; }
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    int err = 0;
+    if (connect(s, (sockaddr*)&a, sizeof(a)) == 0) {
+        err = 0;
+    } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        err = WSAGetLastError();
+    } else {
+        err = WSAETIMEDOUT;
+        const DWORD t0 = GetTickCount();
+        while (!InterlockedCompareExchange(&g.stop, 0, 0) && GetTickCount() - t0 < kDialMs) {
+            fd_set wr, ex;
+            FD_ZERO(&wr); FD_ZERO(&ex);
+            FD_SET(s, &wr); FD_SET(s, &ex);
+            timeval tv{ 0, 100000 };
+            if (select(0, nullptr, &wr, &ex, &tv) <= 0) continue;
+            int so = 0; int sl = sizeof(so);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so, &sl);
+            err = (FD_ISSET(s, &wr) && so == 0) ? 0 : (so ? so : WSAECONNREFUSED);
+            break;
+        }
+    }
+    if (err != 0) { closesocket(s); return err; }
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking);       // the link threads use plain blocking recv
+    out = s;
+    return 0;
+}
+
+DWORD WINAPI dial_thread(LPVOID) {
+    int last = WSAETIMEDOUT;
+    for (int i = 0; i < g_dial.n && !InterlockedCompareExchange(&g.stop, 0, 0); ++i) {
+        log_line("NET", "connecting to %s:%u (%d of %d)", g_dial.cands[i], (unsigned)g_dial.port, i + 1, g_dial.n);
+        SOCKET s = INVALID_SOCKET;
+        int e = 0;
+        if (!strncmp(g_dial.cands[i], "steam:", 6)) {
+            // The same TCP link, carried by Steam: the bridge hands back a loopback socket that is pumped to the host's Steam
+            // connection (see mgmp_steambridge.h).
+            int why = 0;
+            s = steam_bridge_dial(strtoull(g_dial.cands[i] + 6, nullptr, 10), kSteamDialMs, &g.stop, &why);
+            e = s != INVALID_SOCKET ? 0 : (why == 2 ? WSAETIMEDOUT : WSAECONNREFUSED);
+        } else {
+            e = dial_one(g_dial.cands[i], g_dial.port, s);
+        }
+        if (e == 0) {
+            g.self = kNoPeer;     // our own id is not known until PEERS arrives; the host stamps `from` regardless
+            set_state(NetState::Connected);
+            log_line("NET", "connected to %s", g_dial.cands[i]);
+            start_link(0, s, kHostPeer);
+            return 0;
+        }
+        last = e;
+        log_line("NET", "!! %s:%u did not answer (WSA %d)", g_dial.cands[i], (unsigned)g_dial.port, e);
+    }
+    if (InterlockedCompareExchange(&g.stop, 0, 0)) return 0;      // shut down while dialling: not a failure
+    InterlockedExchange(&g_dial_err, last);
+    fail("connect", last);
+    InterlockedIncrement(&g_dial_seq);
+    return 0;
+}
+
+// `addr` is one address or a comma-separated list of up to four, in the order to try them.
 bool net_join(const char* addr, uint16_t port) {
     if (g.role != NetRole::None) return false;
     ensure_cs();
     if (!wsa_init()) return false;
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) { fail("socket", WSAGetLastError()); return false; }
-
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_port   = htons(port);
-    if (inet_pton(AF_INET, addr, &a.sin_addr) != 1) {
-        _snprintf_s(g.error, sizeof(g.error), _TRUNCATE, "bad address '%s'", addr);
+    g_dial = DialJob{};
+    g_dial.port = port;
+    for (const char* p = addr ? addr : ""; *p && g_dial.n < kMaxCands;) {
+        const char* e = strchr(p, ',');
+        const size_t len = e ? (size_t)(e - p) : strlen(p);
+        char one[64] = {};
+        if (len > 0 && len < sizeof(one)) {
+            memcpy(one, p, len);
+            in_addr tmp{};
+            bool steam_ok = !strncmp(one, "steam:", 6) && len > 6;
+            for (size_t k = 6; steam_ok && k < len; ++k) if (one[k] < '0' || one[k] > '9') steam_ok = false;
+            if (steam_ok || inet_pton(AF_INET, one, &tmp) == 1) {
+                bool dup = false;
+                for (int i = 0; i < g_dial.n; ++i) if (!strcmp(g_dial.cands[i], one)) dup = true;
+                if (!dup) strncpy_s(g_dial.cands[g_dial.n++], sizeof(g_dial.cands[0]), one, _TRUNCATE);
+            }
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    if (g_dial.n == 0) {
+        _snprintf_s(g.error, sizeof(g.error), _TRUNCATE, "bad address '%s'", addr ? addr : "");
         set_state(NetState::Failed);
         log_line("NET", "!! %s", g.error);
-        closesocket(s);
-        return false;
-    }
-
-    set_state(NetState::Connecting);
-    log_line("NET", "connecting to %s:%u", addr, (unsigned)port);
-    if (connect(s, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-        fail("connect", WSAGetLastError());
-        closesocket(s);
         return false;
     }
 
     g.role = NetRole::Client;
-    // Our own id is not known until PEERS arrives; until then we can still send,
-    // because the host overwrites the envelope's `from` with the id it handed
-    // this socket regardless of what we put there.
     g.self = kNoPeer;
-
     InterlockedExchange(&g.stop, 0);
-    set_state(NetState::Connected);
-    log_line("NET", "connected");
-    return start_link(0, s, kHostPeer);
+    set_state(NetState::Connecting);
+    g_dial_thread = CreateThread(nullptr, 0, dial_thread, nullptr, 0, nullptr);
+    if (!g_dial_thread) {
+        g.role = NetRole::None;
+        fail("CreateThread", (int)GetLastError());
+        return false;
+    }
+    return true;
 }
+
+uint32_t net_dial_seq() { return (uint32_t)InterlockedCompareExchange(&g_dial_seq, 0, 0); }
+int      net_dial_error() { return (int)InterlockedCompareExchange(&g_dial_err, 0, 0); }
 
 // The transport learns our own id from the same PEERS message the session layer
 // sees; net_poll calls this so the two can never disagree.
@@ -569,6 +672,12 @@ void net_shutdown() {
         if (l.sock != INVALID_SOCKET) { shutdown(l.sock, SD_BOTH); closesocket(l.sock); l.sock = INVALID_SOCKET; }
     }
 
+    if (g_dial_thread) {
+        if (WaitForSingleObject(g_dial_thread, 3000) == WAIT_TIMEOUT)
+            log_line("NET", "!! dial thread did not exit in 3 s");
+        CloseHandle(g_dial_thread);
+        g_dial_thread = nullptr;
+    }
     if (g.accept_thread) {
         if (WaitForSingleObject(g.accept_thread, 2000) == WAIT_TIMEOUT)
             log_line("NET", "!! accept thread did not exit in 2 s");

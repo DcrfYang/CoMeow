@@ -527,6 +527,33 @@ bool catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len) {
     return ok;
 }
 
+static bool cat_data_perished(const void* cat) {
+    uint8_t killed = 0; uint64_t flags = 0;
+    if (!cat) return false;
+    if (mem_read((const uint8_t*)cat + kCatData_Killed, &killed, 1) && killed) return true;
+    return mem_read((const uint8_t*)cat + kCatData_Flags, &flags, sizeof(flags)) && (flags & kCatFlag_Perished) != 0;
+}
+
+bool catsync_cat_exists(uint64_t id) {
+    ensure_state();
+    if (!g.resolved || !g.director_slot) return false;
+    const uint8_t* dir = nullptr;
+    const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return false;
+    void* cat = nullptr;
+    return safe_by_id((void*)registry, id, &cat) && cat;
+}
+
+bool catsync_cat_perished(uint64_t id) {
+    ensure_state();
+    if (!g.resolved || !g.director_slot) return false;
+    const uint8_t* dir = nullptr;
+    const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return false;
+    void* cat = nullptr;
+    return safe_by_id((void*)registry, id, &cat) && cat && cat_data_perished(cat);
+}
+
 bool catsync_local_briefs(CatBrief* out, uint32_t max, uint32_t& n) {
     n = 0;
     if (!out || !max || !g.resolved || !g.director_slot) return false;
@@ -572,6 +599,9 @@ bool catsync_local_briefs(CatBrief* out, uint32_t max, uint32_t& n) {
     for (uint32_t i = 0; i < np && n < max; ++i) {
         void* cat = nullptr;
         if (!safe_by_id((void*)rc.registry, picks[i].id, &cat) || !cat) continue;
+        // A cat whose corpse was just destroyed is gone for good: the panel drops it at that moment, not when the battle ends and the
+        // game finally takes the id out of the run's lists. (A cat that only fell, corpse intact, comes back and stays at hp 0.)
+        if (cat_data_perished(cat)) continue;
         uint8_t* image = nullptr;
         const uint32_t size = serialize_cat(cat, &image);
         if (!size || !image) continue;
@@ -680,6 +710,28 @@ void catsync_setup_sent(const SetupMsg& snapshot) {
 // Native 3B5430 returns both +5B8 (party) and +640 (familiars) to
 // the House. Its settlement loops traverse those vectors; removing the peer
 // IDs before the call restricts the normal game writeback to this owner.
+// THE GAME'S OWN PERMADEATH, as read from the disassembly (2026-10-02). A cat whose corpse is destroyed goes through a routine that
+// (1) appends a 24-byte DEATH RECORD {cat id, .., kind at +0xC, flag at +0x10} to the director's list (cap +0x5D8, count +0x5DC,
+// data +0x5E0) and (2) removes that id from the run's party / mirror / familiar vectors. The settlement (ENDFINAL 0x3B5430 and the
+// defeat twin 0x3B4750) then walks the record list: every recorded cat gets +0xBF8 |= 0x10 (dead) and the on-adventure bit cleared.
+// For a session clone that is exactly the state the merge writes back over the original -- so the death should reach the save
+// by itself. This only prints the list so the next full run can confirm it.
+static void log_death_records(const uint8_t* dir, const char* why) {
+    uint32_t n = 0;
+    const uint8_t* data = nullptr;
+    if (!dir || !mem_read(dir + 0x5DC, &n, 4) || n > 64) return;
+    char text[400] = {};
+    int off = 0;
+    if (n && mem_read(dir + 0x5E0, &data, sizeof(data)) && data) {
+        for (uint32_t i = 0; i < n && off < 350; ++i) {
+            uint64_t id = 0; int32_t kind = 0; uint8_t flag = 0;
+            mem_read(data + i * 24, &id, 8); mem_read(data + i * 24 + 0xC, &kind, 4); mem_read(data + i * 24 + 0x10, &flag, 1);
+            off += _snprintf_s(text + off, sizeof(text) - off, _TRUNCATE, " %llx(kind %d flag %u)", (unsigned long long)id, kind, (unsigned)flag);
+        }
+    }
+    log_line("CATSYNC", "death records (%s): %u%s", why, n, n ? text : "");
+}
+
 bool catsync_prepare_settlement(void* director) {
     ensure_state();
     if (!g.on || g.settling || net_peer_pos() >= kMaxPeers) return false;
@@ -687,6 +739,7 @@ bool catsync_prepare_settlement(void* director) {
     if (!g.director_slot || !mem_read(g.director_slot, &live, sizeof(live)) ||
         !director || live != director) return false;
     const uint8_t owner = net_peer_pos();
+    log_death_records((const uint8_t*)director, "before the native settlement");
     RunCats rc{};
     if (!run_cats(rc) || rc.count > kSetupMaxCats) return false;
     unsigned seen = 0, own_n=0, masks[kMaxPeers]{};
@@ -694,6 +747,21 @@ bool catsync_prepare_settlement(void* director) {
     for (uint32_t i = 0; i < rc.count; ++i) {
         const uint64_t id = rc.ids[i];
         const int pos=session_cat_owner(id);
+        // A CAT THE GAME BROUGHT IN DURING THE RUN (the gain_cat_familiar event) has an ordinary id, not a session one. This used to
+        // fail the whole check below and hold the home door shut for ever. Such a cat is the HOST's (events and loot are the host's
+        // call): the host settles it with its own party -- it is a real cat of the host's house, not a clone -- and a client leaves it
+        // out like any other copy of somebody else's cat.
+        if (pos < 0 && id < 0x70000000ull) {
+            void* gained = nullptr;
+            if (owner == 0 && own_n < 4 && safe_by_id((void*)rc.registry, id, &gained) && gained) {
+                own[own_n++] = id;
+                log_line("SETTLE", "cat %016llx was gained during the run: settled with the host's own party", (unsigned long long)id);
+            } else {
+                log_line("SETTLE", "cat %016llx was gained during the run: %s", (unsigned long long)id,
+                         owner == 0 ? "not settled with the party (no room / not registered)" : "the host's -- left out of this peer's settlement");
+            }
+            continue;
+        }
         const int slot=pos<0 ? -1 : int((id & 0xFFFFFF)-1);
         void* cat = nullptr;
         uint8_t noted = 0xFF;
@@ -876,6 +944,71 @@ bool adopt_as_new_cat(const void* registry, const uint8_t* image, uint32_t size,
 }
 } // namespace
 
+
+// --- clone -> original, remembered (see catsync.h) ------------------------------------------------------------------------------
+namespace {
+CloneOriginNote g_origin[32];
+uint32_t g_origin_n = 0;
+}
+
+void catsync_note_origin(uint64_t clone, uint64_t original) {
+    if (!clone || !original || original >= 0x70000000ull) return;          // an ordinary cat of the save is the only thing worth recording
+    for (uint32_t i = 0; i < g_origin_n; ++i)
+        if (g_origin[i].clone == clone) { g_origin[i].original = original; return; }
+    if (g_origin_n < 32) g_origin[g_origin_n++] = { clone, original };
+}
+
+uint64_t catsync_origin_of(uint64_t clone) {
+    for (uint32_t i = 0; i < g_origin_n; ++i) if (g_origin[i].clone == clone) return g_origin[i].original;
+    return 0;
+}
+
+void catsync_origin_clear() { for (uint32_t i = 0; i < g_origin_n; ++i) g_origin[i] = {}; g_origin_n = 0; }
+
+static void origin_forget(uint64_t clone) {
+    for (uint32_t i = 0; i < g_origin_n; ++i)
+        if (g_origin[i].clone == clone) { g_origin[i] = g_origin[--g_origin_n]; g_origin[g_origin_n] = {}; return; }
+}
+
+uint32_t catsync_origin_export(CloneOriginNote* out, uint32_t max) {
+    if (!out || !max) return 0;
+    const uint32_t n = g_origin_n < max ? g_origin_n : max;
+    for (uint32_t i = 0; i < n; ++i) out[i] = g_origin[i];
+    return n;
+}
+
+void catsync_origin_import(const CloneOriginNote* in, uint32_t count) {
+    if (!in) return;
+    for (uint32_t i = 0; i < count; ++i) catsync_note_origin(in[i].clone, in[i].original);
+}
+
+// WHAT IS LEFT OUT AFTER THE MERGE (2026-10-02): a cat whose clone died in the run has no settled clone to come back from, so its
+// original stays flagged "out on adventure" for good (hidden, never deleted). This only LOOKS and says so in the log -- which
+// ordinary cats are still out, which of this player's session cats still exist and in what state -- so the comparison "the cats
+// that left vs the cats that came back" can be read after a real run before anything is written about it.
+static void settle_audit(const void* registry, const uint8_t* dir, const char* why) {
+    log_death_records(dir, why);
+    const uint64_t base = 0x70000000ull + ((uint64_t)net_peer_pos() << 24);
+    char away[400] = {}, mine[400] = {};
+    int ao = 0, mo = 0;
+    unsigned n_away = 0, n_mine = 0;
+    registry_walk(registry, [&](uint64_t key, void* cat) {
+        uint64_t flags = 0, seed = 0;
+        if (!mem_read((uint8_t*)cat + kCatData_Flags, &flags, sizeof(flags)) || !mem_read(cat, &seed, sizeof(seed))) return;
+        if (!is_session_range(key)) {
+            if (!(flags & kCatFlag_OnAdventure)) return;
+            ++n_away;
+            if (ao < 340) ao += _snprintf_s(away + ao, sizeof(away) - ao, _TRUNCATE, " %llx(flags %llx seed %llx)", (unsigned long long)key, (unsigned long long)flags, (unsigned long long)seed);
+        } else if (key > base && key <= base + 32) {
+            ++n_mine;
+            if (mo < 340) mo += _snprintf_s(mine + mo, sizeof(mine) - mo, _TRUNCATE, " %llx(flags %llx seed %llx)", (unsigned long long)key, (unsigned long long)flags, (unsigned long long)seed);
+        }
+    });
+    if (n_away || n_mine)
+        log_line("CATSYNC", "settle audit (%s): %u ordinary cat(s) still out on adventure:%s | %u of this player's session cat(s) still registered:%s",
+                 why, n_away, away[0] ? away : " -", n_mine, mine[0] ? mine : " -");
+}
+
 unsigned catsync_merge_session_cats(const char* why) {
     ensure_state();
     if (!g.on || !g.import_ready || !g.director_slot || net_peer_pos() >= kMaxPeers) return 0;
@@ -893,7 +1026,7 @@ unsigned catsync_merge_session_cats(const char* why) {
         if (run_cats(rc)) { nbusy = rc.count < 64 ? rc.count : 64; memcpy(busy, rc.all_ids, nbusy * sizeof(uint64_t)); }
     }
 
-    unsigned merged = 0;
+    unsigned merged = 0, by_record = 0, by_seed = 0, as_new = 0, dead_n = 0;
     uint64_t from_id[32] = {}, to_id[32] = {};
     const uint64_t base = 0x70000000ull + ((uint64_t)net_peer_pos() << 24);
     for (uint32_t slot = 1; slot <= 32; ++slot) {
@@ -903,7 +1036,15 @@ unsigned catsync_merge_session_cats(const char* why) {
         uint64_t flags = 0, seed = 0;
         if (!mem_read((uint8_t*)clone + kCatData_Flags, &flags, sizeof(flags)) ||
             !mem_read(clone, &seed, sizeof(seed))) continue;
-        if (!flags || (flags & kCatFlag_OnAdventure)) continue;     // retired already / still out on a run
+        // Still flagged "out on a run" normally means the run is not over for that clone. NOT when the game has marked it dead for
+        // good and the run no longer lists it: a cat whose corpse was destroyed left the lists, so the settlement never walked it and
+        // never cleared the flag -- merging it is how the death reaches the original (and the departure bit is cleared below).
+        const bool clone_dead = cat_data_perished(clone);
+        bool in_run = false;
+        for (uint32_t b = 0; b < nbusy; ++b) if (busy[b] == id) in_run = true;
+        if (!flags || ((flags & kCatFlag_OnAdventure) && !(clone_dead && !in_run))) continue;     // retired already / still out on a run
+        log_line("CATSYNC", "merge (%s): session cat %016llx settled with flags %llx (bit 0x10/0x20 = the game's \"dead\" marks, 0x1/0x2 = alive)",
+                 why, (unsigned long long)id, (unsigned long long)flags);
         if (adopted_has(id)) {                                      // kept as a new cat before; its flags came back
             const uint64_t retired_again = 0;
             mem_write((uint8_t*)clone + kCatData_Flags, &retired_again, sizeof(retired_again));
@@ -914,8 +1055,27 @@ unsigned catsync_merge_session_cats(const char* why) {
 
         Origin o;
         uint64_t oflags = 0;
-        bool have_origin = find_origin_by_seed(registry, seed, busy, nbusy, o) &&
-                           mem_read((uint8_t*)o.cat + kCatData_Flags, &oflags, sizeof(oflags)) && (oflags & kCatFlag_OnAdventure);
+        // 1. The recorded origin (setup noted it; a restored journal brought it back). Trusted only if that cat is still there, is not
+        //    in the run, and still carries the clone's seed -- the seed is a byte copy at cloning time and never changes afterwards.
+        bool have_origin = false, recorded = false;
+        {
+            const uint64_t oid = catsync_origin_of(id);
+            void* oc = nullptr; uint64_t os = 0;
+            bool busy_o = false;
+            for (uint32_t b = 0; b < nbusy; ++b) if (busy[b] == oid) busy_o = true;
+            if (oid && !is_session_range(oid) && !busy_o && safe_by_id((void*)registry, oid, &oc) && oc && mem_read(oc, &os, sizeof(os)) &&
+                os == seed && mem_read((uint8_t*)oc + kCatData_Flags, &oflags, sizeof(oflags))) {
+                o = Origin{ oid, oc, false };
+                have_origin = true; recorded = true;
+            } else if (oid) {
+                log_line("CATSYNC", "merge (%s): session cat %016llx has a recorded origin %016llx that is gone, in the run or no longer the same cat -- searching by seed",
+                         why, (unsigned long long)id, (unsigned long long)oid);
+            }
+        }
+        // 2. Fallback: the cat with this seed that is out on adventure (the way it always worked).
+        if (!have_origin)
+            have_origin = find_origin_by_seed(registry, seed, busy, nbusy, o) &&
+                          mem_read((uint8_t*)o.cat + kCatData_Flags, &oflags, sizeof(oflags)) && (oflags & kCatFlag_OnAdventure);
         if (!have_origin && slot > kCloneSlots) {                   // a leftover of an older build: it is its own cat
             log_line("CATSYNC", "merge (%s): session cat %016llx (seed %llx) has no usable original (out on adventure: %u ordinary, %u older clone(s); at home with that seed: %u) -- left as the cat it is",
                      why, (unsigned long long)id, (unsigned long long)seed, o.ordinary_away, o.legacy_away, o.ordinary_home);
@@ -949,13 +1109,35 @@ unsigned catsync_merge_session_cats(const char* why) {
                     now &= ~kCatFlag_OnAdventure;                   // ... make sure the departure bit is gone
                     mem_write((uint8_t*)o.cat + kCatData_Flags, &now, sizeof(now));
                 }
-                log_line("CATSYNC", "merge (%s): session cat %016llx returned to %016llx%s (flags %llx -> %llx), clone retired",
+                // A cat that died for good must come home DEAD in the way the game itself marks it: 0x20 beside the 0x40000 the
+                // corpse destruction wrote (the settlement sets 0x20 on a killed cat, 0x10 on one that merely left).
+                if (clone_dead) {
+                    if (!(now & 0x20)) { now |= 0x20; mem_write((uint8_t*)o.cat + kCatData_Flags, &now, sizeof(now)); }
+                    ++dead_n;
+                }
+                // Read it back: the original must carry the clone's seed and no departure bit now.
+                {
+                    uint64_t chk_seed = 0, chk_flags = 0;
+                    if (!mem_read(o.cat, &chk_seed, sizeof(chk_seed)) || chk_seed != seed || !mem_read((uint8_t*)o.cat + kCatData_Flags, &chk_flags, sizeof(chk_flags)) ||
+                        (chk_flags & kCatFlag_OnAdventure))
+                        log_line_lvl(LogLevel::Error, "CATSYNC", "!! merge (%s): the original %016llx did not read back as expected (seed %llx, flags %llx)",
+                                     why, (unsigned long long)o.id, (unsigned long long)chk_seed, (unsigned long long)chk_flags);
+                }
+                if (recorded) ++by_record; else ++by_seed;
+                origin_forget(id);
+                log_line("CATSYNC", "merge (%s): session cat %016llx returned to %016llx%s%s%s (flags %llx -> %llx), clone retired",
                          why, (unsigned long long)id, (unsigned long long)o.id, o.legacy ? " (an older build's clone)" : "",
+                         recorded ? " [by the recorded origin]" : " [by seed]", clone_dead ? " [DEAD]" : "",
                          (unsigned long long)oflags, (unsigned long long)now);
             }
         } else {
             ok = adopt_as_new_cat(registry, image, size, target);
-            if (ok) adopted_note(id);
+            if (ok) { adopted_note(id); ++as_new; origin_forget(id); }
+            if (ok) {
+                void* nc = nullptr; uint64_t nf = 0;
+                if (safe_by_id((void*)registry, target, &nc) && nc && mem_read((uint8_t*)nc + kCatData_Flags, &nf, sizeof(nf)))
+                    log_line("CATSYNC", "merge (%s): the new cat %016llx carries flags %llx", why, (unsigned long long)target, (unsigned long long)nf);
+            }
             if (ok) log_line("CATSYNC", "merge (%s): session cat %016llx has no usable original -- kept as the NEW cat %016llx",
                              why, (unsigned long long)id, (unsigned long long)target);
             else log_line_lvl(LogLevel::Error, "CATSYNC", "!! merge (%s): session cat %016llx could not be kept as a new cat -- left as it is",
@@ -992,6 +1174,10 @@ unsigned catsync_merge_session_cats(const char* why) {
             log_line("CATSYNC", "merge (%s): the run's %s list re-pointed at the cats the clones became -- %s", why, source, wrote ? "written" : "NOT written");
         }
     }
+    if (merged || as_new)
+        log_line("CATSYNC", "merge (%s): summary -- %u clone(s) returned (%u by the recorded origin, %u by seed, %u of them dead), %u kept as new cats",
+                 why, merged - as_new, by_record, by_seed, dead_n, as_new);
+    settle_audit(registry, dir, why);
     return merged;
 }
 
@@ -1122,6 +1308,7 @@ bool catsync_prepare_party_setup(SetupMsg& out, uint8_t owner_pos) {
         }
         session_ids[i] = id;
         adopted_clear(id);                                          // this slot is a new selection now
+        if (owner_pos == net_peer_pos()) catsync_note_origin(id, original.cats[i].id);   // so the settlement need not guess
     }
 
     if (!roster_setup_replace_party(session_ids, original.count,

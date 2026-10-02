@@ -63,6 +63,9 @@ const char* session_status();   // one line for the banner / diagnostics
 //
 // A request made while another is pending replaces it: the last thing the
 // player clicked is what they meant.
+// Do "a new cat joins" event effects do nothing? The host's setting (ui.block_new_cats), whichever peer is asking.
+bool session_block_new_cats();
+
 void session_request_host(uint16_t port);
 void session_request_join(const char* addr, uint16_t port);
 void session_request_disconnect();

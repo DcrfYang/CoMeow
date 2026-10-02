@@ -26,7 +26,9 @@
     // The game session's own TCP port: the host listens on it, clients dial it.
     "addr": "127.0.0.1",
     "port": 27600,
-    "control": "auto"
+    "control": "auto",
+    // Also reach / offer the host through Steam's peer-to-peer network (no open port needed). Needs Steam running on both sides.
+    "steam": true
   },
 
   "ui": {

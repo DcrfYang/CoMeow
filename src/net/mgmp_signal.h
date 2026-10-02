@@ -127,6 +127,10 @@ bool        signal_room_has_password();      // the room this peer is in has one
 const char* signal_error_code();
 uint32_t    signal_error_seq();
 
+// Hosts: the server dials our game port from outside a moment after the room is created (and again once the router mapping
+// is up). 0 = not known yet, 1 = reachable, 2 = NOT reachable (friends outside this network will time out).
+int signal_reach();
+
 // --- state for the panel -----------------------------------------------------
 
 SignalState signal_state();
@@ -136,7 +140,9 @@ const char* signal_server();     // "addr:port" we are connected to, "" if not
 const char* signal_name();       // this player's lobby name
 const char* signal_room();       // room id, "" when not in one
 const char* signal_role();       // "host" | "client" | ""
-const char* signal_host_addr();  // where the host is; "" until a room is joined
+// where the host is; "" until a room is joined. May be a comma-separated list (the address, then fallbacks): pass it
+// to session_request_join as it is.
+const char* signal_host_addr();
 uint16_t    signal_host_port();
 const char* signal_last_event(); // last membership line, for the lobby's log
 
