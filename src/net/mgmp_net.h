@@ -80,6 +80,9 @@ struct NetMsg {
     SaveWaitMsg  savewait;  // the save-selection stage, host -> everyone, see MSG_SAVEWAIT
     AbandonMsg   abandon;   // the abandon-adventure vote, every peer, see MSG_ABANDON
     RoomCtlMsg   roomctl;   // room coordination, every peer, see MSG_ROOMCTL
+    MapSeedsMsg  mapseeds;  // the chapter map's node seeds, host -> clients, see MSG_MAPSEEDS
+    UnlocksMsg   unlocks;   // the host's unlock answers, host -> clients, see MSG_UNLOCKS
+    BoardMsg     board;     // the host's battle board and stream, host -> clients, see MSG_BOARD
     HaltMsg   halt;
     char      refuse[192] = {};
 };
@@ -95,6 +98,17 @@ bool net_host(uint16_t port);
 // `addr` may be a comma-separated list (up to four) of addresses to try in order. Returns at once (the dial runs on a thread):
 // the state is Connecting, then Connected or Failed (see net_error, net_dial_seq).
 bool net_join(const char* addr, uint16_t port);
+
+// The lobby's way of asking the HOST to dial this peer over Steam when the peer's own dial was refused (mgmp_steambridge: reverse dialling). Set once by
+// the signaling layer; called from the dial thread with the host's SteamID64, true when the request was sent.
+void net_set_steam_reverse_hook(bool (*hook)(uint64_t host_steamid));
+// THE SERVER AS THE CARRIER (2026-10-03). Where the lobby server's relay is (it is the lobby server itself); set by the signaling layer.
+void net_relay_set_server(const char* host, uint16_t port);
+// Host: a joiner asked for pipe `id` -- open a connection to the server, answer with the host's token, and bridge it to the game's own port on this machine.
+// Runs on its own thread; every bridge ends by itself, or all at once with net_relay_stop().
+bool net_relay_serve(const char* host_token, uint32_t id, uint16_t game_port);
+void net_relay_stop();
+// A joiner dials the relay with the candidate "relay:<its token>" in the address list given to net_join.
 uint32_t net_dial_seq();              // goes up by one each time a dial gives up on every address
 int      net_dial_error();            // the last WSA error of that failure (10060 timed out, 10061 refused, 10051/10065 no route)
 void net_shutdown();
@@ -201,6 +215,23 @@ bool net_send_cats(const CatsMsg& m);
 bool net_send_savewait(const SaveWaitMsg& m);
 bool net_send_abandon(const AbandonMsg& m);
 bool net_send_roomctl(const RoomCtlMsg& m);
+// Host-authored: net_send reaches every client.
+bool net_send_mapseeds(const MapSeedsMsg& m);
+// Host-authored: net_send reaches every client.
+bool net_send_unlocks(const UnlocksMsg& m);
+// The newest level name the host sent (filled by the receive thread, not the frame queue): true when it is for `node_id`.
+bool net_host_level(uint64_t node_id, char* out, size_t cap);
+// The host's queue of returning enemies that came with that level (same mailbox): true when the level message for `node_id` has arrived.
+bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n);   // out[kPendingQueues][kPendingMax], n[kPendingQueues]
+// The host's battle board (MSG_BOARD): host-authored, net_send reaches every client; _to is the replay for a peer that joins late.
+bool net_send_board(const BoardMsg& m);
+bool net_send_board_to(uint8_t peer, const BoardMsg& m);
+// The board of battle `battle` as the receive thread assembled it from the host's chunks (the game thread may be parked waiting for it, so it cannot
+// come through the frame queue): true once every chunk is in.
+// The host's board for one TURN boundary of a battle (the last few are kept): true once every chunk of it is in.
+bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out);
+// The host's weather names that came with that level (same mailbox): true when the level message for `node_id` has arrived.
+bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n);
 
 // The desync dump. Sent at most once per divergence, so it has no throughput
 // budget to respect and no dedupe to do -- by the time it goes out the run is

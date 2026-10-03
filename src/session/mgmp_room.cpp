@@ -12,6 +12,7 @@
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_config.h"
 #include "mgmp_leave.h"
+#include "mgmp_lockstep.h"
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
 #include "mgmp_menu.h"
@@ -298,6 +299,11 @@ void tick_notices() {
         else
             _snprintf_s(text, sizeof(text), _TRUNCATE,
                         tr(Tx::R_PEER_DROPPED), row + 1);
+        // Dropped in the middle of a fight: say that the boss that would have ended the run is taken care of.
+        if (!away && lockstep_fight_up()) {
+            const size_t len = strlen(text);
+            _snprintf_s(text + len, sizeof(text) - len, _TRUNCATE, " %s", tr(Tx::R_PEER_DROPPED_FIGHT));
+        }
         push_notice(text);
     };
 
@@ -526,6 +532,16 @@ bool room_refuse_story_item(const char* item) {
 void room_say_story_only_host() { toast(tr(Tx::R_STORY_ONLY_HOST)); }
 void room_say_chapter_client() { toast(tr(Tx::R_CHAPTER_CLIENT)); }
 void room_say_chapter_wait() { toast(tr(Tx::R_CHAPTER_WAIT)); }
+void room_say_chapter_locked_2() { toast(tr(Tx::R_CHAPTER_LOCKED_2)); }
+void room_say_chapter_locked_3() { toast(tr(Tx::R_CHAPTER_LOCKED_3)); }
+void room_say_no_chapter_ready() { toast(tr(Tx::R_START_READY)); }
+void room_say_no_chapter_wait() { toast(tr(Tx::R_START_WAIT)); }
+
+void room_sync_trouble(const char* what) {
+    if (!net_active() || net_peer_count() < 2) return;
+    log_line("ROOM", "!! sync timed out (%s) -- the client's connection to the host may have a problem", what ? what : "?");
+    push_notice(tr(Tx::R_SYNC_TROUBLE));
+}
 
 bool room_notice(char* out, size_t cap) {
     if (!g.notices) return false;

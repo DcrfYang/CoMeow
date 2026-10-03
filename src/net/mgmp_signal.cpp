@@ -22,6 +22,7 @@
 #include "mgmp_lan.h"
 #include "mgmp_upnp.h"
 #include "mgmp_steambridge.h"
+#include "mgmp_net.h"
 #include "mgmp_log.h"
 #include "mgmp_session.h"
 
@@ -78,6 +79,7 @@ struct Request {
     char     name[32] = {};
     char     arg[48]  = {};   // room name to create, or room id to join
     char     pw[72]   = {};   // the password's digest ("" = none)
+    int      tr = 0;          // RoomTransport for a create
 };
 
 struct State {
@@ -112,6 +114,15 @@ struct State {
     char     host_cands[192] = {};      // host_addr, then the fallbacks the server named (comma separated)
     uint16_t host_port = 0;
     char     host_steam[24] = {};       // the host's SteamID64 (digits) when it can be reached through Steam
+    char     host_tr[8] = {};           // "direct" | "steam" | "relay" | "": the carrier the host chose (the server's "tr")
+    char     ptok[24] = {};             // our secret in a relay room (the server's "ptok"): opens pipes
+    int      relay_max = 0, relay_used = 0;   // the server's relay allowance (0 max = it cannot relay)
+    // The pre-check of the game port (see DirectCheck)
+    DirectCheck dcheck = DirectCheck::Unknown;
+    SOCKET   dlisten = INVALID_SOCKET;  // the temporary listener on the game port while checking
+    bool     dcheck_wanted = false;     // run the check at the next update (after connecting / on request)
+    bool     dcheck_sent = false;
+    ULONGLONG dcheck_at = 0, dcheck_sent_at = 0;
     int      host_reach = 0;            // the server's probe of the HOST's game port: 0 unknown, 1 open, 2 not reachable
     int      reach = 0;                 // the server's probe of OUR game port (hosts): 0 not known, 1 open, 2 not reachable
     UpnpState upnp_prev = UpnpState::Idle;
@@ -465,14 +476,98 @@ void stop_worker() {
     set_state(SignalState::Off);
 }
 
+bool is_private_host(const char* a);
+
+// --- the carrier a joiner uses -----------------------------------------------------------------------------------------------
+
+bool tr_is(const char* t) { return !strcmp(g.host_tr, t); }
+
+// The addresses to dial, in order, for the room this peer joined. The host's choice ("tr") decides: "steam" = only Steam, "direct" = only the
+// addresses; without it (an older host, a LAN room) everything, Steam first when the host's port is closed. A joiner that cannot use Steam falls
+// back to the addresses rather than to nothing.
+std::string candidate_list() {
+    const std::string tcp = g.host_cands[0] ? g.host_cands : g.host_addr;
+    const bool steam_ok = config().net_steam && g.host_steam[0] && steam_bridge_id() && !is_private_host(g.host_addr);
+    const std::string st = std::string("steam:") + g.host_steam;
+    if (tr_is("relay")) return g.ptok[0] ? std::string("relay:") + g.ptok : tcp;
+    if (tr_is("direct")) return tcp;
+    if (tr_is("steam")) return steam_ok ? st : tcp;
+    if (!steam_ok) return tcp;
+    return (g.host_reach == 2) ? st + "," + tcp : tcp + "," + st;
+}
+
+// --- the pre-check of the game port -------------------------------------------------------------------------------------------
+
+void close_direct_listener() {
+    if (g.dlisten != INVALID_SOCKET) { closesocket(g.dlisten); g.dlisten = INVALID_SOCKET; }
+}
+
+void finish_direct_check(DirectCheck result, const char* why) {
+    close_direct_listener();
+    g.dcheck = result;
+    g.dcheck_sent = false;
+    // the mapping asked for the check is not kept: creating the room asks for it again
+    if (!g.room[0]) upnp_stop();
+    const char* name = result == DirectCheck::Open ? "OPEN" : result == DirectCheck::Closed ? "CLOSED" : result == DirectCheck::Busy ? "BUSY"
+                     : result == DirectCheck::NoAnswer ? "no answer" : "unknown";
+    log_line_lvl(result == DirectCheck::Closed || result == DirectCheck::Busy ? LogLevel::Warn : LogLevel::Info, "SIGNAL", "game port %u pre-check: %s (%s)",
+                 (unsigned)config().net_port, name, why);
+}
+
+void start_direct_check() {
+    close_direct_listener();
+    g.dcheck_sent = false;
+    if (is_private_host(g.addr)) { finish_direct_check(DirectCheck::Open, "the server is on this network"); return; }
+    const uint16_t port = config().net_port;
+    SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (l == INVALID_SOCKET) { finish_direct_check(DirectCheck::NoAnswer, "no socket"); return; }
+    sockaddr_in a{};
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(port);
+    if (bind(l, (sockaddr*)&a, sizeof(a)) != 0 || listen(l, 4) != 0) {
+        const int err = WSAGetLastError();
+        closesocket(l);
+        finish_direct_check(DirectCheck::Busy, err == WSAEADDRINUSE ? "another program listens on it" : "it cannot be opened here");
+        return;
+    }
+    u_long nb = 1;
+    ioctlsocket(l, FIONBIO, &nb);
+    g.dlisten = l;
+    g.dcheck = DirectCheck::Checking;
+    g.dcheck_at = GetTickCount64();
+    upnp_start(port);                      // the router first: a mapping may be all the port needs
+    log_line("SIGNAL", "checking whether game port %u can be reached from outside (listening for the server's probe; router mapping requested)", (unsigned)port);
+}
+
+// Every update while Checking: the temporary listener swallows the probe's connection; the probe is requested once the router has answered.
+void direct_check_step() {
+    if (g.dcheck != DirectCheck::Checking) return;
+    if (g.dlisten != INVALID_SOCKET) {
+        for (int i = 0; i < 4; ++i) { SOCKET c = accept(g.dlisten, nullptr, nullptr); if (c == INVALID_SOCKET) break; closesocket(c); }
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!g.dcheck_sent) {
+        const UpnpState us = upnp_state();
+        if (us == UpnpState::Mapped || us == UpnpState::Failed || now - g.dcheck_at > 5000) {
+            g.dcheck_sent = true; g.dcheck_sent_at = now;
+            send_cmd("reach");
+        }
+    } else if (now - g.dcheck_sent_at > 12000) {
+        finish_direct_check(DirectCheck::NoAnswer, "the server did not answer");
+    }
+}
+
 void forget_room() {
     g.room[0]      = 0;
     g.role[0]      = 0;
     g.host_addr[0] = 0;
     g.host_cands[0] = 0;
     g.host_steam[0] = 0;
+    g.host_tr[0]   = 0;
+    g.ptok[0]      = 0;
+    net_relay_stop();
     g.host_reach   = 0;
     steam_bridge_host_stop();
+    steam_bridge_client_listen_stop();
     g.host_port    = 0;
     g.reach        = 0;
     upnp_stop();                 // the router mapping lives only as long as the room
@@ -543,28 +638,29 @@ void adopt_room(const char* role) {
     strncpy_s(g.role, sizeof(g.role), role, _TRUNCATE);
 
     if (_stricmp(role, "host") == 0) {
+        close_direct_listener();                  // the pre-check's listener must be gone before the game binds the port
         session_request_host(config().net_port);
         g.reach = 0;
-        // A host on the internet needs its game port reachable: ask the router to forward it. Not for a lobby on the local
-        // network (nobody outside is meant to come in).
+        // A host on the internet needs its game port reachable (direct) or Steam: the host's choice at creation decides which is prepared
+        // (neither choice = both, as before). Not for a lobby on the local network (nobody outside is meant to come in).
         if (!is_private_host(g.addr)) {
-            upnp_start(config().net_port);
-            if (config().net_steam) steam_bridge_host_start(config().net_port);   // Steam peers reach the same game port, bridged
+            const bool want_direct = !g.host_tr[0] || tr_is("direct");
+            const bool want_steam  = !g.host_tr[0] || tr_is("steam");
+            if (tr_is("relay")) net_relay_set_server(g.addr, g.port);      // the server carries the bytes: no port, no Steam
+            if (want_direct) upnp_start(config().net_port);
+            if (want_steam && config().net_steam) steam_bridge_host_start(config().net_port);   // Steam peers reach the same game port, bridged
         }
-        set_status("room %s -- you are the HOST (listening on port %u)",
-                   g.room, (unsigned)config().net_port);
-        log_line("SIGNAL", "room %s: we are the host -- hosting on port %u",
-                 g.room, (unsigned)config().net_port);
+        set_status("room %s -- you are the HOST (listening on port %u%s)",
+                   g.room, (unsigned)config().net_port, tr_is("relay") ? ", via the server" : tr_is("steam") ? ", Steam relay" : tr_is("direct") ? ", direct" : "");
+        log_line("SIGNAL", "room %s: we are the host -- hosting on port %u (carrier: %s)",
+                 g.room, (unsigned)config().net_port, g.host_tr[0] ? g.host_tr : "both");
     } else {
-        {   // The order to try: the server's (the host's own network first for a player behind its router, then its public
-            // address), with Steam last -- unless the server found the host's port closed, when Steam goes first.
-            std::string list = g.host_cands[0] ? g.host_cands : g.host_addr;
-            if (config().net_steam && g.host_steam[0] && steam_bridge_id()) {
-                const std::string st = std::string("steam:") + g.host_steam;
-                list = (g.host_reach == 2 && !is_private_host(g.host_addr)) ? st + "," + list : list + "," + st;
-                log_line("SIGNAL", "the host can also be reached through Steam (%s)%s", g.host_steam,
-                         g.host_reach == 2 ? " -- its game port is closed, so Steam goes first" : "");
-            }
+        {   // The order to try: decided by the host's choice (candidate_list)
+            net_relay_set_server(g.addr, g.port);
+            const std::string list = candidate_list();
+            if (config().net_steam && g.host_steam[0] && !tr_is("relay")) steam_bridge_client_listen_start();      // for a reverse call from the host (see mgmp_steambridge.h)
+            log_line("SIGNAL", "the host's carrier: %s%s -- trying: %s", g.host_tr[0] ? g.host_tr : "not stated",
+                     g.host_steam[0] ? (g.host_reach == 2 ? " (its game port is closed)" : "") : " (no Steam id)", list.c_str());
             session_request_join(list.c_str(), g.host_port);
         }
         set_status("room %s -- joining the host at %s:%u", g.room, g.host_addr,
@@ -572,6 +668,14 @@ void adopt_room(const char* role) {
         log_line("SIGNAL", "room %s: we are a client -- dialling %s:%u", g.room,
                  g.host_addr, (unsigned)g.host_port);
     }
+}
+
+// {"relay":{"max":10,"used":3}} in "welcome"/"rooms"; absent = this server cannot relay.
+void store_relay_info(const json& j) {
+    auto r = j.find("relay");
+    if (r == j.end() || !r->is_object()) { g.relay_max = 0; g.relay_used = 0; return; }
+    g.relay_max  = jint(*r, "max", 0);
+    g.relay_used = jint(*r, "used", 0);
 }
 
 void handle_line(const char* line) {
@@ -594,6 +698,7 @@ void handle_line(const char* line) {
         { auto pw = j.find("pw"); g.server_pw = pw != j.end() && pw->is_boolean() && pw->get<bool>(); }
         auto it = j.find("rooms");
         if (it != j.end()) store_rooms(*it);
+        store_relay_info(j);
         set_status("connected to %s -- %u room(s)", g.server, (unsigned)g.room_count);
         log_line("SIGNAL", "welcomed by the server as '%s'", g.name);
         return;
@@ -602,6 +707,7 @@ void handle_line(const char* line) {
     if (t == "rooms") {
         auto it = j.find("rooms");
         if (it != j.end()) store_rooms(*it);
+        store_relay_info(j);
         return;
     }
 
@@ -618,6 +724,8 @@ void handle_line(const char* line) {
             strncpy_s(g.host_cands, sizeof(g.host_cands), cands.c_str(), _TRUNCATE);
             strncpy_s(g.host_steam, sizeof(g.host_steam), jstr(j, "hsteam").c_str(), _TRUNCATE);
             g.host_reach = jint(j, "hreach", 0);
+            strncpy_s(g.host_tr, sizeof(g.host_tr), jstr(j, "tr").c_str(), _TRUNCATE);
+            strncpy_s(g.ptok, sizeof(g.ptok), jstr(j, "ptok").c_str(), _TRUNCATE);
         }
         g.auto_done  = true;
         g.locked     = false;
@@ -641,6 +749,7 @@ void handle_line(const char* line) {
             auto pw = j.find("pw");
             if (pw != j.end() && pw->is_boolean()) g.room_pw = pw->get<bool>();
         }
+        { const std::string tr = jstr(j, "tr"); if (!tr.empty()) strncpy_s(g.host_tr, sizeof(g.host_tr), tr.c_str(), _TRUNCATE); }
         {   // the probe finishing is announced to the room with a plain membership message
             const std::string hs = jstr(j, "hsteam");
             if (!hs.empty()) { strncpy_s(g.host_steam, sizeof(g.host_steam), hs.c_str(), _TRUNCATE); g.host_reach = jint(j, "hreach", g.host_reach); }
@@ -691,9 +800,39 @@ void handle_line(const char* line) {
 
     if (t == "pong") return;
 
+    if (t == "pipe") {
+        // A joiner wants a pipe through the server: open ours and bridge it to the game's own port.
+        if (g.room[0] && !_stricmp(g.role, "host") && tr_is("relay") && g.ptok[0]) {
+            const uint32_t id = (uint32_t)jint(j, "id", 0);
+            if (id) {
+                log_line("SIGNAL", "a joiner asks for relay pipe %u -- opening it", (unsigned)id);
+                net_relay_serve(g.ptok, id, config().net_port);
+            }
+        }
+        return;
+    }
+
+    if (t == "relay") {
+        // The host is asked to dial a joiner over Steam (the joiner's own dial was refused: see mgmp_steambridge.h, reverse dialling).
+        if (jstr(j, "k") == "steamrev" && g.room[0] && !_stricmp(g.role, "host") && config().net_steam) {
+            const std::string sid = jstr(j, "steam");
+            bool ok = !sid.empty() && sid.size() <= 20;
+            for (char ch : sid) if (ch < '0' || ch > '9') ok = false;
+            if (ok) {
+                log_line("SIGNAL", "'%s' could not reach us over Steam and asks us to call it (SteamID64 %s) -- dialling out", jstr(j, "from").c_str(), sid.c_str());
+                steam_bridge_dial_out(strtoull(sid.c_str(), nullptr, 10));
+            }
+        }
+        return;
+    }
+
     if (t == "reach") {
         auto ok = j.find("ok");
         const bool open = ok != j.end() && ok->is_boolean() && ok->get<bool>();
+        if (!g.room[0] && g.dcheck == DirectCheck::Checking) {        // the pre-check, not a room's probe
+            finish_direct_check(open ? DirectCheck::Open : DirectCheck::Closed, open ? "the server reached it" : "the server could not reach it");
+            return;
+        }
         g.reach = open ? 1 : 2;
         log_line_lvl(open ? LogLevel::Info : LogLevel::Warn, "SIGNAL", "%sthe server %s our game port %s:%d from outside",
                      open ? "" : "!! ", open ? "reached" : "could NOT reach", jstr(j, "addr").c_str(), jint(j, "port", 0));
@@ -768,6 +907,9 @@ void apply_request() {
                         g.addr, (unsigned)g.port);
             g.auto_tries = 0;
             g.auto_done  = false;
+            close_direct_listener();
+            g.dcheck = DirectCheck::Unknown;
+            g.dcheck_wanted = true;                 // checked once the connection is up
             set_status("connecting to %s...", g.server);
             log_line("SIGNAL", "connecting to %s as '%s'", g.server, g.name);
             start_worker();
@@ -781,6 +923,9 @@ void apply_request() {
             log_line("SIGNAL", "disconnecting from %s", g.server);
             stop_worker();
             forget_room();
+            close_direct_listener();
+            g.dcheck = DirectCheck::Unknown;
+            g.dcheck_wanted = false;
             g.server[0]   = 0;
             g.room_count  = 0;
             g.rooms_valid = false;
@@ -800,10 +945,15 @@ void apply_request() {
                 log_line_lvl(LogLevel::Warn, "SIGNAL", "!! not creating a password room: the server does not announce password support");
                 break;
             }
-            log_line("SIGNAL", "asking the server to create room '%s'%s", req.arg, req.pw[0] ? " (password)" : "");
+            close_direct_listener();
+            log_line("SIGNAL", "asking the server to create room '%s'%s (carrier: %s)", req.arg, req.pw[0] ? " (password)" : "",
+                     req.tr == (int)RoomTransport::Direct ? "direct" : req.tr == (int)RoomTransport::Steam ? "steam" : req.tr == (int)RoomTransport::Relay ? "server relay" : "both");
             json o = json::object();
             o["t"] = "create"; o["name"] = req.arg;
             if (req.pw[0]) o["pw"] = req.pw;
+            if (req.tr == (int)RoomTransport::Direct) o["tr"] = "direct";
+            else if (req.tr == (int)RoomTransport::Steam) o["tr"] = "steam";
+            else if (req.tr == (int)RoomTransport::Relay) o["tr"] = "relay";
             add_lan_addresses(o);
             send_obj(o);
             break;
@@ -839,7 +989,18 @@ void apply_request() {
 
 // ---------------------------------------------------------------------------
 
+// The net layer's dial thread calls this when Steam refused our call: ask the host (through the lobby server) to call us instead.
+static bool request_steam_reverse(uint64_t host_steamid) {
+    (void)host_steamid;
+    const uint64_t me = steam_bridge_id();
+    if (!me) return false;
+    json o = json::object();
+    o["t"] = "relay"; o["k"] = "steamrev"; o["steam"] = std::to_string((unsigned long long)me);
+    return send_obj(o);
+}
+
 void signal_init() {
+    net_set_steam_reverse_hook(&request_steam_reverse);
     if (config().net_steam) steam_bridge_init();      // idle until the game has initialised Steam
     const Config& cfg = config();
 
@@ -892,6 +1053,10 @@ void signal_update() {
         }
     }
 
+    if (state() == SignalState::Connected && !g.room[0] && g.dcheck_wanted) { g.dcheck_wanted = false; start_direct_check(); }
+    if (state() != SignalState::Connected && g.dcheck == DirectCheck::Checking) finish_direct_check(DirectCheck::Unknown, "the connection to the server ended");
+    direct_check_step();
+
     if (state() == SignalState::Connected) {
         if (g.want_lock >= 0 && g.room[0]) {
             json o = json::object();
@@ -940,8 +1105,9 @@ static std::string pw_digest(const char* pw) {
     return out;
 }
 
-void signal_request_create(const char* room_name, const char* password) {
+void signal_request_create(const char* room_name, const char* password, RoomTransport transport) {
     g.request.kind = Req::Create;
+    g.request.tr = (int)transport;
     strncpy_s(g.request.arg, sizeof(g.request.arg), room_name ? room_name : "", _TRUNCATE);
     strncpy_s(g.request.pw, sizeof(g.request.pw), pw_digest(password).c_str(), _TRUNCATE);
 }
@@ -991,17 +1157,24 @@ const char* signal_server()     { return g.server; }
 const char* signal_name()       { return g.name; }
 const char* signal_room()       { return g.room; }
 const char* signal_role()       { return g.role; }
-// The whole list, Steam included, in the order to try -- what a redial uses too.
+// The whole list, in the order to try -- what a redial uses too (the host's carrier choice decides it: candidate_list).
 const char* signal_host_addr()  {
     static char list[256];
-    std::string s = g.host_cands[0] ? g.host_cands : g.host_addr;
-    if (!s.empty() && config().net_steam && g.host_steam[0] && steam_bridge_id()) {
-        const std::string st = std::string("steam:") + g.host_steam;
-        s = (g.host_reach == 2 && !is_private_host(g.host_addr)) ? st + "," + s : s + "," + st;
-    }
+    const std::string s = g.host_addr[0] ? candidate_list() : std::string();
     strncpy_s(list, sizeof(list), s.c_str(), _TRUNCATE);
     return list;
 }
+const char* signal_room_transport() { return g.room[0] ? g.host_tr : ""; }
+DirectCheck signal_direct_check() { return g.dcheck; }
+void signal_request_direct_check() { if (!g.room[0]) { g.dcheck = DirectCheck::Unknown; g.dcheck_wanted = true; } }
+bool signal_server_private() { return is_private_host(g.addr); }
+bool signal_relay_info(int* used, int* max) {
+    if (used) *used = g.relay_used;
+    if (max) *max = g.relay_max;
+    return g.relay_max > 0;
+}
+bool signal_steam_usable() { return config().net_steam && steam_bridge_ready() && !steam_bridge_dead(); }
+void signal_steam_status(char* out, unsigned cap) { steam_bridge_status_text(out, cap); }
 int         signal_reach()      { return g.reach; }
 uint16_t    signal_host_port()  { return g.host_port; }
 const char* signal_last_event() { return g.event; }

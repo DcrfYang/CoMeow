@@ -34,4 +34,25 @@ void steam_bridge_host_stop();
 // aborts it. Called from the dial thread, never the game thread.
 SOCKET   steam_bridge_dial(uint64_t host_steamid, unsigned long timeout_ms, volatile long* stop, int* why);
 
+// --- diagnostics (2026-10-03) -----------------------------------------------------------------------------------------------
+// Steam's own state, polled once a second by the worker and logged when it changes: the authentication status (the certificate every
+// P2P connection needs), the relay network and its configuration. 2026-10-02: for half an hour every dial to one host ended with
+// "Bad cert: CA key ... is not known to us" -- an unknown CA key on the ACCEPTING side's Steam client -- and nothing in the log said what Steam
+// thought of itself at the time.
+bool steam_bridge_dead();                                // Steam networking is not available in this process
+void steam_bridge_status_text(char* out, unsigned cap);  // "authentication: ready, relay network: ready, ..." (best effort, may be stale by a second)
+// Why the last Steam connection ended: Steam's end reason (5001 = an internal error on the accepting side) and its debug text.
+void steam_bridge_last_failure(int* reason, char* dbg, unsigned cap);
+
+// --- reverse dialling ---------------------------------------------------------------------------------------------------------
+// Steam's certificate check is asymmetric: the side whose Steam client holds an OLDER network configuration cannot accept a connection whose
+// certificate was signed by a newer CA key, but it can still present its own. When a joiner's dial is refused that way, the HOST dials the joiner
+// instead (the lobby server forwards the request). The joiner listens on its own virtual port for that, only while it is waiting for it.
+void steam_bridge_client_listen_start();                 // joiner: listen for the host's call (virtual port 28)
+void steam_bridge_client_listen_stop();
+bool steam_bridge_rev_arm();                             // joiner: from now on one incoming call is accepted and bridged; false = Steam not ready
+SOCKET steam_bridge_rev_wait(unsigned long timeout_ms, volatile long* stop, int* why);   // joiner: the connected loopback socket, or INVALID_SOCKET (why 2 timeout, 3 failed)
+void steam_bridge_rev_cancel();                          // joiner: stop waiting
+void steam_bridge_dial_out(uint64_t joiner_steamid);     // host: dial this joiner over Steam and bridge it to the game's own port (asynchronous)
+
 } // namespace mgmp

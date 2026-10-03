@@ -243,8 +243,20 @@ int main() {
     for(unsigned i=0;i<2;++i)at(i,[]{checkpoint_on_node(124,1);CHECK(!g.skip);});
     boundary(7502); certified(2);
 
-    reset(L"different map states cannot be confirmed"); start();
-    at(0,[]{checkpoint_on_map(7000);});at(1,[]{checkpoint_on_map(7001);});drain(); CHECK(states[0].failed && states[1].failed);
+    // Different map fingerprints no longer stop the checkpoint (2026-10-02): the host's map names the
+    // transaction and every peer stages its own database under it.
+    reset(L"different map states are still confirmed"); start();
+    for(int round=0;round<2;++round){
+        for(unsigned i=0;i<2;++i)at(i,[i]{checkpoint_on_map(7000+i);});
+        drain();
+    }
+    certified(1);
+    // ...and a peer whose own map changes between arrival and capture (the map sync adopting the host's) is not refused either: the transaction is named by the host's map.
+    reset(L"a map that changes during preparation is not an error"); start();
+    for(unsigned i=0;i<2;++i)at(i,[i]{checkpoint_on_map(7100+i);});
+    drain();
+    at(1,[]{checkpoint_on_map(7199);});at(0,[]{checkpoint_on_map(7100);});drain(); CHECK(!states[1].failed && !states[0].failed);
+    certified(1);
 
     reset(L"SQLite snapshot failure preserves confirmed queue"); start();boundary(8000); capture_ok=false;next(8001);
     at(0,[]{Entry e{};CHECK(read_entry(file(L".0"),e,true));CHECK(e.certificate.seq==1);CHECK(!checkpoint_can_enter());});
@@ -475,10 +487,10 @@ int main() {
     at(1,[]{ChapterMapMsg old{};old.selection=g.config.identity+1;checkpoint_on_chaptermap(0,old);CHECK(g.awaitingMap && !g.failed);});
     drain(); CHECK(states[0].released && states[1].released);
 
-    reset(L"a settled warehouse opens without peers; unfinished run stays held");
+    reset(L"without peers a settled warehouse AND a run in progress both open alone (single player)");
     connected=false; live=1;
     at(0,[]{CHECK(checkpoint_select(1,g.path.c_str()));CHECK(!checkpoint_active());});
-    at(1,[]{sql_exec(g.path,"UPDATE properties SET data=1 WHERE key='on_adventure'");CHECK(!checkpoint_select(2,g.path.c_str()));CHECK(g.on && !g.failed && !g.selected);});
+    at(1,[]{sql_exec(g.path,"UPDATE properties SET data=1 WHERE key='on_adventure'");CHECK(checkpoint_select(2,g.path.c_str()));CHECK(!checkpoint_active() && !g.failed && !g.selected);});
     connected=true; live=2;
 
     reset(L"invalid local SQLite is retryable by explicit save selection");

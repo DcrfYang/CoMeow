@@ -89,6 +89,11 @@ void follow_mark_node_consumed(void* node);
 // follow_mark_node_consumed, and play already works without it.
 void follow_move_marker_to(void* node);
 
+// The chapter map's node seeds. The host sends its own (once per map); a client with the same node count and types writes them over its own
+// before its map is reported to the checkpoint, which otherwise refuses two maps whose seeds differ. Stored on arrival, applied in follow_map_update.
+struct MapSeedsMsg;
+void follow_on_mapseeds(uint8_t from, const MapSeedsMsg& m);
+
 // CLIENT ONLY, and only for a node whose content this peer is allowed to draw
 // differently -- i.e. anything that is NOT a battle. Advances this peer's
 // simulation stream by one draw immediately after EnterNode returns, which is what

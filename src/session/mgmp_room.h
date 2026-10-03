@@ -76,6 +76,16 @@ bool room_refuse_story_item(const char* item);
 void room_say_story_only_host();
 void room_say_chapter_client();
 void room_say_chapter_wait();
+// The host picked a chapter some player has not unlocked: 2 = somebody lacks chapter 2 (chapters 2 and 3 are closed), 3 = only chapter 3 is closed.
+void room_say_chapter_locked_2();
+void room_say_chapter_locked_3();
+// A player without chapter 2 locked the gear screen: a client is READY and waits for the host, the host waits for every READY.
+void room_say_no_chapter_ready();
+void room_say_no_chapter_wait();
+
+// A sync that waits for another player's data ran out of time: the player is told (a notice with an OK) that the client's connection to the
+// host may have a problem and the games cannot be kept in sync. `what` names the data, for the log. Silent outside a session.
+void room_sync_trouble(const char* what);
 
 // --- solo house boss ---------------------------------------------------------------------------------
 bool room_solo_active();        // this player is away fighting a house boss on its own

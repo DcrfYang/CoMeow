@@ -101,7 +101,33 @@ void signal_request_list();
 // `password` is optional: empty/null = an open room (create) / no password offered (join). It is hashed here --
 // the server only ever sees a SHA-256 digest -- and a server that predates room passwords is refused rather than
 // silently making the room public (see signal_server_has_passwords).
-void signal_request_create(const char* room_name, const char* password = nullptr);
+// How the host wants to be reached (2026-10-03): its own game port, or Steam's peer-to-peer relay. A joiner then uses only that carrier.
+// Relay = the lobby server carries the game's bytes (it can only afford a few such rooms: see signal_relay_info).
+enum class RoomTransport : int { Any = 0, Direct = 1, Steam = 2, Relay = 3 };
+void signal_request_create(const char* room_name, const char* password = nullptr, RoomTransport transport = RoomTransport::Any);
+// The carrier of the room this peer is in: "direct", "steam", or "" (an older host / a LAN room: everything is tried).
+const char* signal_room_transport();
+
+// The pre-check of the game port, before a room is created: the mod listens on it for a moment (and asks the router for a mapping), and the server
+// dials it from outside. Runs by itself after connecting to a public server; signal_request_direct_check() runs it again (e.g. after the player
+// opened the port).
+enum class DirectCheck : int {
+    Unknown,   // not run yet
+    Checking,  // under way
+    Open,      // the server reached the port (or the server is on this network: nothing to check)
+    Closed,    // the server could not reach it: the port has to be opened (forwarded) before "direct" can be chosen
+    Busy,      // another program already listens on the port here
+    NoAnswer,  // the server did not answer (an older server): direct is allowed, but unproven
+};
+DirectCheck signal_direct_check();
+void signal_request_direct_check();
+// Steam as a carrier: usable = Steam networking is up in this process. `text` = its state in one line (for the panel / the log).
+bool signal_steam_usable();
+// The lobby server is on this machine / this network (a LAN lobby): no carrier needs choosing there.
+bool signal_server_private();
+// The server's relay allowance as it last said ("welcome"/"rooms"): true when this server can relay at all; `used` of `max` rooms are taken.
+bool signal_relay_info(int* used, int* max);
+void signal_steam_status(char* out, unsigned cap);
 void signal_request_join(const char* room_id, const char* password = nullptr);
 // Leave the room AND drop the game session: the room exists to introduce the
 // two peers, so staying connected to the server while walking out of the room

@@ -37,6 +37,7 @@ volatile LONG   g_want  = 0;   // 1 = the port should be mapped
 volatile LONG   g_busy  = 0;   // an operation thread is running
 uint16_t        g_port  = 0;
 char            g_ext[64]   = {};
+volatile LONG g_double_nat = 0;   // the router's WAN address is private (see upnp_double_nat)
 char            g_err[128]  = {};
 ULONGLONG       g_mapped_at = 0;
 
@@ -276,6 +277,13 @@ void delete_mapping(uint16_t port) {
     log_line("UPNP", "mapping of TCP %u removed (HTTP %d)", (unsigned)port, st);
 }
 
+// 10/8, 172.16/12, 192.168/16, 100.64/10 (carrier-grade NAT), 169.254/16.
+bool private_ipv4(const char* s) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (sscanf_s(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 || a > 255 || b > 255 || c > 255 || d > 255) return false;
+    return a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127) || (a == 169 && b == 254);
+}
+
 void read_external_ip() {
     std::string body;
     if (soap(g_router, "GetExternalIPAddress", std::string(), body) == 200) {
@@ -308,15 +316,19 @@ DWORD WINAPI op_thread(LPVOID p) {
             } else if (add_mapping(a.port)) {
                 read_external_ip();
                 g_mapped_at = GetTickCount64();
-                log_line("UPNP", "TCP %u is forwarded (the router's address: %s)", (unsigned)a.port, g_ext[0] ? g_ext : "unknown");
+                const bool nat2 = g_ext[0] && private_ipv4(g_ext);
+                InterlockedExchange(&g_double_nat, nat2 ? 1 : 0);
+                if (nat2) log_line("UPNP", "TCP %u was accepted, but the router's own address %s is private: it sits behind another NAT, so the forward cannot be reached from the internet", (unsigned)a.port, g_ext);
+                else      log_line("UPNP", "TCP %u is forwarded (the router's address: %s)", (unsigned)a.port, g_ext[0] ? g_ext : "unknown");
                 if (!g_want) { delete_mapping(a.port); set_state(UpnpState::Idle); }   // stopped meanwhile
+                else if (nat2) { set_err("the router is behind another NAT (its own address is private)"); set_state(UpnpState::Failed); }
                 else set_state(UpnpState::Mapped);
             } else {
                 set_state(UpnpState::Failed);
             }
         } else {
             if (g_have_router && !g_want) delete_mapping(a.port);
-            if (!g_want) { g_ext[0] = 0; set_state(UpnpState::Idle); }
+            if (!g_want) { g_ext[0] = 0; InterlockedExchange(&g_double_nat, 0); set_state(UpnpState::Idle); }
         }
         if (wsa_ok) WSACleanup();
     }
@@ -361,6 +373,7 @@ void upnp_update() {
 
 UpnpState   upnp_state()       { return (UpnpState)InterlockedCompareExchange(&g_state, 0, 0); }
 const char* upnp_external_ip() { return g_ext; }
+bool upnp_double_nat() { return g_double_nat != 0; }
 const char* upnp_error()       { return g_err; }
 
 } // namespace mgmp

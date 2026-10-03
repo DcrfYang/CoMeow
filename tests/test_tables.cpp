@@ -32,14 +32,28 @@ int main() {
               i, t.name, t.rva, s.name, s.rva_hint);
         CHECK(!strcmp(t.name, s.name), "target #%d: kTargets '%s' vs kTargetSigs '%s'", i, t.name, s.name);
         CHECK(s.pattern && s.pattern[0], "target #%d (%s) has an empty pattern", i, s.name);
+        {   // the scanner refuses a pattern whose last token is a wildcard ("it adds no uniqueness") -- found only at run time, which left a hook out
+            // of a test once (BUILDENEMIES, 2026-10-02): the build stage was not hooked and the stream leaked
+            const char* p = s.pattern ? s.pattern : "";
+            size_t n = strlen(p);
+            while (n && p[n - 1] == ' ') --n;
+            CHECK(!n || p[n - 1] != '?', "target #%d (%s): the pattern ends with a wildcard", i, s.name);
+        }
         CHECK(names.insert(t.name).second, "target #%d: duplicate name %s", i, t.name);
     }
     std::set<uint32_t> rvas;
     for (int i = 0; i < T_COUNT; ++i)
         CHECK(rvas.insert(kTargets[i].rva).second, "target #%d (%s): another target already has rva 0x%X", i, kTargets[i].name, kTargets[i].rva);
-    for (int i = 0; i < C_COUNT; ++i)
+    for (int i = 0; i < C_COUNT; ++i) {
+        {
+            const char* p = kCallSigs[i].pattern ? kCallSigs[i].pattern : "";
+            size_t n = strlen(p);
+            while (n && p[n - 1] == ' ') --n;
+            CHECK(!n || p[n - 1] != '?', "call #%d (%s): the pattern ends with a wildcard", i, kCallSigs[i].name);
+        }
         CHECK(kCalls[i].rva == kCallSigs[i].rva_hint, "call #%d: kCalls says '%s' @0x%X but the signature at that index is %s @0x%X",
               i, kCalls[i].name, kCalls[i].rva, kCallSigs[i].name, kCallSigs[i].rva_hint);
+    }
     static_assert(sizeof(kSigData) / sizeof(kSigData[0]) == (size_t)D_COUNT, "data sig count");
     const struct { int d; const char* name; } data_order[] = {
         { D_MewDirectorPtr, "MewDirectorPtr" }, { D_MouseCache, "MouseCache" }, { D_ApplicationBase, "ApplicationBase" },

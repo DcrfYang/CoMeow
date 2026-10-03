@@ -10,6 +10,7 @@
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
+#include "mgmp_setup.h"
 
 namespace mgmp {
 namespace {
@@ -74,6 +75,10 @@ PageState detect() {
     const MenuScreen sc = leave_menu_screen();
     if (sc == MenuScreen::SaveSelect) return PageState::SaveSlots;
     if (sc == MenuScreen::MainMenu)   return PageState::MainMenu;
+
+    // A gear-screen lock that is being held for the room (a player without chapter 2: the game has no chapter page for them):
+    // for the room that player is on the chapter page, whatever the scenes underneath say.
+    if (setup_no_chapter_pending()) return PageState::Chapter;
 
     // 3/4: the two gear screens, which are panels rather than scenes. The collar
     // has its own button and is asked first: it is the first of the two, and the

@@ -54,6 +54,7 @@
 #include "mgmp_savefile.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_setup.h"
+#include "mgmp_unlocks.h"
 #include "mgmp_leave.h"
 #include "mgmp_page.h"
 #include "mgmp_abandon.h"
@@ -86,6 +87,8 @@ uintptr_t g_base = 0;
 bool g_live[T_COUNT] = {};
 
 typedef void  (__fastcall* fn_this)(void* self);
+typedef bool  (__fastcall* fn_unlock_chk)(void* save, void* name);
+typedef int64_t (__fastcall* fn_prop_int)(void* props, void* key, int64_t fallback);
 typedef void  (__fastcall* fn_this_i32)(void* self, int arg);
 typedef void  (__fastcall* fn_ptr_i32)(void* a, int b);
 typedef void  (__fastcall* fn_this_ptr)(void* self, void* ta);
@@ -114,6 +117,10 @@ fn_trydepart  o_TryDepart     = nullptr;
 fn_iskitten   o_IsKitten      = nullptr;
 fn_loadchar   o_LoadChar      = nullptr;
 fn_this       o_EndRunDefeat  = nullptr;
+fn_this       o_GenerateMap   = nullptr;   // MapScreen::generate_map
+fn_unlock_chk o_IsAbility = nullptr, o_IsPassive = nullptr, o_IsItem = nullptr, o_IsLevel = nullptr, o_IsBoss = nullptr;   // MewSaveFile "is X unlocked" checks
+fn_prop_int    o_PropGetInt    = nullptr;   // the save-properties getter (key BY VALUE)
+fn_this       o_EquipDone     = nullptr;   // the gear screen's done-closure (std::function body, void())
 fn_two_ptr    o_GainCat       = nullptr;   // the event effect gain_cat_familiar(context, <unused>)
 fn_this       o_TimeDelay     = nullptr;
 fn_this       o_MapUpdate     = nullptr;
@@ -220,7 +227,7 @@ void __fastcall h_NextTurn(void* self) {
     // Before the original: snapshot the roster on the first boundary of a
     // battle, then exchange this turn's hash while the queue is still the one
     // the turn ended with.
-    if (lockstep_active()) lockstep_turn_boundary(self);
+    if (lockstep_active()) { lockstep_turn_boundary(self); lockstep_reseed(nullptr, 0); }
     Who      w(self, "tc");
     log_line("NEXTTURN", ">>> turn %u begins  %s", t, w.text);
 
@@ -319,6 +326,7 @@ void __fastcall h_Trigger(void* self, void* ta) {
 void __fastcall h_BeginTurn(void* self, int arg) {
     Who w(self, "char");
     log_line("BEGINTURN", "%s arg=%d", w.text, arg);
+    lockstep_reseed(self, arg);
     o_BeginTurn(self, arg);
 }
 
@@ -695,8 +703,17 @@ bool __fastcall h_ScumWarn(void* pause, void* on_quit) {
 // screens -- on the map, in a battle -- the answer is simply no, on every peer alike. In the warehouse, the
 // collar / gear / chapter pages (where the player is still choosing, and the game shows who is a kitten) the
 // game's own answer stands. Only in a room: alone, the shipped game is untouched.
+//
+// A SESSION CAT IS NEVER A KITTEN (2026-10-02). The page gate alone failed: on the map the client's page detector read '选择装备', the game
+// asked about the host's three cats while building the battle, and they were kittens there -- every stat -2, SPEED 5/4/4 became 3/2/2 and
+// the party was placed in another order. A session copy (id 0x70000000..0x7FFFFFFF) only exists for a cat in the run's party, so in a room
+// it is answered "no" whatever the page; the player's own cats keep the page rule.
 bool __fastcall h_IsKitten(void* cat) {
-    if (net_active() && net_peer_count() >= 2 && page_self() == PageState::InGame) return false;
+    if (net_active() && net_peer_count() >= 2) {
+        uint64_t id = 0;
+        if (cat && mem_read((const uint8_t*)cat + kCatData_SaveId, &id, sizeof(id)) && id >= 0x70000000ull && id < 0x80000000ull) return false;
+        if (page_self() == PageState::InGame) return false;
+    }
     return o_IsKitten(cat);
 }
 
@@ -706,10 +723,20 @@ bool __fastcall h_IsKitten(void* cat) {
 // inputs, so the lockstep state stays identical. Alone, the shipped game is untouched.
 void* __fastcall h_LoadChar(void* chr, void* name, uint8_t a, uint8_t b) {
     if (!multiplayer_live() || !chr) return o_LoadChar(chr, name, a, b);
+    // The shared stream before every definition a battle loads: the two peers' lists show the first load after which they drew differently.
+    if (const uint64_t* s = rng_global_stream()) {
+        char what[64] = "?";
+        mem_read_std_string(name, what, sizeof(what));
+        uint64_t s0 = 0;
+        mem_read(s, &s0, sizeof(s0));
+        log_line("RNGTRACE", "stream %016llx before loading '%s'", (unsigned long long)s0, what);
+    }
+    unlocks_build_load();   // inside the battle build: this load starts from a stream every peer shares
     int32_t hp_before = 0;
     mem_read((const uint8_t*)chr + kChr_Hp, &hp_before, sizeof(hp_before));
     void* r = o_LoadChar(chr, name, a, b);
     balance_scale_enemy(chr, hp_before);
+    unlocks_build_load_done();   // ...and again when it is over: what the definition drew (a random cat's name) must not reach the next roll
     return r;
 }
 
@@ -947,7 +974,11 @@ void __fastcall h_TryAbandon(void* self) {
 // What follows EVERY end of a run, won or lost (the abandon / defeat path joined the settlement one in
 // 2026-10-01): this player's clones go back to their originals, then the per-run state of every module is reset.
 static void run_settled(const char* how, bool was_shared) {
-    if (was_shared) { catsync_merge_session_cats(how); catsync_release_stuck_cats(how); }
+    if (was_shared) {
+        const unsigned merged = catsync_merge_session_cats(how);
+        catsync_release_stuck_cats(how);
+        if (merged) catsync_save_game(how);     // the settlement saved BEFORE the merge: write the merged state to disk too, so a reload finds it
+    }
     leave_on_settlement();
     checkpoint_clear(true);
     // THE RUN IS OVER, THE SESSION IS NOT (2026-09-28). The same two peers may
@@ -1016,6 +1047,174 @@ void* __fastcall h_GainCat(void* ctx, void* arg) {
         return nullptr;
     }
     return o_GainCat(ctx, arg);
+}
+
+// The gear screen's lock. A player with chapter 2 unlocked goes on to the chapter page (the setup barrier lives there); one WITHOUT it
+// has no page: the closure starts chapter 1 on the spot. In a room that click is taken over (mgmp_setup: a client's is READY, the host's
+// is the chapter choice) and the closure is run later, by setup_tick, through a copy of the two fields it reads.
+void equip_done_go(void* director) {
+    alignas(16) uint8_t closure[0x20] = {};   // the original reads +0x8 (0: no chapter page) and +0x10 (the director), nothing else
+    memcpy(closure + kEquipDone_Director, &director, sizeof(director));
+    o_EquipDone(closure);
+}
+
+void __fastcall h_EquipDone(void* self) {
+    uint8_t act_select = 1;
+    void*   director   = nullptr;
+    if (mem_read((const uint8_t*)self + kEquipDone_ActSelect, &act_select, sizeof(act_select)) && !act_select &&
+        mem_read((const uint8_t*)self + kEquipDone_Director, &director, sizeof(director)) && director &&
+        setup_on_equip_done(director, equip_done_go)) return;
+    o_EquipDone(self);
+}
+
+// While a chapter map is generated its mapflag_* nodes answer with the flags EVERY player has (mgmp_unlocks). The getter destroys its key,
+// so the original is always run -- for an overridden key only to let it do that -- and an inactive override costs one load and a branch.
+int64_t __fastcall h_PropGetInt(void* props, void* key, int64_t fallback) {
+    if (unlocks_override_active()) {
+        char name[96];
+        if (mem_read_std_string(key, name, sizeof(name))) {
+            const int64_t local = o_PropGetInt(props, key, fallback);   // the getter destroys its key, so it always runs; its answer is the "this save says"
+            int64_t value = 0;
+            return unlocks_override_lookup(name, local, value) ? value : local;
+        }
+    }
+    return o_PropGetInt(props, key, fallback);
+}
+
+// While a client builds a battle the host's unlock answers replace its own (mgmp_unlocks). The check destroys its name argument, so the original always
+// runs -- its answer is the "this save says" half of the debug line.
+bool unlock_detour(UnlockList list, fn_unlock_chk original, void* save, void* name) {
+    if (!unlocks_window_active()) return original(save, name);
+    char text[96];
+    if (!mem_read_std_string(name, text, sizeof(text))) return original(save, name);
+    const bool local = original(save, name);
+    return unlocks_window_answer(list, text, local);
+}
+bool __fastcall h_IsAbility(void* save, void* name) { return unlock_detour(UnlockList::Ability,   o_IsAbility, save, name); }
+bool __fastcall h_IsPassive(void* save, void* name) { return unlock_detour(UnlockList::Passive,   o_IsPassive, save, name); }
+bool __fastcall h_IsItem   (void* save, void* name) { return unlock_detour(UnlockList::Item,      o_IsItem,    save, name); }
+bool __fastcall h_IsLevel  (void* save, void* name) { return unlock_detour(UnlockList::LevelGroup, o_IsLevel,   save, name); }
+// select_boss_level's predicate: (closure, GonObject&) -- the boss's name is the std::string at +0x88 of the GonObject. It only reads it, so the original is
+// asked first for the "this save says" half and the host's answer replaces it.
+bool __fastcall h_IsBoss(void* closure, void* gon) {
+    const bool local = o_IsBoss(closure, gon);
+    if (!unlocks_window_active()) return local;
+    char text[96];
+    if (!mem_read_std_string((const uint8_t*)gon + 0x88, text, sizeof(text))) return local;
+    return unlocks_window_answer(UnlockList::Boss, text, local);
+}
+// The battle's party sort (0x364760, an insertion sort of the party's CatData* by speed): see mgmp_unlocks -- logged on both peers, and on a
+// client put into the host's order when it came out differently.
+// The level picker (0x394450): in a room every peer picks from the same shared stream, and the pick is logged (mgmp_unlocks). The fifth
+// argument is a bool in a stack slot -- passed through whole.
+typedef void* (__fastcall* fn_level_pick)(void* self, void* out, void* kind, void* node, uint64_t flag);
+fn_level_pick o_LevelPick = nullptr;
+void* __fastcall h_LevelPick(void* self, void* out, void* kind, void* node, uint64_t flag) {
+    unlocks_level_pick(kind, node, nullptr, false);
+    void* r = o_LevelPick(self, out, kind, node, flag);
+    unlocks_level_pick(kind, node, r, true);
+    return r;
+}
+// The stages of the battle build: each returns, then the shared stream is set from the battle id (mgmp_unlocks: unlocks_build_stage_end).
+typedef void* (__fastcall* fn_stage)(void* self);
+// An event outcome's `random_pool` (sub_1409310B0): both peers draw its entry from the same stream (mgmp_unlocks: unlocks_event_roll).
+typedef void (__fastcall* fn_random_pool)(void* state, void* node);
+fn_random_pool o_RandomPool = nullptr;
+void __fastcall h_RandomPool(void* state, void* node) { unlocks_event_roll(); o_RandomPool(state, node); }
+// Every other event keyword that draws from the shared stream (sub_1409173A0 calls each as handler(state, node [, cat])): the stream is reset from the node and the draw count first,
+// so the host's click gives the same result on every peer (weather_roll = 'Happening', random_chance, reward, ...). Three register arguments are forwarded, the result is passed back.
+typedef uint64_t (__fastcall* fn_ev_handler)(void* a, void* b, void* c);
+fn_ev_handler o_EvWeatherRoll = nullptr;
+uint64_t __fastcall h_EvWeatherRoll(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvWeatherRoll(a, b, c); }
+fn_ev_handler o_EvPoolLuck = nullptr;
+uint64_t __fastcall h_EvPoolLuck(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvPoolLuck(a, b, c); }
+fn_ev_handler o_EvRandomChance = nullptr;
+uint64_t __fastcall h_EvRandomChance(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvRandomChance(a, b, c); }
+fn_ev_handler o_EvReward = nullptr;
+uint64_t __fastcall h_EvReward(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvReward(a, b, c); }
+fn_ev_handler o_EvDisorderPool = nullptr;
+uint64_t __fastcall h_EvDisorderPool(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvDisorderPool(a, b, c); }
+fn_ev_handler o_EvLearnAbility = nullptr;
+uint64_t __fastcall h_EvLearnAbility(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvLearnAbility(a, b, c); }
+fn_ev_handler o_EvLearnPassive = nullptr;
+uint64_t __fastcall h_EvLearnPassive(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvLearnPassive(a, b, c); }
+fn_ev_handler o_EvMutSet = nullptr;
+uint64_t __fastcall h_EvMutSet(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvMutSet(a, b, c); }
+fn_ev_handler o_EvMut = nullptr;
+uint64_t __fastcall h_EvMut(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvMut(a, b, c); }
+// The option's stat check (sub_14091BE20, `stat int`/`str`/...: one draw against the chosen cat's stat gives good or bad, stored at event+0xF8). Without the reset the good/bad of
+// DarkDen differed between the peers (host: CharmedBear familiar, client: MaddenedBear spawn) and the boards halted on a friendly bear (2026-10-03).
+// The event's constructor: from here on its draws (difficulty, the subject cat) come from the node-seeded stream, the same on every peer.
+fn_ev_handler o_EvSetup = nullptr;
+uint64_t __fastcall h_EvSetup(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvSetup(a, b, c); }
+// "A random element of this vector" (sub_1400AB770, 41 callers). Only the call that picks an event's SUBJECT cat is taken over (the instruction after that call is kRet_EventSubject): the
+// candidates are sorted by cat id and the draw indexes the sorted list, so both peers name the same cat even when their party lists are in another order (the client's own cats come first).
+typedef void* (__fastcall* fn_pick_random)(void* vec, void* stream);
+fn_pick_random o_PickRandom = nullptr;
+void* __fastcall h_PickRandom(void* vec, void* stream) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    if ((uintptr_t)_ReturnAddress() == base + kRet_EventSubject) {
+        void* r = nullptr;
+        if (unlocks_event_subject(vec, stream, (void*)o_PickRandom, &r)) return r;
+    }
+    return o_PickRandom(vec, stream);
+}
+// The save-properties int setter (increment/decrement_legacy_counter): inside an event window the new value is what the property reads as from then on (mgmp_unlocks: unlocks_property_set).
+// The callee destroys the name string it is given, so it is read BEFORE the original runs.
+typedef void (__fastcall* fn_prop_set_int)(void* name, int value);
+fn_prop_set_int o_PropSetInt = nullptr;
+void __fastcall h_PropSetInt(void* name, int value) { unlocks_property_set(name, value); o_PropSetInt(name, value); }
+// The House state writer: before it writes `files.house_state`, the House cat entities that still carry a clone's id get the id of the cat that clone was swapped into (mgmp_catsync).
+// Without it the file named the clone ids, and the next load brought the clones back to life (flags 1, not retired) while the retired originals were not loaded at all.
+fn_ev_handler o_HouseSave = nullptr;
+uint64_t __fastcall h_HouseSave(void* a, void* b, void* c) { catsync_house_save(a); return o_HouseSave(a, b, c); }
+// The pool item picker behind get_item_from_pool (and its siblings): it draws from the shared stream, but what the event did just before (party_damage hits each peer's OWN party, whose
+// on-damage passives draw too) is not the same on every peer -- Baphomet gave one peer the Cancer trinket (2026-10-03). Called from the WorldEvent code only: the stream is reset first.
+typedef void* (__fastcall* fn_item_pick)(void* a, void* b, void* c, double luck);
+fn_item_pick o_EvItemPick = nullptr;
+void* __fastcall h_EvItemPick(void* a, void* b, void* c, double luck) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uintptr_t ra = (uintptr_t)_ReturnAddress() - base;
+    if ((ra >= 0x9173A0 && ra < 0x919752) || (ra >= 0x91F5F0 && ra < 0x9205F7)) unlocks_event_roll();
+    return o_EvItemPick(a, b, c, luck);
+}
+fn_ev_handler o_EvStatCheck = nullptr;
+uint64_t __fastcall h_EvStatCheck(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvStatCheck(a, b, c); }
+fn_stage o_BuildStatics = nullptr;
+void* __fastcall h_BuildStatics(void* self) { void* r = o_BuildStatics(self); unlocks_build_stage_end("statics"); return r; }
+fn_stage o_BuildTerrain = nullptr;
+void* __fastcall h_BuildTerrain(void* self) { void* r = o_BuildTerrain(self); unlocks_build_stage_end("terrain"); return r; }
+fn_stage o_BuildProps = nullptr;
+void* __fastcall h_BuildProps(void* self) { void* r = o_BuildProps(self); unlocks_build_stage_end("props"); return r; }
+fn_stage o_BuildParty = nullptr;
+void* __fastcall h_BuildParty(void* self) { void* r = o_BuildParty(self); unlocks_build_stage_end("party"); return r; }
+fn_stage o_BuildAllies = nullptr;
+void* __fastcall h_BuildAllies(void* self) { void* r = o_BuildAllies(self); unlocks_build_stage_end("allies"); return r; }
+fn_stage o_BuildExtra = nullptr;
+void* __fastcall h_BuildExtra(void* self) { void* r = o_BuildExtra(self); unlocks_build_stage_end("extra"); return r; }
+fn_stage o_BuildEnemies = nullptr;
+void* __fastcall h_BuildEnemies(void* self) { void* r = o_BuildEnemies(self); unlocks_build_stage_end("enemies"); return r; }
+// The battle build (0x35AAF0): in a room every peer starts it from the same shared stream (mgmp_unlocks).
+typedef void* (__fastcall* fn_battle_build)(void* a, void* b, void* c, void* d);
+fn_battle_build o_BattleBuild = nullptr;
+void* __fastcall h_BattleBuild(void* a, void* b, void* c, void* d) {
+    unlocks_battle_build();
+    void* r = o_BattleBuild(a, b, c, d);
+    unlocks_battle_build_done();
+    return r;
+}
+typedef void** (__fastcall* fn_spawn_sort)(void** first, void** last);
+fn_spawn_sort o_SpawnSort = nullptr;
+void** __fastcall h_SpawnSort(void** first, void** last) {
+    unlocks_spawn_sort(first, last, false);
+    void** r = o_SpawnSort(first, last);
+    unlocks_spawn_sort(first, last, true);
+    return r;
+}
+
+void __fastcall h_GenerateMap(void* self) {
+    setup_on_generate_map();
+    o_GenerateMap(self);
 }
 
 void __fastcall h_SelectAct(void* self, int act) {
@@ -1183,6 +1382,8 @@ void __fastcall h_FrameBegin(void* self) {
     abandon_tick();
     room_tick();
     checkpoint_tick();
+    setup_tick();
+    unlocks_tick();
 
 
     // Frame markers are what let Run D ask its question: with identical actions
@@ -1243,6 +1444,40 @@ const Binding kBindings[] = {
     { T_EndRunFinalize, (void*)&h_EndRunFinalize, (void**)&o_EndRunFinalize },
     { T_EndRunDefeat,   (void*)&h_EndRunDefeat,   (void**)&o_EndRunDefeat },
     { T_GainCat,        (void*)&h_GainCat,        (void**)&o_GainCat },
+    { T_EquipDone,      (void*)&h_EquipDone,      (void**)&o_EquipDone },
+    { T_PropGetInt,     (void*)&h_PropGetInt,     (void**)&o_PropGetInt },
+    { T_GenerateMap,    (void*)&h_GenerateMap,    (void**)&o_GenerateMap },
+    { T_IsAbilityUnlocked, (void*)&h_IsAbility,   (void**)&o_IsAbility },
+    { T_IsPassiveUnlocked, (void*)&h_IsPassive,   (void**)&o_IsPassive },
+    { T_IsItemUnlocked,    (void*)&h_IsItem,      (void**)&o_IsItem },
+    { T_IsLevelUnlocked,   (void*)&h_IsLevel,     (void**)&o_IsLevel },
+    { T_IsBossAvailable,   (void*)&h_IsBoss,      (void**)&o_IsBoss },
+    { T_SpawnSort,         (void*)&h_SpawnSort,   (void**)&o_SpawnSort },
+    { T_BattleBuild,       (void*)&h_BattleBuild, (void**)&o_BattleBuild },
+    { T_LevelPick,         (void*)&h_LevelPick,   (void**)&o_LevelPick },
+    { T_BuildStatics,    (void*)&h_BuildStatics,  (void**)&o_BuildStatics },
+    { T_BuildTerrain,    (void*)&h_BuildTerrain,  (void**)&o_BuildTerrain },
+    { T_BuildProps,      (void*)&h_BuildProps,    (void**)&o_BuildProps },
+    { T_BuildParty,      (void*)&h_BuildParty,    (void**)&o_BuildParty },
+    { T_BuildAllies,     (void*)&h_BuildAllies,   (void**)&o_BuildAllies },
+    { T_BuildExtra,      (void*)&h_BuildExtra,    (void**)&o_BuildExtra },
+    { T_BuildEnemies,    (void*)&h_BuildEnemies,  (void**)&o_BuildEnemies },
+    { T_RandomPool,      (void*)&h_RandomPool,    (void**)&o_RandomPool },
+    { T_EvWeatherRoll, (void*)&h_EvWeatherRoll, (void**)&o_EvWeatherRoll },
+    { T_EvPoolLuck, (void*)&h_EvPoolLuck, (void**)&o_EvPoolLuck },
+    { T_EvRandomChance, (void*)&h_EvRandomChance, (void**)&o_EvRandomChance },
+    { T_EvReward, (void*)&h_EvReward, (void**)&o_EvReward },
+    { T_EvDisorderPool, (void*)&h_EvDisorderPool, (void**)&o_EvDisorderPool },
+    { T_EvLearnAbility, (void*)&h_EvLearnAbility, (void**)&o_EvLearnAbility },
+    { T_EvLearnPassive, (void*)&h_EvLearnPassive, (void**)&o_EvLearnPassive },
+    { T_EvMutSet, (void*)&h_EvMutSet, (void**)&o_EvMutSet },
+    { T_EvMut, (void*)&h_EvMut, (void**)&o_EvMut },
+    { T_EvStatCheck, (void*)&h_EvStatCheck, (void**)&o_EvStatCheck },
+    { T_EvSetup, (void*)&h_EvSetup, (void**)&o_EvSetup },
+    { T_PickRandom, (void*)&h_PickRandom, (void**)&o_PickRandom },
+    { T_PropSetInt, (void*)&h_PropSetInt, (void**)&o_PropSetInt },
+    { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
+    { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },
     { T_TryAbandon,     (void*)&h_TryAbandon,     (void**)&o_TryAbandon     },
     { T_SelectAct,        (void*)&h_SelectAct, (void**)&o_SelectAct },
     { T_ChapterLower,     (void*)&h_ChapterLower, (void**)&o_ChapterLower },

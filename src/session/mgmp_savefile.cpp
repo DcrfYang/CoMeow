@@ -905,7 +905,9 @@ bool savefile_on_slot_click(void* ss, int slot) {
     Names names{};
     bool  have_names = read_slot_names(ss, names);
     if (!g.recovery_click) {
-        if ((net_active() && !session_ready()) || !have_names || (uint32_t)slot >= names.count) return false;
+        // Alone (no second peer yet or any more) is single player: the click goes on to checkpoint_select, which opens the
+        // save locally. Only a session with others in it waits for its handshake (2026-10-02).
+        if ((net_active() && net_peer_count() >= 2 && !session_ready()) || !have_names || (uint32_t)slot >= names.count) return false;
         ensure_dir();
         if (!g.have_dir) return false;
         wchar_t wname[128], path[MAX_PATH]; wide(names.v[slot], wname, 128);

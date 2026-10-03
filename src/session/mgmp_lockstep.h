@@ -147,6 +147,10 @@ void lockstep_arm_enemy_hit(int32_t amount);
 // been snapshotted.
 void lockstep_set_turn_control(void* turn_control);
 
+// In a room: set the shared simulation stream from (battle, turn, actor) -- called by the NextTurn hook after the turn boundary (`actor` = null) and by the BeginTurn hook
+// (`actor` = the character, `arg` its argument). The same call on every peer gives the same stream whatever was drawn before it. A no-op outside a room or a snapshotted battle.
+void lockstep_reseed(const void* actor, int arg);
+
 // The armed click's landing point: apply AND broadcast, so both peers write the
 // same hp change. Local-only was the first version and it left the other peer
 // fighting a battle this one had left -- see MSG_DEBUGHIT.
@@ -302,6 +306,9 @@ bool lockstep_halted();
 // mgmp_catsync and mgmp_invsync gate their apply paths on it. See the note on
 // catsync_on_message for the shield that got through before they did.
 bool lockstep_in_battle();
+// The CURRENT battle (the one lockstep_enter_battle last named) has been built and its roster snapshotted: unlike lockstep_in_battle() this is false
+// again the moment the next battle is entered, until that one is built.
+bool lockstep_battle_ready();
 
 // --- AND THE ONE SIGNAL THAT SURVIVES A HALT: THE BATTLE IS OVER (2026-09-23) ---------
 //
@@ -337,6 +344,11 @@ uint64_t lockstep_last_turn_ms();
 // longer resolves. Heartbeat AND list-gone is the fight being over, with no screen, button or
 // live session involved -- which is exactly the window the party swap has to land in.
 bool lockstep_battle_list_gone();
+
+// A fight is up RIGHT NOW: the roster was snapshotted and the character list it came from is still the live one. Unlike
+// lockstep_in_battle() this survives a halt (a dropped peer halts the session), so it answers "was the player in a fight when the
+// peer went away". False at the victory screen, in the warehouse and with no session ever armed.
+bool lockstep_fight_up();
 
 // A cat's health AS THE BATTLE HAS IT, found by the cat's own identity (CatData+0xC48, the id the
 // run lists carry) rather than by roster position. Only while the fight is really up -- the same

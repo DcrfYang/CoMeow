@@ -266,7 +266,10 @@ constexpr bool     kChoice    = true;   // replicate event / level-up decisions
 // to both peers whatever their pools say. If that ever fails, the symptom is a
 // chapter-level divergence right after a boss -- and the fix is this one flag
 // back to true, which restores the shared pool for the whole run.
-constexpr bool     kRunHist   = false;  // (was true) push *(MewDirector+1424), the used-event list
+// BACK ON, 2026-10-03: the "?" events are SHARED again (kPerPlayerNodes is off for good), but nothing pushed the used-event list any more, so the two saves' lists
+// drifted and the same node rolled DIFFERENT events (host: Little John pushed onto rocks, client: Little John hungry) -- and an event's effects (add_weather
+// RainingFrogs ...) reach the shared battle: a toad weather on one peer only was a halt. The host's list goes over the client's at every node entry, as before.
+constexpr bool     kRunHist   = true;   // push *(MewDirector+1424), the used-event list
 constexpr bool     kNodeHash  = true;   // the meta layer's per-node hash
 
 // PRINT WHAT A NODE AND THE MAP LOOK LIKE AT EVERY FOLLOWED NODE ENTRY (2026-09-22).
@@ -755,7 +758,27 @@ constexpr bool     kPartySwapWhileEditing = true;
 // save-level merge.
 //
 // Every adoption is logged, with all four words, on the peer that adopted.
-constexpr bool     kAdoptHostSeed = false;
+constexpr bool     kAdoptHostSeed = true;    // 2026-10-02: ON -- with the map seed sync it only fires for a node the whole-map sync did not cover
+
+// HOW LONG A PEER WAITS FOR THE HOST'S DATA BEFORE GIVING UP (2026-10-02). Raised from 5 s / 3 s / 8 s after tests over the internet: a slow or
+// lossy link (or a host that is still building) needs more than a LAN does, and giving up too early is the worse failure -- the peer then plays
+// the board / level / map IT built, which is a desync. When a wait does run out the player is told (room_sync_trouble: "the client's connection
+// to the host may have a problem, the games cannot be kept in sync"). The first two park the GAME THREAD (nothing is drawn meanwhile), so they are
+// long enough for a bad link and short enough not to look like a crash.
+//
+// NOT RAISED, ON PURPOSE: the level-up owner waits and the event-name wait in mgmp_choice. They are also the NORMAL way out of screens that exist on
+// one peer only (a shop purchase, a per-player event), so a longer bound is a longer dead click on every one of those, and a notice would be
+// a false alarm.
+// IN A ROOM THE SHARED SIMULATION STREAM IS RESET AT EVERY TURN AND EVERY ACTOR'S START (mgmp_lockstep: lockstep_reseed). Draws made in between differ between the peers for a thousand
+// reasons (a per-save input, a frame-timed effect, a unit created with another roll), and one extra draw used to shift every roll after it for the rest of the battle. With the stream
+// derived from (battle, turn, actor) a difference can only live until the next actor begins -- and the turn hash still says it happened. false = the game's own stream continues.
+constexpr bool kReseedPerTurn = true;
+constexpr uint32_t kDebugHitWaitMs = 5000;   // a debug hit whose tile holds no enemy here yet (the host's enemy move is still being played on this peer) is held this long (mgmp_lockstep: debug_hits_pump)
+constexpr bool     kBoardEveryTurn = true;    // the host publishes its board at EVERY turn boundary and a client takes it over (mgmp_lockstep: board_sync), not only at the battle start
+constexpr uint32_t kBoardTurnWaitMs = 3000;   // how long a client waits for the host's board of a later turn before playing the turn without it
+constexpr uint32_t kBoardWaitMs = 20000;    // the host's battle board and stream (mgmp_lockstep: board_sync)
+constexpr uint32_t kLevelWaitMs = 12000;    // the host's level for this battle (mgmp_unlocks: unlocks_level_pick)
+constexpr uint32_t kSeedWaitMs  = 20000;    // the host's map seeds / the clients' map flags (mgmp_follow: map_seed_sync)
 
 // AIMED AT THE APPEND CHUNK BY EXECUTE BREAKPOINT -- ABANDONED, DO NOT REVIVE.
 //

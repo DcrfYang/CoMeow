@@ -18,6 +18,8 @@ void checkpoint_on_map(uint64_t map_hash);
 // prepared separately carry two different ones -- the first node boundary
 // refuses to certify that pair, so the host's row becomes the run's map.
 void checkpoint_on_chaptermap(uint8_t from, const ChapterMapMsg& m);
+// This peer's run came back from a handshake save that was already under way (RESTORE), not a fresh one (NEW).
+bool checkpoint_run_restored();
 bool checkpoint_needs_map();
 bool checkpoint_can_enter();
 void checkpoint_on_message(uint8_t from, const CheckpointMsg& m);
@@ -62,7 +64,7 @@ enum SaveSyncPhase : uint8_t {
 struct SaveSyncView {
     SaveSyncPhase phase = kSyncNone;
     bool     host = false;
-    uint8_t  selected = 0;          // bit n = the peer with transport id n has picked
+    uint8_t  selected = 0;          // bit n = the peer with transport id n has picked (kSyncInvalid: ... holds an unfinished co-op record)
     bool     prep = false;          // the preparation stage is allowed (host choosing)
     unsigned n = 0;                 // handshake saves listed (host choosing), newest first
     SaveSyncEntry entry[4];

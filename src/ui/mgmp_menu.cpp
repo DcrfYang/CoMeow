@@ -177,6 +177,8 @@ struct Menu {
     char room_name[48] = {};          // the name of the room we are in, as we know it
     char search[48] = {};             // the room list's search box
     char create_pw[40] = {};          // the optional password for a room being created
+    int  transport = 0;               // the carrier chosen for a room being created: 0 = not chosen (the best usable one), 1 = direct (the game port), 2 = Steam relay, 3 = the server relay
+    bool relay_warn = false;          // the "low-spec server" notice for the server relay is up
     // The password prompt for joining a locked room.
     bool     pw_ask   = false;
     bool     pw_wrong = false;        // the last try was refused: say so
@@ -904,7 +906,7 @@ void draw_multi_window(const View& v) {
     ensure_inited();
     const SignalState st0 = signal_state();
     const bool disconnected = st0 == SignalState::Off || st0 == SignalState::Failed || st0 == SignalState::Closed;
-    const float W = 900, H = in_room() ? (lan_host_running() ? 886.0f : 860.0f) : (st0 == SignalState::Connected ? 800.0f : (disconnected && g.lan_tab ? 880.0f : 760.0f));
+    const float W = 900, H = in_room() ? (lan_host_running() ? 886.0f : 860.0f) : (st0 == SignalState::Connected ? (signal_server_private() ? 800.0f : 900.0f) : (disconnected && g.lan_tab ? 880.0f : 760.0f));
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f + 20);
     const ImVec2 sz(W * v.k, H * v.k);
     if (!overlay_window_begin("##mgmp_multi", a, sz)) { ImGui::End(); return; }
@@ -999,7 +1001,7 @@ void draw_multi_window(const View& v) {
     text_at(dl, ImVec2(X(50), Y(150)), 26 * k, kInk, tr(Tx::SEARCH));
     paper_input("##search", ImVec2(X(190), Y(138)), ImVec2(X(W - 50), Y(190)), g.search, sizeof(g.search), tr(Tx::SEARCH_HINT), 26 * k);
 
-    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(204), ly1 = Y(H - 270);
+    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(204), ly1 = Y(H - (signal_server_private() ? 270 : 450));
     rough_rect(dl, ImVec2(lx0, ly0), ImVec2(lx1, ly1), IM_COL32(255, 255, 250, 70), kInk, 2.2f, 91, 1.2f);
     const uint32_t total = signal_rooms(g.rooms, 32);
     // The rows that match the search: open rooms first, locked ones after them (the server sends them that way
@@ -1051,6 +1053,55 @@ void draw_multi_window(const View& v) {
         ImGui::EndChild();
     }
 
+    // THE CARRIER (2026-10-03): the game port (direct) or Steam's relay. "Direct" is only offered once the server has seen the port from outside.
+    RoomTransport chosen = RoomTransport::Any;
+    if (!signal_server_private()) {      // a lobby on this network needs no choosing
+        const DirectCheck ds = signal_direct_check();
+        const bool direct_ok = ds == DirectCheck::Open || ds == DirectCheck::NoAnswer;
+        const bool steam_ok = signal_steam_usable();
+        int relay_used = 0, relay_max = 0;
+        const bool relay_known = signal_relay_info(&relay_used, &relay_max);
+        const bool relay_ok = relay_known && relay_used < relay_max;
+        int eff = g.transport;
+        if (eff == 1 && !direct_ok) eff = 0;
+        if (eff == 2 && !steam_ok) eff = 0;
+        if (eff == 3 && !relay_ok) eff = 0;
+        if (eff == 0) eff = direct_ok ? 1 : (steam_ok ? 2 : 0);
+        const unsigned port = (unsigned)config().net_port;
+        char lbl[96];
+        text_at(dl, ImVec2(X(50), Y(H - 426)), 26 * k, kInk, tr(Tx::TR_LABEL));
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, tr(Tx::TR_DIRECT), port);
+        if (paper_button("tr_direct", ImVec2(X(190), Y(H - 440)), ImVec2(X(400), Y(H - 388)), lbl, 22 * k, direct_ok && !busy, eff == 1 ? Tone::Good : Tone::Normal)) g.transport = 1;
+        if (paper_button("tr_steam", ImVec2(X(410), Y(H - 440)), ImVec2(X(620), Y(H - 388)), tr(Tx::TR_STEAM), 22 * k, steam_ok && !busy, eff == 2 ? Tone::Good : Tone::Normal)) g.transport = 2;
+        if (relay_known) _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s %u/%u", tr(Tx::TR_RELAY), (unsigned)relay_used, (unsigned)relay_max);
+        else             _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s", tr(Tx::TR_RELAY));
+        if (paper_button("tr_relay", ImVec2(X(630), Y(H - 440)), ImVec2(X(W - 50), Y(H - 388)), lbl, 22 * k, relay_ok && !busy && !g.relay_warn, eff == 3 ? Tone::Good : Tone::Normal)) {
+            // The project's own server is small: say so before the server is chosen as the carrier
+            if (strncmp(signal_server(), "49.233.209.67:", 14) == 0) g.relay_warn = true;
+            else g.transport = 3;
+        }
+        char hint[400] = {};
+        ImU32 col = kInkSoft;
+        if (eff == 3) {
+            _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_RELAY_SEL), (unsigned)relay_used, (unsigned)relay_max);
+        } else {
+            switch (ds) {
+                case DirectCheck::Unknown:
+                case DirectCheck::Checking: _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_CHECKING), port); break;
+                case DirectCheck::Open:     _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_OPEN), port); col = kGreen; break;
+                case DirectCheck::Closed:   _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_CLOSED), port, port); col = kRed; break;
+                case DirectCheck::Busy:     _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_BUSY), port); col = kRed; break;
+                case DirectCheck::NoAnswer: _snprintf_s(hint, sizeof(hint), _TRUNCATE, "%s", tr(Tx::TR_NOANSWER)); col = kAmber; break;
+            }
+            if (!steam_ok) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_STEAM_NA)); }
+        }
+        if (!relay_known) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_RELAY_NA)); }
+        else if (!relay_ok) { const size_t n = strlen(hint); char full[200]; _snprintf_s(full, sizeof(full), _TRUNCATE, tr(Tx::TR_RELAY_FULL), (unsigned)relay_used, (unsigned)relay_max); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", full); }
+        wrap_text(dl, X(50), Y(H - 376), (W - 100 - 180) * k, 20 * k, 24 * k, col, hint);
+        if (paper_button("tr_recheck", ImVec2(X(W - 190), Y(H - 372)), ImVec2(X(W - 50), Y(H - 322)), tr(Tx::TR_RECHECK), 22 * k, ds != DirectCheck::Checking && !busy)) signal_request_direct_check();
+        chosen = eff == 1 ? RoomTransport::Direct : eff == 2 ? RoomTransport::Steam : eff == 3 ? RoomTransport::Relay : RoomTransport::Any;
+    }
+
     // create rows: the name, and an optional password (empty = an open room)
     text_at(dl, ImVec2(X(50), Y(H - 252)), 26 * k, kInk, tr(Tx::ROOM_NAME));
     paper_input("##room", ImVec2(X(190), Y(H - 264)), ImVec2(X(W - 320), Y(H - 212)), g.room, sizeof(g.room), tr(Tx::ROOM_NAME_HINT), 26 * k);
@@ -1058,9 +1109,10 @@ void draw_multi_window(const View& v) {
     paper_input("##roompw", ImVec2(X(190), Y(H - 202)), ImVec2(X(W - 320), Y(H - 150)), g.create_pw, sizeof(g.create_pw), tr(Tx::ROOM_PW_HINT), 26 * k,
                 ImGuiInputTextFlags_Password);
     if (paper_button("create", ImVec2(X(W - 300), Y(H - 264)), ImVec2(X(W - 50), Y(H - 150)), tr(Tx::CREATE_ROOM), 30 * k, !busy && !g.pw_ask, Tone::Good)) {
-        signal_request_create(g.room, g.create_pw);
+        signal_request_create(g.room, g.create_pw, chosen);
         strncpy_s(g.room_name, sizeof(g.room_name), g.room, _TRUNCATE);
-        log_line("MENU", "create requested: '%s'%s", g.room, g.create_pw[0] ? " (password)" : "");
+        log_line("MENU", "create requested: '%s'%s, carrier %s", g.room, g.create_pw[0] ? " (password)" : "",
+                 chosen == RoomTransport::Direct ? "direct" : chosen == RoomTransport::Steam ? "Steam" : chosen == RoomTransport::Relay ? "server relay" : "any");
     }
 
     if (paper_button("refresh", ImVec2(X(50), Y(H - 120)), ImVec2(X(50 + (W - 100 - 20) / 3), Y(H - 56)), tr(Tx::REFRESH), 30 * k, !busy)) {
@@ -1329,10 +1381,14 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
 
     // The host's game port is closed to the outside (the server tried it): the one thing a host must be told. Not while the
     // router mapping is still being set up -- that may fix it a moment from now.
-    if (host && signal_reach() == 2 && upnp_state() != UpnpState::Working && !steam_bridge_ready()) {
-        char warn[300];
-        _snprintf_s(warn, sizeof(warn), _TRUNCATE, tr(Tx::REACH_WARN), (unsigned)config().net_port);
-        y = wrap_text(dl, o.x, y, w, 21 * k, 25 * k, kAmber, warn) + 8 * k;
+    // Not in a server-relay room: its bytes go through the lobby server, the game port is not needed.
+    if (host && signal_reach() == 2 && upnp_state() != UpnpState::Working && strcmp(signal_room_transport(), "relay") != 0) {
+        const bool via_steam = steam_bridge_ready(), nat2 = upnp_double_nat();
+        char warn[400];
+        if (via_steam) _snprintf_s(warn, sizeof(warn), _TRUNCATE, "%s", tr(nat2 ? Tx::REACH_STEAM_NAT : Tx::REACH_STEAM));
+        else if (nat2) _snprintf_s(warn, sizeof(warn), _TRUNCATE, "%s", tr(Tx::REACH_WARN_NAT));
+        else           _snprintf_s(warn, sizeof(warn), _TRUNCATE, tr(Tx::REACH_WARN), (unsigned)config().net_port);
+        y = wrap_text(dl, o.x, y, w, 21 * k, 25 * k, via_steam ? kGreen : kAmber, warn) + 8 * k;
     }
 
     // Session line.
@@ -1921,6 +1977,7 @@ void draw_save_sync(const View& v) {
 
     const float W = 780;
     float H = 300;
+    if (sv.phase == kSyncInvalid && sv.selected) H = 400;
     if (show_rows)     H = 170 + (np ? np : 1) * 62 + 40 + 76;
     else if (choosing) H = 190 + (items ? items : 1) * 76 + 40 + 76;
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
@@ -1981,6 +2038,17 @@ void draw_save_sync(const View& v) {
         text_c(dl, X(W / 2), Y(50), 44 * k, kRed, tr(Tx::COMBO_INVALID));
         text_c(dl, X(W / 2), Y(122), 26 * k, kInk, tr(Tx::COMBO_INVALID_1));
         text_c(dl, X(W / 2), Y(160), 26 * k, kInk, tr(Tx::COMBO_INVALID_2));
+        if (sv.selected) {   // for this phase the mask names the players whose save carries an unfinished co-op record
+            char who[160] = "";
+            for (uint32_t i = 0; i < np; ++i)
+                if ((sv.selected >> (id_for_room_row(i) & 7)) & 1) {
+                    const size_t at = strlen(who);
+                    _snprintf_s(who + at, sizeof(who) - at, _TRUNCATE, "%s%s", at ? ", " : "", peers[i].name);
+                }
+            char line[360];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::COMBO_INVALID_3), who[0] ? who : "?");
+            wrap_text(dl, X(50), Y(204), (W - 100) * k, 22 * k, 28 * k, kInkSoft, line);
+        }
         // OK starts the round over on EVERY peer: nobody is left holding a pick the host refused.
         if (paper_button("hs_ok", ImVec2(X(W / 2 - 150), Y(H - 90)), ImVec2(X(W / 2 + 150), Y(H - 34)),
                          tr(Tx::OK_REPICK), 26 * k, true, Tone::Normal)) {
@@ -2063,7 +2131,7 @@ void draw_room_notice(const View& v) {
     char text[1024];
     if (!room_notice(text, sizeof(text))) return;
     const float k = v.k;
-    const float W = 820, H = 330;
+    const float W = 820, H = 410;   // room for the drop notice plus its fight sentence in the longer languages
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f - 60);
     const ImVec2 sz(W * k, H * k);
     if (!overlay_window_begin("##mgmp_room_notice", a, sz)) { ImGui::End(); return; }
@@ -2127,7 +2195,7 @@ void draw_settings_window(const View& v) {
 
 void draw_beta_notice(const View& v) {
     const float k = v.k;
-    const float W = 900, H = 640;
+    const float W = 900, H = 880;
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
     const ImVec2 sz(W * k, H * k);
     if (!modal_begin("##mgmp_beta")) return;
@@ -2200,6 +2268,27 @@ void draw_pw_prompt(const View& v) {
     if (paper_button("pw_cancel", ImVec2(X(W / 2 + 10), Y(H - 100)), ImVec2(X(W - 70), Y(H - 36)), tr(Tx::CANCEL), 30 * k)) {
         g.pw_ask = false; g.pw_wrong = false; g.pw_buf[0] = 0;
     }
+    ImGui::End();
+}
+
+// The notice before the project's small server is chosen as the carrier.
+void draw_relay_warn(const View& v) {
+    const float k = v.k;
+    const float W = 780, H = 420;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_relaywarn")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kInk, tr(Tx::TR_RELAY));
+    wrap_text(dl, X(60), Y(110), (W - 120) * k, 28 * k, 40 * k, kAmber, tr(Tx::TR_RELAY_WARN));
+    if (paper_button("rw_ok", ImVec2(X(60), Y(H - 100)), ImVec2(X(W / 2 - 10), Y(H - 36)), tr(Tx::TR_RELAY_OK), 28 * k, true, Tone::Good)) {
+        g.transport = 3; g.relay_warn = false;
+        log_line("MENU", "server relay chosen after the low-spec notice");
+    }
+    if (paper_button("rw_cancel", ImVec2(X(W / 2 + 10), Y(H - 100)), ImVec2(X(W - 60), Y(H - 36)), tr(Tx::CANCEL), 30 * k)) g.relay_warn = false;
     ImGui::End();
 }
 
@@ -2390,6 +2479,9 @@ void menu_draw() {
                 g.pw_ask = true; g.pw_wrong = g.pw_sent; g.pw_buf[0] = 0;
             } else if (!strcmp(code, "server")) {
                 say("%s", tr(Tx::PW_SERVER_OLD));
+            } else if (!strcmp(code, "relay_full")) {
+                int ru = 0, rm = 0; signal_relay_info(&ru, &rm);
+                say(tr(Tx::TR_RELAY_FULL), (unsigned)(rm > 0 ? rm : 10), (unsigned)(rm > 0 ? rm : 10));
             } else if (strcmp(code, "password") != 0 && signal_error()[0]) {
                 // Anything else the server refused (a room name that is taken, a full room ..): the player had to read the log to
                 // find out why the click did nothing.
@@ -2402,6 +2494,9 @@ void menu_draw() {
             g.pw_ask = false; g.pw_wrong = false; g.pw_buf[0] = 0;
         }
         if (g.pw_ask) draw_pw_prompt(v);
+        // ...and so does the server-relay notice
+        if (g.relay_warn && (g.win != Win::Multi || signal_state() != SignalState::Connected || in_room())) g.relay_warn = false;
+        if (g.relay_warn) draw_relay_warn(v);
     }
 
     // The first-run notice, once the title screen is up.

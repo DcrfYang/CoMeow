@@ -25,6 +25,7 @@ unsigned sends = 0, last_peer = 0, roster_releases = 0, roster_entries = 0, rost
 unsigned drained = 0;
 bool setup_ready = true, shared_setup = false, checkpoint_ready = true, connected = true;
 uint64_t resume_checkpoint = 0;
+bool needs_map = false; unsigned map_reports = 0, seeds_published = 0; uint64_t last_map_report = 0;
 std::vector<unsigned> sync_order;
 // THE LAST ENTERNODE SENT, and it has to live HERE.
 //
@@ -81,15 +82,18 @@ struct Fixture {
         if (from == 0) CHECK(m.catdata.data == nullptr);
         std::free(m.catdata.data);
     }
+    void hist(unsigned value) {   // the used-event list half of a snapshot (tune::kRunHist is on again: a node without it is an incomplete snapshot)
+        NetMsg hist{}; hist.type = MSG_RUNHIST; hist.from = 0;
+        hist.runhist.size = value; hist.runhist.data = (uint8_t*)std::calloc(value, 1);
+        CHECK(follow_hold_state(hist));
+        CHECK(hist.runhist.data == nullptr);
+    }
     void snapshot(unsigned value) {
         cat(value);
         NetMsg inv{}; inv.type = MSG_INVENTORY; inv.from = 0;
         inv.inventory.coins = value; inv.inventory.hash = value;
         CHECK(follow_hold_state(inv));
-        NetMsg hist{}; hist.type = MSG_RUNHIST; hist.from = 0;
-        hist.runhist.size = value; hist.runhist.data = (uint8_t*)std::calloc(value, 1);
-        CHECK(follow_hold_state(hist));
-        CHECK(hist.runhist.data == nullptr);
+        hist(value);
     }
 };
 void queued_snapshots() {
@@ -285,6 +289,7 @@ void peer_updates_do_not_starve_local_publish() {
     CHECK(follow_map_update(f.map) == nullptr && map_publishes == 13);
     // Once ENTERNODE arrives, preserve its batch and stop publishing across
     // that boundary, even while the follower's artificial delay is active.
+    f.hist(2);
     follow_on_message(f.node(1));
     cfg.net_follow_delay_ms = 100000;
     CHECK(follow_map_update(f.map) == nullptr && map_publishes == 13);
@@ -294,7 +299,7 @@ void peer_updates_do_not_starve_local_publish() {
 }
 void first_join_still_waits_for_snapshot() {
     Fixture f;
-    f.cat(11);
+    f.cat(11); f.hist(1);
     CHECK(follow_map_update(f.map) == nullptr);
     CHECK(map_publishes == 0);
     follow_on_message(f.node(0));
@@ -464,11 +469,19 @@ namespace mgmp {
 const Config& config() { return cfg; }
 NetRole net_role() { return role; }
 bool net_active() { return connected; }
+uint8_t net_self(){return 0;}
 uint8_t net_peer_count(){return 4;}
 bool net_peer_ids(uint8_t* ids,uint8_t cap){if(cap<4)return false;for(unsigned i=0;i<4;++i)ids[i]=(uint8_t)i;return true;}
 bool checkpoint_can_enter() { return checkpoint_ready; }
-bool checkpoint_needs_map() { return false; }
-void checkpoint_on_map(uint64_t) {}
+bool checkpoint_needs_map() { return needs_map; }
+void checkpoint_on_map(uint64_t h) { ++map_reports; last_map_report = h; }
+unsigned unlock_publishes = 0, unlock_windows = 0;
+void unlocks_publish() { ++unlock_publishes; }
+void unlocks_window_open(const char*, bool) { ++unlock_windows; }
+void unlocks_on_map(bool) {}
+bool net_send_mapseeds(const MapSeedsMsg&) { ++seeds_published; return true; }
+int room_troubles = 0;
+void room_sync_trouble(const char*) { ++room_troubles; }   // a sync that ran out of time tells the player (mgmp_room)
 void checkpoint_on_node(uint64_t,uint32_t) {}
 bool setup_runtime_ready() { return setup_ready; }
 bool setup_has_shared_roster() { return shared_setup; }
@@ -514,7 +527,71 @@ void relayed_cat_ownership(){
  m.type=MSG_INVENTORY;CHECK(follow_hold_state(m));
  m.type=MSG_RUNHIST;CHECK(follow_hold_state(m));
 }
+// A client whose map has the host's structure but other seeds adopts the host's seeds BEFORE it reports the map; it waits for them; a structure that
+// differs is left alone.
+void map_seed_sync_adopts() {
+    for (int variant = 0; variant < 3; ++variant) {
+        Fixture f;
+        needs_map = true; map_reports = 0; seeds_published = 0;
+        auto send = [&](uint32_t epoch, uint32_t total, uint8_t type) {
+            for (uint32_t first = 0; first < total; first += kMapSeedsChunk) {
+                MapSeedsMsg m{};
+                m.epoch = epoch; m.total = total; m.first = first;
+                m.count = (uint8_t)((total - first) < kMapSeedsChunk ? (total - first) : kMapSeedsChunk);
+                for (uint32_t i = 0; i < m.count; ++i) { m.nodes[i].type = type; for (int k = 0; k < 4; ++k) m.nodes[i].seed[k] = 9000 + (first + i) * 10 + k; m.nodes[i].flags = ((first + i) % 3 == 0) ? 1u : 0u; }
+                follow_on_mapseeds(0, m);
+            }
+        };
+        auto seed_of = [&](unsigned i) { uint64_t v = 0; std::memcpy(&v, f.nodes[i] + 0x118, 8); return v; };
+        follow_map_update(f.map);
+        CHECK(map_reports == 0);                          // waiting for the host: nothing is reported yet
+        if (variant == 0) {                               // same structure: adopted, then reported
+            send(5, 12, 9);
+            follow_map_update(f.map);
+            CHECK(map_reports == 1);
+            for (unsigned i = 0; i < 12; ++i) CHECK(seed_of(i) == 9000 + i * 10);
+            for (unsigned i = 0; i < 12; ++i) { uint32_t fl = 0; std::memcpy(&fl, f.nodes[i] + 0x168, 4); CHECK(fl == ((i % 3 == 0) ? 1u : 0u)); }   // the host's merged flags
+            follow_map_update(f.map); CHECK(map_reports == 2 && seed_of(3) == 9030);   // already synced: no second wait
+        } else if (variant == 1) {                        // other node count: not touched, still reported
+            send(6, 10, 9);
+            follow_map_update(f.map);
+            CHECK(map_reports == 1 && seed_of(0) == 100);
+        } else {                                          // other node types: not touched
+            send(7, 12, 5);
+            follow_map_update(f.map);
+            CHECK(map_reports == 1 && seed_of(0) == 100);
+        }
+        needs_map = false;
+    }
+}
+// THE HOST'S FLAGS ARE THE MAP'S (2026-10-03, the user's rule): the host publishes its own node locks without waiting for the clients and without merging theirs into it (it used
+// to OR them in, so a node a client had locked locked the host too). A client's report, when it comes, changes nothing.
+void map_sync_host_merges() {
+    Fixture f;
+    role = NetRole::Host; follow_init();
+    needs_map = true; map_reports = 0; seeds_published = 0;
+    put(f.nodes[1], 0x168, uint32_t(1));                  // locked on the host
+    auto flag_of = [&](unsigned i) { uint32_t v = 0; std::memcpy(&v, f.nodes[i] + 0x168, 4); return v; };
+    auto report = [&](uint8_t from, unsigned at, uint32_t flag) {
+        for (uint32_t first = 0; first < 12; first += kMapSeedsChunk) {
+            MapSeedsMsg m{};
+            m.kind = kMapSeedsFromClient; m.epoch = 10u + from; m.total = 12; m.first = first;
+            m.count = (uint8_t)((12 - first) < kMapSeedsChunk ? (12 - first) : kMapSeedsChunk);
+            for (uint32_t i = 0; i < m.count; ++i) { m.nodes[i].type = 9; m.nodes[i].flags = (first + i == at) ? flag : 0u; }
+            follow_on_mapseeds(from, m);
+        }
+    };
+    report(1, 2, 0x100); report(3, 5, 0x10000);           // two clients lock nodes the host has open
+    follow_map_update(f.map);                             // no waiting for client 2, which never reports
+    CHECK(map_reports == 1 && seeds_published == 2);      // 12 nodes: two chunks
+    CHECK(flag_of(1) == 1 && flag_of(2) == 0 && flag_of(5) == 0 && flag_of(0) == 0 && flag_of(7) == 0);   // the host's own locks only
+    follow_map_update(f.map);
+    CHECK(seeds_published == 2);                          // once per map
+    needs_map = false; role = NetRole::Client;
+}
 int main() {
+    map_seed_sync_adopts();
+    map_sync_host_merges();
     relayed_cat_ownership();
     queued_snapshots(); coalesce_only_within_batch(); gates_and_failures();
     reset_and_untrusted_sender(); overflow_and_host_failure();

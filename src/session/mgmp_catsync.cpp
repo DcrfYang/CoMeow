@@ -534,6 +534,16 @@ static bool cat_data_perished(const void* cat) {
     return mem_read((const uint8_t*)cat + kCatData_Flags, &flags, sizeof(flags)) && (flags & kCatFlag_Perished) != 0;
 }
 
+uint64_t catsync_image_hash(void* cat) {
+    ensure_state();
+    if (!cat) return 0;
+    uint8_t* bytes = nullptr;
+    const uint32_t n = serialize_cat(cat, &bytes);
+    const uint64_t h = n && bytes ? fnv1a(bytes, n) : 0;
+    free(bytes);
+    return h;
+}
+
 bool catsync_cat_exists(uint64_t id) {
     ensure_state();
     if (!g.resolved || !g.director_slot) return false;
@@ -881,7 +891,54 @@ void adopted_clear(uint64_t id) {
         if (g_adopted[i] == id) { g_adopted[i] = g_adopted[--g_adopted_n]; return; }
 }
 
-struct Origin { uint64_t id = 0; void* cat = nullptr; bool legacy = false; unsigned ordinary_away = 0, ordinary_home = 0, legacy_away = 0; };
+struct Origin { uint64_t id = 0; void* cat = nullptr; bool legacy = false; unsigned ordinary_away = 0, ordinary_home = 0, legacy_away = 0; void* home_cat = nullptr; };
+
+// Clone id -> the original it was swapped into (swap_identity), kept so the House's entities -- which carry their OWN id, written to house_state -- can be put right.
+struct SwapNote { uint64_t clone = 0, original = 0; };
+SwapNote g_swaps[32];
+uint32_t g_swaps_n = 0;
+void swap_note(uint64_t clone, uint64_t original) {
+    for (uint32_t i = 0; i < g_swaps_n; ++i) if (g_swaps[i].clone == clone) { g_swaps[i].original = original; return; }
+    if (g_swaps_n < 32) g_swaps[g_swaps_n++] = { clone, original };
+    else { memmove(g_swaps, g_swaps + 1, sizeof(g_swaps) - sizeof(SwapNote)); g_swaps[31] = { clone, original }; }
+}
+
+// The registry's list node of an id ({next, prev, key, CatData*}); null when the id is not there.
+uint8_t* registry_node(const void* registry, uint64_t id) {
+    const uint8_t* table = (const uint8_t*)registry + 0xE8;
+    const uint8_t* head = nullptr;
+    const uint8_t* n = nullptr;
+    if (!mem_read(table + 8, &head, sizeof(head)) || !head || !mem_read(head, &n, sizeof(n))) return nullptr;
+    for (unsigned guard = 0; n && n != head && guard < 20000; ++guard) {
+        RegNode node{};
+        if (!mem_read(n, &node, sizeof(node))) return nullptr;
+        if (node.key == id) return (uint8_t*)n;
+        n = node.next;
+    }
+    return nullptr;
+}
+
+// THE HOUSE KEEPS THE CLONE (2026-10-03). The native settlement puts the SETTLED CLONES into the House (and so into the save's house_state, by id); the
+// originals stay out of the House. Copying the clone's progress onto the original and zeroing the clone's flags (the way this used to work) left the House
+// holding a clone with flags 0: the next load put it back as a live cat (flags 1, NOT retired -- it could go out again, a twin of the retired original), and
+// the original, absent from house_state, was not loaded at all. So the two cats swap IDENTITIES instead: the registry entries and the saved ids are
+// exchanged, the object the House already holds (the clone, with everything the run did to it, flags 3) becomes the original's id, and the old original
+// object becomes the clone slot (retired afterwards by the caller). The House, the save and the registry then agree, as after a solo run.
+bool swap_identity(const void* registry, uint64_t clone_id, void* clone, uint64_t orig_id, void* orig) {
+    uint8_t* nc = registry_node(registry, clone_id);
+    uint8_t* no = registry_node(registry, orig_id);
+    if (!nc || !no || nc == no) return false;
+    void* vc = nullptr; void* vo = nullptr;
+    if (!mem_read(nc + 0x18, &vc, sizeof(vc)) || !mem_read(no + 0x18, &vo, sizeof(vo)) || vc != clone || vo != orig) return false;
+    uint64_t sc = 0, so = 0;
+    if (!mem_read((uint8_t*)clone + kCatData_SaveId, &sc, sizeof(sc)) || !mem_read((uint8_t*)orig + kCatData_SaveId, &so, sizeof(so)) || sc != clone_id || so != orig_id) return false;
+    const bool ok = mem_write(nc + 0x18, &orig, sizeof(orig)) && mem_write(no + 0x18, &clone, sizeof(clone)) &&
+                    mem_write((uint8_t*)clone + kCatData_SaveId, &orig_id, sizeof(orig_id)) && mem_write((uint8_t*)orig + kCatData_SaveId, &clone_id, sizeof(clone_id));
+    if (ok) return true;
+    mem_write(nc + 0x18, &clone, sizeof(clone)); mem_write(no + 0x18, &orig, sizeof(orig));          // put everything back
+    mem_write((uint8_t*)clone + kCatData_SaveId, &clone_id, sizeof(clone_id)); mem_write((uint8_t*)orig + kCatData_SaveId, &orig_id, sizeof(orig_id));
+    return false;
+}
 
 // The cat a clone was made from, found by its seed (a clone is a byte copy, so the seed is the same; it is unique among
 // ordinary cats). An ORDINARY cat is preferred; failing that, a leftover session cat of an older build (slot above
@@ -899,14 +956,15 @@ bool find_origin_by_seed(const void* registry, uint64_t seed, const uint64_t* bu
         const bool away = (flags & kCatFlag_OnAdventure) != 0;
         // Only a cat that is OUT on adventure can be the original of a clone: a cat at home with the same seed is a
         // copy (an adopted clone) or a cat somebody played on, and must never be written over or make the match ambiguous.
-        if (!is_session_range(key)) { if (away) { ++out.ordinary_away; o_ord = {key, cat, false}; } else ++out.ordinary_home; return; }
+        if (!is_session_range(key)) { if (away) { ++out.ordinary_away; o_ord = {key, cat, false}; } else { ++out.ordinary_home; out.home_cat = cat; } return; }
         if ((key & 0xFFFFFF) > kCloneSlots && away) { ++out.legacy_away; o_leg = {key, cat, true}; }
     });
     if (!walked) return false;
     const unsigned oa = out.ordinary_away, oh = out.ordinary_home, la = out.legacy_away;
-    if (oa) { if (oa != 1) return false; out = o_ord; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; return true; }
+    void* const hc = out.home_cat;
+    if (oa) { if (oa != 1) return false; out = o_ord; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; out.home_cat = hc; return true; }
     if (la != 1) return false;
-    out = o_leg; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; return true;
+    out = o_leg; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; out.home_cat = hc; return true;
 }
 
 // The highest id among ORDINARY cats (0 when the walk fails).
@@ -1009,6 +1067,51 @@ static void settle_audit(const void* registry, const uint8_t* dir, const char* w
                  why, n_away, away[0] ? away : " -", n_mine, mine[0] ? mine : " -");
 }
 
+namespace {
+// POD-only (SEH).
+bool call_save_game(uintptr_t fn, const void* director) {
+    __try { ((void(__fastcall*)(const void*))fn)(director); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+}
+
+bool catsync_save_game(const char* why) {
+    ensure_state();
+    const uintptr_t fn = addr_of_call(C_SaveGame);
+    const void* director = nullptr;
+    if (!fn || !g.director_slot || !mem_read(g.director_slot, &director, sizeof(director)) || !director) {
+        log_line_lvl(LogLevel::Warn, "CATSYNC", "!! save (%s): MewDirector::SaveGame is not available -- the file on disk keeps the settlement's own save", why ? why : "");
+        return false;
+    }
+    const bool ok = call_save_game(fn, director);
+    log_line_lvl(ok ? LogLevel::Info : LogLevel::Error, "CATSYNC", "save (%s): the game's own save was written again after the clone merge (%s)", why ? why : "", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+void catsync_house_save(void* house) {
+    if (!g_swaps_n || !house) return;
+    // The writer (sub_1401E6810) reads the entity list from ((house+0x18)->+8)->+0x20 -> +0x4480: a vector {.. count at +0xC, element pointers at +0x10}; each entity's id is at +0x80.
+    const uint8_t* a = nullptr; const uint8_t* b = nullptr; const uint8_t* c = nullptr; const uint8_t* vec = nullptr;
+    if (!mem_read((const uint8_t*)house + 0x18, &a, sizeof(a)) || !a || !mem_read(a + 8, &b, sizeof(b)) || !b ||
+        !mem_read(b + 0x20, &c, sizeof(c)) || !c || !mem_read(c + 0x4480, &vec, sizeof(vec)) || !vec) return;
+    uint32_t count = 0; const uint8_t* const* data = nullptr;
+    if (!mem_read(vec + 0xC, &count, sizeof(count)) || !count || count > 4096 || !mem_read(vec + 0x10, &data, sizeof(data)) || !data) return;
+    unsigned fixed = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t* ent = nullptr; uint64_t id = 0;
+        if (!mem_read(data + i, &ent, sizeof(ent)) || !ent || !mem_read(ent + 0x80, &id, sizeof(id)) || !is_session_range(id)) continue;
+        for (uint32_t k = 0; k < g_swaps_n; ++k) {
+            if (g_swaps[k].clone != id) continue;
+            if (mem_write((uint8_t*)ent + 0x80, &g_swaps[k].original, sizeof(uint64_t))) {
+                ++fixed;
+                log_line("CATSYNC", "house save: the House's cat entity %016llx is written as %016llx (the cat it was swapped into)", (unsigned long long)id, (unsigned long long)g_swaps[k].original);
+            }
+            break;
+        }
+    }
+    (void)fixed;
+}
+
 unsigned catsync_merge_session_cats(const char* why) {
     ensure_state();
     if (!g.on || !g.import_ready || !g.director_slot || net_peer_pos() >= kMaxPeers) return 0;
@@ -1084,15 +1187,48 @@ unsigned catsync_merge_session_cats(const char* why) {
         if (!have_origin)
             log_line("CATSYNC", "merge (%s): session cat %016llx (seed %llx): originals out on adventure: %u ordinary, %u older clone(s); at home with that seed: %u",
                      why, (unsigned long long)id, (unsigned long long)seed, o.ordinary_away, o.legacy_away, o.ordinary_home);
+        // A live clone whose original is AT HOME already (the merge returned it before, and the game put the clone's flags back -- or an older build
+        // left it live) is a DUPLICATE of a cat that exists: keeping it as a new cat gave a second, identical cat WITHOUT the retired mark (flags 1, the
+        // original's 3), which the adventure box accepts although the cat has been on its adventure (2026-10-03 live: "returned cats are not retired and
+        // can go out again"). It is only retired again.
+        bool twin = false;                                            // exactly ONE cat at home with this seed, and it is the clone's image but for the flags
+        if (!have_origin && o.ordinary_home == 1 && o.home_cat) {
+            uint64_t cf = 0, hf = 0;
+            uint8_t* a = nullptr; uint8_t* b = nullptr;
+            if (mem_read((uint8_t*)clone + kCatData_Flags, &cf, sizeof(cf)) && mem_read((uint8_t*)o.home_cat + kCatData_Flags, &hf, sizeof(hf)) &&
+                mem_write((uint8_t*)clone + kCatData_Flags, &hf, sizeof(hf))) {              // same flags on both for the comparison, put back right after
+                const uint32_t sa = serialize_cat(clone, &a);
+                mem_write((uint8_t*)clone + kCatData_Flags, &cf, sizeof(cf));
+                const uint32_t sb = serialize_cat(o.home_cat, &b);
+                twin = sa && sa == sb && a && b && memcmp(a, b, sa) == 0;
+            }
+            free(a); free(b);
+        }
+        if (twin) {
+            const uint64_t zero = 0;
+            mem_write((uint8_t*)clone + kCatData_Flags, &zero, sizeof(zero));
+            origin_forget(id);
+            log_line_lvl(LogLevel::Warn, "CATSYNC", "!! merge (%s): session cat %016llx (flags %llx) is a live duplicate of %u cat(s) already at home -- retired again, NOT kept as a new cat",
+                         why, (unsigned long long)id, (unsigned long long)flags, o.ordinary_home);
+            continue;
+        }
 
         uint8_t* image = nullptr;
         const uint32_t size = serialize_cat(clone, &image);
         if (!size || !image) { free(image); continue; }
         uint64_t target = 0;
         bool ok = false;
+        bool swapped = false;
         if (have_origin) {
             uint8_t* backup = nullptr;
-            const uint32_t bsize = serialize_cat(o.cat, &backup);   // so a failed write can be undone
+            // A cat that survived: the clone the House holds BECOMES the original (see swap_identity). A dead one has nothing in the House: its image is copied.
+            if (!clone_dead && swap_identity(registry, id, clone, o.id, o.cat)) {
+                swapped = true; ok = true;
+                swap_note(id, o.id);
+                std::swap(clone, o.cat);                            // from here `o.cat` is the object that carries the progress, `clone` the old original (retired below)
+            }
+            const uint32_t bsize = swapped ? 0 : serialize_cat(o.cat, &backup);   // so a failed write can be undone
+            if (!swapped)
             ok = bsize && backup && reset_cat(o.cat) && catsync_deserialize_into(o.cat, image, size) &&
                  mem_write((uint8_t*)o.cat + kCatData_SaveId, &o.id, sizeof(o.id)) && post_load_cat(o.cat);
             if (!ok && bsize && backup) {                           // put the original back as it was
@@ -1125,18 +1261,37 @@ unsigned catsync_merge_session_cats(const char* why) {
                 }
                 if (recorded) ++by_record; else ++by_seed;
                 origin_forget(id);
-                log_line("CATSYNC", "merge (%s): session cat %016llx returned to %016llx%s%s%s (flags %llx -> %llx), clone retired",
+                log_line("CATSYNC", "merge (%s): session cat %016llx returned to %016llx%s%s%s%s (flags %llx -> %llx), clone retired",
                          why, (unsigned long long)id, (unsigned long long)o.id, o.legacy ? " (an older build's clone)" : "",
-                         recorded ? " [by the recorded origin]" : " [by seed]", clone_dead ? " [DEAD]" : "",
+                         recorded ? " [by the recorded origin]" : " [by seed]", clone_dead ? " [DEAD]" : "", swapped ? " [identities swapped: the House's cat is now the original]" : "",
                          (unsigned long long)oflags, (unsigned long long)now);
             }
         } else {
             ok = adopt_as_new_cat(registry, image, size, target);
             if (ok) { adopted_note(id); ++as_new; origin_forget(id); }
+            if (ok && !clone_dead) {
+                // THE HOUSE HOLDS THE CLONE HERE TOO (2026-10-03, host: one cat lost its retired mark after the reload). The adopted copy is a new object nobody shows, and the
+                // House (and house_state) still name the clone's id: on the next load the clone slot came back alive, not retired. So the same identity swap as for an original:
+                // the object the House holds becomes the new cat, the fresh copy takes the clone slot (and is retired below).
+                void* adopted = nullptr;
+                if (safe_by_id((void*)registry, target, &adopted) && adopted && swap_identity(registry, id, clone, target, adopted)) {
+                    swap_note(id, target);
+                    std::swap(clone, adopted);
+                    log_line("CATSYNC", "merge (%s): session cat %016llx is now the new cat %016llx [identities swapped: the House's cat is the new cat]",
+                             why, (unsigned long long)id, (unsigned long long)target);
+                }
+            }
             if (ok) {
                 void* nc = nullptr; uint64_t nf = 0;
-                if (safe_by_id((void*)registry, target, &nc) && nc && mem_read((uint8_t*)nc + kCatData_Flags, &nf, sizeof(nf)))
+                if (safe_by_id((void*)registry, target, &nc) && nc && mem_read((uint8_t*)nc + kCatData_Flags, &nf, sizeof(nf))) {
+                    // A cat that comes out of a run has been on its adventure: it is RETIRED (flag 2, set by the native settlement; a clone the game put back to
+                    // life has lost it). Without it the adventure box takes the cat again.
+                    if ((nf & 1) && !(nf & 0x32) && !clone_dead) {
+                        const uint64_t fixed = nf | 2;
+                        if (mem_write((uint8_t*)nc + kCatData_Flags, &fixed, sizeof(fixed))) { log_line("CATSYNC", "merge (%s): the new cat %016llx had lost its retired mark -- flags %llx -> %llx", why, (unsigned long long)target, (unsigned long long)nf, (unsigned long long)fixed); nf = fixed; }
+                    }
                     log_line("CATSYNC", "merge (%s): the new cat %016llx carries flags %llx", why, (unsigned long long)target, (unsigned long long)nf);
+                }
             }
             if (ok) log_line("CATSYNC", "merge (%s): session cat %016llx has no usable original -- kept as the NEW cat %016llx",
                              why, (unsigned long long)id, (unsigned long long)target);

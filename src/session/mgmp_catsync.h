@@ -148,6 +148,9 @@ bool catsync_cat_perished(uint64_t id);
 
 // Is there a cat with this id in the game's registry? (A cat gained during the run -- the gain_cat_familiar event -- is one.)
 bool catsync_cat_exists(uint64_t id);
+
+// FNV-1a of a cat's serialized image -- the hash CATDATA carries; 0 when it cannot be serialized. For logs.
+uint64_t catsync_image_hash(void* cat);
 // Capture the four cats currently selected in this peer's local setup. The
 // returned images are owned by the caller and must be freed with free().
 bool catsync_export_party_setup(SetupMsg& out);
@@ -166,6 +169,15 @@ bool catsync_prepare_settlement(void* director);
 // after the native settlement and, as a safety net for saves the old behaviour left behind, before a new run's
 // clones are made. Returns how many clones were merged.
 unsigned catsync_merge_session_cats(const char* why);
+
+// The House is about to write its state (T_HouseSave; `house` = the writer's first argument). Every House cat entity whose id is a clone's that the merge swapped into its original
+// gets the ORIGINAL's id, so `house_state` names the cats that came home -- see swap_identity.
+void catsync_house_save(void* house);
+
+// THE SAVE THE NATIVE SETTLEMENT WRITES IS NOT THE ONE THAT COUNTS (2026-10-03). MewDirector::SaveGame is the settlement's own last step, and it runs BEFORE the clone merge: the file on disk then
+// holds the settled CLONES under their session ids, the originals still "on adventure", and a house_state naming the clones. A player who reloads before anything saves again got the
+// un-retired originals back. After a merge that changed anything, the game's own SaveGame is called once more (the House state writer hook puts the House's ids right inside it).
+bool catsync_save_game(const char* why);
 
 // WHICH ORIGINAL A CLONE CAME FROM, REMEMBERED (2026-10-02). The merge used to find an original by its seed among cats flagged "out on
 // adventure" -- fine from the warehouse, but a run resumed from a handshake save may no longer offer that evidence. The setup now

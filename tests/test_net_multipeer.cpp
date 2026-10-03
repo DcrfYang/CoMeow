@@ -38,7 +38,7 @@ int run(bool host,unsigned port){
             net_msg_release(m);
         }
         if(sent && (seen|(1u<<net_self()))==15){
-            if(!host){HashMsg h{};acked=net_send_hash(h);if(acked){result=0;break;}}
+            if(!host){HashMsg h{};acked=net_send_hash(h);if(acked){result=0;Sleep(300);break;}}   // let the frame leave before the socket is closed: without it the host sometimes counted 10 or 12 of 14 acknowledgements (a test race, not a network loss)
             else if((done&14)==14){result=0;break;}
         }
         Sleep(1);

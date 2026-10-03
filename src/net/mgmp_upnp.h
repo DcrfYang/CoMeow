@@ -24,5 +24,8 @@ void upnp_update();                    // game thread, once per frame: renews th
 UpnpState   upnp_state();
 const char* upnp_external_ip();        // the router's WAN address when it said so, else ""
 const char* upnp_error();              // a short English reason when Failed
+// The router accepted the mapping but its own WAN address is private (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16): it sits behind
+// ANOTHER NAT (a second router or the carrier's), so the forward cannot be reached from the internet. State is Failed in that case.
+bool        upnp_double_nat();
 
 } // namespace mgmp

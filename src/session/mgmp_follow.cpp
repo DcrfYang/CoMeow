@@ -8,6 +8,8 @@
 #include "mgmp_nodesnapshot.h"
 #include "mgmp_runhist.h"
 #include "mgmp_follow.h"
+#include "mgmp_unlocks.h"
+#include "mgmp_room.h"
 #include "mgmp_roster.h"     // roster_tick -- the run edit point is this tick
 #include "mgmp_lockstep.h"
 #if defined(MGMP_WITH_SETUP)
@@ -256,6 +258,8 @@ uint64_t node_seed0(void* node) {
 
 // ---------------------------------------------------------------------------
 
+void follow_seed_sync_reset();   // the map seed sync below
+
 void follow_init() {
     if (!g.cs_ready) { InitializeCriticalSection(&g.cs); g.cs_ready = true; }
     g.on        = config().net_follow;
@@ -295,6 +299,7 @@ void follow_init() {
 
 void follow_reset_run() {
     Guard guard;
+    follow_seed_sync_reset();
     pending_clear();
     roster_party_swap_reset();
     g.map = nullptr;
@@ -439,6 +444,7 @@ void follow_after_enter_node() {
 }
 
 void follow_shutdown() {
+    follow_seed_sync_reset();
     pending_clear();
     if (!g.on) return;
     log_line_lvl(LogLevel::Trace, "FOLLOW",
@@ -605,6 +611,7 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
                            " adopt it", index);
     memcpy(m.seed, words, sizeof(m.seed));
     m.seed[0] = seed;
+    if (type >= 5 && type <= 11) unlocks_publish();   // battles and events: the clients answer from the host's unlock answers and event properties (shops and chests stay personal)
     if (!net_send_enter_node(m)) {
         g.faulted = true;
         log_line_lvl(LogLevel::Error, "FOLLOW", "!! node %u could not be sent -- NOT entered", index);
@@ -1313,6 +1320,9 @@ uint64_t follow_resume_checkpoint(void* map) {
         for (size_t i = 0; i < n; ++i) { h ^= bytes[i]; h *= 0x100000001b3ull; }
     };
     hash_bytes(&count, sizeof(count));
+    char types[130] = {};   // the node types in order, for the log: two maps that differ say where
+    char firsts[24 * 17 + 1] = {};   // each node's first seed word (up to 24 nodes), for the same reason
+    char extra[24 * 22 + 1] = {};    // each node's consumed dword and a fold of seed words 1..3
     for (uint32_t i = 0; i < count; ++i) {
         void* node = node_at(map, i);
         uint64_t seeds[4] = {};
@@ -1321,11 +1331,192 @@ uint64_t follow_resume_checkpoint(void* map) {
             !mem_read((uint8_t*)node + kNode_Type, &type, 4) ||
             !mem_read((uint8_t*)node + kNode_Consumed, &consumed, 4)) return 0;
         hash_bytes(seeds, sizeof(seeds)); hash_bytes(&type, 4); hash_bytes(&consumed, 4);
+        if (i < 128) types[i] = (char)(type < 10 ? '0' + type : 'a' + (type - 10) % 26);
+        if (i < 24) _snprintf_s(firsts + i * 17, 18, _TRUNCATE, "%016llx ", (unsigned long long)seeds[0]);
+        if (i < 24) _snprintf_s(extra + i * 22, 23, _TRUNCATE, "%u:%016llx ", consumed, (unsigned long long)(seeds[1] ^ (seeds[2] * 31) ^ (seeds[3] * 131)));
+    }
+    static uint64_t logged = 0;
+    if (h && h != logged) {
+        logged = h;
+        log_line("FOLLOW", "map %016llx: %u node(s), types %s -- compare with the other peer: a refused checkpoint means these differ", (unsigned long long)h, count, types);
+        log_line("FOLLOW", "map %016llx: node seed words %s", (unsigned long long)h, firsts);
+        log_line("FOLLOW", "map %016llx: consumed:fold(seed words 1..3) per node: %s", (unsigned long long)h, extra);
     }
     return h ? h : 1;
 }
 
+// ---- THE MAP SYNC ---------------------------------------------------------------------------------------------------------------------------
+//
+// Two peers with different saves generate the same map STRUCTURE (the log says "22 node(s), types ..." on both) and different node SEEDS, and different
+// lock bytes: generate_map flags the nodes that are locked for THIS player's unlock progress (the hard path, the sewers and junkyard exits, ...) in the
+// dword at MapNode+0x168, which the checkpoint hash covers. The checkpoint therefore refused the pair at node 0 and the run sat there.
+//
+//   * SEEDS: the host is the authority -- it publishes every node's type and 32-byte seed, a client with the same structure overwrites its own.
+//   * LOCKS: the least progress decides. Every client reports its flag dwords to the host first; the host ORs them with its own (a node locked for
+//     anybody is locked for everybody), writes the result into its map, and publishes it together with the seeds; the clients overwrite theirs.
+//
+// A structure that does not match is not touched, and says so. Everybody waits for the other side a few seconds at most.
+namespace {
+struct Report {                              // a client's flags as the host holds them
+    uint32_t epoch = 0, total = 0, got = 0, used_epoch = 0;
+    bool     have[kMapSeedsMaxNodes] = {};
+    uint8_t  type[kMapSeedsMaxNodes] = {};
+    uint32_t flags[kMapSeedsMaxNodes] = {};
+};
+struct SeedSync {
+    // client: what the host published
+    uint32_t epoch = 0, total = 0, got = 0;
+    bool     have[kMapSeedsMaxNodes] = {};
+    MapSeedNode node[kMapSeedsMaxNodes] = {};
+    uint32_t applied_epoch = 0;
+    void*    applied_map = nullptr;
+    void*    reported_map = nullptr;         // the map this client has sent its flags for
+    void*    waiting_map = nullptr;
+    ULONGLONG waiting_since = 0;
+    // host
+    Report   rep[kMaxPeers];                 // by transport id
+    uint64_t published_hash = 0;
+    void*    host_map = nullptr;
+    ULONGLONG host_since = 0;
+    bool     merged = false;
+} ss;
+constexpr ULONGLONG kSeedWaitMs = tune::kSeedWaitMs;
+constexpr uintptr_t kNodeFlagsDword = 0x168;
+
+} // namespace
+
+void follow_seed_sync_reset() { ss = SeedSync{}; }
+
+void follow_on_mapseeds(uint8_t from, const MapSeedsMsg& m) {
+    if (!valid_mapseeds(m)) return;
+    if (!g.is_client) {                                   // the host: a client's flags
+        if (m.kind != kMapSeedsFromClient || from >= kMaxPeers) return;
+        Report& r = ss.rep[from];
+        if (m.epoch != r.epoch) { const uint32_t used = r.used_epoch; r = Report{}; r.used_epoch = used; r.epoch = m.epoch; r.total = m.total; }
+        if (m.total != r.total) return;
+        for (uint32_t i = 0; i < m.count; ++i) {
+            const uint32_t at = m.first + i;
+            if (at >= kMapSeedsMaxNodes) return;
+            if (!r.have[at]) { r.have[at] = true; ++r.got; }
+            r.type[at] = m.nodes[i].type; r.flags[at] = m.nodes[i].flags;
+        }
+        return;
+    }
+    if (from != kHostPeer || m.kind != kMapSeedsFromHost) return;
+    if (m.epoch != ss.epoch) {                            // a new publication replaces the old one
+        ss.epoch = m.epoch; ss.total = m.total; ss.got = 0;
+        memset(ss.have, 0, sizeof(ss.have));
+    }
+    if (m.total != ss.total) return;
+    for (uint32_t i = 0; i < m.count; ++i) {
+        const uint32_t at = m.first + i;
+        if (at >= kMapSeedsMaxNodes) return;
+        if (!ss.have[at]) { ss.have[at] = true; ++ss.got; }
+        ss.node[at] = m.nodes[i];
+    }
+}
+
+namespace {
+
+bool read_flags(void* node, uint32_t& v) { return node && mem_read((const uint8_t*)node + kNodeFlagsDword, &v, sizeof(v)); }
+
+// Sends this map's per-node data in chunks. `seeds` false: only types and flags (a client's report).
+bool send_map(void* map, uint32_t count, uint8_t kind, uint32_t epoch, const uint32_t* flags_override) {
+    for (uint32_t first = 0; first < count; first += kMapSeedsChunk) {
+        MapSeedsMsg m{};
+        m.kind = kind; m.epoch = epoch; m.total = count; m.first = first;
+        m.count = (uint8_t)((count - first) < kMapSeedsChunk ? (count - first) : kMapSeedsChunk);
+        for (uint32_t i = 0; i < m.count; ++i) {
+            void* node = node_at(map, first + i);
+            uint32_t fl = 0;
+            if (!node || !read_flags(node, fl)) return false;
+            if (kind == kMapSeedsFromHost && !mem_read((const uint8_t*)node + kNode_Seed, m.nodes[i].seed, sizeof(m.nodes[i].seed))) return false;
+            m.nodes[i].type = (uint8_t)node_type(node);
+            m.nodes[i].flags = flags_override ? flags_override[first + i] : fl;
+        }
+        if (!net_send_mapseeds(m)) return false;
+    }
+    return true;
+}
+
+// True when this map may be reported to the checkpoint now.
+bool map_seed_sync(void* map) {
+    if (!g.on || !map) return true;
+    uint32_t count = 0; void* data = nullptr;
+    if (!read_nodes(map, count, data) || count > kMapSeedsMaxNodes) return true;
+    const ULONGLONG now = GetTickCount64();
+
+    if (!g.is_client) {
+        if (!net_active()) return true;
+        if (ss.host_map != map) { ss.host_map = map; ss.host_since = now; ss.merged = false; }
+        if (!ss.merged) {
+            // THE HOST'S FLAGS ARE THE MAP'S (2026-10-03, the user's rule): a node a client has not unlocked does not lock the host -- the host leads the others in. Nothing of the
+            // clients' reports is merged and nobody is waited for; the clients overwrite their own flags with the published ones (the adoption below).
+            for (int k = 0; k < kMaxPeers; ++k) ss.rep[k].used_epoch = ss.rep[k].epoch;
+            ss.merged = true;
+            log_line("FOLLOW", "map flags: this (host) map's own node locks stand; the clients' are not merged into it");
+        }
+        const uint64_t h = follow_resume_checkpoint(map);
+        if (!h || h == ss.published_hash) return true;
+        if (!send_map(map, count, kMapSeedsFromHost, (uint32_t)GetTickCount() | 1u, nullptr)) return true;   // not recorded: the next tick tries again
+        ss.published_hash = h;
+        log_line("FOLLOW", "published this map's %u node seed(s) and flags to the clients (map %016llx)", count, (unsigned long long)h);
+        return true;
+    }
+
+    // client: first tell the host this map's own flags (before anything is overwritten), then wait for the host's seeds and merged flags
+    if (ss.reported_map != map) {
+        if (!send_map(map, count, kMapSeedsFromClient, (uint32_t)GetTickCount() | 1u, nullptr)) return false;
+        ss.reported_map = map;
+    }
+    // A map object is adopted once -- and again for every LATER publication of the host (it republishes when its map changed: a node finished, a battle
+    // over). Only a new epoch re-opens it; without one the map is as agreed as it will get.
+    const bool newer = ss.epoch && ss.epoch != ss.applied_epoch;
+    if (map == ss.applied_map && !newer) return true;
+    if (newer && ss.got == ss.total && ss.total) {
+        ss.applied_epoch = ss.epoch; ss.applied_map = map; ss.waiting_map = nullptr;
+        if (ss.total != count) {
+            log_line("FOLLOW", "!! the map sync cannot apply: the host's map has %u node(s), this one %u", ss.total, count);
+            return true;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            void* node = node_at(map, i);
+            if (node && node_type(node) != ss.node[i].type) {
+                log_line("FOLLOW", "!! the map sync cannot apply: node %u is '%s' here but '%s' on the host -- the structures differ",
+                         i, node_type_name(node_type(node)), node_type_name(ss.node[i].type));
+                return true;
+            }
+        }
+        uint32_t seeds_changed = 0, flags_changed = 0, shown = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            void* node = node_at(map, i);
+            if (!node) continue;
+            uint64_t mine[4] = {};
+            if (mem_read((const uint8_t*)node + kNode_Seed, mine, sizeof(mine)) && memcmp(mine, ss.node[i].seed, sizeof(mine)) != 0 &&
+                mem_write((uint8_t*)node + kNode_Seed, ss.node[i].seed, sizeof(ss.node[i].seed))) ++seeds_changed;
+            uint32_t fl = 0;
+            if (read_flags(node, fl) && fl != ss.node[i].flags) {
+                if (shown < 8) { ++shown; log_line("FOLLOW", "map sync: node %u flag dword (+0x%X: consumed, +0x169, +0x16A, +0x16B) here %08x, host %08x", i, (unsigned)kNodeFlagsDword, fl, ss.node[i].flags); }
+                if (mem_write((uint8_t*)node + kNodeFlagsDword, &ss.node[i].flags, sizeof(ss.node[i].flags))) ++flags_changed;
+            }
+        }
+        log_line_lvl(LogLevel::Warn, "FOLLOW", "ADOPTED the host's map: %u of %u node seed(s) and %u node flag word(s) were overwritten "
+                                              "(same node count and types) -- the maps now agree", seeds_changed, count, flags_changed);
+        return true;
+    }
+    // The host's seeds have not (all) arrived: wait for them, a few seconds at most.
+    if (ss.waiting_map != map) { ss.waiting_map = map; ss.waiting_since = now; }
+    if (now - ss.waiting_since < kSeedWaitMs) return false;
+    log_line_lvl(LogLevel::Warn, "FOLLOW", "the host's map did not arrive in %llu ms -- reporting this map as it is", (unsigned long long)kSeedWaitMs);
+    room_sync_trouble("the host's map");
+    ss.applied_map = map; ss.applied_epoch = ss.epoch;   // (the epoch too: an incomplete publication must not hold every later tick)
+    return true;
+}
+
+} // namespace
+
 void* follow_map_update(void* map_screen) {
+    if (!g.faulted) unlocks_on_map(map_ready(map_screen));   // a battle / event node is over once the map is ready again
     if (g.faulted || !map_ready(map_screen)) {
         g.map_tick = 0;
         if (g.on && pending_any() && !g.transition_logged) {
@@ -1412,7 +1603,10 @@ void* follow_map_update(void* map_screen) {
     if (!pending_any() && (g.incoming.empty() || established)) catsync_map_tick();
 
 #if defined(MGMP_WITH_CHECKPOINT)
-    if (checkpoint_needs_map()) checkpoint_on_map(follow_resume_checkpoint(map_screen));
+    if (checkpoint_needs_map()) {
+        if (!map_seed_sync(map_screen)) return nullptr;   // a client waits (seconds at most) for the host's node seeds
+        checkpoint_on_map(follow_resume_checkpoint(map_screen));
+    }
     if (!checkpoint_can_enter()) return nullptr;
 #endif
 
@@ -1714,6 +1908,7 @@ void* follow_map_update(void* map_screen) {
     ++g.entered;
     lockstep_enter_battle(seed);
     remember_node(entering, count, type, seed);
+    if (type >= 5 && type <= 11) { char why[48]; _snprintf_s(why, sizeof(why), _TRUNCATE, "node %u (%s)", entering, node_type_name(type)); unlocks_window_open(why, type >= 9); }
 
     // A shift-held EnterNode takes a completely different branch (the very
     // first thing it does is SDL_GetScancodeFromKey(SDLK_LSHIFT) and, if down,

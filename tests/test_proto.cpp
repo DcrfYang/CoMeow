@@ -415,17 +415,91 @@ int main() {
             ChapterMsg m{};
             m.kind = kind; m.generation = 42;
             if (kind == kChapterSelect) { m.act = 3; m.difficulty = 4; }
-            uint8_t bytes[11]{};
-            check(enc_chapter(bytes, sizeof(bytes), m) == 11, "chapter control fits exact wire size");
+            m.mapflags = kind == kChapterReady ? 0x12345u : 0x4000u;
+            uint8_t bytes[15]{};
+            check(enc_chapter(bytes, sizeof(bytes), m) == 15, "chapter control fits exact wire size");
             Reader r(bytes, sizeof(bytes)); r.u8v(); ChapterMsg copy{};
             check(dec_chapter(r, copy) && copy.generation == 42 && copy.act == m.act &&
-                  copy.difficulty == m.difficulty, "chapter/ready fields round-trip");
-            for (uint32_t cut = 1; cut < 11; ++cut) {
+                  copy.difficulty == m.difficulty && copy.mapflags == m.mapflags, "chapter/ready fields round-trip");
+            for (uint32_t cut = 1; cut < 15; ++cut) {
                 Reader short_r(bytes, cut); short_r.u8v();
                 check(!dec_chapter(short_r, copy), "truncated chapter command rejected");
             }
             m.generation = 0;
             check(!enc_chapter(bytes, sizeof(bytes), m), "chapter requires setup generation");
+        }
+        {
+            MapSeedsMsg m{};
+            m.kind = kMapSeedsFromClient; m.epoch = 77; m.total = 22; m.first = 16; m.count = 6;
+            for (uint32_t i = 0; i < m.count; ++i) { m.nodes[i].type = (uint8_t)(i + 3); for (int k = 0; k < 4; ++k) m.nodes[i].seed[k] = 0x1111000000000000ull * (i + 1) + k; m.nodes[i].flags = 0x01010000u + i; }
+            uint8_t bytes[400]{};
+            const uint32_t n = enc_mapseeds(bytes, sizeof(bytes), m);
+            check(n == 1 + 1 + 4 + 4 + 4 + 1 + 6 * 37, "map seeds chunk wire size");
+            Reader r(bytes, n); r.u8v(); MapSeedsMsg copy{};
+            check(dec_mapseeds(r, copy) && copy.epoch == 77 && copy.total == 22 && copy.first == 16 && copy.count == 6 &&
+                  copy.kind == kMapSeedsFromClient && copy.nodes[5].type == 8 && copy.nodes[5].seed[3] == m.nodes[5].seed[3] && copy.nodes[5].flags == 0x01010005u, "map seeds round-trip");
+            for (uint32_t cut = 1; cut < n; ++cut) { Reader sr(bytes, cut); sr.u8v(); check(!dec_mapseeds(sr, copy), "truncated map seeds rejected"); }
+            MapSeedsMsg bad = m; bad.first = 20; check(!enc_mapseeds(bytes, sizeof(bytes), bad), "chunk past the end of the map rejected");
+            bad = m; bad.epoch = 0; check(!enc_mapseeds(bytes, sizeof(bytes), bad), "epoch zero rejected");
+            bad = m; bad.kind = 2; check(!enc_mapseeds(bytes, sizeof(bytes), bad), "unknown kind rejected");
+            bad = m; bad.count = 9; check(!enc_mapseeds(bytes, sizeof(bytes), bad), "oversized chunk rejected");
+        }
+        {
+            // proto 61: the host's board
+            BoardMsg m{};
+            m.battle = 0xB4944BBDCDE1ECB9ull; m.turn = 7; m.cats = 36; m.total = 25; m.first = 16; m.count = 9;
+            for (int k = 0; k < 4; ++k) m.rng[k] = 0x0123456789ABCDEFull + k;
+            for (uint32_t i = 0; i < m.count; ++i) {
+                BoardUnit& u = m.units[i];
+                u.index = (uint8_t)(14 + i); u.ident = 0xA0000000u + i; u.hp = 20 - (int)i; u.shield = (int)i; u.maxhp = 25; u.flags = (uint8_t)(i & 3);
+                u.tx = (int)i - 2; u.ty = 8 - (int)i; u.fx = -1; u.fy = (int)(i & 1);
+                u.key_a = 12 + (int)i; u.key_b = 0xFF000001 + (int)i * 977; u.speed = 5 + (int)(i & 3); u.init_base = -3 + (int)i;   // proto 69/70: the turn-order keys
+            }
+            m.units[8].tx = -5000; m.units[8].ty = -5000;
+            uint8_t bytes[1024]{};
+            const uint32_t n = enc_board(bytes, sizeof(bytes), m);
+            check(n == 1 + 8 + 4 + 4 + 4 + 4 + 1 + 32 + 9 * 50, "board chunk wire size");
+            check(n <= 1024 && kBoardChunk * 50 + 58 <= 1024, "a full board chunk fits the send buffer");
+            Reader r(bytes, n); r.u8v(); BoardMsg copy{};
+            check(dec_board(r, copy) && copy.battle == m.battle && copy.turn == 7 && copy.cats == 36 && copy.total == 25 && copy.first == 16 && copy.count == 9 &&
+                  copy.rng[3] == m.rng[3] && copy.units[0].index == 14 && copy.units[8].tx == -5000 && copy.units[3].hp == 17 && copy.units[5].ident == 0xA0000005u &&
+                  copy.units[2].fx == -1 && copy.units[1].flags == 1 && copy.units[4].key_a == 16 && copy.units[4].key_b == (int32_t)(0xFF000001u + 4 * 977) && copy.units[6].speed == 7 && copy.units[5].init_base == 2, "board round-trip");
+            for (uint32_t cut = 1; cut < n; ++cut) { Reader sr(bytes, cut); sr.u8v(); check(!dec_board(sr, copy), "truncated board rejected"); }
+            BoardMsg bad = m; bad.battle = 0; check(!enc_board(bytes, sizeof(bytes), bad), "board without a battle rejected");
+            bad = m; bad.units[0].index = 40; check(!enc_board(bytes, sizeof(bytes), bad), "board unit past the roster rejected");
+            bad = m; bad.first = 20; check(!enc_board(bytes, sizeof(bytes), bad), "board chunk past the end rejected");
+            bad = m; bad.total = 40; check(!enc_board(bytes, sizeof(bytes), bad), "board with more units than the roster rejected");
+            bad = BoardMsg{}; bad.battle = 1; bad.cats = 12; bad.total = 0; bad.count = 0;
+            check(enc_board(bytes, sizeof(bytes), bad) > 0, "a board with no non-player unit is still a message (it carries the stream)");
+        }
+        {
+            UnlocksMsg m{};
+            m.epoch = 9; m.abilities = 0x5; m.passives = 0x80000001u; m.items[0] = 0xAA; m.items[15] = 0x01; m.levels = 1; m.bosses = 0x2A;
+            m.n_abilities = 31; m.n_passives = 29; m.n_items = 128; m.n_levels = 1; m.n_bosses = 6;
+            m.n_spawn = 2; m.spawn_ids[0] = 0x70000002ull; m.spawn_ids[1] = 0x70000003ull; m.spawn_keys[0] = 7; m.spawn_keys[1] = -3;
+            m.n_events = 3; m.events[0] = 7; m.events[1] = -1; m.events[2] = 99;
+            m.level_node = 0xABCDull; m.n_level_name = 12; memcpy(m.level_name, "levels/x.lvl", 12);
+            m.n_pending[0] = 2; m.pending[0][0].ident = 0xA1B2C3D5u; m.pending[0][0].remaining = 1; m.pending[0][0].hp = 7; m.pending[0][0].mode = 1;
+            m.pending[0][1].ident = 0x11u; m.pending[0][1].remaining = 2; m.pending[0][1].hp = -3; m.pending[0][1].mode = -1;
+            m.n_pending[1] = 1; m.pending[1][0].ident = 0x77u; m.pending[1][0].remaining = 3;
+            m.n_pending[2] = 1; m.pending[2][0].ident = 0x99u; m.pending[2][0].hp = 20; m.pending[2][0].mode = 5;
+            m.n_weather = 2; strcpy_s(m.weather[0], "OilSpill"); strcpy_s(m.weather[1], "GeomagneticStorm"); m.build_info = 1;
+            uint8_t bytes[400]{};
+            const uint32_t n = enc_unlocks(bytes, sizeof(bytes), m);
+            check(n == 1 + 4 + 4 + 4 + 16 + 1 + 1 + 4 + 1 + 1 + 3 * 4 + 1 + 2 * 12 + 8 + 1 + 12 + 3 + 4 * 16 + 1 + (1 + 8) + (1 + 16) + 1, "unlock snapshot wire size");
+            Reader r(bytes, n); r.u8v(); UnlocksMsg copy{};
+            check(dec_unlocks(r, copy) && copy.epoch == 9 && copy.abilities == 5 && copy.passives == 0x80000001u && copy.items[0] == 0xAA &&
+                  copy.items[15] == 1 && copy.levels == 1 && copy.n_items == 128 && copy.n_events == 3 && copy.events[1] == -1 && copy.events[2] == 99 && copy.bosses == 0x2A && copy.n_bosses == 6 && copy.level_node == 0xABCDull && strcmp(copy.level_name, "levels/x.lvl") == 0 &&
+                  copy.n_spawn == 2 && copy.spawn_ids[1] == 0x70000003ull && copy.spawn_keys[1] == -3 &&
+                  copy.n_pending[0] == 2 && copy.pending[0][0].ident == 0xA1B2C3D5u && copy.pending[0][0].hp == 7 && copy.pending[0][1].remaining == 2 && copy.pending[0][1].hp == -3 && copy.pending[0][1].mode == -1 &&
+                  copy.n_pending[1] == 1 && copy.pending[1][0].ident == 0x77u && copy.pending[1][0].remaining == 3 && copy.n_pending[2] == 1 && copy.pending[2][0].hp == 20 && copy.pending[2][0].mode == 5 && copy.build_info == 1 && copy.n_weather == 2 && strcmp(copy.weather[0], "OilSpill") == 0 && strcmp(copy.weather[1], "GeomagneticStorm") == 0, "unlock snapshot round-trip");
+            for (uint32_t cut = 1; cut < n; ++cut) { Reader sr(bytes, cut); sr.u8v(); check(!dec_unlocks(sr, copy), "truncated unlock snapshot rejected"); }
+            UnlocksMsg bad = m; bad.epoch = 0; check(!enc_unlocks(bytes, sizeof(bytes), bad), "epoch zero rejected");
+            bad = m; bad.n_items = 200; check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized list rejected");
+            bad = m; bad.n_spawn = 9; check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized spawn order rejected");
+            bad = m; bad.n_weather = (uint8_t)(kWeatherNames + 1); check(!enc_unlocks(bytes, sizeof(bytes), bad), "too many weathers rejected");
+            bad = m; bad.n_pending[1] = (uint8_t)(kPendingMax + 1); check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized returning-enemy queue rejected");
+            bad = m; bad.n_events = 65; check(!enc_unlocks(bytes, sizeof(bytes), bad), "too many event properties rejected");
         }
         ChapterMsg bad{}; bad.generation = 1; bad.kind = kChapterSelect;
         check(!enc_chapter(buf, sizeof(buf), bad), "chapter zero rejected");
@@ -436,6 +510,7 @@ int main() {
         check(!enc_chapter(buf, sizeof(buf), bad), "excessive difficulty rejected");
         bad.kind = kChapterReady; bad.difficulty = 0;
         check(!enc_chapter(buf, sizeof(buf), bad), "ready cannot carry chapter selection");
+
     }
     {
         uint8_t cat0[3] = {1, 2, 3};

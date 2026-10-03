@@ -71,6 +71,7 @@ add_library(mgmp SHARED
     src/ui/mgmp_i18n.cpp
     src/session/mgmp_checkpoint_io.cpp
     src/session/mgmp_setup.cpp
+    src/session/mgmp_unlocks.cpp
     src/session/mgmp_leave.cpp
     src/session/mgmp_listprobe.cpp
     src/session/mgmp_catsync.cpp

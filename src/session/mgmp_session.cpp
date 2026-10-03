@@ -15,6 +15,7 @@
 #include "mgmp_runhist.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_follow.h"
+#include "mgmp_unlocks.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_page.h"
@@ -659,6 +660,17 @@ void session_update() {
 
             case MSG_CHAPTERMAP:
                 checkpoint_on_chaptermap(m.from, m.chaptermap);
+                break;
+
+            case MSG_MAPSEEDS:
+                follow_on_mapseeds(m.from, m.mapseeds);
+                break;
+
+            case MSG_UNLOCKS:
+                unlocks_on_message(m.from, m.unlocks);
+                break;
+
+            case MSG_BOARD:   // taken by the receive thread into a mailbox (net_host_board): the game thread waits for it inside the turn boundary
                 break;
 
 

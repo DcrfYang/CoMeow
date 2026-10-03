@@ -521,7 +521,13 @@ void clones_return_to_their_originals() {
     for (unsigned i = 0; i < 4; ++i) CHECK(flags_of(0x71000001ull + i) == kAway);   // the clones left with the originals' flags
     CHECK(catsync_merge_session_cats("test") == 0);                                  // still out on the run: nothing to merge
     for (unsigned i = 0; i < 4; ++i) settle_clone(0x71000001ull + i, 70 + (int32_t)i);
+    void* clone_obj[4]; void* orig_obj[4];
+    for (unsigned i = 0; i < 4; ++i) { clone_obj[i] = entries[0x71000001ull + i].cat; orig_obj[i] = entries[party[i]].cat; }
     CHECK(catsync_merge_session_cats("test") == 4);
+    for (unsigned i = 0; i < 4; ++i) {                                               // IDENTITIES SWAPPED (2026-10-03): the House holds the clone, so the clone object is now the original
+        CHECK(entries[party[i]].cat == clone_obj[i] && entries[0x71000001ull + i].cat == orig_obj[i]);
+        CHECK(get<uint64_t>(clone_obj[i], kCatData_SaveId) == party[i] && get<uint64_t>(orig_obj[i], kCatData_SaveId) == 0x71000001ull + i);
+    }
     { const uint64_t* now = get<const uint64_t*>(director, kDir_CatIdData);       // the party list names the originals again
       CHECK(get<uint32_t>(director, kDir_CatIdCount) == 4);
       for (unsigned i = 0; i < 4; ++i) CHECK(now[i] == party[i]); }
@@ -683,6 +689,11 @@ void merge_refusals_and_rollback() {
     // the next merge must not keep the same clone as yet another new cat
     { size_t before = entries.size(); put(entries[0x71000001ull].cat, kCatData_Flags, uint64_t(kHome));
       CHECK(catsync_merge_session_cats("again") == 0 && flags_of(0x71000001ull) == 0 && entries.size() == before); }
+    // ... but a twin: the cat at home IS the clone's image (only the flags differ -- the game put a retired clone back to life next to its original): the clone is
+    // only retired again, no second identical cat is made (2026-10-03: "the returned cats are not retired and can go out again")
+    fresh(); catsync_origin_clear(); put(entries[party[0]].cat, 0x70C, int32_t(90)); put(entries[party[0]].cat, kCatData_Flags, uint64_t(kHome));
+    { size_t before = entries.size();
+      CHECK(catsync_merge_session_cats("t") == 3 && flags_of(0x71000001ull) == 0 && entries.size() == before && flags_of(party[0]) == kHome); }
     // two ordinary cats with the clone's seed: ambiguous, so no match -- the clone becomes a new cat
     fresh(); catsync_origin_clear(); { void* twin = allocate(0xC58); put(twin, kCatData_SaveId, uint64_t(99)); put(twin, 0, party[1] * 10); put(twin, kCatData_Flags, uint64_t(kAway)); entries[99].cat = twin; }
     CHECK(catsync_merge_session_cats("t") == 4 && flags_of(0x71000002ull) == 0 && adopted_with_stat(91));
@@ -695,10 +706,12 @@ void merge_refusals_and_rollback() {
     // another player's clones are never touched
     fresh(); { void* other = allocate(0xC58); put(other, kCatData_SaveId, uint64_t(0x70000001ull)); put(other, 0, party[0] * 10); put(other, kCatData_Flags, uint64_t(kHome)); entries[0x70000001ull].cat = other; }
     CHECK(catsync_merge_session_cats("t") == 4 && flags_of(0x70000001ull) == kHome);
-    // a failed write puts the original back as it was and leaves the clone alone
+    // a failed read: the identity swap is refused and the image copy takes over (or, when that fails too, the original is put back as it was and the clone left alone)
     fresh(); const int32_t before = get<int32_t>(entries[party[0]].cat, 0x70C); fail_reads = 1;
-    CHECK(catsync_merge_session_cats("t") == 3);
-    CHECK(get<int32_t>(entries[party[0]].cat, 0x70C) == before && flags_of(party[0]) == kAway && flags_of(0x71000001ull) == kHome);
+    { const unsigned n = catsync_merge_session_cats("t");
+      CHECK(n == 3 || n == 4);
+      if (n == 4) CHECK(get<int32_t>(entries[party[0]].cat, 0x70C) == 90 && !(flags_of(party[0]) & kCatFlag_OnAdventure));
+      else CHECK(get<int32_t>(entries[party[0]].cat, 0x70C) == before && flags_of(party[0]) == kAway && flags_of(0x71000001ull) == kHome); }
     fail_reads = 0;
     entries.clear(); peer_position = 0; catsync_forget();
 }

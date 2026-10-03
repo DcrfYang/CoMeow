@@ -7,16 +7,17 @@
 // until this server, that meant one peer knowing the other's IP by hand and
 // mgmp.json saying host or client before the game started.
 //
-// This server does introductions and nothing else. It never sees a game
-// message, never relays one, and never learns anything about the run: it hands
-// each joiner the host's address and port and then gets out of the way. The
-// game traffic goes directly between the two peers on the host's own port.
+// This server does introductions. By default it never sees a game message and
+// never learns anything about the run: it hands each joiner the host's address
+// and port and then gets out of the way; the game traffic goes directly between
+// the two peers on the host's own port (or over Steam). The one exception is a
+// room whose host chose the "relay" carrier (see PIPES below): then the server
+// moves that room's bytes, within a small cap on rooms and on traffic.
 //
 // WHAT IT IS NOT.
 //
-//   - Not a relay. If the two players cannot reach each other directly this
-//     server cannot help them; that needs a relay or NAT punch, which is a
-//     different (much larger) piece of work.
+//   - Not a general relay. A room only goes through the server when its host
+//     asked for that, and the number of such rooms is capped.
 //   - Not authoritative about anything in the game. The room is a lobby, and
 //     the lobby ends the moment the game session starts.
 //   - Not secure. No accounts, no authentication, no encryption. Anyone who can
@@ -82,12 +83,32 @@
 //                                                  "hreach" (0 not known, 1 the game port is open, 2 it is not), so a joiner picks
 //                                                  its carrier: direct TCP first when the port is open, Steam first when it is not
 //
+//     "tr":"direct"|"steam" on create: how the host wants to be reached (2026-10-03). A joiner then tries ONLY that carrier ("direct" = the
+//                                                  address/port, "steam" = Steam peer-to-peer); a room without it keeps the old "try everything"
+//                                                  behaviour. "joined"/"room" carry it back as "tr".
+//     client -> server  {"t":"reach"} from a peer that is NOT in a room: a pre-check of its own game port before it creates a room (the mod
+//                                                  opens a temporary listener first); answered with the same {"t":"reach",..} message.
+//     client -> server  {"t":"relay","k":"steamrev","steam":"<SteamID64>"}   a joiner whose Steam connection to the host failed asks the HOST
+//                                                  to dial IT instead (Steam's certificate check is asymmetric: the side with the older network
+//                                                  configuration cannot accept a newer certificate but can still present its own). Forwarded to the
+//                                                  room's host as {"t":"relay","k":"steamrev","from":"<name>","steam":"<id>"}.
+//
 // LAN MODE (no server machine at all). The mod can run this very code inside the game process (build with MGMP_EMBEDDED):
 // the host starts it, connects to it on 127.0.0.1 and creates a room; friends on the same network connect to the host's
 // address. A room whose host is on the loopback address is advertised to each joiner as the address THAT joiner used to
 // reach the server -- the host's LAN address, whichever network adapter it is. Hosts on the local network can also be
 // found without typing an address: a UDP datagram "MGMP-DISCOVER 1" to port 27701 (broadcast) is answered, to the sender,
 // with {"t":"here","port":<tcp port>,"rooms":[{"id","name","host","players","cap","pw"}]}.
+//
+//     "tr":"relay" on create (2026-10-03): the SERVER carries the game's TCP bytes (for hosts and joiners that can use neither an open port
+//                                                  nor Steam). Only this many such rooms exist at once (--relay-rooms, default 10): a further create is refused with
+//                                                  {"t":"error","code":"relay_full"}. "welcome"/"rooms" carry {"relay":{"max":10,"used":3}} (absent = this server
+//                                                  cannot relay). Every member of a relay room gets a secret "ptok" in "joined"; a relay room's traffic is capped
+//                                                  per room (--relay-kbps, default 32 KB/s sustained, a 3 MiB burst allowance).
+//     PIPES. A joiner opens a NEW connection and sends {"t":"pipe","tok":"<its ptok>"}; the server tells the room's host, on its lobby connection,
+//                                                  {"t":"pipe","id":N}; the host opens another connection and sends {"t":"pipe","tok":"<host ptok>","id":N}.
+//                                                  Both ends are then answered with {"t":"piped"} and from the next byte on the two connections are ONE raw
+//                                                  byte stream (the game's own protocol). A pipe that is not matched within 15 s is dropped.
 //
 // An empty create "name" is an automatic name: the player's own, or that with -2, -3 .. when a room already has it. Every accepted
 // connection has TCP keepalive on (60 s idle, 10 s apart, 3 tries), so a peer that vanished without a FIN loses its slot and room.
@@ -110,6 +131,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <random>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -121,7 +143,7 @@
 // winsock2.h BEFORE windows.h, always: windows.h pulls in winsock.h otherwise,
 // and the two headers collide over every type they both declare.
 #ifndef FD_SETSIZE
-#define FD_SETSIZE 128          // the default 64 is the size of the client table; the listeners need room too
+#define FD_SETSIZE 256          // the default 64 is the size of the client table; the listeners need room too
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -357,7 +379,7 @@ FILE* open_for_write(const std::string& path) {
 // room holds 4. The server refuses the fifth rather than letting the game's
 // handshake discover it: by then the peer has already loaded the run.
 constexpr int      kRoomCap    = 4;
-constexpr int      kMaxClients = 64;
+constexpr int      kMaxClients = 160;    // a relay room holds up to 4 lobby connections + 3 pipes of 2 connections each
 constexpr int      kMaxRooms   = 64;
 constexpr uint32_t kLineMax    = 8192;    // a log chunk line is ~3.3 KB; the buffer must hold a partial one plus a read
 constexpr int      kUpMaxFiles = 4;
@@ -451,6 +473,10 @@ struct Room {
     char        pw[72]    = {};      // the digest the joiner must present
     char        lan[4][16] = {};     // the host's private addresses (see addr_for)
     int         nlan      = 0;
+    char        tr[8]     = {};      // "direct" | "steam" | "relay" | "" -- the carrier the host chose (see the protocol notes)
+    int64_t     rl_tokens = 0;       // relay rooms: the traffic allowance (bytes) left
+    uint64_t    rl_last   = 0;       // when it was last refilled
+    uint64_t    rl_bytes  = 0;       // bytes carried so far (logged when the room ends)
 };
 
 // An upload in progress: the files are written as the chunks arrive and the folder is deleted if it never completes.
@@ -479,6 +505,7 @@ struct Client {
     int      pw_fails = 0;          // wrong passwords tried on this connection
     uint32_t gen        = 0;        // which connection this slot holds (slots are reused)
     int      probes_made = 0;       // reachability probes started for this connection
+    int      relays_made = 0;       // "relay" requests forwarded for this connection (capped)
     char     steam[24]   = {};      // the peer's SteamID64 (digits), when it said so
     int      reach       = 0;       // the probe's verdict on this peer's game port: 0 unknown, 1 open, 2 not reachable
     uint64_t last_probe  = 0;
@@ -486,6 +513,19 @@ struct Client {
     int      nlan     = 0;
     char     rbuf[kLineMax] = {};
     uint32_t rlen    = 0;
+    // RELAY (see the protocol notes): ptok = this member's secret in a relay room; kind: 0 = a lobby connection, 1 = a pipe waiting for the host,
+    // 2 = a live pipe (a raw byte stream paired with pipe_peer)
+    char     ptok[20] = {};
+    int      kind      = 0;
+    int      pipe_room = -1;
+    uint32_t pipe_id   = 0;
+    bool     pipe_host_side = false;
+    int      pipe_owner = -1;        // the lobby connection this pipe belongs to (slot + gen)
+    uint32_t pipe_owner_gen = 0;
+    int      pipe_peer = -1;
+    uint32_t pipe_peer_gen = 0;
+    uint64_t pipe_start = 0;
+    std::string outq;                // bytes waiting to be written to this (pipe) connection
 };
 
 Client g_clients[kMaxClients];
@@ -533,6 +573,43 @@ json room_summary(const Room& r) {
     return o;
 }
 
+// --- the relay carrier: limits and helpers -------------------------------------------------------------------------------------
+
+int      g_relay_max   = 10;                  // rooms that may use the server as the carrier at once (--relay-rooms)
+int      g_relay_kbps  = 32;                  // sustained KB/s per relay room (--relay-kbps)
+constexpr int64_t kRelayBurst = 3ll << 20;    // a save is up to 4 MiB: the first sync must not crawl
+constexpr uint64_t kPipeWaitMs = 15000;       // how long a joiner's pipe waits for the host's side
+constexpr size_t   kPipeQueueMax = 256 * 1024;  // bytes queued for a slow reader before the sender is paused
+uint32_t g_pipe_seq = 0;
+
+int relay_rooms_used() {
+    int n = 0;
+    for (int i = 0; i < kMaxRooms; ++i) if (g_rooms[i].used && !strcmp(g_rooms[i].tr, "relay")) ++n;
+    return n;
+}
+
+// {"relay":{"max":..,"used":..}} -- absent where the server cannot relay (the embedded LAN lobby)
+void put_relay_info(json& o) {
+#ifndef MGMP_EMBEDDED
+    json r = json::object();
+    r["max"]  = g_relay_max;
+    r["used"] = relay_rooms_used();
+    o["relay"] = r;
+#else
+    (void)o;
+#endif
+}
+
+// A secret of 16 hex digits.
+void make_token(char* out, size_t cap) {
+    static std::random_device rd;
+    static const char* hex = "0123456789abcdef";
+    char t[17];
+    for (int i = 0; i < 16; ++i) t[i] = hex[rd() & 15u];
+    t[16] = 0;
+    copy_str(out, cap, t);
+}
+
 json rooms_array() {
     json a = json::array();
     // A locked room is invisible: its players have started, and nobody else may walk in. Open rooms come first and
@@ -578,6 +655,7 @@ void send_rooms(SOCKET s) {
     json o = json::object();
     o["t"]     = "rooms";
     o["rooms"] = rooms_array();
+    put_relay_info(o);
     send_json(s, o);
 }
 
@@ -663,6 +741,7 @@ void put_route(json& o, const Room& r, const Client& rc) {
         const Client& host = g_clients[r.members[0]];
         if (host.steam[0]) { o["hsteam"] = host.steam; o["hreach"] = host.reach; }
     }
+    if (r.tr[0]) o["tr"] = r.tr;
 }
 
 // The membership message. `event`/`who` are what the lobby shows as a line of
@@ -701,11 +780,26 @@ void broadcast_room(int ri, const char* event, const char* who) {
 // Drop a client out of its room. The HOST leaving destroys the room, because a
 // room whose host is gone has nobody to introduce anybody to: the joiners are
 // told so by name rather than left waiting for an address that will never come.
+void close_client(int slot);
+
 void leave_room(int slot, const char* why) {
     Client& c = g_clients[slot];
     if (c.room < 0) return;
     const int ri = c.room;
     Room& r = g_rooms[ri];
+
+    // The pipes of this member go with it (and every pipe of the room when the host leaves)
+    if (!strcmp(r.tr, "relay")) {
+        const bool host_leaves = r.count > 0 && r.members[0] == slot;
+        const uint32_t gen = c.gen;
+        for (int i = 0; i < kMaxClients; ++i) {
+            Client& p = g_clients[i];
+            if (!p.used || p.kind == 0 || i == slot) continue;
+            if ((p.pipe_owner == slot && p.pipe_owner_gen == gen) || (host_leaves && p.pipe_room == ri)) close_client(i);
+        }
+        if (host_leaves || r.count <= 1)
+            logf("room %s: relayed %llu KB in total", r.id, (unsigned long long)(r.rl_bytes / 1024));
+    }
 
     const bool was_host = (r.count > 0 && r.members[0] == slot);
     char who[64];
@@ -937,6 +1031,12 @@ void close_client(int slot) {
     Client& c = g_clients[slot];
     if (!c.used) return;
     up_abort(c, "the peer disconnected");
+    if (c.kind == 2 && c.pipe_peer >= 0) {          // a pipe ends on both sides at once
+        const int ps = c.pipe_peer;
+        const uint32_t pg = c.pipe_peer_gen;
+        c.pipe_peer = -1;
+        if (g_clients[ps].used && g_clients[ps].gen == pg) { g_clients[ps].pipe_peer = -1; close_client(ps); }
+    }
     leave_room(slot, "disconnected");
     if (c.sock != INVALID_SOCKET) { close_socket(c.sock); c.sock = INVALID_SOCKET; }
     logf("peer '%s' (%s) disconnected", c.name[0] ? c.name : "?", c.ip);
@@ -944,6 +1044,8 @@ void close_client(int slot) {
 }
 
 // --- the commands -----------------------------------------------------------
+
+void handle_pipe(int slot, const json& j);
 
 void handle_line(int slot, const std::string& line) {
     Client& c = g_clients[slot];
@@ -978,9 +1080,12 @@ void handle_line(int slot, const std::string& line) {
         o["pw"]    = true;          // this server understands room passwords
         o["logs"]  = !g_logdir.empty();   // ...and collects game logs
         o["rooms"] = rooms_array();
+        put_relay_info(o);
         send_json(c.sock, o);
         return;
     }
+
+    if (t == "pipe") { handle_pipe(slot, j); return; }
 
     // Everything else needs a name, and a name only comes from hello. A peer
     // that skipped it is refused here rather than showing up in the lobby as
@@ -1040,6 +1145,26 @@ void handle_line(int slot, const std::string& line) {
         r.port    = c.listen_port;
         c.nlan    = parse_lan(j, c.lan);
         parse_steam(j, c);
+        {
+            const std::string tr = json_str(j, "tr");
+            if (tr == "direct" || tr == "steam") copy_str(r.tr, sizeof(r.tr), tr);
+            if (tr == "relay") {
+#ifdef MGMP_EMBEDDED
+                r = Room{}; send_error(c.sock, "this lobby cannot carry the game's traffic", "relay_na"); return;
+#else
+                if (relay_rooms_used() >= g_relay_max) {
+                    logf("'%s' wanted a relay room but %d/%d are in use -- refused", c.name, relay_rooms_used(), g_relay_max);
+                    r = Room{};
+                    send_error(c.sock, "the server already carries as many rooms as it can -- choose another connection method", "relay_full");
+                    return;
+                }
+                copy_str(r.tr, sizeof(r.tr), tr);
+                r.rl_tokens = kRelayBurst;
+                r.rl_last   = tick_ms();
+                make_token(c.ptok, sizeof(c.ptok));
+#endif
+            }
+        }
         r.nlan    = c.nlan;
         memcpy(r.lan, c.lan, sizeof(r.lan));
         r.members[0] = slot;
@@ -1060,6 +1185,8 @@ void handle_line(int slot, const std::string& line) {
         o["you"]    = c.name;
         o["players"] = json::array();   // filled by the broadcast below
         o["pw"]      = r.has_pw;
+        if (r.tr[0]) o["tr"] = r.tr;
+        if (c.ptok[0]) o["ptok"] = c.ptok;
         send_json(c.sock, o);
         broadcast_room(ri, "create", c.name);
         probe_schedule(slot, 1500);
@@ -1108,14 +1235,38 @@ void handle_line(int slot, const std::string& line) {
         o["cap"]  = kRoomCap;
         o["you"]  = c.name;
         o["pw"]   = r.has_pw;
+        if (!strcmp(r.tr, "relay")) { make_token(c.ptok, sizeof(c.ptok)); o["ptok"] = c.ptok; }
         send_json(c.sock, o);
         broadcast_room(ri, "join", c.name);
         return;
     }
 
+    if (t == "relay") {
+        // A joiner asks the host to dial it over Steam (see the protocol notes). Only "steamrev", only to the host of the room it is in.
+        if (c.room < 0) return;
+        Room& r = g_rooms[c.room];
+        if (!r.count || r.members[0] == slot || c.relays_made >= 40) return;
+        if (json_str(j, "k") != "steamrev") return;
+        const std::string sid = json_str(j, "steam");
+        bool ok = !sid.empty() && sid.size() <= 20;
+        for (char ch : sid) if (ch < '0' || ch > '9') ok = false;
+        if (!ok) return;
+        ++c.relays_made;
+        const Client& host = g_clients[r.members[0]];
+        json o = json::object();
+        o["t"]     = "relay";
+        o["k"]     = "steamrev";
+        o["from"]  = c.name;
+        o["steam"] = sid;
+        send_json(host.sock, o);
+        logf("room %s: '%s' asks the host to dial it over Steam (%s)", r.id, c.name, sid.c_str());
+        return;
+    }
+
     if (t == "reach") {
         // The host asks for another probe (its UPnP mapping may have just come up). Not more often than every 8 seconds.
-        if (c.room < 0 || g_rooms[c.room].members[0] != slot) return;
+        // A peer that is NOT in a room may ask too: a pre-check of its game port before it creates a room (the mod listens on it meanwhile).
+        if (c.room >= 0 && g_rooms[c.room].members[0] != slot) return;
         const uint64_t now = tick_ms();
         if (now - c.last_probe < 8000) return;
         c.last_probe = now;
@@ -1167,6 +1318,7 @@ void on_readable(int slot) {
     const int n = (int)recv(c.sock, buf, sizeof(buf), 0);
     if (n < 0 && interrupted()) return;          // a signal, not a dead peer: the next select brings it back
     if (n <= 0) { close_client(slot); return; }
+    if (c.kind == 1) return;                      // a pipe still waiting for the host sends nothing: ignore stray bytes
 
     if (c.rlen + (uint32_t)n > kLineMax) {
         send_error(c.sock, "a line longer than 8192 bytes -- dropping the peer");
@@ -1237,6 +1389,104 @@ bool connect_pending() {
 #endif
 }
 
+bool would_block() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+// --- pipes: the server as the carrier ---------------------------------------------------------------------------------------------
+
+void handle_pipe(int slot, const json& j) {
+    Client& c = g_clients[slot];
+#ifdef MGMP_EMBEDDED
+    send_error(c.sock, "this lobby cannot carry the game's traffic", "relay_na");
+    close_client(slot);
+    return;
+#else
+    if (c.helloed || c.kind) { send_error(c.sock, "not allowed here"); close_client(slot); return; }
+    const std::string tok = json_str(j, "tok");
+    int owner = -1;
+    if (tok.size() == 16)
+        for (int i = 0; i < kMaxClients; ++i) {
+            const Client& o = g_clients[i];
+            if (i != slot && o.used && o.kind == 0 && o.ptok[0] && o.room >= 0 && digest_equal(o.ptok, tok.c_str())) { owner = i; break; }
+        }
+    if (owner < 0) { send_error(c.sock, "the relay token is not valid (any more)", "pipe"); close_client(slot); return; }
+    Client& ow = g_clients[owner];
+    const int ri = ow.room;
+    Room& r = g_rooms[ri];
+    const bool is_host = r.count > 0 && r.members[0] == owner;
+
+    if (is_host) {
+        const uint32_t id = (uint32_t)(j.contains("id") && j["id"].is_number_unsigned() ? j["id"].get<uint32_t>() : 0u);
+        int w = -1;
+        for (int i = 0; i < kMaxClients; ++i)
+            if (g_clients[i].used && g_clients[i].kind == 1 && g_clients[i].pipe_id == id && g_clients[i].pipe_room == ri) { w = i; break; }
+        if (!id || w < 0) { send_error(c.sock, "no joiner is waiting for that pipe (it may have given up)", "pipe"); close_client(slot); return; }
+        Client& wc = g_clients[w];
+        c.kind = 2; wc.kind = 2;
+        c.pipe_room = ri; c.pipe_host_side = true; c.pipe_owner = owner; c.pipe_owner_gen = ow.gen;
+        c.pipe_peer = w;  c.pipe_peer_gen = wc.gen;
+        wc.pipe_peer = slot; wc.pipe_peer_gen = c.gen;
+        // (rlen is left alone: on_readable is still walking this connection's buffer; nothing is read from it again)
+        json ok = json::object();
+        ok["t"] = "piped";
+        send_json(wc.sock, ok);            // blocking, tiny: before the sockets turn non-blocking
+        send_json(c.sock, ok);
+        set_nonblocking(c.sock); set_nonblocking(wc.sock);
+        logf("room %s: pipe %u up ('%s' <-> host)", r.id, (unsigned)id, ow.name);
+        return;
+    }
+
+    // a joiner asks for a pipe
+    int n = 0;
+    for (int i = 0; i < kMaxClients; ++i) if (g_clients[i].used && g_clients[i].kind && g_clients[i].pipe_room == ri && !g_clients[i].pipe_host_side) ++n;
+    if (n >= 8) { send_error(c.sock, "too many pipes for this room", "pipe"); close_client(slot); return; }
+    c.kind = 1; c.pipe_room = ri; c.pipe_id = ++g_pipe_seq; c.pipe_start = tick_ms();
+    c.pipe_owner = owner; c.pipe_owner_gen = ow.gen;
+    json ask = json::object();
+    ask["t"]  = "pipe";
+    ask["id"] = c.pipe_id;
+    send_json(g_clients[r.members[0]].sock, ask);
+    logf("room %s: '%s' asks for pipe %u", r.id, ow.name, (unsigned)c.pipe_id);
+#endif
+}
+
+// Writes what is queued for a pipe connection. False when the connection is dead.
+bool pipe_flush(Client& c) {
+    while (!c.outq.empty()) {
+        const int w = (int)send(c.sock, c.outq.data(), (int)c.outq.size(), kSendFlags);
+        if (w > 0) { c.outq.erase(0, (size_t)w); continue; }
+        if (w < 0 && would_block()) return true;
+        return false;
+    }
+    return true;
+}
+
+// A live pipe connection became readable: carry the bytes to its peer.
+void pipe_readable(int slot) {
+    Client& c = g_clients[slot];
+    char buf[16384];
+    const int n = (int)recv(c.sock, buf, sizeof(buf), 0);
+    if (n < 0 && (would_block() || interrupted())) return;
+    if (n <= 0) { close_client(slot); return; }
+    if (c.pipe_peer < 0 || !g_clients[c.pipe_peer].used || g_clients[c.pipe_peer].gen != c.pipe_peer_gen) { close_client(slot); return; }
+    Client& p = g_clients[c.pipe_peer];
+    Room& r = g_rooms[c.pipe_room];
+    r.rl_tokens -= n;
+    r.rl_bytes  += (uint64_t)n;
+    int sent = 0;
+    if (p.outq.empty()) {
+        const int w = (int)send(p.sock, buf, n, kSendFlags);
+        if (w > 0) sent = w;
+        else if (w < 0 && !would_block()) { close_client(slot); return; }
+    }
+    if (sent < n) p.outq.append(buf + sent, (size_t)(n - sent));
+}
+
 bool private_or_loopback(const char* ip) {
     in_addr a{};
     if (inet_pton(AF_INET, ip, &a) != 1) return true;
@@ -1266,13 +1516,13 @@ void probe_answer(Probe& p, bool ok) {
     probe_free(p);
 }
 
-// Ask for a probe of this host in `delay_ms`. At most 6 per connection, one at a time.
+// Ask for a probe of this host in `delay_ms`. At most 14 per connection, one at a time.
 void probe_schedule(int slot, uint64_t delay_ms) {
 #ifdef MGMP_EMBEDDED
     (void)slot; (void)delay_ms;
 #else
     Client& c = g_clients[slot];
-    if (!c.used || (!g_probe_all && private_or_loopback(c.ip)) || c.probes_made >= 6) return;
+    if (!c.used || (!g_probe_all && private_or_loopback(c.ip)) || c.probes_made >= 14) return;
     for (Probe& p : g_probes) if (p.used && p.slot == slot) return;
     for (Probe& p : g_probes) {
         if (p.used) continue;
@@ -1391,6 +1641,8 @@ void usage() {
            "\n"
            "  --port <n>       TCP port to listen on (default 27700)\n"
            "  --probe-all      also check the game port of hosts on private addresses (testing)\n"
+           "  --relay-rooms <n> rooms that may use this server as the carrier at once (default 10, 0 = none)\n"
+           "  --relay-kbps <n>  sustained KB/s one relay room may use (default 32)\n"
            "  --lan-discovery  also answer UDP discovery broadcasts (port 27701), for LAN use\n"
            "  --logdir <path>  where game logs uploaded from the mod's F2 panel are stored\n"
            "                   (default: a mgmp_logs folder beside this exe)\n"
@@ -1451,15 +1703,22 @@ void serve_loop() {
         FD_SET(g_listen, &rd);
         SOCKET highest = g_listen;
         if (g_udp != INVALID_SOCKET) { FD_SET(g_udp, &rd); if (g_udp > highest) highest = g_udp; }
-        for (int i = 0; i < kMaxClients; ++i) {
-            if (!g_clients[i].used) continue;
-            FD_SET(g_clients[i].sock, &rd);
-            if (g_clients[i].sock > highest) highest = g_clients[i].sock;
-        }
-
         fd_set wr, ex;
         FD_ZERO(&wr);
         FD_ZERO(&ex);
+        for (int i = 0; i < kMaxClients; ++i) {
+            const Client& c = g_clients[i];
+            if (!c.used) continue;
+            bool want_read = true;
+            if (c.kind == 2) {
+                // backpressure: a pipe is read only while its peer can take the bytes and the room's allowance lasts
+                const bool peer_ok = c.pipe_peer >= 0 && g_clients[c.pipe_peer].used && g_clients[c.pipe_peer].outq.size() < kPipeQueueMax;
+                want_read = peer_ok && g_rooms[c.pipe_room].rl_tokens > 0;
+                if (!c.outq.empty()) FD_SET(c.sock, &wr);
+            }
+            if (want_read) FD_SET(c.sock, &rd);
+            if (want_read || !c.outq.empty()) if (c.sock > highest) highest = c.sock;
+        }
         for (const Probe& p : g_probes) {
             if (!p.used || p.s == INVALID_SOCKET) continue;
             FD_SET(p.s, &wr); FD_SET(p.s, &ex);
@@ -1486,6 +1745,23 @@ void serve_loop() {
                 }
         }
         probe_tick();
+        {   // relay housekeeping: refill each relay room's allowance; give up on pipes the host never answered
+            const uint64_t now = tick_ms();
+            for (int i = 0; i < kMaxRooms; ++i) {
+                Room& r = g_rooms[i];
+                if (!r.used || strcmp(r.tr, "relay")) continue;
+                if (now > r.rl_last) {
+                    r.rl_tokens += (int64_t)((now - r.rl_last) * (uint64_t)g_relay_kbps * 1024ull / 1000ull);
+                    if (r.rl_tokens > kRelayBurst) r.rl_tokens = kRelayBurst;
+                    r.rl_last = now;
+                }
+            }
+            for (int i = 0; i < kMaxClients; ++i)
+                if (g_clients[i].used && g_clients[i].kind == 1 && now - g_clients[i].pipe_start > kPipeWaitMs) {
+                    send_error(g_clients[i].sock, "the host did not answer in time", "pipe");
+                    close_client(i);
+                }
+        }
         if (rc == 0) continue;
         probe_poll(&wr, &ex);
 
@@ -1493,9 +1769,13 @@ void serve_loop() {
         if (g_udp != INVALID_SOCKET && FD_ISSET(g_udp, &rd)) answer_discovery();
 
         for (int i = 0; i < kMaxClients; ++i) {
+            if (!g_clients[i].used || g_clients[i].kind != 2 || !FD_ISSET(g_clients[i].sock, &wr)) continue;
+            if (!pipe_flush(g_clients[i])) close_client(i);
+        }
+        for (int i = 0; i < kMaxClients; ++i) {
             if (!g_clients[i].used) continue;
             if (!FD_ISSET(g_clients[i].sock, &rd)) continue;
-            on_readable(i);
+            if (g_clients[i].kind == 2) pipe_readable(i); else on_readable(i);
         }
     }
 }
@@ -1567,6 +1847,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quiet")) g_quiet = true;
         else if (!strcmp(argv[i], "--lan-discovery")) discovery = true;
         else if (!strcmp(argv[i], "--probe-all")) g_probe_all = true;
+        else if (!strcmp(argv[i], "--relay-rooms") && i + 1 < argc) g_relay_max = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--relay-kbps") && i + 1 < argc) g_relay_kbps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--logdir") && i + 1 < argc) g_logdir = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
         else { printf("unknown argument '%s'\n\n", argv[i]); usage(); return 2; }
@@ -1590,7 +1872,7 @@ int main(int argc, char** argv) {
     if (!open_listener(port, discovery, err)) { printf("%s\n", err.c_str()); return 1; }
 
     logf("mgmp signaling server listening on 0.0.0.0:%u", (unsigned)port);
-    logf("rooms hold up to %d players; it does not relay game traffic", kRoomCap);
+    logf("rooms hold up to %d players; up to %d rooms may use this server as the carrier (%d KB/s each)", kRoomCap, g_relay_max, g_relay_kbps);
 
     signal(SIGINT, [](int) { g_stop = 1; });
     signal(SIGTERM, [](int) { g_stop = 1; });

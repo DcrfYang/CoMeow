@@ -276,6 +276,10 @@ void report(uint8_t from, const NodeHashMsg& a, const NodeHashMsg& b) {
     // it is now a description rather than a symptom: "the used-event list differs,
     // so the peers will roll DIFFERENT EVENTS".
     const bool per_player_same = hist_same && inv_same && evt_same;
+    // Random events must be the SAME event on every peer (their effects reach the shared simulation): say so loudly when two peers drew different ones.
+    if (a.point == kNodePointEvent && a.event[0] && b.event[0] && !evt_same)
+        log_line_lvl(LogLevel::Error, "NODEHASH", "!! EVENT DIFFERS at node %016llx: this peer drew '%s', peer %u drew '%s' -- the run will diverge",
+                     (unsigned long long)a.node_seed, a.event, (unsigned)from, b.event);
 
     if ((!rng_compared || rng_same) && cats_same) {
         ++g.agreed;

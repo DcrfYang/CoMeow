@@ -16,7 +16,7 @@ namespace {
 // lobby
 SignalPeer lobby[8]; uint32_t lobby_n = 0;
 char room_id[16] = "ROOM", my_name[32] = "alice", my_role[8] = "host";
-bool locked = false; int lock_asked = -1; int away_said = -1;
+bool locked = false; int lock_asked = -1; int away_said = -1; bool fight_up = false;
 // transport
 bool active = true; uint8_t ids[4] = {0, 1}; uint8_t nids = 2, me = 0;
 std::vector<RoomCtlMsg> sent;
@@ -66,6 +66,7 @@ bool signal_room_locked() { return room_id[0] && locked; }
 void signal_request_lock(bool on) { lock_asked = on ? 1 : 0; }
 void signal_set_away(bool on) { away_said = on ? 1 : 0; for (uint32_t i = 0; i < lobby_n; ++i) if (!strcmp(lobby[i].name, my_name)) lobby[i].away = on; }
 bool net_active() { return active; }
+bool lockstep_fight_up() { return fight_up; }
 bool net_peer_ids(uint8_t* out, uint8_t cap) { if (!active || cap < nids) return false; memcpy(out, ids, nids); return true; }
 uint8_t net_peer_count() { return active ? nids : 0; }
 uint8_t net_self() { return me; }
@@ -164,6 +165,10 @@ int main() {
     fresh(); self_page = PageState::House; pages[1] = PageState::House; say_name(1, "bob");
     room_tick(); pages[1] = PageState::MainMenu; room_tick();
     CHECK(notice_text() == "P2玩家掉线，如果要继续游戏，请所有玩家回到主菜单重新开始游戏->选择存档并进入游戏");
+    // dropped in the middle of a fight: the notice adds the sentence about the house boss; outside a fight it does not
+    fresh(); peers({ "alice", "bob" }); nids = 2; say_name(1, "bob"); self_page = PageState::InGame; pages[1] = PageState::InGame;
+    room_tick(); fight_up = true; nids = 1; room_tick(); fight_up = false;
+    CHECK(notice_text() == "P2玩家掉线，如果要继续游戏，请所有玩家回到主菜单重新开始游戏->选择存档并进入游戏 放心吧，本模组已经让史蒂文“下班了”。");
     // nothing is said on the menus
     fresh(); say_name(1, "bob"); room_tick(); nids = 1; room_tick(); CHECK(notice_text().empty());
 
@@ -234,6 +239,13 @@ int main() {
     CHECK(room_party_limit() == 2 && room_depart_allowed(2) && !room_depart_allowed(3));
     CHECK(toast_text() == "当前为4人联机，每名玩家最多选择2只猫");
     active = false; CHECK(room_party_limit() == 0 && room_depart_allowed(4));   // alone: the game's own rules
+
+    printf("-- a sync that ran out of time tells the player --\n");
+    fresh(); room_sync_trouble("the host's board");
+    CHECK(notice_text().find("连接") != std::string::npos && notice_text().find("同步") != std::string::npos);
+    room_notice_dismiss(); CHECK(notice_text().empty());
+    nids = 1; room_sync_trouble("the host's board"); CHECK(notice_text().empty());     // alone: nothing to be out of sync with
+    fresh(); active = false; room_sync_trouble("the host's board"); CHECK(notice_text().empty()); active = true;
 
     printf("-- the text follows the game's language --\n");
     CHECK(i18n_set_lang_code("en") && i18n_lang() == kLangEn);

@@ -73,7 +73,7 @@ namespace mgmp {
 // 39: fresh sessions pre-sync the host's serialized chapter_map row into the client's
 //     save before load (departure-ready saves carry two different generated maps,
 //     which the first node boundary refused to certify).
-constexpr uint32_t kProtoVersion = 51;  // 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number
+constexpr uint32_t kProtoVersion = 71;  // 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 58 UNLOCKS carries the locked_bosses list too, 59 UNLOCKS carries the order the host's battle will spawn its party in, 60 UNLOCKS carries the level the host's battle picked, 61 BOARD carries the host's battle board and simulation stream, 62 UNLOCKS carries the host's queue of returning enemies, 63 ... and the other two queues of the director the battle build consumes, 64 ... and its list of active global modifiers (weather), 65 the modifiers move to MSG_WEATHER (weather only), 66 MSG_WEATHER carries the director's queued battle-start spawns (name + number), 67 MSG_WEATHER is gone: UNLOCKS carries the director's weather names with the level, 68 ... and with the start of EVERY battle build (build_info), not only the level pick, 69 BOARD covers EVERY unit (players too) and carries its turn-order keys (Character+0x954 / +0x958 / speed), 70 ... and the initiative base +0x5DC the first key is recomputed from, 71 BOARD is published at EVERY turn boundary (carries the turn)
 
 // A frame's payload may not exceed this. RUNSTATE (phase 5) is the only message
 // that will ever approach it; everything in phase 4 is under 128 bytes.
@@ -181,6 +181,75 @@ inline int session_cat_owner(uint64_t id) {
 }
 constexpr uint8_t MSG_CHAPTER = 24;
 constexpr uint8_t MSG_CHECKPOINT = 25; // node-boundary save proposal/ack/commit and slot identity
+// The chapter map's node seeds, host -> clients (proto 54). Two peers generate the same map STRUCTURE (node count, types) but, when their saves differ, not
+// the same 32-byte xoshiro seed per node; the host sends its seeds in chunks and a client whose structure matches adopts them before its map is reported
+// to the checkpoint (mgmp_follow: map_seed_sync).
+constexpr uint8_t  MSG_MAPSEEDS = 34;
+constexpr uint32_t kMapSeedsChunk = 8;     // nodes per message
+constexpr uint32_t kMapSeedsMaxNodes = 128;
+struct MapSeedNode {
+    uint8_t  type = 0;
+    uint64_t seed[4] = {};
+    uint32_t flags = 0;     // the dword at MapNode+0x168: consumed + the lock/hidden bytes next to it (generation sets them for locked nodes)
+};
+constexpr uint8_t kMapSeedsFromHost = 0;     // the host's seeds and the MERGED flags, host -> clients
+constexpr uint8_t kMapSeedsFromClient = 1;   // a client's own flags (seeds unused), client -> host: the host merges them (a node locked for anybody is locked)
+struct MapSeedsMsg {
+    uint8_t  kind = kMapSeedsFromHost;
+    uint32_t epoch = 0;     // one per publication; the chunks of one map share it
+    uint32_t total = 0;     // nodes in the map
+    uint32_t first = 0;     // index of nodes[0]
+    uint8_t  count = 0;     // entries used in nodes[]
+    MapSeedNode nodes[kMapSeedsChunk];
+};
+// The HOST's unlock answers (proto 56). A battle is generated from each peer's own unlock lists (which level groups, which pickups, ...), so two
+// players with different progress build different battles. The host sends one bit per name of the game's blacklists (mgmp_unlock_lists.h, in that
+// order: set = unlocked for the host) and every client answers the generation of a battle with them (mgmp_unlocks).
+constexpr uint8_t MSG_UNLOCKS = 35;
+// One entry of the director's queue of enemies that come back (MewDirector+0x610, 0x38 bytes each): what the enemy stage of the battle build spawns.
+constexpr uint32_t kPendingMax = 6;
+constexpr uint32_t kWeatherNames = 4;    // weathers in the list
+constexpr uint32_t kWeatherLen = 32;     // longest name + NUL
+constexpr uint32_t kPendingQueues = 3;   // see mgmp_unlocks: 0 returning enemies, 1 neutral critters, 2 carried units
+struct PendingEnemy {
+    uint32_t ident = 0;      // hash of the enemy definition's name
+    int32_t  remaining = 0;  // +0x24: battles it still comes back for
+    int32_t  hp = 0;         // +0x20: the health it returns with
+    int32_t  mode = 0;       // +0x28
+};
+struct UnlocksMsg {
+    uint32_t epoch = 0;
+    uint32_t abilities = 0;      // bit n = locked_abilities[n] is unlocked for the host
+    uint32_t passives = 0;
+    uint8_t  items[16] = {};
+    uint8_t  levels = 0;         // locked_levelgroups
+    uint8_t  bosses = 0;         // locked_bosses (bit n = the boss can be drawn for the host)
+    uint8_t  n_bosses = 0;
+    uint8_t  n_abilities = 0, n_passives = 0, n_items = 0, n_levels = 0;   // the host's list sizes: a different game data version is refused
+    // The values of the save properties the random events read (mgmp_event_keys.h, in that order): tokens, counters, flags.
+    uint8_t  n_events = 0;
+    int32_t  events[64] = {};
+    // The order the HOST's battle will place its party in (the game stable-sorts the party by each cat's computed SPEED, highest first),
+    // with the key each cat sorts on. A client whose own sort comes out differently is put into this order (mgmp_unlocks).
+    uint8_t  n_spawn = 0;
+    uint64_t spawn_ids[8] = {};
+    int32_t  spawn_keys[8] = {};
+    // The level the HOST's battle picked (sub_140394450), tagged with the battle id it was picked for (proto 60). The clients' own pick can differ
+    // (the candidate list is filtered by per-save state) and is overwritten with this one.
+    uint64_t level_node = 0;
+    uint8_t  n_level_name = 0;
+    char     level_name[48] = {};
+    // The host's queue of returning enemies at the moment it picked the level (proto 62), sent with the level only. The enemy stage of a client's
+    // build aligns its own queue with it (mgmp_unlocks: unlocks_build_enemies_begin).
+    uint8_t  n_pending[kPendingQueues] = {};
+    PendingEnemy pending[kPendingQueues][kPendingMax];
+    // The names in the HOST's weather list (MewDirector+0x668, in order; proto 67), sent with the level. A client whose list differs builds the battle with these.
+    uint8_t  n_weather = 0;
+    char     weather[kWeatherNames][kWeatherLen] = {};
+    // 1 when pending[] / weather[] are valid and belong to the battle `level_node` (proto 68). Sent with the level pick of an ordinary battle AND at the start of every
+    // battle build (a mini-boss or boss node never goes through the level pick).
+    uint8_t  build_info = 0;
+};
 constexpr uint8_t kChapterReady = 0;
 constexpr uint8_t kChapterSelect = 1;
 struct ChapterMsg {
@@ -188,6 +257,10 @@ struct ChapterMsg {
     uint32_t generation = 0;
     uint8_t act = 0;
     int32_t difficulty = 0;
+    // The map flags (mgmp_unlocks: mapflag_HardPathUnlocked, ...Sewers..., ...Desert...) as a bit set (proto 53). kChapterReady: THIS player's.
+    // kChapterSelect: the ones EVERY player has -- the chapter map is generated from them on all peers, so the host cannot enter a node a
+    // player without the flag could not, and the host cannot choose a chapter somebody has not unlocked (mgmp_setup).
+    uint32_t mapflags = 0;
 };
 
 // Recovery traffic never carries another player's database. Each participant
@@ -1190,13 +1263,164 @@ inline uint32_t enc_chapter(uint8_t* p, uint32_t cap, const ChapterMsg& m) {
     if (!valid_chapter(m)) return 0;
     Writer w(p, cap);
     w.u8v(MSG_CHAPTER); w.u8v(m.kind); w.u32v(m.generation);
-    w.u8v(m.act); w.i32v(m.difficulty);
+    w.u8v(m.act); w.i32v(m.difficulty); w.u32v(m.mapflags);
     return w.ok ? w.len : 0;
 }
 inline bool dec_chapter(Reader& r, ChapterMsg& m) {
     m.kind = r.u8v(); m.generation = r.u32v();
-    m.act = r.u8v(); m.difficulty = r.i32v();
+    m.act = r.u8v(); m.difficulty = r.i32v(); m.mapflags = r.u32v();
     return r.ok && r.pos == r.len && valid_chapter(m);
+}
+
+inline bool valid_mapseeds(const MapSeedsMsg& m) {
+    return m.kind <= kMapSeedsFromClient && m.epoch != 0 && m.total >= 1 && m.total <= kMapSeedsMaxNodes && m.count >= 1 && m.count <= kMapSeedsChunk &&
+           m.first <= m.total && m.count <= m.total - m.first;
+}
+inline uint32_t enc_mapseeds(uint8_t* p, uint32_t cap, const MapSeedsMsg& m) {
+    if (!valid_mapseeds(m)) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_MAPSEEDS); w.u8v(m.kind); w.u32v(m.epoch); w.u32v(m.total); w.u32v(m.first); w.u8v(m.count);
+    for (uint32_t i = 0; i < m.count; ++i) {
+        w.u8v(m.nodes[i].type);
+        for (int k = 0; k < 4; ++k) w.u64v(m.nodes[i].seed[k]);
+        w.u32v(m.nodes[i].flags);
+    }
+    return w.ok ? w.len : 0;
+}
+inline bool dec_mapseeds(Reader& r, MapSeedsMsg& m) {
+    m.kind = r.u8v(); m.epoch = r.u32v(); m.total = r.u32v(); m.first = r.u32v(); m.count = r.u8v();
+    if (!r.ok || m.count > kMapSeedsChunk) return false;
+    for (uint32_t i = 0; i < m.count; ++i) {
+        m.nodes[i].type = r.u8v();
+        for (int k = 0; k < 4; ++k) m.nodes[i].seed[k] = r.u64v();
+        m.nodes[i].flags = r.u32v();
+    }
+    return r.ok && r.pos == r.len && valid_mapseeds(m);
+}
+
+// THE HOST'S BOARD (proto 61). A battle is built by each peer from its OWN save, and the unit kinds, tiles and numbers that depend on per-save data
+// (a pickup's roll, a corpse, a placement draw ...) came out differently on the two machines -- measured 2026-10-02: 34 of 36 units equal and two
+// coins on other tiles, which was a turn-0 halt. The host now sends, once per battle at the first turn boundary, every NON-PLAYER unit of its roster
+// (index, kind, hp / max hp / shield, tile, facing) and the state of the shared simulation stream; a client overwrites its own board with them
+// before the first turn hash and carries on from the host's stream, so the enemies' decisions are the host's as well (mgmp_lockstep: board_*).
+constexpr uint8_t  MSG_BOARD = 36;
+constexpr uint32_t kBoardChunk = 16;      // units per message
+constexpr uint32_t kBoardMax = 254;       // the roster cap (kMaxCats in mgmp_lockstep)
+constexpr uint8_t  kBoardDead = 1, kBoardLinked = 2, kBoardHuman = 4;   // kBoardHuman: a player's cat on the host -- only its turn-order keys are meant to be taken over
+struct BoardUnit {
+    uint8_t  index = 0;      // the unit's index in the battle roster (the roster order is the same on every peer)
+    uint32_t ident = 0;      // hash of the unit's kind (Character+0x248, the authored type name)
+    int32_t  hp = 0, shield = 0, maxhp = 0;
+    uint8_t  flags = 0;      // kBoardDead / kBoardLinked
+    int32_t  tx = 0, ty = 0; // the tile
+    int32_t  fx = 0, fy = 0; // the facing
+    // The turn order is a shuffle of the character list (the shared stream) and a sort on these two keys (sub_1408E3C20): Character+0x954 (2*speed + bonus) and +0x958 (a random
+    // number drawn when the character was created). A peer whose keys differ plays another turn order (2026-10-03: the host's mini-boss first, the client's own cat first).
+    int32_t  key_a = 0, key_b = 0, speed = 0;   // Character+0x954, +0x958, and the speed stat +0x5CC (the input of the first, for the log)
+    // +0x954 is RECOMPUTED (recompute_stats: 2*speed + [+0x5DC]) whenever the unit's stats are touched, so writing it alone is undone at the next recompute; +0x5DC is the base the game
+    // sets once at creation (base_initiative + the random initiative_variation), and it is what has to be the host's (proto 70).
+    int32_t  init_base = 0;                      // Character+0x5DC
+};
+struct BoardMsg {
+    uint64_t battle = 0;     // the battle id (the node seed both peers share)
+    uint32_t turn = 0;       // the turn boundary the snapshot was taken at (0 = battle start; one per boundary since proto 71)
+    uint32_t cats = 0;       // the roster size on the host
+    uint32_t total = 0;      // non-player units over all chunks
+    uint32_t first = 0;      // index into the unit list of units[0]
+    uint8_t  count = 0;      // entries used in units[]
+    uint64_t rng[4] = {};    // the host's simulation stream at that boundary
+    BoardUnit units[kBoardChunk];
+};
+// What the receive thread has put together from the chunks (net_host_board).
+struct BoardAssembled {
+    uint64_t battle = 0;
+    uint32_t turn = 0;
+    uint32_t cats = 0, total = 0, got = 0;
+    bool     complete = false;
+    uint64_t rng[4] = {};
+    bool     have[kBoardMax] = {};
+    BoardUnit unit[kBoardMax];
+};
+
+inline bool valid_board(const BoardMsg& m) {
+    if (m.battle == 0 || m.cats > kBoardMax || m.total > m.cats || m.count > kBoardChunk || m.first > m.total ||
+        m.count > m.total - m.first || (m.count == 0 && m.total != 0)) return false;
+    for (uint32_t i = 0; i < m.count; ++i) if (m.units[i].index >= m.cats) return false;
+    return true;
+}
+inline uint32_t enc_board(uint8_t* p, uint32_t cap, const BoardMsg& m) {
+    if (!valid_board(m)) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_BOARD); w.u64v(m.battle); w.u32v(m.turn); w.u32v(m.cats); w.u32v(m.total); w.u32v(m.first); w.u8v(m.count);
+    for (int k = 0; k < 4; ++k) w.u64v(m.rng[k]);
+    for (uint32_t i = 0; i < m.count; ++i) {
+        const BoardUnit& u = m.units[i];
+        w.u8v(u.index); w.u32v(u.ident); w.i32v(u.hp); w.i32v(u.shield); w.i32v(u.maxhp); w.u8v(u.flags);
+        w.i32v(u.tx); w.i32v(u.ty); w.i32v(u.fx); w.i32v(u.fy); w.i32v(u.key_a); w.i32v(u.key_b); w.i32v(u.speed); w.i32v(u.init_base);
+    }
+    return w.ok ? w.len : 0;
+}
+inline bool dec_board(Reader& r, BoardMsg& m) {
+    m.battle = r.u64v(); m.turn = r.u32v(); m.cats = r.u32v(); m.total = r.u32v(); m.first = r.u32v(); m.count = r.u8v();
+    for (int k = 0; k < 4; ++k) m.rng[k] = r.u64v();
+    if (!r.ok || m.count > kBoardChunk) return false;
+    for (uint32_t i = 0; i < m.count; ++i) {
+        BoardUnit& u = m.units[i];
+        u.index = r.u8v(); u.ident = r.u32v(); u.hp = r.i32v(); u.shield = r.i32v(); u.maxhp = r.i32v(); u.flags = r.u8v();
+        u.tx = r.i32v(); u.ty = r.i32v(); u.fx = r.i32v(); u.fy = r.i32v(); u.key_a = r.i32v(); u.key_b = r.i32v(); u.speed = r.i32v(); u.init_base = r.i32v();
+    }
+    return r.ok && r.pos == r.len && valid_board(m);
+}
+
+inline bool valid_unlocks(const UnlocksMsg& m) {
+    return m.epoch != 0 && m.n_abilities <= 32 && m.n_passives <= 32 && m.n_items <= 128 && m.n_levels <= 8 && m.n_bosses <= 8 && m.n_events <= 64 && m.n_spawn <= 8 && m.n_level_name < sizeof(m.level_name) && m.n_pending[0] <= kPendingMax && m.n_pending[1] <= kPendingMax && m.n_pending[2] <= kPendingMax && m.n_weather <= kWeatherNames;
+}
+inline uint32_t enc_unlocks(uint8_t* p, uint32_t cap, const UnlocksMsg& m) {
+    if (!valid_unlocks(m)) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_UNLOCKS); w.u32v(m.epoch); w.u32v(m.abilities); w.u32v(m.passives);
+    w.raw(m.items, sizeof(m.items)); w.u8v(m.levels); w.u8v(m.bosses);
+    w.u8v(m.n_abilities); w.u8v(m.n_passives); w.u8v(m.n_items); w.u8v(m.n_levels); w.u8v(m.n_bosses);
+    w.u8v(m.n_events);
+    for (uint32_t i = 0; i < m.n_events; ++i) w.i32v(m.events[i]);
+    w.u8v(m.n_spawn);
+    for (uint32_t i = 0; i < m.n_spawn; ++i) { w.u64v(m.spawn_ids[i]); w.i32v(m.spawn_keys[i]); }
+    w.u64v(m.level_node); w.u8v(m.n_level_name);
+    for (uint32_t i = 0; i < m.n_level_name; ++i) w.u8v((uint8_t)m.level_name[i]);
+    for (uint32_t q = 0; q < kPendingQueues; ++q) {
+        w.u8v(m.n_pending[q]);
+        for (uint32_t i = 0; i < m.n_pending[q]; ++i) { const PendingEnemy& e = m.pending[q][i]; w.u32v(e.ident); w.i32v(e.remaining); w.i32v(e.hp); w.i32v(e.mode); }
+    }
+    w.u8v(m.n_weather);
+    for (uint32_t i = 0; i < m.n_weather; ++i) { const uint8_t len = (uint8_t)strnlen(m.weather[i], kWeatherLen - 1); w.u8v(len); for (uint8_t k = 0; k < len; ++k) w.u8v((uint8_t)m.weather[i][k]); }
+    w.u8v(m.build_info);
+    return w.ok ? w.len : 0;
+}
+inline bool dec_unlocks(Reader& r, UnlocksMsg& m) {
+    m.epoch = r.u32v(); m.abilities = r.u32v(); m.passives = r.u32v();
+    for (size_t i = 0; i < sizeof(m.items); ++i) m.items[i] = r.u8v();
+    m.levels = r.u8v(); m.bosses = r.u8v();
+    m.n_abilities = r.u8v(); m.n_passives = r.u8v(); m.n_items = r.u8v(); m.n_levels = r.u8v(); m.n_bosses = r.u8v();
+    m.n_events = r.u8v();
+    if (m.n_events > 64) return false;
+    for (uint32_t i = 0; i < m.n_events; ++i) m.events[i] = r.i32v();
+    m.n_spawn = r.u8v();
+    if (m.n_spawn > 8) return false;
+    for (uint32_t i = 0; i < m.n_spawn; ++i) { m.spawn_ids[i] = r.u64v(); m.spawn_keys[i] = r.i32v(); }
+    m.level_node = r.u64v(); m.n_level_name = r.u8v();
+    if (m.n_level_name >= sizeof(m.level_name)) return false;
+    for (uint32_t i = 0; i < m.n_level_name; ++i) m.level_name[i] = (char)r.u8v();
+    m.level_name[m.n_level_name] = 0;
+    for (uint32_t q = 0; q < kPendingQueues; ++q) {
+        m.n_pending[q] = r.u8v();
+        if (m.n_pending[q] > kPendingMax) return false;
+        for (uint32_t i = 0; i < m.n_pending[q]; ++i) { PendingEnemy& e = m.pending[q][i]; e.ident = r.u32v(); e.remaining = r.i32v(); e.hp = r.i32v(); e.mode = r.i32v(); }
+    }
+    m.n_weather = r.u8v();
+    if (m.n_weather > kWeatherNames) return false;
+    for (uint32_t i = 0; i < m.n_weather; ++i) { const uint8_t len = r.u8v(); if (len >= kWeatherLen) return false; for (uint8_t k = 0; k < len; ++k) m.weather[i][k] = (char)r.u8v(); m.weather[i][len] = 0; }
+    m.build_info = r.u8v();
+    return r.ok && r.pos == r.len && valid_unlocks(m);
 }
 
 inline uint32_t enc_chapterseed(uint8_t* p, uint32_t cap, const ChapterSeedMsg& m) {

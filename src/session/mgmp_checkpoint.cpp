@@ -48,6 +48,7 @@ struct State {
     bool choosing=false, invalid=false, dismissed=false;
     CheckpointRef list[kCheckpointCandidates]{}; unsigned listN=0; bool listPrep=false;
     uint8_t waitPhase=0, waitMask=0;
+    uint8_t holders=0;   // bit n = the peer with transport id n holds an unfinished co-op record (mode 1 or snapshots): who refused the round
     uint8_t sentPhase=255, sentMask=255; ULONGLONG sentAt=0; unsigned invalidSends=0;
 };
 State g;
@@ -402,6 +403,19 @@ unsigned common_saves(CheckpointRef* out) {
         }
     return n;
 }
+// A refused round, on the record: what each player offered. Without this the log says "no common confirmed save" and nothing about WHO
+// carries the unfinished run that makes the saves incompatible; the mask goes to the panel (and to the guests in the SAVEWAIT).
+void note_refusal() {
+    uint8_t holders=0;
+    for(unsigned i=0;i<g.config.count;++i) {
+        const auto& m=g.offers[i];
+        unsigned snaps=0; for(const auto& c:m.candidates) if(c.run) ++snaps;
+        log_line("CHECKPOINT","offer of player %u (peer %u): mode %u, run %016llx, %u snapshot(s)%s",i+1,(unsigned)g.config.peers[i],(unsigned)m.mode,
+                 (unsigned long long)m.run,snaps,(m.mode==1||snaps)?" -- holds an unfinished co-op record":"");
+        if((m.mode==1||snaps) && g.config.peers[i]<kMaxPeers) holders|=(uint8_t)(1u<<g.config.peers[i]);
+    }
+    g.holders=holders;
+}
 void send_wait(uint8_t phase);
 void choose() {
     if(!g.host || !all(g.haveOffer) || g.failed || g.tx.kind==kCheckpointSelect) return;
@@ -422,6 +436,7 @@ void choose() {
         g.listN=nc; for(unsigned i=0;i<nc;++i) g.list[i]=common[i];
         g.listPrep=!running;
         if(!nc && !g.listPrep) {
+            note_refusal();
             g.invalid=true;
             fail("recovery refused: no common confirmed save (or this run already settled)");
             send_wait(kSaveWaitInvalid); return;
@@ -431,7 +446,7 @@ void choose() {
         send_wait(kSaveWaitChoosing); return;
     }
     const CheckpointRef best=nc?common[0]:CheckpointRef{};
-    if(!fresh && !best.run) { fail("recovery refused: no common confirmed save (or this run already settled)"); return; }
+    if(!fresh && !best.run) { note_refusal(); fail("recovery refused: no common confirmed save (or this run already settled)"); return; }
     CheckpointMsg m=g.config; m.kind=kCheckpointSelect; m.mode=fresh?0:1;
     m.run=fresh?checkpoint_io::nonce():best.run; m.seq=best.seq; m.stamp=best.stamp; m.token=best.certificate;
     if(!m.run) { fail("cannot allocate recovery run identity"); return; }
@@ -446,7 +461,7 @@ uint8_t selected_mask() {
 }
 void send_wait(uint8_t phase) {
     if(!g.host || !g_manual || g.inSession) return;
-    SaveWaitMsg m; m.phase=phase; m.selected=selected_mask();
+    SaveWaitMsg m; m.phase=phase; m.selected=phase==kSaveWaitInvalid ? g.holders : selected_mask();   // invalid: who holds the unfinished record
     net_send_savewait(m);
     g.sentPhase=phase; g.sentMask=m.selected; g.sentAt=GetTickCount64();
 }
@@ -522,9 +537,14 @@ void apply_select(const CheckpointMsg& m) {
 bool transaction(const CheckpointMsg& m) { return m.run==g.tx.run && m.seq==g.tx.seq && m.map==g.tx.map && m.stamp==g.tx.stamp; }
 void prepare() {
     if(!g.host || g.preparing || !all(g.haveArrival) || g.failed) return;
+    // THE MAP FINGERPRINTS NO LONGER HAVE TO AGREE (2026-10-02). The host's map names the transaction;
+    // a peer whose own map differs still stages its own database under it. Each peer only checks that
+    // ITS map did not change between its arrival and its capture (checkpoint_on_map).
     uint64_t map=g.arrivals[0].map;
-    for(unsigned i=0;i<g.config.count;++i) if(g.arrivals[i].map!=map || !map) {
-        fail("checkpoint refused: map state differs between participants"); return;
+    if(!map) { fail("checkpoint refused: the host's map is unreadable"); return; }
+    for(unsigned i=1;i<g.config.count;++i) if(g.arrivals[i].map!=map) {
+        log_line("CHECKPOINT","map %016llx on peer slot %u differs from the host's %016llx -- continuing",
+                     (unsigned long long)g.arrivals[i].map,i,(unsigned long long)map);
     }
     CheckpointMsg m=g.config; m.kind=kCheckpointPrepare; m.run=g.run; m.seq=g.seq+1; m.map=map; m.stamp=now();
     memset(m.hashes,0,sizeof(m.hashes)); // configuration carried selection nonces
@@ -612,6 +632,17 @@ static bool select_impl(uint8_t slot,const wchar_t* path,bool inSession) {
     // path may alias g.path. Copy before clearing a completed/failed round.
     const std::wstring selected_path(path);
     if(g.finished || g.released || g.loadIssued || g.inSession || g.failed) reset_selection();
+    // NOBODY TO PLAY WITH IS SINGLE PLAYER (2026-10-02). The handshake exists to keep a co-op run recoverable by
+    // everybody in it; with no connected peer there is nobody to certify with, and holding the pick left a
+    // save that was on the map (a run in progress) impossible to open alone -- "unfinished save held;
+    // reconnect all players" after the other side dropped, or with the host waiting for a join. Any save
+    // opens as it would in the shipped game: the checkpoint steps aside and the caller tears the leftover
+    // session down. Only the in-session next chapter (inSession) still insists on its participants.
+    if(!inSession && (!net_active() || net_peer_count()<2)) {
+        g.on=false;
+        status("no connected peer; opening the local save alone");
+        return true;
+    }
     g.inSession=inSession;
     if(g.selected) {
         status("save selection pending; finish both selections or reconnect the room to change slots");
@@ -619,14 +650,7 @@ static bool select_impl(uint8_t slot,const wchar_t* path,bool inSession) {
     }
     bool running=false;
     if(!checkpoint_io::in_run(selected_path,running)) { fail("save selection refused: unreadable or invalid SQLite save"); return false; }
-    if(!net_active() || net_peer_count()<2) {
-        if(!running && !inSession) {
-            // No adventure can be advanced by opening an already settled House.
-            // Caller tears down the leftover session before any new co-op run.
-            g.on=false;
-            status("no connected peer; opening local warehouse save");
-            return true;
-        }
+    if(!net_active() || net_peer_count()<2) {   // only the in-session next chapter gets here
         status("unfinished save held; reconnect all players and select saves again");
         return false;
     }
@@ -673,6 +697,7 @@ void checkpoint_on_node(uint64_t seed,uint32_t) {
     status(g.skip ? "node in progress; this node's checkpoint is skipped (roster disagreement), previous confirmed saves retained"
                   : "node in progress; previous confirmed saves retained");
 }
+bool checkpoint_run_restored() { return g.on && g.mode==1; }
 bool checkpoint_needs_map() { return g.on && g.released && !g.failed && g.dirty && !g.skip; }
 void checkpoint_on_map(uint64_t map_hash) {
     if(!checkpoint_needs_map() || !map_hash) return;
@@ -685,7 +710,10 @@ void checkpoint_on_map(uint64_t map_hash) {
         else if(!net_send_checkpoint(m)) fail("checkpoint arrival send failed");
     }
     if(!g.capture || g.failed) return;
-    if(map_hash!=g.tx.map) { fail("checkpoint refused: map changed during preparation"); return; }
+    if(map_hash!=g.map) {   // this peer's own map changed since it arrived (the map sync adopted the host's): not an error, the transaction is named by the host's map
+        log_line("CHECKPOINT","this peer's map changed from %016llx to %016llx during preparation (the map sync) -- continuing",(unsigned long long)g.map,(unsigned long long)map_hash);
+        g.map=map_hash;
+    }
     uint8_t* data=nullptr; uint32_t size=0; uint64_t hash=0;
     if(!savefile_read_checkpoint(&data,&size,&hash)) { fail("checkpoint capture failed; next node held"); return; }
     g.pending.certificate=g.tx; g.pending.certificate.hashes[g.pos]=hash;
@@ -766,7 +794,9 @@ void checkpoint_on_message(uint8_t from,const CheckpointMsg& m) {
             if(m.run!=g.run || m.seq!=g.seq || !g.run) return;
             g.released=true; g.dirty=true; status("all saves validated; loading local save"); break;
         case kCheckpointPrepare:
-            if(!g.released || !g.arrived || g.preparing || m.run!=g.run || m.seq!=g.seq+1 || m.map!=g.map || !same_config(m)) return;
+            if(!g.released || !g.arrived || g.preparing || m.run!=g.run || m.seq!=g.seq+1 || !m.map || !same_config(m)) return;
+            if(m.map!=g.map) log_line("CHECKPOINT","the host's map %016llx differs from this peer's %016llx -- continuing",
+                                          (unsigned long long)m.map,(unsigned long long)g.map);
             g.tx=m; g.preparing=true; g.capture=true; break;
         case kCheckpointCommit: apply_commit(m); break;
         case kCheckpointAdvance:
@@ -839,7 +869,7 @@ void checkpoint_on_savewait(uint8_t from,const SaveWaitMsg& m) {
     if(m.phase==kSaveWaitInvalid) {
         // Only a round this peer is IN can be invalid, and never one it started over a moment ago.
         if(!g.selected || g.released || GetTickCount64()-g_abort_at<3000) return;
-        g.invalid=true;
+        g.invalid=true; g.holders=m.selected;
     }
     g.waitPhase=m.phase; g.waitMask=m.selected;
 }
@@ -866,7 +896,7 @@ bool checkpoint_sync_view(SaveSyncView& v) {
     v=SaveSyncView{};
     if(!g.on || !g_manual || g.inSession || g.dismissed) return false;
     v.host=g.host;
-    if(g.invalid) { v.phase=kSyncInvalid; return true; }
+    if(g.invalid) { v.phase=kSyncInvalid; v.selected=g.holders; return true; }
     if(!g.selected || g.released || g.loadIssued) return false;
     if(g.host) {
         v.selected=selected_mask();

@@ -58,6 +58,18 @@ int say_client=0,say_wait=0,say_story=0;
 void room_say_chapter_client(){++say_client;}
 void room_say_chapter_wait(){++say_wait;}
 void room_say_story_only_host(){++say_story;}
+int say_ready=0,say_start_wait=0;
+void room_say_no_chapter_ready(){++say_ready;}
+void room_say_no_chapter_wait(){++say_start_wait;}
+bool checkpoint_run_restored(){return false;}
+int say_lock2=0,say_lock3=0;
+void room_say_chapter_locked_2(){++say_lock2;}
+void room_say_chapter_locked_3(){++say_lock3;}
+uint32_t test_flags[4]={~0u,~0u,~0u,~0u};   // each player's map flags, by session position
+uint32_t unlocks_mapflags(){return test_flags[net_peer_pos()];}
+uint32_t override_flags[4]={};int override_sets[4]={};int override_clears=0;
+void unlocks_override_set(uint32_t f){override_flags[net_peer_pos()]=f;++override_sets[net_peer_pos()];}
+void unlocks_override_clear(){++override_clears;}
 }
 namespace {
 int eq_calls=0; bool eq_legacy=false,eq_missing=false;int64_t eq_location=-1;
@@ -111,9 +123,14 @@ void test_equipment(){
  at(0,[]{CHECK(!setup_client_preparing());});
  for(unsigned p=1;p<4;++p)at(p,[]{CHECK(setup_client_preparing());});
  prepare();for(unsigned p=0;p<4;++p)at(p,[]{CHECK(!setup_client_preparing());});
- // An early resume packet from a different checkpoint must not be applied later.
+ // A resume packet carries the sender's map fingerprint, and the receiver's own map may differ (each peer restored its own local checkpoint): it is
+ // used all the same (2026-10-02; it used to be dropped, and the restored run then never left its first map).
  reset(2,0);at(0,[]{SetupMsg m{};catsync_export_resume(m,1);m.kind=kSetupResumeExport;m.generation=20;m.checkpoint=0xbad;setup_on_message(m,1);free_msg(m);});
- tick(0,true);CHECK(!states[0].reply_sent&&imports[0]==0);
+ tick(0,true);CHECK(states[0].reply_sent&&imports[0]==1);
+ // ...and a whole resume exchange between two peers whose maps have different fingerprints completes both ways.
+ reset(2,0);
+ for(unsigned k=0;k<125;++k){at(0,[]{setup_on_map(0x111);});at(1,[]{setup_on_map(0x222);});drain();}
+ at(0,[]{CHECK(g.reply_sent&&setup_runtime_ready());});at(1,[]{CHECK(g.host_reply_seen&&setup_runtime_ready());});
 }
 }
 void test_hints(){
@@ -129,8 +146,63 @@ void test_hints(){
  at(0,[]{CHECK(!setup_on_select_act(2));});                                                                           // already committed: nothing to wait for
  CHECK(say_wait==0&&say_client==1);
 }
+namespace {
+int went[4]{};
+void go_cb(void*){++went[current];}
+void spin(unsigned n,unsigned rounds=125){for(unsigned k=0;k<rounds;++k){for(unsigned p=0;p<n;++p)at(p,[]{setup_tick();});drain();}}
+}
+void test_no_chapter(){
+ // A player WITHOUT chapter 2 has no chapter page: the gear screen's lock is the page. A client's lock is READY, the host's is the
+ // chapter-1 choice; the game's closure runs only once the host has committed, and runs exactly once on every peer.
+ for(unsigned n=2;n<=4;++n){
+  reset(n,0);say_ready=say_start_wait=0;for(auto& w:went)w=0;int dir=1;
+  at(0,[&]{CHECK(setup_on_equip_done(&dir,go_cb));CHECK(setup_no_chapter_pending());CHECK(!setup_on_equip_done(&dir,go_cb));});   // taken over once
+  CHECK(say_start_wait==1);
+  spin(n,10);CHECK(went[0]==0);                                                    // the clients have not locked: the host waits
+  for(unsigned p=1;p<n;++p)at(p,[&]{CHECK(setup_on_equip_done(&dir,go_cb));CHECK(setup_no_chapter_pending());});
+  CHECK(say_ready==(int)n-1);
+  spin(n);
+  for(unsigned p=0;p<n;++p){CHECK(went[p]==1);at(p,[]{CHECK(!setup_no_chapter_pending());});}
+  for(unsigned p=1;p<n;++p)CHECK(!memcmp(rngs[0],rngs[p],32));                     // the host's RNG stream, as on the chapter page
+  spin(n,20);for(unsigned p=0;p<n;++p)CHECK(went[p]==1);                           // and never again
+ }
+ // A client never starts on its own while the host has not committed; the page the room sees for it is held.
+ reset(2,0);for(auto& w:went)w=0;int dir=2;at(1,[&]{CHECK(setup_on_equip_done(&dir,go_cb));});spin(2,40);CHECK(went[1]==0);
+ // The room going away releases the lock instead of leaving the player stuck.
+ online=false;spin(2,3);CHECK(went[1]==1);online=true;
+ // Not in a room, or already committed: the game is left alone.
+ reset(2,0);prepare();at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);CHECK(setup_on_select_act(2));CHECK(!setup_on_equip_done(&dir,go_cb));});
+}
+void test_chapter_unlocks(){
+ // The host may only choose a chapter every player has unlocked (mask: bit 0 = chapter 2, bit 1 = chapter 3).
+ const uint32_t kBoth=kMapFlag_Desert|kMapFlag_Lab;
+ for(unsigned n=2;n<=4;++n)for(unsigned who=0;who<n;++who)for(uint32_t lacking:{0u,(uint32_t)kMapFlag_Desert,kBoth})for(int act=2;act<=3;++act){   // flags: none / chapter 2 only / both
+  reset(n,0);for(auto& u:test_flags)u=~0u;test_flags[who]=lacking;say_lock2=say_lock3=0;prepare();
+  const bool no2=lacking==0,no3=lacking!=kBoth,allowed=act==2?!no2:(!no2&&!no3);
+  at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,act,&d,native);CHECK(setup_on_select_act(act)==allowed);});
+  CHECK(say_lock2==((!allowed&&no2)?1:0)&&say_lock3==((!allowed&&!no2)?1:0));
+ }
+ for(auto& u:test_flags)u=~0u;
+ // The map is generated from the flags EVERY player has: the host sets that AND when it commits, every client sets what the host sent.
+ reset(3,0);const uint32_t hard=1u<<12,sew=1u<<22;
+ test_flags[0]=~0u;test_flags[1]=~hard;test_flags[2]=~sew;memset(override_sets,0,sizeof(override_sets));prepare();
+ at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);CHECK(setup_on_select_act(2));});drain();
+ for(unsigned p=1;p<3;++p)control(p);
+ for(unsigned p=0;p<3;++p)CHECK(override_sets[p]==1&&override_flags[p]==(~hard&~sew));
+ for(auto& u:test_flags)u=~0u;
+ // The stream is re-seeded at the start of the map generation, whatever drew from it in between: the host with the seed it committed, a client
+ // with the seed the host sent -- the two end up identical.
+ reset(2,0);prepare();
+ uint64_t committed[4]{};
+ at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);memcpy(committed,rngs[0],32);CHECK(setup_on_select_act(2));});drain();
+ for(int i=0;i<4;++i)rngs[0][i]^=0x5555u;   // draws between the commit and the generation
+ at(0,[]{setup_on_generate_map();});CHECK(!memcmp(rngs[0],committed,32));
+ rngs[0][0]^=1;at(0,[]{setup_on_generate_map();});CHECK(rngs[0][0]!=committed[0]);   // used once
+ control(1);for(int i=0;i<4;++i)rngs[1][i]^=0x7777u;
+ at(1,[]{setup_on_generate_map();});CHECK(!memcmp(rngs[1],committed,32));
+}
 int main(){
- test_equipment();test_hints();
+ test_equipment();test_hints();test_no_chapter();test_chapter_unlocks();
  // Polling readiness before all players join must not freeze a two-player room.
  reset(4,0);live=2;at(0,[]{CHECK(!setup_runtime_ready());});live=4;prepare();
  // Transport peer IDs can have holes; ownership always uses session position.

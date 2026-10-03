@@ -89,6 +89,40 @@ enum Target : int {
     T_LoadChar,          // Character: fill a freshly made character from its definition -- enemy health / armor x2, mgmp_balance.h
     T_EndRunDefeat,      // MewDirector end of a LOST / abandoned run (0x3B4750) -- the ownership filter and the clones' return
     T_GainCat,           // the event effect gain_cat_familiar (0x929B80): a new cat joins the run -- ui.block_new_cats makes it do nothing
+    T_EquipDone,         // the gear screen's done-closure (0x3CBFB0): the chapter page, or -- chapter 2 locked -- chapter 1 outright
+    T_PropGetInt,        // the save-properties int getter (0x22C5E0): while a chapter map is generated, mapflag_* answer with the flags EVERY player has
+    T_GenerateMap,       // MapScreen::generate_map (0x21CA60): the stream is re-seeded from the host's committed seed right at its entry, on every peer
+    T_IsAbilityUnlocked, // MewSaveFile: is this ability available (0x232860) -- while a battle is built a client answers like the host
+    T_IsPassiveUnlocked, // ... passive (0x232920)
+    T_IsItemUnlocked,    // ... item (0x1402329E0)
+    T_IsLevelUnlocked,   // ... level group (0x232AA0): which levels a battle may be built from
+    T_IsBossAvailable,   // select_boss_level's predicate lambda (0x399B80): bool(closure, const GonObject& boss) -- locked_bosses
+    T_SpawnSort,         // the battle's party sort (0x364760): CatData** (CatData** first, CatData** last) -- the order the party is placed in
+    T_BattleBuild,       // the battle build (0x35AAF0): (builder, ?) -- terrain, statics, the party, enemies, pickups; in a room it starts from a shared stream
+    T_LevelPick,         // the level picker (0x394450): std::string* (self, std::string* out, const std::string& kind, MapNode* node, bool) -- which level a battle uses
+    T_BuildStatics,        // the build stage for the level's static objects (0x14035FFA0): in a room the shared stream is reset when it returns
+    T_BuildTerrain,        // the build stage for the terrain (0x14035C070): in a room the shared stream is reset when it returns
+    T_BuildProps,          // the build stage for props (0x14035E1F0): in a room the shared stream is reset when it returns
+    T_BuildParty,          // the build stage for the player's party (0x14035C3E0): in a room the shared stream is reset when it returns
+    T_BuildAllies,         // the build stage for allies (0x14035DCC0): in a room the shared stream is reset when it returns
+    T_BuildExtra,          // the build stage for extra spawns (also called by a mid-battle spawner: only the build window is touched) (0x14035E5E0): in a room the shared stream is reset when it returns
+    T_BuildEnemies,        // the build stage for the enemy list (0x14035D0B0): in a room the shared stream is reset when it returns
+    T_RandomPool,          // WorldEvent `random_pool` handler (0x1409310B0): (event state, gon node) -- draws one weighted entry of an event outcome from the shared stream
+    T_EvWeatherRoll,   // WorldEvent `weather_roll` handler (0x140935ED0): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvPoolLuck,   // WorldEvent `random_pool_consider_luck` handler (0x140931130): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvRandomChance,   // WorldEvent `random_chance` handler (0x140930750): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvReward,   // WorldEvent `reward` handler (0x140930860): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvDisorderPool,   // WorldEvent `gain_disorder_from_pool` handler (0x14092A640): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvLearnAbility,   // WorldEvent `learn_ability_from_pool` handler (0x140924AA0): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvLearnPassive,   // WorldEvent `learn_passive_from_pool` handler (0x140924DD0): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvMutSet,   // WorldEvent `random_mutation_from_set` handler (0x140932770): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvMut,   // WorldEvent `random_mutation` handler (0x140933270): draws from the shared stream -- the stream is reset from the node first (unlocks_event_roll)
+    T_EvStatCheck,   // WorldEvent stat check of an option (0x14091BE20, `stat int` ...): ONE draw from the shared stream against the chosen cat's stat decides good/bad -- reset first (unlocks_event_roll)
+    T_EvSetup,            // WorldEvent constructor (0x140913A90: this, event name, flag): the shared stream is reset first, so the event's own draws (difficulty, the subject cat) are the same on every peer
+    T_PickRandom,         // the "random element of a vector" helper (0x1400AB770, 41 callers): hooked ONLY for the call that picks an event's subject cat (return address kRet_EventSubject)
+    T_PropSetInt,         // the save-properties int setter (0x140938F40: std::string* name [destroyed by the callee], int value): increment/decrement_legacy_counter write through it -- seen inside an event window, so the answers follow the event's own writes
+    T_HouseSave,          // the House state writer (0x1401E6810, `files.house_state`): it writes each House cat entity's OWN id (entity+0x80) -- the ids of cats swapped with their clones are put right first (mgmp_catsync)
+    T_EvItemPick,         // the pool item picker (0x1408DEC40: pool, out, node, luck in xmm3) that get_item_from_pool & co. call: hooked ONLY for calls made by the WorldEvent code (return address in 0x9173A0-0x919752 / 0x91F5F0-0x9205F7) -- the stream is reset from the node first (unlocks_event_roll), so what the party_damage etc. before it drew on each peer's own party cannot change the pick (Baphomet, 2026-10-03)
     T_COUNT
 };
 
@@ -553,6 +587,64 @@ static const TargetDesc kTargets[T_COUNT] = {
     // The event effect interpreter (0x9173A0) compares the effect name and calls this for gain_cat_familiar: it builds a cat and files
     // its id in the party (or the familiars when the party is full). rcx = the event context.
     { 0x00929B80, "GAINCAT", "event effect gain_cat_familiar" },
+    // MewDirector::DoHouseStorageEquipFlow (0x3B0BB0) opens the gear screen ("StorageItems") with a closure that runs when the player locks
+    // it in: if mapflag_DesertUnlocked is set it makes the chapter page ("ActSelection"), otherwise it starts "alley.gon" -- chapter 1 --
+    // straight away. The closure is a std::function body: rcx = the closure, +0x8 = that flag, +0x10 = the director.
+    { 0x003CBFB0, "EQUIPDONE", "gear screen done: chapter page or chapter 1" },
+    // MewSaveFile property getter: int64(props, std::string key BY VALUE, int64 fallback). The chapter map's nodes (hard path, the sewers and
+    // junkyard exits, ...) are locked or open by the mapflag_* properties of the save that generates it.
+    { 0x0022C5E0, "PROPGETINT", "save properties: integer getter" },
+    // MapScreen::init (0x38D150) calls it once; it retries try_generate_map (0x21D880) until a map is accepted, and writes every node's 32-byte seed
+    // (MapNode+0x118) from the shared stream. Anything that draws from that stream between the chapter commit and this call (the two peers reach it
+    // by different routes when one has no chapter page, and after a fade of a different length) shifts every seed.
+    { 0x0021CA60, "GENMAP", "MapScreen::generate_map" },
+    // MewSaveFile "is X unlocked" checks: bool(MewSaveFile*, std::string name BY VALUE). Debug unlock byte -> true; the name is in the unlocked set ->
+    // true; the name is on locked_content.gon's blacklist -> false; otherwise true. The four differ only in which two sets they read.
+    { 0x00232860, "ISABILITY", "MewSaveFile: ability unlocked?" },
+    { 0x00232920, "ISPASSIVE", "MewSaveFile: passive unlocked?" },
+    { 0x002329E0, "ISITEM", "MewSaveFile: item unlocked?" },
+    { 0x00232AA0, "ISLEVEL", "MewSaveFile: level group unlocked?" },
+    // lambda_1 of MapScreen::select_boss_level (a std::function body): rdx = the boss's GonObject, its name a std::string at +0x88; the closure is unused.
+    // Debug byte -> true; name in the unlocked-bosses set (save +0x2A0, rebuilt from the vector at +0x158) -> true; on the blacklist (+0x428) -> false; else true.
+    { 0x00399B80, "ISBOSS", "select_boss_level: boss available?" },
+    // sub_14035C3E0 (the battle's player spawn) lists the party's CatData* in party order (sub_1403B2F30) and, for up to 32, insertion-sorts
+    // them with this (its only caller): key = the cat's computed stats (sub_1400C1820) +0x10, SPEED, highest first; ties keep the party order.
+    { 0x00364760, "SPAWNSORT", "battle: sort the party for placement" },
+    // sub_14035AAF0, called once per battle (from 0x140897BC0): reads the difficulty (sub_1403B94F0), then 0x35FFA0 / 0x35C070 / 0x35E1F0, the
+    // player spawn 0x35C3E0, 0x35DCC0 / 0x35E5E0, the enemy list 0x35D0B0 ... -- every draw that places the board happens inside it.
+    { 0x0035AAF0, "BATTLEBUILD", "battle: build the board" },
+    // sub_140394450: picks the level a battle node is played on and returns its name in `out`. Called from MapScreen::EnterNode's battle branch
+    // (0x392AD8: kind "easy" / "hard" by upgrade_basic_combats_to_hard, node = the MapNode, whose seed is at +0x118) and from two std::function
+    // bodies (0x39D579 / 0x39DCFB, node = null). It filters by the level groups (0x232AA0) and draws from the shared stream.
+    { 0x00394450, "LEVELPICK", "map: pick the level of a battle node" },
+    // The callees of the battle build (0x35AAF0), in call order: statics 0x35FFA0, terrain 0x35C070, props 0x35E1F0, party 0x35C3E0, allies 0x35DCC0,
+    // extra 0x35E5E0, enemies 0x35D0B0 -- then the 20% bird roll (0x35B54A..0x35B584, MewDirector+0x70C == 0 && +0x6DC != 0) and the pickups. All take
+    // the builder in rcx. A definition load's own draws (a random cat for a Kitten) differ per save, so each stage ends by resetting the stream.
+    { 0x0035FFA0, "BUILDSTATICS", "battle build stage: the level's static objects" },
+    { 0x0035C070, "BUILDTERRAIN", "battle build stage: the terrain" },
+    { 0x0035E1F0, "BUILDPROPS", "battle build stage: props" },
+    { 0x0035C3E0, "BUILDPARTY", "battle build stage: the player's party" },
+    { 0x0035DCC0, "BUILDALLIES", "battle build stage: allies" },
+    { 0x0035E5E0, "BUILDEXTRA", "battle build stage: extra spawns (also called by a mid-battle spawner: only the build window is touched)" },
+    { 0x0035D0B0, "BUILDENEMIES", "battle build stage: the enemy list" },
+    // events/*.gon `random_pool [ {...} {...} ]` (the result of Tragedy, ...): this 113-byte handler calls sub_14094FF80(node, "weight", stream) -- one draw from the shared
+    // simulation stream at TLS+0x178 -- and runs the entry it returns through sub_1409173A0 (the event interpreter: set_frame, prompt, self_damage [a b] ...).
+    { 0x009310B0, "RANDOMPOOL", "event: random_pool outcome" },
+    { 0x00935ED0, "EVWEATHERROLL", "event: weather_roll" },
+    { 0x00931130, "EVPOOLLUCK", "event: random_pool_consider_luck" },
+    { 0x00930750, "EVRANDOMCHANCE", "event: random_chance" },
+    { 0x00930860, "EVREWARD", "event: reward" },
+    { 0x0092A640, "EVDISORDERPOOL", "event: gain_disorder_from_pool" },
+    { 0x00924AA0, "EVLEARNABILITY", "event: learn_ability_from_pool" },
+    { 0x00924DD0, "EVLEARNPASSIVE", "event: learn_passive_from_pool" },
+    { 0x00932770, "EVMUTSET", "event: random_mutation_from_set" },
+    { 0x00933270, "EVMUT", "event: random_mutation" },
+    { 0x0091BE20, "EVSTATCHECK", "event: option stat check (good/bad)" },
+    { 0x00913A90, "EVSETUP", "event: WorldEvent constructor" },
+    { 0x000AB770, "PICKRANDOM", "random element of a vector (event subject cat)" },
+    { 0x00938F40, "PROPSETINT", "save property int setter (event legacy counters)" },
+    { 0x001E6810, "HOUSESAVE", "House state writer (house_state)" },
+    { 0x008DEC40, "EVITEMPICK", "event: pick an item from a pool (get_item_from_pool)" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -648,6 +740,9 @@ enum Call : int {
     C_EquipmentRefresh,
     C_CatMaxHealth,          // int(CatData*, const StatFilter*) -- 4 x effective CON + base health, min 1
     C_StartTransition,       // void(MewDirector*, std::string* name, std::function<void()>* done, double delay)
+    C_PropGetInt,            // int64(MewSaveFile* props, std::string key BY VALUE, int64 default) -- sub_14022C5E0, reads one `properties` row
+    C_CatStats,              // int* (CatData*, int out[7], const int filter[7] (16-aligned, -1 = all), bool full, bool no_kitten_penalty) -- sub_1400C1820
+    C_SaveGame,              // void(MewDirector*) -- sub_1403BDCF0: writes the whole save (cats table, house_state, properties). The native settlement calls it as its last step (0x1403B5F6E), BEFORE the clone merge
     C_COUNT
 };
 
@@ -910,6 +1005,9 @@ static const CallDesc kCalls[C_COUNT] = {
     // before it tidies the popup, which is the only part that needs the pause menu. So peers that never
     // opened one can run the abandon by making the same call -- see mgmp_abandon_game.cpp.
     { 0x003C0210, "MewDirector::start_transition" },
+    { 0x0022C5E0, "SaveProps::get_int" },
+    { 0x000C1820, "CatData::total_stats" },
+    { 0x003BDCF0, "MewDirector::SaveGame" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -1041,6 +1139,8 @@ constexpr uintptr_t kCatData_Flags = 0xBF8;   // u64 status bits, serialized wit
 // 0xD2D40 clears the byte. So "this cat is dead for good" is readable straight off its CatData while it is still registered.
 constexpr uintptr_t kCatData_Killed  = 0x7AC;   // u8
 constexpr uint64_t  kCatFlag_Perished = 0x40000;
+// The instruction after the call that picks a WorldEvent's subject cat (sub_140913A90, `call sub_1400AB770` at 0x1409150F3): T_PickRandom only acts when it returns here.
+constexpr uintptr_t kRet_EventSubject = 0x009150F8;
 constexpr uint64_t  kCatFlag_OnAdventure = 0x80000; // set by set_party_and_go (0x3B1504) on the cats that leave; 0xD2D40 clears it
 constexpr uintptr_t kCatData_StatusEffects = 0x7B8; // RVA 0x22F301 appends; 0xFD44D restores each entry into battle.
 constexpr uintptr_t kCatStatusEffectSize = 0xB8; // RVA 0x237368 append stride and 0x617B9 destructor stride.
@@ -1258,6 +1358,16 @@ constexpr const char kBtnName_LevelupBoon[] = "Levelup_Boon";
 //
 // The heartbeat is what makes it safe: a button's update stops when its screen
 // goes away, so "seen within the last half second" is the test, not "seen once".
+// The gear screen's done-closure (T_EquipDone): +0x8 is "chapter 2 is unlocked, so show the chapter page" (a bool, mapflag_DesertUnlocked or the
+// debug flag), +0x10 the director it hands to the level loader. With the flag clear there is NO chapter page for this player.
+constexpr uintptr_t kEquipDone_ActSelect = 0x8;
+constexpr uintptr_t kEquipDone_Director  = 0x10;
+
+// MewDirector+0x38 is the save's own property store (MewSaveFile, embedded); +0x78D is the debug "everything unlocked" byte the gear lock and the
+// chapter page both read next to the two flags. mapflag_DesertUnlocked = chapter 2 may be chosen, mapflag_LabUnlocked = the three-chapter page.
+constexpr uintptr_t kDir_SaveProps   = 0x38;
+constexpr uintptr_t kDir_DebugUnlock = 0x78D;
+
 constexpr const char kBtnName_ChapterLower[] = "Button_LowerDifficulty";
 constexpr const char kBtnName_ChapterRaise[] = "Button_RaiseDifficulty";
 

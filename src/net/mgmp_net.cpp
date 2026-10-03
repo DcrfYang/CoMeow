@@ -90,8 +90,43 @@ bool wsa_init() {
     return true;
 }
 
+struct LevelBox { uint64_t node = 0; char name[48] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {}; } g_level_box;
+constexpr uint32_t kBoardRing = 4;
+BoardAssembled g_board_ring[kBoardRing];   // the last few turns' boards, guarded by g.cs like the level box
+uint32_t g_board_next = 0;
+
 void queue_push(const NetMsg& m) {
     EnterCriticalSection(&g.cs);
+    if (m.type == MSG_UNLOCKS && m.unlocks.n_level_name) {          // the level of a battle (picked by the level picker)
+        g_level_box.node = m.unlocks.level_node;
+        memcpy(g_level_box.name, m.unlocks.level_name, sizeof(g_level_box.name));
+    }
+    if (m.type == MSG_UNLOCKS && m.unlocks.build_info && m.unlocks.level_node) {   // the build information of a battle (ANY battle node), keyed on its own
+        g_level_box.bnode = m.unlocks.level_node;
+        memcpy(g_level_box.n_pending, m.unlocks.n_pending, sizeof(g_level_box.n_pending));
+        memcpy(g_level_box.pending, m.unlocks.pending, sizeof(g_level_box.pending));
+        g_level_box.n_weather = m.unlocks.n_weather;
+        memcpy(g_level_box.weather, m.unlocks.weather, sizeof(g_level_box.weather));
+    }
+    if (m.type == MSG_BOARD) {
+        const BoardMsg& b = m.board;
+        BoardAssembled* box = nullptr;
+        for (uint32_t k = 0; k < kBoardRing && !box; ++k)
+            if (g_board_ring[k].battle == b.battle && g_board_ring[k].turn == b.turn) box = &g_board_ring[k];
+        if (!box) { box = &g_board_ring[g_board_next++ % kBoardRing]; *box = BoardAssembled{}; box->battle = b.battle; box->turn = b.turn; }
+        if (box->cats != b.cats || box->total != b.total) {
+            *box = BoardAssembled{};   // a republication of that turn with another shape: start over
+            box->battle = b.battle; box->turn = b.turn; box->cats = b.cats; box->total = b.total;
+        }
+        memcpy(box->rng, b.rng, sizeof(box->rng));
+        for (uint32_t i = 0; i < b.count; ++i) {
+            const uint32_t at = b.first + i;
+            if (at >= kBoardMax) break;
+            if (!box->have[at]) { box->have[at] = true; ++box->got; }
+            box->unit[at] = b.units[i];
+        }
+        box->complete = box->got >= box->total;
+    }
     if (g.count >= kQueueCap) {
         // Drop the newest rather than the oldest. Losing the oldest would
         // reorder the action stream, and an out-of-order ACTION is a desync;
@@ -181,6 +216,9 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_SAVEWAIT:  return dec_savewait(r, m.savewait);
         case MSG_ABANDON:   return dec_abandon(r, m.abandon);
         case MSG_ROOMCTL:   return dec_roomctl(r, m.roomctl);
+        case MSG_MAPSEEDS:  return dec_mapseeds(r, m.mapseeds);
+        case MSG_UNLOCKS:   return dec_unlocks(r, m.unlocks);
+        case MSG_BOARD:     return dec_board(r, m.board);
         case MSG_PEERS:   return dec_peers(r, m.peers);
         case MSG_HALT:    return dec_halt(r, m.halt);
         case MSG_REFUSE:  r.str(m.refuse, sizeof(m.refuse)); return r.ok;
@@ -504,6 +542,8 @@ bool net_host(uint16_t port) {
 constexpr DWORD kDialMs = 5000;     // per address
 constexpr int   kMaxCands = 6;
 constexpr DWORD kSteamDialMs = 15000;   // a Steam connection may need to find a route or a relay
+constexpr DWORD kSteamRevMs = 15000;    // how long a joiner waits for the host to call it back after its own dial was refused
+bool (*g_steam_reverse)(uint64_t host_steamid) = nullptr;
 
 struct DialJob {
     char     cands[kMaxCands][64] = {};
@@ -511,6 +551,157 @@ struct DialJob {
     uint16_t port = 0;
 };
 DialJob g_dial;
+
+// --- the server as the carrier ------------------------------------------------------------------------------------------------
+// The lobby server pairs two connections ("pipe") and then moves their bytes unchanged. The joiner's end IS the game socket (the same protocol
+// as a direct TCP link); the host's end is bridged to its own game port, the way the Steam bridge does it.
+int dial_one(const char* addr, uint16_t port, SOCKET& out);   // below
+namespace {
+char     g_rl_host[64] = {};
+uint16_t g_rl_port = 0;
+volatile LONG g_rl_gen = 0;
+
+// A connection to the relay server (a name is resolved). 0 = connected (blocking socket in `out`), else a WSA error.
+int rl_connect(SOCKET& out, volatile LONG* stop, LONG gen) {
+    out = INVALID_SOCKET;
+    if (!g_rl_host[0] || !g_rl_port) return WSAEINVAL;
+    char ip[64] = {};
+    in_addr tmp{};
+    if (inet_pton(AF_INET, g_rl_host, &tmp) == 1) {
+        strncpy_s(ip, sizeof(ip), g_rl_host, _TRUNCATE);
+    } else {
+        addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (getaddrinfo(g_rl_host, nullptr, &hints, &res) != 0 || !res) return WSAHOST_NOT_FOUND;
+        inet_ntop(AF_INET, &((sockaddr_in*)res->ai_addr)->sin_addr, ip, sizeof(ip));
+        freeaddrinfo(res);
+    }
+    (void)stop; (void)gen;
+    return dial_one(ip, g_rl_port, out);
+}
+
+// One line (up to 300 bytes), read byte by byte so that nothing after it is consumed. False on a timeout, a stop or a closed connection.
+bool rl_read_line(SOCKET s, char* out, size_t cap, DWORD timeout_ms, volatile LONG* stop, LONG gen) {
+    size_t n = 0;
+    const DWORD t0 = GetTickCount();
+    while (GetTickCount() - t0 < timeout_ms) {
+        if ((stop && InterlockedCompareExchange(stop, 0, 0)) || InterlockedCompareExchange(&g_rl_gen, 0, 0) != gen) return false;
+        fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
+        timeval tv{ 0, 100000 };
+        const int r = select(0, &rd, nullptr, nullptr, &tv);
+        if (r < 0) return false;
+        if (r == 0) continue;
+        char ch;
+        if (recv(s, &ch, 1, 0) != 1) return false;
+        if (ch == '\n') { out[n] = 0; return true; }
+        if (n + 1 < cap) out[n++] = ch;
+    }
+    return false;
+}
+
+bool rl_send_line(SOCKET s, const char* line) {
+    const int len = (int)strlen(line);
+    return send(s, line, len, 0) == len;
+}
+
+// Joiner: connect, ask for a pipe, wait for the host's side. The returned socket carries the game protocol from its first byte.
+SOCKET rl_dial(const char* tok, int* why) {
+    *why = 0;
+    SOCKET s = INVALID_SOCKET;
+    const LONG gen = InterlockedCompareExchange(&g_rl_gen, 0, 0);
+    const int e = rl_connect(s, &g.stop, gen);
+    if (e != 0) { *why = e; return INVALID_SOCKET; }
+    char msg[96];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE, "{\"t\":\"pipe\",\"tok\":\"%s\"}\n", tok);
+    char line[320] = {};
+    if (!rl_send_line(s, msg) || !rl_read_line(s, line, sizeof(line), 20000, &g.stop, gen)) {
+        closesocket(s); *why = WSAETIMEDOUT; return INVALID_SOCKET;
+    }
+    if (!strstr(line, "\"piped\"")) {
+        log_line("NET", "!! the relay refused the pipe: %.200s", line);
+        closesocket(s); *why = WSAECONNREFUSED; return INVALID_SOCKET;
+    }
+    BOOL on = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof(on));
+    return s;
+}
+
+struct RlServe { char tok[24]; uint32_t id; uint16_t port; LONG gen; };
+
+DWORD WINAPI rl_serve_thread(LPVOID p) {
+    RlServe job = *(RlServe*)p;
+    delete (RlServe*)p;
+    SOCKET a = INVALID_SOCKET, b = INVALID_SOCKET;
+    auto done = [&](const char* why) {
+        if (a != INVALID_SOCKET) closesocket(a);
+        if (b != INVALID_SOCKET) closesocket(b);
+        log_line("NET", "relay pipe %u closed (%s)", (unsigned)job.id, why);
+    };
+    const int e = rl_connect(a, nullptr, job.gen);
+    if (e != 0) { a = INVALID_SOCKET; done("could not reach the server"); return 0; }
+    char msg[112];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE, "{\"t\":\"pipe\",\"tok\":\"%s\",\"id\":%u}\n", job.tok, (unsigned)job.id);
+    char line[320] = {};
+    if (!rl_send_line(a, msg) || !rl_read_line(a, line, sizeof(line), 15000, nullptr, job.gen) || !strstr(line, "\"piped\"")) { done("the server did not pair it"); return 0; }
+    // the joiner is on the other end: connect to the game's own port
+    b = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = htons(job.port);
+    if (b == INVALID_SOCKET || connect(b, (sockaddr*)&sa, sizeof(sa)) != 0) { if (b != INVALID_SOCKET) { closesocket(b); b = INVALID_SOCKET; } done("the game is not listening"); return 0; }
+    BOOL on = TRUE;
+    setsockopt(a, IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof(on));
+    setsockopt(b, IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof(on));
+    log_line("NET", "relay pipe %u up", (unsigned)job.id);
+    static const int kBuf = 16384;
+    char* buf = new char[kBuf];
+    const char* why = "ended";
+    for (;;) {
+        if (InterlockedCompareExchange(&g_rl_gen, 0, 0) != job.gen) { why = "the room ended"; break; }
+        fd_set rd; FD_ZERO(&rd); FD_SET(a, &rd); FD_SET(b, &rd);
+        timeval tv{ 0, 100000 };
+        const int r = select(0, &rd, nullptr, nullptr, &tv);
+        if (r < 0) { why = "select failed"; break; }
+        if (r == 0) continue;
+        bool dead = false;
+        for (int side = 0; side < 2 && !dead; ++side) {
+            SOCKET from = side ? b : a, to = side ? a : b;
+            if (!FD_ISSET(from, &rd)) continue;
+            const int n = recv(from, buf, kBuf, 0);
+            if (n <= 0) { dead = true; why = side ? "the game closed it" : "the joiner left"; break; }
+            for (int off = 0; off < n;) {
+                const int w = send(to, buf + off, n - off, 0);
+                if (w <= 0) { dead = true; why = "send failed"; break; }
+                off += w;
+            }
+        }
+        if (dead) break;
+    }
+    delete[] buf;
+    done(why);
+    return 0;
+}
+
+} // namespace
+
+void net_relay_set_server(const char* host, uint16_t port) {
+    strncpy_s(g_rl_host, sizeof(g_rl_host), host ? host : "", _TRUNCATE);
+    g_rl_port = port;
+}
+
+bool net_relay_serve(const char* host_token, uint32_t id, uint16_t game_port) {
+    if (!wsa_init() || !host_token || !host_token[0] || strlen(host_token) >= 24) return false;
+    RlServe* job = new RlServe{};
+    strncpy_s(job->tok, sizeof(job->tok), host_token, _TRUNCATE);
+    job->id = id; job->port = game_port;
+    job->gen = InterlockedCompareExchange(&g_rl_gen, 0, 0);
+    HANDLE h = CreateThread(nullptr, 0, rl_serve_thread, job, 0, nullptr);
+    if (!h) { delete job; return false; }
+    CloseHandle(h);
+    return true;
+}
+
+void net_relay_stop() { InterlockedIncrement(&g_rl_gen); }
+
 HANDLE  g_dial_thread = nullptr;
 volatile LONG g_dial_seq = 0;
 volatile LONG g_dial_err = 0;
@@ -562,9 +753,42 @@ DWORD WINAPI dial_thread(LPVOID) {
         if (!strncmp(g_dial.cands[i], "steam:", 6)) {
             // The same TCP link, carried by Steam: the bridge hands back a loopback socket that is pumped to the host's Steam
             // connection (see mgmp_steambridge.h).
+            // A Steam connection that is refused straight away is usually the host's side not being ready yet (a room that was just rebuilt): try a
+            // couple more times before giving the address up.
             int why = 0;
-            s = steam_bridge_dial(strtoull(g_dial.cands[i] + 6, nullptr, 10), kSteamDialMs, &g.stop, &why);
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (attempt) {
+                    log_line("NET", "Steam connection failed -- trying again (%d of 3)", attempt + 1);
+                    for (int w = 0; w < 30 && !InterlockedCompareExchange(&g.stop, 0, 0); ++w) Sleep(50);
+                }
+                s = steam_bridge_dial(strtoull(g_dial.cands[i] + 6, nullptr, 10), kSteamDialMs, &g.stop, &why);
+                if (s != INVALID_SOCKET || why == 1 || why == 2 || InterlockedCompareExchange(&g.stop, 0, 0)) break;
+            }
+            if (s == INVALID_SOCKET && why == 3 && g_steam_reverse && !InterlockedCompareExchange(&g.stop, 0, 0)) {
+                // REVERSE DIALLING. Steam refused our call (2026-10-02: "Bad cert: CA key ... is not known to us" -- the host's Steam client could not accept our newer
+                // certificate). The check is asymmetric, so ask the HOST to dial US: it presents its own certificate, which we can verify.
+                int rf = 0; char dbg[132] = {};
+                steam_bridge_last_failure(&rf, dbg, sizeof(dbg));
+                log_line("NET", "Steam refused the call (end reason %d '%s') -- asking the host to call us back over Steam", rf, dbg);
+                const uint64_t host_id = strtoull(g_dial.cands[i] + 6, nullptr, 10);
+                if (steam_bridge_rev_arm()) {
+                    if (g_steam_reverse(host_id)) {
+                        int rw = 0;
+                        s = steam_bridge_rev_wait(kSteamRevMs, &g.stop, &rw);
+                        log_line("NET", s != INVALID_SOCKET ? "the host's call came through" : "!! the host did not call back in time (%d)", rw);
+                        if (s == INVALID_SOCKET) why = rw == 2 ? 2 : 3;
+                    } else {
+                        steam_bridge_rev_cancel();
+                        log_line("NET", "!! the request to call back could not be sent");
+                    }
+                }
+            }
             e = s != INVALID_SOCKET ? 0 : (why == 2 ? WSAETIMEDOUT : WSAECONNREFUSED);
+        } else if (!strncmp(g_dial.cands[i], "relay:", 6)) {
+            // The same TCP link, carried by the lobby server (the host chose "server relay"): the socket the server hands over IS the game socket.
+            int why = 0;
+            s = rl_dial(g_dial.cands[i] + 6, &why);
+            e = s != INVALID_SOCKET ? 0 : (why ? why : WSAECONNREFUSED);
         } else {
             e = dial_one(g_dial.cands[i], g_dial.port, s);
         }
@@ -585,6 +809,8 @@ DWORD WINAPI dial_thread(LPVOID) {
     return 0;
 }
 
+void net_set_steam_reverse_hook(bool (*hook)(uint64_t host_steamid)) { g_steam_reverse = hook; }
+
 // `addr` is one address or a comma-separated list of up to four, in the order to try them.
 bool net_join(const char* addr, uint16_t port) {
     if (g.role != NetRole::None) return false;
@@ -602,7 +828,9 @@ bool net_join(const char* addr, uint16_t port) {
             in_addr tmp{};
             bool steam_ok = !strncmp(one, "steam:", 6) && len > 6;
             for (size_t k = 6; steam_ok && k < len; ++k) if (one[k] < '0' || one[k] > '9') steam_ok = false;
-            if (steam_ok || inet_pton(AF_INET, one, &tmp) == 1) {
+            bool relay_ok = !strncmp(one, "relay:", 6) && len > 6;
+            for (size_t k = 6; relay_ok && k < len; ++k) if (!isxdigit((unsigned char)one[k])) relay_ok = false;
+            if (steam_ok || relay_ok || inet_pton(AF_INET, one, &tmp) == 1) {
                 bool dup = false;
                 for (int i = 0; i < g_dial.n; ++i) if (!strcmp(g_dial.cands[i], one)) dup = true;
                 if (!dup) strncpy_s(g_dial.cands[g_dial.n++], sizeof(g_dial.cands[0]), one, _TRUNCATE);
@@ -813,6 +1041,51 @@ bool net_send_savewait(const SaveWaitMsg& m) { MGMP_SEND_WITH(enc_savewait, m); 
 // Peer-authored and relayed by the host (see relayed()).
 bool net_send_abandon(const AbandonMsg& m) { MGMP_SEND_WITH(enc_abandon, m); }
 bool net_send_roomctl(const RoomCtlMsg& m) { MGMP_SEND_WITH(enc_roomctl, m); }
+// Host-authored, so it is NOT in relayed(): net_send already reaches every client.
+bool net_send_mapseeds(const MapSeedsMsg& m) { MGMP_SEND_WITH(enc_mapseeds, m); }
+// Host-authored, so it is NOT in relayed() either.
+bool net_send_unlocks(const UnlocksMsg& m) { uint8_t p[1024]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // bigger than the 512-byte default since proto 62
+
+// Host-authored, so it is NOT in relayed() either. Bigger than the 512-byte default: a chunk is up to 16 units.
+bool net_send_board(const BoardMsg& m) { uint8_t p[1024]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_board_to(uint8_t peer, const BoardMsg& m) { uint8_t p[1024]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send_peer(peer, p, n); }
+bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n) {
+    n = 0;
+    if (!g.cs_ready || !names || !node_id) return false;
+    EnterCriticalSection(&g.cs);
+    const bool ok = g_level_box.bnode == node_id;
+    if (ok) { n = g_level_box.n_weather; for (uint8_t i = 0; i < n && i < kWeatherNames; ++i) memcpy(names[i], g_level_box.weather[i], kWeatherLen); }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
+bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
+    if (!g.cs_ready || !battle) return false;
+    EnterCriticalSection(&g.cs);
+    bool ok = false;
+    for (uint32_t k = 0; k < kBoardRing && !ok; ++k)
+        if (g_board_ring[k].battle == battle && g_board_ring[k].turn == turn && g_board_ring[k].complete) { out = g_board_ring[k]; ok = true; }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
+
+bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n) {
+    for (uint32_t q = 0; q < kPendingQueues; ++q) n[q] = 0;
+    if (!g.cs_ready || !out || !node_id) return false;
+    EnterCriticalSection(&g.cs);
+    const bool ok = g_level_box.bnode == node_id;
+    if (ok) for (uint32_t q = 0; q < kPendingQueues; ++q) { n[q] = g_level_box.n_pending[q]; for (uint8_t i = 0; i < n[q] && i < kPendingMax; ++i) out[q][i] = g_level_box.pending[q][i]; }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
+
+bool net_host_level(uint64_t node_id, char* out, size_t cap) {
+    if (!g.cs_ready || !out || !cap) return false;
+    EnterCriticalSection(&g.cs);
+    const bool ok = node_id && g_level_box.node == node_id && g_level_box.name[0];
+    if (ok) { strncpy_s(out, cap, g_level_box.name, _TRUNCATE); }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
 bool net_send_refuse (const char* reason) { MGMP_SEND_WITH(enc_refuse,  reason); }
 
 #undef MGMP_SEND_WITH
