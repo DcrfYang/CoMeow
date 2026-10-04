@@ -610,6 +610,16 @@ bool savefile_read_checkpoint(uint8_t** data, uint32_t* size, uint64_t* hash) {
     return true;
 }
 
+bool savefile_live_path(wchar_t* out, size_t out_len) {
+    ensure_state();
+    if (!out || !out_len || !g.on || !g.have_slot) return false;
+    ensure_dir();
+    if (!g.have_dir) return false;
+    wchar_t wname[128]; wide(g.name, wname, 128);
+    _snwprintf_s(out, out_len, _TRUNCATE, L"%s\\%s", g.dir, wname);
+    return true;
+}
+
 bool savefile_selected_slot(uint8_t* slot) {
     if (!slot) return false;
     ensure_state();

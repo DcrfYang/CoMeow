@@ -81,8 +81,8 @@ void boundary(uint64_t map) {
     for(unsigned i=0;i<participants;++i) at(i,[&]{checkpoint_on_map(map);});
     drain();
 }
-void next(uint64_t map) {
-    for(unsigned i=0;i<participants;++i) at(i,[]{checkpoint_on_node(123,1);});
+void next(uint64_t map,uint32_t type=0) {
+    for(unsigned i=0;i<participants;++i) at(i,[&]{checkpoint_on_node(123,1,type);});
     boundary(map);
 }
 void restart() {
@@ -117,6 +117,7 @@ bool net_send_savewait(const SaveWaitMsg& m) {
     return true;
 }
 bool lockstep_halted(){return false;}
+void lockstep_share_log(const char*) {}
 uint32_t lockstep_owner_note_export(LockstepOwnerNote* out, uint32_t max) {
     if (max < 2) return 0;
     out[0] = {0x70000001ull, 0}; out[1] = {0x71000001ull, 1};
@@ -137,7 +138,7 @@ uint8_t net_peer_count(){return (uint8_t)live;}
 bool net_peer_ids(uint8_t* out,uint8_t cap) { if(cap<live)return false; for(unsigned i=0;i<live;++i)out[i]=(uint8_t)i;return true; }
 bool net_send_checkpoint(const CheckpointMsg& m) {
     // Round-trip EVERY simulated network message through the real wire codec.
-    uint8_t bytes[512]; auto n=enc_checkpoint(bytes,sizeof(bytes),m); CHECK(n);
+    static uint8_t bytes[8192]; auto n=enc_checkpoint(bytes,sizeof(bytes),m); CHECK(n);
     Reader r(bytes,n); CHECK(r.u8v()==MSG_CHECKPOINT); CheckpointMsg decoded{}; CHECK(dec_checkpoint(r,decoded));
     if(current==0) { for(unsigned i=1;i<live;++i)packets.push_back({current,i,decoded}); }
     else packets.push_back({current,0,decoded});
@@ -165,7 +166,34 @@ void log_line(const char*,const char* fmt,...) {
     va_list a; va_start(a,fmt); vprintf(fmt,a); va_end(a); putchar('\n');
 }
 }
+// The player identity lives in mgmp-peer-id.bin beside the binary. A fresh folder (the mod updated by unpacking a new zip) used to mean a NEW identity and every recovery record of the run in
+// progress orphaned (2026-10-03: "save combination invalid" after both players re-downloaded). With exactly one non-empty earlier identity folder it is taken over instead.
+static void test_identity_adoption() {
+    wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr,exe,MAX_PATH);
+    std::wstring id_file=std::wstring(exe); id_file=id_file.substr(0,id_file.find_last_of(L"\\/"))+L"\\mgmp-peer-id.bin";
+    const std::wstring kept=id_file+L".test-keep";
+    const bool had=GetFileAttributesW(id_file.c_str())!=INVALID_FILE_ATTRIBUTES;
+    if(had) CHECK(MoveFileExW(id_file.c_str(),kept.c_str(),MOVEFILE_REPLACE_EXISTING));
+    std::wstring root=std::wstring(exe); root=root.substr(0,root.find_last_of(L"\\/"))+L"\\idtest-"+std::to_wstring(GetTickCount64());
+    CHECK(CreateDirectoryW(root.c_str(),nullptr));
+    auto mkdir_with=[&](const wchar_t* name,bool file){ std::wstring d=root+L"\\"+name; CHECK(CreateDirectoryW(d.c_str(),nullptr)); if(file) { HANDLE h=CreateFileW((d+L"\\x.state").c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,0,nullptr); CHECK(h!=INVALID_HANDLE_VALUE); CloseHandle(h); } };
+    mkdir_with(L"1234567890123",true); mkdir_with(L"777",false); mkdir_with(L"notanumber",true);
+    uint64_t id=0; bool adopted=false;
+    CHECK(checkpoint_io::identity(id,root.c_str(),&adopted));
+    CHECK(adopted && id==1234567890123ull);                      // the empty one and the non-number are ignored
+    uint64_t again=0; bool a2=true;
+    CHECK(checkpoint_io::identity(again,root.c_str(),&a2) && !a2 && again==id);   // now it is kept in the file
+    DeleteFileW(id_file.c_str());
+    mkdir_with(L"42",true);                                      // two candidates: ambiguous -> a fresh random id
+    uint64_t fresh=0; bool a3=true;
+    CHECK(checkpoint_io::identity(fresh,root.c_str(),&a3) && !a3 && fresh && fresh!=id && fresh!=42);
+    DeleteFileW(id_file.c_str());
+    if(had) MoveFileExW(kept.c_str(),id_file.c_str(),MOVEFILE_REPLACE_EXISTING);
+    printf("identity adoption: ok\n");
+}
+
 int main() {
+    test_identity_adoption();
     reset(L"four participants / independent DBs / latest common restore",4); start(); boundary(1000); certified(1);
     CHECK(states[0].tx.hashes[0]!=states[0].tx.hashes[1]);
     next(1001); certified(2); next(1002); certified(3);
@@ -179,10 +207,20 @@ int main() {
     at(0,[]{
         Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.owner_count==2);
         CHECK(e.origin_count==2 && e.origins[0].clone==0x70000001ull && e.origins[0].original==0x2daull && e.origins[1].original==0x2fcull);   // disk version 3
-        Bytes v3=encode_entry(e);
+        Bytes v3=encode_entry(e);      // now version 4 (flags) -- the strips below drop the flags section as well
+        // a version-3 file (no flags section) is still read, with no flags
+        {
+            Bytes v3o(v3.begin(),v3.end()-8-4);
+            v3o[4]=3; v3o[5]=0; v3o[6]=0; v3o[7]=0;
+            uint64_t h3=savefile_hash(v3o.data(),(uint32_t)v3o.size());
+            for(int i=0;i<8;++i) v3o.push_back((uint8_t)(h3>>(i*8)));
+            CHECK(checkpoint_io::atomic_write(file(L".pending"),v3o));
+            Entry r3{}; CHECK(read_entry(file(L".pending"),r3,true));
+            CHECK(r3.origin_count==2 && r3.flags==0);
+        }
         // a version-2 file (owner notes, no origin record) is still read, with an empty origin table
         {
-            const uint32_t strip3=4+e.origin_count*16;
+            const uint32_t strip3=4+4+e.origin_count*16;
             Bytes v2(v3.begin(),v3.end()-8-strip3);
             v2[4]=2; v2[5]=0; v2[6]=0; v2[7]=0;
             uint64_t h2=savefile_hash(v2.data(),(uint32_t)v2.size());
@@ -191,7 +229,7 @@ int main() {
             Entry r2{}; CHECK(read_entry(file(L".pending"),r2,true));
             CHECK(r2.owner_count==2 && r2.origin_count==0 && r2.database.size()==e.database.size());
         }
-        const uint32_t strip=4+e.owner_count*9+4+e.origin_count*16;
+        const uint32_t strip=4+e.owner_count*9+4+e.origin_count*16+4;
         Bytes v1(v3.begin(),v3.end()-8-strip);
         v1[4]=1; v1[5]=0; v1[6]=0; v1[7]=0;                 // disk version 1
         uint64_t h=savefile_hash(v1.data(),(uint32_t)v1.size());
@@ -336,6 +374,26 @@ int main() {
                         "INSERT INTO files VALUES('trollengine_state',x'03000000000000000000000001000000');");
     });
     restart(); CHECK(states[0].failed && states[1].failed);
+
+    // ---- 2026-10-03: the same shape through the save-selection panel. The host's save stood on the map after a run the other player never entered, its journal only a settled tombstone: the host was
+    // offered the preparation stage, apply_select refused it, and nobody was told. Now both peers get the "invalid" panel, and it says the saves are on the map with NO RECORD (kHoldersNoRecord). ----
+    {
+        reset(L"handshake: a save on the map whose journal is only a settled tombstone is invalid, and the panel says there is no record");start();boundary(9705);
+        at(0,[]{
+            checkpoint_clear();
+            sql_exec(g.path,"UPDATE properties SET data=1 WHERE key='on_adventure';"
+                            "CREATE TABLE files(key TEXT PRIMARY KEY,data BLOB);"
+                            "INSERT INTO files VALUES('trollengine_state',x'03000000000000000000000001000000');");
+        });
+        at(1,[]{ checkpoint_clear(); sql_exec(g.path,"UPDATE properties SET data=0 WHERE key='on_adventure'"); });   // the other player is back in the warehouse
+        drain();
+        struct Guard { Guard(){g_manual=true;} ~Guard(){g_manual=false;} } manual;      // the selection panel from here on
+        restart();
+        at(0,[]{ checkpoint_tick(); }); drain();
+        for(unsigned i=0;i<2;++i) at(i,[]{ SaveSyncView v; CHECK(checkpoint_sync_view(v)); CHECK(v.phase==kSyncInvalid); CHECK(v.selected & 1); CHECK(v.selected & kHoldersNoRecord); CHECK(!(v.selected & 2)); });
+        CHECK(!states[0].released && !states[1].released);
+        at(0,[]{ CHECK(!checkpoint_host_pick(-1)); });
+    }
 
     reset(L"on-map save before its first node (counter zero, adventure_started 1) refuses a fresh session");start();boundary(9710);
     for(unsigned i=0;i<2;++i)at(i,[]{
@@ -505,16 +563,43 @@ int main() {
     at(0,[]{CHECK(!checkpoint_select(g.slot,g.path.c_str()));});drain();
     CHECK(states[0].released && states[1].released && states[0].seq==1);
 
-    // ---- the queue is four deep ----
-    reset(L"the confirmed-save queue keeps the four newest, newest first");start();boundary(20000);
-    for(unsigned k=1;k<=5;++k) next(20000+k);
+    // ---- the queue keeps the whole run (2026-10-04; it was four deep) ----
+    reset(L"the confirmed-save queue keeps every save of the run, newest first");start();boundary(20000);
+    for(unsigned k=1;k<=11;++k) next(20000+k, k==7 ? 8u : 0u);       // seq 8 is confirmed right after a boss node (type 8)
     for(unsigned i=0;i<2;++i) at(i,[]{
-        for(unsigned s=0;s<4;++s) { Entry e{}; CHECK(read_entry(file(kQueue[s]),e,true)); CHECK(e.certificate.seq==6-s); }
+        CHECK(queue_indices().size()==12);
+        for(unsigned s=0;s<12;++s) {
+            Entry e{}; CHECK(read_entry(qfile(s),e,true)); CHECK(e.certificate.seq==12-s);
+            CHECK(((e.flags&kCheckpointAfterBoss)!=0)==(e.certificate.seq==8));
+        }
     });
+    {   // every one of them is offered, with its flag, through the real codec
+        struct Guard { Guard(){g_manual=true;} ~Guard(){g_manual=false;} } manual;
+        restart();
+        at(0,[]{ SaveSyncView v; CHECK(checkpoint_sync_view(v)); CHECK(v.phase==kSyncHostChoosing);
+                 CHECK(v.n==12); CHECK(v.entry[0].seq==12 && v.entry[11].seq==1);
+                 for(unsigned s=0;s<12;++s) CHECK(((v.entry[s].flags&kCheckpointAfterBoss)!=0)==(v.entry[s].seq==8)); });
+        at(0,[]{ CHECK(checkpoint_host_pick(4)); }); drain();          // seq 8, the after-boss one
+        for(unsigned i=0;i<2;++i) at(i,[]{
+            Entry e{}; CHECK(read_entry(qfile(0),e,true)); CHECK(e.certificate.seq==8 && (e.flags&kCheckpointAfterBoss));
+            CHECK(queue_indices().size()==12);                          // 8 at the head; 12..9 and 7..1 are KEPT (2026-10-04)
+        });
+    }
+    {   // a gap in the numbering (a file lost) is closed by the next commit, nothing is overwritten
+        reset(L"a gap in the queue is closed by the next commit");start();boundary(20500);
+        for(unsigned k=1;k<=4;++k) next(20500+k);                         // .0..4 = seq 5..1
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(erase_index(0) && erase_index(1)); });   // seq 5 and 4 gone: .2 .3 .4 = 3 2 1
+        next(20510);                                                      // seq 6
+        for(unsigned i=0;i<2;++i) at(i,[]{
+            CHECK(queue_indices().size()==4);
+            const uint64_t want[4]={6,3,2,1};
+            for(unsigned s=0;s<4;++s) { Entry e{}; CHECK(read_entry(qfile(s),e,true)); CHECK(e.certificate.seq==want[s]); }
+        });
+    }
 
-    // ---- restoring an older entry drops the ones newer than it ----
+    // ---- restoring an older entry keeps the ones newer than it ----
     {
-        reset(L"handshake: host chooses an older save; newer entries leave the queue");start();boundary(21000);
+        reset(L"handshake: host chooses an older save; newer entries stay in the queue");start();boundary(21000);
         for(unsigned k=1;k<=3;++k) next(21000+k);            // seq 1..4 confirmed, by the automatic path
         struct Guard { Guard(){g_manual=true;} ~Guard(){g_manual=false;} } manual;
         restart();
@@ -531,8 +616,17 @@ int main() {
         CHECK(states[0].released && states[1].released && states[0].seq==2 && states[1].seq==2);
         for(unsigned i=0;i<2;++i) at(i,[]{
             Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.certificate.seq==2);
-            CHECK(read_entry(file(L".1"),e,true)); CHECK(e.certificate.seq==1);
-            CHECK(!disk_exists(file(L".2")) && !disk_exists(file(L".3")));
+            CHECK(read_entry(file(L".1"),e,true));      // the others follow in creation order, newest first
+            CHECK(disk_exists(file(L".2")) && disk_exists(file(L".3")) && queue_indices().size()==4);   // the two newer ones are kept
+        });
+        // the next commit after the restore has the number 3, like the kept one: both exist, and the new one is listed first
+        next(21100);
+        for(unsigned i=0;i<2;++i) at(i,[]{
+            CHECK(queue_indices().size()==5);
+            Entry e{}; CHECK(read_entry(qfile(0),e,true)); CHECK(e.certificate.seq==3);
+            unsigned threes=0;
+            for(unsigned k:queue_indices()) { Entry x{}; CHECK(read_entry(qfile(k),x,true)); if(x.certificate.seq==3) ++threes; }
+            CHECK(threes==2);
         });
     }
 
@@ -598,6 +692,40 @@ int main() {
         CHECK(states[0].released && states[1].released);
         // Once loading, a round can no longer be started over.
         at(0,[]{ CHECK(!checkpoint_abort_round()); });
+    }
+
+    // A player is known by TWO ids (proto 73): reinstalling the mod changes the fingerprint beside the DLL, and the records of the run in progress must still be found through the other id.
+    {
+        auto layout=[&](bool reinstall,bool keep_alt) {
+            for(unsigned i=0;i<participants;++i) {
+                State old=states[i]; states[i]=State{}; auto& s=states[i];
+                s.on=true; s.host=i==0; s.path=old.path;
+                s.hroot=testroot;
+                if(!reinstall) { s.identity=old.identity; s.identity2=old.identity2; }
+                else { s.identity=500+i; s.identity2=keep_alt?old.identity:0; }
+                s.root=testroot+L"\\"+std::to_wstring(s.identity); CreateDirectoryW(s.root.c_str(),nullptr);
+            }
+        };
+        reset(L"reinstall keeps the run: the old id is the other id",2);
+        layout(false,false);                       // the first install: primary ids 100/101, no alternates
+        start(); boundary(1000); certified(1); next(1001); certified(2);
+        const std::wstring first_key=states[0].key;
+        // The reinstall: new primary ids (500/501), the old ones kept as the alternates
+        layout(true,true); selections();
+        for(unsigned i=0;i<participants;++i) CHECK(states[i].released && !states[i].failed && states[i].seq==2);
+        CHECK(states[0].key==first_key);           // the same record, found under the other combination
+        CHECK(states[0].root==testroot+L"\\100");  // ...in the folder of the old id
+        // And with nothing to connect the new ids to the old ones the run is NOT found (saves on the map, no record)
+        reset(L"a reinstall with no alternate id cannot find the run",2);
+        layout(false,false); start(); boundary(1000); certified(1);
+        layout(true,false); selections();
+        for(unsigned i=0;i<participants;++i) CHECK(!states[i].released);
+        // The Steam id out of the save directory path
+        CHECK(checkpoint_io::steam_id_from_dir(L"C:\\Users\\a\\AppData\\Roaming\\Glaiel Games\\Mewgenics\\76561198862908557\\saves")==76561198862908557ull);
+        CHECK(checkpoint_io::steam_id_from_dir(L"C:\\Users\\a\\saves")==0);
+        CHECK(checkpoint_io::steam_id_from_dir(L"C:\\x\\12345678901234567\\saves")==0);      // 17 digits but not a SteamID64
+        CHECK(checkpoint_io::steam_id_from_dir(nullptr)==0);
+        printf("two ids: ok\n");
     }
 
     // Wire decoder rejects all truncations and trailing data, no heap ownership.

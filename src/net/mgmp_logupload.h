@@ -23,6 +23,9 @@ struct LogUploadRequest {
     char     info[160]  = {};          // a one-line fingerprint (protocol, role, room) the panel fills in
     wchar_t  files[kLogUploadMaxFiles][MAX_PATH] = {};
     int      nfiles     = 0;
+    // Files the worker deletes once the server has SAVED the upload (and only then): the "this run did not end cleanly" markers of mgmp_prevrun, so a log that arrived is not offered again.
+    wchar_t  on_ok_delete[4][MAX_PATH] = {};
+    int      ndelete    = 0;
 };
 
 enum class LogUploadState : uint8_t { Idle, Working, Done, Failed };

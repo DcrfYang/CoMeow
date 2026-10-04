@@ -3,6 +3,11 @@
 
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
+#include "mgmp_net.h"
+#include "mgmp_page.h"
+#include "mgmp_prevrun.h"
+#include "mgmp_lockstep.h"
+#include "mgmp_catsync.h"
 
 #include <windows.h>
 
@@ -145,6 +150,81 @@ bool frame_is_ours(void* addr) {
     return mod != nullptr && (uintptr_t)mod == g.self_base;
 }
 
+// THE STACK OF THE FAULTING INSTRUCTION, walked from the exception's own CONTEXT (2026-10-03). RtlCaptureStackBackTrace walks the HANDLER's stack, and for an execute fault at address 0 -- a call through a
+// null function pointer -- it stops at the dispatcher: the crash report then said "no mgmp.dll frame on this stack" about a stack it had not looked at. From the context: a faulting rip with no unwind info
+// (null, or a jump into data) is treated as a call that landed there, so the return address is at [rsp]; every other frame is unwound with the unwind tables. The first entry is the faulting rip itself.
+USHORT walk_context(const CONTEXT* in, void** frames, USHORT max) {
+    USHORT n = 0;
+    __try {
+        CONTEXT c = *in;
+        frames[n++] = (void*)c.Rip;
+        while (n < max) {
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION fe = c.Rip ? RtlLookupFunctionEntry(c.Rip, &image, nullptr) : nullptr;
+            if (fe) {
+                PVOID handler_data = nullptr; DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fe, &c, &handler_data, &frame, nullptr);
+            } else {
+                DWORD64 ret = 0;
+                if (!readable((const void*)c.Rsp, 8)) break;
+                ret = *(const DWORD64*)c.Rsp;
+                c.Rip = ret; c.Rsp += 8;
+            }
+            if (!c.Rip) break;
+            frames[n++] = (void*)c.Rip;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return n;
+}
+
+USHORT capture_frames(const EXCEPTION_POINTERS* ep, void** frames, USHORT max) {
+    if (ep && ep->ContextRecord) {
+        const USHORT n = walk_context(ep->ContextRecord, frames, max);
+        if (n) return n;
+    }
+    return RtlCaptureStackBackTrace(1, max, frames, nullptr);
+}
+
+// The words on the stack that look like return addresses (they point into a loaded module): a second opinion when the unwinder cannot be trusted, and the only one for a stack the faulting code built by hand.
+void dump_stack_scan(const CONTEXT* c) {
+    __try {
+        const DWORD64* sp = (const DWORD64*)c->Rsp;
+        int shown = 0;
+        for (int i = 0; i < 96 && shown < 24; ++i) {
+            if (!readable(sp + i, 8)) break;
+            const DWORD64 v = sp[i];
+            if (v < 0x10000) continue;
+            HMODULE mod = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)v, &mod) || !mod) continue;
+            char at[128];
+            describe((void*)v, at, sizeof(at));
+            log_line("CRASH", "    [rsp+%03X] %s%s", i * 8, at, frame_is_ours((void*)v) ? "   <-- mgmp" : "");
+            ++shown;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// What a register that holds a pointer points at: the first words, and -- when the first word is a pointer into the game -- the vtable's RVA. "rcx = 0x...5288: [vtable -> 0x...]" is how a freed or overwritten
+// object shows (its first word is then a heap pointer or garbage instead of a vtable in the exe's image).
+void dump_pointer(const char* name, DWORD64 v) {
+    if (v < 0x10000 || !readable((const void*)v, 32)) return;
+    __try {
+        const DWORD64* q = (const DWORD64*)v;
+        char vt[96] = "not a game vtable";
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)q[0], &mod) && mod)
+            describe((void*)q[0], vt, sizeof(vt));
+        log_line("CRASH", "    %s %016llX -> %016llX %016llX %016llX %016llX  [first word: %s]", name, (unsigned long long)v,
+                 (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3], vt);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void dump_pointers(const CONTEXT* c) {
+    log_line("CRASH", "  the registers that point at memory:");
+    dump_pointer("rax", c->Rax); dump_pointer("rbx", c->Rbx); dump_pointer("rcx", c->Rcx); dump_pointer("rdx", c->Rdx);
+    dump_pointer("rsi", c->Rsi); dump_pointer("rdi", c->Rdi); dump_pointer("r8 ", c->R8);  dump_pointer("r9 ", c->R9);
+}
+
 void dump_record(const char* why, const Record& r) {
     char at[128];
     describe(r.addr, at, sizeof(at));
@@ -196,7 +276,7 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
     r.code = code;
     r.addr = er->ExceptionAddress;
     if (code == kCppThrow) type_name_of(er, r.type, sizeof(r.type));
-    r.frame_count = RtlCaptureStackBackTrace(1, kMaxFrames, r.frames, nullptr);
+    r.frame_count = capture_frames(ep, r.frames, kMaxFrames);
 
     LONG slot = InterlockedIncrement(&g.ring_next) - 1;
     g.ring[slot % kRingSize] = r;
@@ -220,7 +300,89 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// WHAT THE FAULT WAS, for an access violation: read or write, and at which address -- the difference between a null pointer (an address near 0) and a dangling one (a wild address) is the first thing
+// a crash in the game's own code has to be asked, and the exception record has it. Plus the registers, so "[rdx]" in a disassembly can be read as a value instead of guessed. Plain formatting only:
+// this runs in a process that is going down.
+void dump_fault(const EXCEPTION_POINTERS* ep) {
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        const ULONG_PTR kind = er->ExceptionInformation[0];
+        log_line("CRASH", "  access violation: %s address %016llX%s",
+                 kind == 0 ? "READ of" : kind == 1 ? "WRITE to" : kind == 8 ? "EXECUTE at" : "access to",
+                 (unsigned long long)er->ExceptionInformation[1],
+                 er->ExceptionInformation[1] < 0x10000 ? "  (a NULL pointer plus an offset)" : "  (a wild or freed pointer)");
+    }
+    if (const CONTEXT* c = ep->ContextRecord) {
+        log_line("CRASH", "  rip %016llX rsp %016llX rbp %016llX", (unsigned long long)c->Rip, (unsigned long long)c->Rsp, (unsigned long long)c->Rbp);
+        log_line("CRASH", "  rax %016llX rbx %016llX rcx %016llX rdx %016llX", (unsigned long long)c->Rax, (unsigned long long)c->Rbx, (unsigned long long)c->Rcx, (unsigned long long)c->Rdx);
+        log_line("CRASH", "  rsi %016llX rdi %016llX r8  %016llX r9  %016llX", (unsigned long long)c->Rsi, (unsigned long long)c->Rdi, (unsigned long long)c->R8, (unsigned long long)c->R9);
+        log_line("CRASH", "  r10 %016llX r11 %016llX r12 %016llX r13 %016llX r14 %016llX r15 %016llX", (unsigned long long)c->R10, (unsigned long long)c->R11,
+                 (unsigned long long)c->R12, (unsigned long long)c->R13, (unsigned long long)c->R14, (unsigned long long)c->R15);
+    }
+}
+
+// A MINIDUMP BESIDE THE LOG (same name, .dmp), so a crash that the log alone cannot explain still leaves something to open in a debugger: the faulting thread's stack, the registers and the memory the
+// stacks point at. dbghelp is loaded on demand -- nothing here costs anything until the process is already dying -- and any failure is silent, because a diagnostic must not turn into a second crash.
+void write_minidump(EXCEPTION_POINTERS* ep) {
+    wchar_t path[MAX_PATH] = {};
+    if (!log_current_path(path, MAX_PATH)) return;
+    wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return;
+    wcscpy_s(dot, (size_t)(path + MAX_PATH - dot), L".dmp");
+
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    if (!dbg) return;
+    typedef BOOL(WINAPI* WriteDumpFn)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+    const WriteDumpFn write = (WriteDumpFn)GetProcAddress(dbg, "MiniDumpWriteDump");
+    HANDLE f = write ? CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) : INVALID_HANDLE_VALUE;
+    if (f != INVALID_HANDLE_VALUE) {
+        struct ExcInfo { DWORD thread; EXCEPTION_POINTERS* ptrs; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+        constexpr int kWithIndirectlyReferencedMemory = 0x40, kWithThreadInfo = 0x1000;
+        // MiniDumpIgnoreInaccessibleMemory (0x20000): without it ONE unreadable page in the memory the dump wants (a guard page, a freed arena) fails the whole dump -- which is how the first report ended up as a
+        // 0 KB file. WithUnloadedModules (0x20) names what was loaded. A second, plainer attempt follows a failure, and the error is in the log either way.
+        constexpr int kIgnoreInaccessible = 0x20000, kWithUnloadedModules = 0x20;
+        BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, kWithIndirectlyReferencedMemory | kWithThreadInfo | kIgnoreInaccessible | kWithUnloadedModules, ep ? &info : nullptr, nullptr, nullptr);
+        DWORD err = ok ? 0 : GetLastError();
+        if (!ok) {
+            log_line("CRASH", "  minidump attempt 1 failed (error 0x%08lX) -- trying a plain one", err);
+            SetFilePointer(f, 0, nullptr, FILE_BEGIN); SetEndOfFile(f);
+            ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, kIgnoreInaccessible, ep ? &info : nullptr, nullptr, nullptr);
+            err = ok ? 0 : GetLastError();
+        }
+        CloseHandle(f);
+        if (ok) log_line("CRASH", "  minidump written: %ls", path);
+        else    log_line("CRASH", "  minidump FAILED (error 0x%08lX): %ls", err, path);
+    }
+}
+
+// WHERE THE SESSION WAS when the process died: the page, the role and who was connected, the battle and turn, the last phase changes (the stage timeline, oldest first, with how long ago each was) and
+// the cat bookkeeping (the run's lists, every clone slot). Each read is guarded; the whole thing is one SEH block because a dying process may hold anything in its memory.
+void dump_session_context() {
+    __try {
+        const NetRole role = net_role();
+        log_line("CRASH", "  session: page '%s', role %s, %u peer(s) connected, net %s, battle %016llx, turn %u",
+                 page_name(page_self()), role == NetRole::Host ? "host" : role == NetRole::Client ? "client" : "none", (unsigned)net_peer_count(),
+                 net_active() ? "up" : "down", (unsigned long long)lockstep_battle_id(), (unsigned)log_turn());
+        log_line("CRASH", "  last stage: %s", log_stage_last());
+        log_stage_dump("CRASH");
+        catsync_log_snapshot("crash");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_line("CRASH", "  (the session context could not be read)");
+    }
+}
+
+// The crash handler's own upload of the log and dump (mgmp_prevrun): a second fault in here (the process may be in any state) must end this attempt, not the report.
+void try_upload_crash_log() {
+    __try {
+        prevrun_crash_upload();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 LONG WINAPI on_unhandled(EXCEPTION_POINTERS* ep) {
+    // a fault in the upload thread lands here again: the first report is already written, so just let the process go
+    static LONG inside = 0;
+    if (InterlockedCompareExchange(&inside, 1, 0) != 0) return EXCEPTION_CONTINUE_SEARCH;
     log_line("CRASH", "==== unhandled exception -- the process is going down ====");
 
     if (ep && ep->ExceptionRecord) {
@@ -228,9 +390,16 @@ LONG WINAPI on_unhandled(EXCEPTION_POINTERS* ep) {
         r.code = ep->ExceptionRecord->ExceptionCode;
         r.addr = ep->ExceptionRecord->ExceptionAddress;
         if (r.code == kCppThrow) type_name_of(ep->ExceptionRecord, r.type, sizeof(r.type));
-        r.frame_count = RtlCaptureStackBackTrace(1, kMaxFrames, r.frames, nullptr);
+        r.frame_count = capture_frames(ep, r.frames, kMaxFrames);
         dump_record("FATAL", r);
+        dump_fault(ep);
+        if (ep->ContextRecord) {
+            dump_pointers(ep->ContextRecord);
+            log_line("CRASH", "  words on the faulting stack that point into a module:");
+            dump_stack_scan(ep->ContextRecord);
+        }
     }
+    dump_session_context();
 
     // The ring, oldest first. For an unhandled C++ throw the stack is already
     // unwound by the time we get here, so the ring's last entry -- captured at
@@ -247,6 +416,8 @@ LONG WINAPI on_unhandled(EXCEPTION_POINTERS* ep) {
         dump_record(label, g.ring[i % kRingSize]);
     }
 
+    if (ep) write_minidump(ep);
+    try_upload_crash_log();     // after the dump: the log and the dump are what is sent
     log_shutdown();
     return EXCEPTION_CONTINUE_SEARCH;   // let WER do what it would have done
 }

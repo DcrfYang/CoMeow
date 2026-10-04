@@ -27,6 +27,13 @@ bool restore(const std::wstring& target, const Bytes& bytes);
 // database itself could not be opened or read. Read-only, so it is safe on a
 // file the game has open. Used by the save-backup list to show progress.
 bool read_property(const std::wstring& source, const char* key, bool& have, std::string& out);
+// Every row of `properties` (key, data as text), read-only. Used to hand a client the host's WHOLE property table (mgmp_unlocks): the game's own in-memory table is only a cache of the keys read so far.
+bool read_all_properties(const std::wstring& source, std::vector<std::pair<std::string, std::string>>& out);
 uint64_t nonce();
-bool identity(uint64_t& id);
+// The player's persistent identity: a random id kept in mgmp-peer-id.bin NEXT TO THE DLL. If that file is missing (a fresh folder -- the mod was updated by deleting the old folder and
+// unpacking the new zip) and `adopt_root` (the mgmp_handshake folder of the save directory, one sub-folder per identity) holds exactly ONE earlier identity, that one is taken over
+// (*adopted = true) so the recovery records of the run in progress are still found; with several (two instances on one machine) a new id is made, as before.
+bool identity(uint64_t& id, const wchar_t* adopt_root = nullptr, bool* adopted = nullptr);
+// The SteamID64 that appears as a folder of the game's save directory (...\Mewgenics\7656119xxxxxxxxxx\saves), or 0 when there is none.
+uint64_t steam_id_from_dir(const wchar_t* dir);
 } }

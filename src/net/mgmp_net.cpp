@@ -90,10 +90,13 @@ bool wsa_init() {
     return true;
 }
 
-struct LevelBox { uint64_t node = 0; char name[48] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {}; } g_level_box;
+struct LevelBox { uint64_t node = 0; char name[64] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {}; } g_level_box;
 constexpr uint32_t kBoardRing = 4;
 BoardAssembled g_board_ring[kBoardRing];   // the last few turns' boards, guarded by g.cs like the level box
 uint32_t g_board_next = 0;
+constexpr uint32_t kRollRing = 64;
+RollMsg g_roll_ring[kRollRing];            // the host's last rolls, guarded by g.cs
+uint32_t g_roll_next = 0;
 
 void queue_push(const NetMsg& m) {
     EnterCriticalSection(&g.cs);
@@ -108,6 +111,7 @@ void queue_push(const NetMsg& m) {
         g_level_box.n_weather = m.unlocks.n_weather;
         memcpy(g_level_box.weather, m.unlocks.weather, sizeof(g_level_box.weather));
     }
+    if (m.type == MSG_ROLL) g_roll_ring[g_roll_next++ % kRollRing] = m.roll;
     if (m.type == MSG_BOARD) {
         const BoardMsg& b = m.board;
         BoardAssembled* box = nullptr;
@@ -209,6 +213,13 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_INVENTORY: return dec_inventory(r, m.inventory);
         case MSG_RUNHIST:   return dec_runhist(r, m.runhist);
         case MSG_STATEDUMP: return dec_statedump(r, m.statedump);
+        case MSG_PEERLOG:   return dec_peerlog(r, m.peerlog);
+        case MSG_AUDIT:     return dec_audit(r, m.audit);
+        case MSG_UQD:       return dec_uqd(r, m.uqd);
+        case MSG_PROPS:     return dec_props(r, m.props);
+        case MSG_RNGL:      return dec_rngl(r, m.rngl);
+        case MSG_CHAT:      return dec_chat(r, m.chat);
+        case MSG_DEEP:      return dec_deep(r, m.deep);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
         case MSG_PAGE:      return dec_page(r, m.page);
@@ -219,6 +230,7 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_MAPSEEDS:  return dec_mapseeds(r, m.mapseeds);
         case MSG_UNLOCKS:   return dec_unlocks(r, m.unlocks);
         case MSG_BOARD:     return dec_board(r, m.board);
+        case MSG_ROLL:      return dec_roll(r, m.roll);
         case MSG_PEERS:   return dec_peers(r, m.peers);
         case MSG_HALT:    return dec_halt(r, m.halt);
         case MSG_REFUSE:  r.str(m.refuse, sizeof(m.refuse)); return r.ok;
@@ -272,6 +284,12 @@ bool relayed(uint8_t type) {
         // never republishes cats owned by someone else.
         case MSG_CATDATA:
         case MSG_HALT:
+        // UQD: every peer authors its own digest of each action, for the others to compare
+        case MSG_UQD:
+        case MSG_RNGL:
+        case MSG_DEEP:
+        // CHAT: every peer authors its own lines, and the others (in a room of three or four, the other clients too) all show them
+        case MSG_CHAT:
         // NODEHASH is symmetric -- every peer authors its own -- so with more
         // than two players a client's has to reach the other clients, exactly
         // like the per-turn HASH above it.
@@ -1013,7 +1031,16 @@ bool net_send_debughit(const DebugHitMsg& m) { MGMP_SEND_WITH(enc_debughit, m); 
 bool net_send_party(const PartyMsg& m) { MGMP_SEND_WITH(enc_party, m); }
 bool net_send_chapter(const ChapterMsg& m) { MGMP_SEND_WITH(enc_chapter, m); }
 bool net_send_chapterseed(const ChapterSeedMsg& m) { MGMP_SEND_WITH(enc_chapterseed, m); }
-bool net_send_checkpoint(const CheckpointMsg& m) { MGMP_SEND_WITH(enc_checkpoint, m); }
+bool net_send_checkpoint(const CheckpointMsg& m) {
+    // proto 76: an offer carries up to kCheckpointCandidates saves (33 bytes each) -- past the 512-byte stack buffer of the small messages
+    static_assert(kCheckpointCandidates * 33 + 512 <= 8192, "checkpoint frame buffer");
+    uint8_t* p = (uint8_t*)malloc(8192);
+    if (!p) return false;
+    const uint32_t n = enc_checkpoint(p, 8192, m);
+    const bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
 bool net_send_setup(const SetupMsg& m) {
     uint32_t need = setup_frame_size(m);
     if (need > kMaxFrame) return false;
@@ -1044,7 +1071,7 @@ bool net_send_roomctl(const RoomCtlMsg& m) { MGMP_SEND_WITH(enc_roomctl, m); }
 // Host-authored, so it is NOT in relayed(): net_send already reaches every client.
 bool net_send_mapseeds(const MapSeedsMsg& m) { MGMP_SEND_WITH(enc_mapseeds, m); }
 // Host-authored, so it is NOT in relayed() either.
-bool net_send_unlocks(const UnlocksMsg& m) { uint8_t p[1024]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // bigger than the 512-byte default since proto 62
+bool net_send_unlocks(const UnlocksMsg& m) { uint8_t p[2048]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // 2048 since proto 78 (the class names)   // bigger than the 512-byte default since proto 62
 
 // Host-authored, so it is NOT in relayed() either. Bigger than the 512-byte default: a chunk is up to 16 units.
 bool net_send_board(const BoardMsg& m) { uint8_t p[1024]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send(p, n); }
@@ -1055,6 +1082,16 @@ bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n) 
     EnterCriticalSection(&g.cs);
     const bool ok = g_level_box.bnode == node_id;
     if (ok) { n = g_level_box.n_weather; for (uint8_t i = 0; i < n && i < kWeatherNames; ++i) memcpy(names[i], g_level_box.weather[i], kWeatherLen); }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
+bool net_send_roll(const RollMsg& m) { uint8_t p[64]; const uint32_t n = enc_roll(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_host_roll(uint64_t battle, uint32_t seq, uint8_t site, RollMsg& out) {
+    if (!g.cs_ready || !battle) return false;
+    EnterCriticalSection(&g.cs);
+    bool ok = false;
+    for (uint32_t k = 0; k < kRollRing && !ok; ++k)
+        if (g_roll_ring[k].battle == battle && g_roll_ring[k].seq == seq && g_roll_ring[k].site == site) { out = g_roll_ring[k]; ok = true; }
     LeaveCriticalSection(&g.cs);
     return ok;
 }
@@ -1268,6 +1305,31 @@ bool net_send_statedump(const StateDumpMsg& m) {
     return ok;
 }
 
+bool net_send_uqd(const UqdMsg& m) { uint8_t p[128]; const uint32_t n = enc_uqd(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_chat(const ChatMsg& m) { uint8_t p[320]; const uint32_t n = enc_chat(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_rngl(const RnglMsg& m) { uint8_t p[512]; const uint32_t n = enc_rngl(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_deep(const DeepMsg& m) { uint8_t p[384]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_props(const PropsMsg& m) { uint8_t p[1024]; const uint32_t n = enc_props(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_audit(const AuditMsg& m) {
+    uint8_t* p = (uint8_t*)malloc(4096);
+    if (!p) return false;
+    const uint32_t n = enc_audit(p, 4096, m);
+    const bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
+
+bool net_send_peerlog(const PeerLogMsg& m) {
+    const uint32_t need = peerlog_frame_size(m);
+    if (need > kMaxFrame) return false;
+    uint8_t* p = (uint8_t*)malloc(need);
+    if (!p) return false;
+    const uint32_t n = enc_peerlog(p, need, m);
+    const bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
+
 bool net_send_inventory(const InventoryMsg& m) {
     uint32_t need = inventory_frame_size(m);
     if (need > kMaxFrame) {
@@ -1291,6 +1353,7 @@ void net_msg_release(NetMsg& m) {
         if (m.setup.cats[i].data) { free(m.setup.cats[i].data); m.setup.cats[i].data = nullptr; }
     if (m.runhist.data)  { free(m.runhist.data);  m.runhist.data  = nullptr; }
     if (m.statedump.data){ free(m.statedump.data);m.statedump.data= nullptr; }
+    if (m.peerlog.data)  { free(m.peerlog.data);  m.peerlog.data  = nullptr; }
     for (uint32_t i = 0; i < kInvBuckets; ++i)
         if (m.inventory.data[i]) { free(m.inventory.data[i]); m.inventory.data[i] = nullptr; }
 }
@@ -1310,6 +1373,7 @@ bool net_poll(NetMsg& out) {
             g.queue[g.head].setup.cats[i].data = nullptr;
         g.queue[g.head].runhist.data  = nullptr;
         g.queue[g.head].statedump.data = nullptr;
+        g.queue[g.head].peerlog.data   = nullptr;
         for (uint32_t i = 0; i < kInvBuckets; ++i)
             g.queue[g.head].inventory.data[i] = nullptr;
         g.head = (g.head + 1) % kQueueCap;

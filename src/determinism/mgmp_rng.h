@@ -56,6 +56,23 @@ void** rng_original_randfloat();
 void** rng_original_rand2();
 void** rng_original_rollchance();
 
+// THE LEDGER (proto 80): while armed, every draw on the shared stream made by the thread that armed it is counted by call site, and its (function, site) goes into an order-sensitive digest. The values
+// drawn are NOT in it: two peers drawing the same sequence from different streams still agree, and the stream itself is compared elsewhere. mgmp_diag takes it once per action and compares it with
+// the other peer's, so a drift INSIDE an action is named by the call site that drew a different number of times.
+constexpr uint32_t kLedgerSites = 96;
+struct RngLedger {
+    uint32_t n = 0, digest = 0;                   // draws made inside an apply-action call (rng_ledger_phase true), and the digest of their order
+    uint32_t n_loose = 0, digest_loose = 0;       // the ones made outside one: the AI's decisions, and on the owner's peer the aim previews
+
+    uint32_t sites = 0, over = 0;                 // distinct sites listed (sorted by key), and draws from sites that did not fit
+    uint32_t key[kLedgerSites] = {};              // site RVA | outside-an-apply << 27 | function << 28
+    uint32_t count[kLedgerSites] = {};
+};
+void rng_ledger_arm(bool on);                     // on: count this thread's draws from now (clears); off: stop
+void rng_ledger_take(RngLedger& out);             // the window so far, sorted; clears it
+bool rng_ledger_armed();
+void rng_ledger_phase(bool in_apply);             // the hook of the game's apply-action call: true around it, false after (a no-op unless armed on this thread)
+
 // Total draws seen, and of those, how many were on the global stream. Logged at
 // each turn so the trace shows the recorder is alive even when the diff is
 // empty.

@@ -621,6 +621,128 @@ void copies_at_home_do_not_make_the_original_ambiguous() {
     entries.clear(); peer_position = 0; catsync_forget();
 }
 
+void settlement_survives_the_other_player_leaving() {
+    // 2026-10-03: the other player crashed mid-run. The survivor's settlement then (a) was held for ever (the filter refused a clone of a peer that is no longer counted), or (b) skipped the filter
+    // altogether because the session was down, and settled the departed player's clones and never merged its own. The filter now works with whoever is left, a real cat of an older build on a
+    // high session id (slot 5 and up) is no reason to refuse, and a client keeps its own position after the roster is gone.
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    uint64_t ids[8] = {0x70000001ull,0x70000002ull,0x70000003ull,0x71000001ull,0x71000002ull,0x71000003ull,0x71000004ull,0};
+    uint64_t mir[3] = {0x70000001ull,0x70000002ull,0x70000003ull};
+    uint64_t fam[4] = {0x71000001ull,0x71000002ull,0x71000003ull,0x71000004ull};
+    uint64_t lst[3] = {0x70000001ull,0x70000002ull,0x70000003ull};
+    for (unsigned i = 0; i < 7; ++i) { void* cat = allocate(0xC58); put(cat, kCatData_SaveId, ids[i]); entries[ids[i]].cat = cat; }
+    put(director, kDir_CatIdCount, uint32_t(3)); put(director, kDir_CatIdCap, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_MirrorCount, uint32_t(3)); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)mir);
+    put(director, kDir_CatFamiliars, uint32_t(4)); put(director, kDir_CatFamiliars + 4, uint32_t(4)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    notes_ready = true;
+    CHECK(catsync_run_is_shared());                                                          // the clones in the lists are known ones
+    peer_count = 1;                                                                          // the client is gone
+    CHECK(catsync_prepare_settlement(director));                                             // refused before: pos 1 >= the peer count of 1
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 0 && get<uint32_t>(director, kDir_CatIdCount) == 3);
+    catsync_forget();
+
+    // a real cat of an older build on slot 5 of the session range, in the host's party, does not hold the door
+    peer_count = 2;
+    uint64_t lst2[3] = {0x70000001ull,0x70000002ull,0x71000005ull};
+    uint64_t mir2[3] = {0x70000001ull,0x70000002ull,0x71000005ull};
+    { void* cat = allocate(0xC58); put(cat, kCatData_SaveId, uint64_t(0x71000005ull)); entries[0x71000005ull].cat = cat; }
+    put(director, kDir_CatIdCount, uint32_t(3)); put(director, kDir_CatIdData, (const uint64_t*)lst2);
+    put(director, kDir_MirrorCount, uint32_t(3)); put(director, kDir_MirrorData, (const uint64_t*)mir2);
+    put(director, kDir_CatFamiliars + 4, uint32_t(4)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    CHECK(catsync_prepare_settlement(director));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 3 && get<const uint64_t*>(director, kDir_CatIdData)[2] == 0x71000005ull);
+    catsync_forget();
+    put(director, kDir_CatIdData, (const uint64_t*)party); put(director, kDir_CatIdCount, uint32_t(4));
+    put(director, kDir_MirrorData, (const uint64_t*)party); put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
+    notes_ready = false;
+
+    // the CLIENT keeps its position after the roster is gone: its clones (0x71...) still go home
+    entries.clear(); peer_position = 1; peer_count = 2; initialize(); depart_all(4);
+    replace_party_for_real = true;
+    SetupMsg first{};
+    CHECK(catsync_prepare_party_setup(first, 1)); free_msg_cats(first);
+    for (unsigned i = 0; i < 4; ++i) settle_clone(0x71000001ull + i, 90 + (int32_t)i);
+    peer_count = 1; peer_position = 0;                                                       // the live roster is gone: the position now reads 0
+    CHECK(catsync_merge_session_cats("after the host left") == 4);
+    for (unsigned i = 0; i < 4; ++i) CHECK(get<int32_t>(entries[party[i]].cat, 0x70C) == 90 + (int32_t)i && flags_of(party[i]) == kHome);
+    replace_party_for_real = false;
+    entries.clear(); peer_position = 0; peer_count = 2; catsync_forget();
+}
+
+void a_settlement_retires_the_other_players_copies() {
+    // 2026-10-03: the host's save held 71000001-3 and the client's 70000001-4, flagged out on adventure. After a settlement the other player's copies are retired (flags 0) unless the run's lists still hold them.
+    entries.clear(); peer_position = 0; peer_count = 2; initialize(); std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : {0x71000001ull, 0x71000002ull, 0x71000003ull}) { void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, kCatData_Flags, uint64_t(kAway)); entries[id].cat = c; }
+    { void* c = allocate(0xC58); put(c, kCatData_SaveId, uint64_t(0x70000001ull)); put(c, kCatData_Flags, uint64_t(kHome)); entries[0x70000001ull].cat = c; }   // this peer's own: not touched
+    static uint64_t in_run[1] = {0x71000003ull};
+    put(director, kDir_CatIdCount, uint32_t(1)); put(director, kDir_CatIdData, (const uint64_t*)in_run);
+    CHECK(catsync_retire_peer_copies("t") == 2);
+    CHECK(flags_of(0x71000001ull) == 0 && flags_of(0x71000002ull) == 0);
+    CHECK(flags_of(0x71000003ull) == kAway && flags_of(0x70000001ull) == kHome);
+    CHECK(catsync_retire_peer_copies("again") == 0);
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
+// The halt after a resume (2026-10-03): an identical session cat was skipped at setup, so the owner's loader-built object and the other peer's rebuilt copy derived different stats. At setup it is rebuilt anyway.
+void identical_session_cats_are_rebuilt_at_setup() {
+    const uint64_t id = 0x71000004ULL;
+    CatImage image{0x1122334455667788ULL, 16, 1, {41}, 5, 10};
+    auto m = message(id, image);
+    CHECK(catsync_apply_snapshot(m, "all-player setup exchange", true));          // created
+    const unsigned loads_after_create = post_loads;
+    uint64_t before_rng[4]; std::memcpy(before_rng, rng, sizeof(rng));
+    CHECK(catsync_apply_snapshot(m, "all-player setup exchange", true));          // identical bytes, same object
+    CHECK(post_loads == loads_after_create + 1);                                  // rebuilt: reset + read + post-load
+    CHECK(std::memcmp(before_rng, rng, sizeof(rng)) == 0);
+    CHECK(entries.count(id) == 1 && get<int32_t>(entries[id].cat, 0x7A8) == 16);
+    CHECK(get<uint64_t>(entries[id].cat, kCatData_SaveId) == id);
+    CHECK(catsync_apply_snapshot(m, "the map tick", true));                       // a mid-run identical update still does nothing
+    CHECK(post_loads == loads_after_create + 1);
+}
+
+void real_cats_on_reserved_ids_are_moved() {
+    // 2026-10-03 live: the HOST's own three cats were 71000004/5/6 (older builds adopted settled clones and let the id counter run on from the session range). 71000004 is the CLIENT's fourth
+    // clone slot, so the host's panel dropped it as somebody else's, and the client's real fourth clone would have been imported over it. A real cat on a reserved id is given an ordinary id
+    // (identities swapped: the object keeps its address, a retired copy takes the reserved id) and the run's party list follows. A live clone (out on adventure), a retired slot and a
+    // recorded clone are left alone.
+    entries.clear(); peer_position = 0; peer_count = 2; initialize(); counter = 0x300;
+    void* real = allocate(0xC58); put(real, kCatData_SaveId, uint64_t(0x71000004ull)); put(real, 0, uint64_t(4242)); put(real, 0x70C, int32_t(77));
+    put(real, kCatData_Flags, uint64_t(kAway)); entries[0x71000004ull].cat = real;               // chosen for the run: the game has flagged it "out on adventure" already
+    void* live = allocate(0xC58); put(live, kCatData_SaveId, uint64_t(0x70000003ull)); put(live, 0, uint64_t(31)); put(live, kCatData_Flags, uint64_t(kAway)); entries[0x70000003ull].cat = live;
+    catsync_note_origin(0x70000003ull, party[2]);                                              // a clone this peer made: it has a recorded origin
+    void* spent = allocate(0xC58); put(spent, kCatData_SaveId, uint64_t(0x70000002ull)); put(spent, 0, uint64_t(32)); put(spent, kCatData_Flags, uint64_t(0)); entries[0x70000002ull].cat = spent;
+    static uint64_t chosen[3] = {party[0], party[1], 0x71000004ull};
+    put(director, kDir_CatIdCount, uint32_t(3)); put(director, kDir_CatIdData, (const uint64_t*)chosen);
+    sync_list();
+
+    CHECK(catsync_relocate_squatters("t") == 1);
+    CHECK(entries.count(0x301) == 1 && entries[0x301].cat == real);                          // the real object, under the next ordinary id
+    CHECK(get<uint64_t>(real, kCatData_SaveId) == 0x301 && get<int32_t>(real, 0x70C) == 77 && get<uint64_t>(real, kCatData_Flags) == kAway);
+    void* copy = entries[0x71000004ull].cat;                                                  // the reserved id now holds a retired copy
+    CHECK(copy && copy != real && get<uint64_t>(copy, kCatData_SaveId) == 0x71000004ull && get<uint64_t>(copy, kCatData_Flags) == 0 && get<uint64_t>(copy, 0) == 4242);
+    CHECK(entries[0x70000003ull].cat == live && flags_of(0x70000003ull) == kAway);           // a live clone is not touched
+    CHECK(entries[0x70000002ull].cat == spent);                                              // nor a retired slot
+    uint32_t n = 0; const uint64_t* data = nullptr;
+    n = get<uint32_t>(director, kDir_CatIdCount); data = get<const uint64_t*>(director, kDir_CatIdData);
+    CHECK(n == 3 && data[0] == party[0] && data[1] == party[1] && data[2] == 0x301);        // the party list follows the cat
+    CHECK(catsync_relocate_squatters("again") == 0);                                         // idempotent: the reserved id is retired now
+    // a cat on a reserved id that the roster install NOTED (the other peer's clone, sent to this one) is not a squatter, whatever its flags say
+    void* theirs = allocate(0xC58); put(theirs, kCatData_SaveId, uint64_t(0x71000003ull)); put(theirs, 0, uint64_t(55)); put(theirs, kCatData_Flags, uint64_t(kHome)); entries[0x71000003ull].cat = theirs;
+    // a past session's saved copy: flagged out on adventure, in nobody's party -- nobody can pick it, so it is left alone (and made no duplicate)
+    void* junk = allocate(0xC58); put(junk, kCatData_SaveId, uint64_t(0x71000002ull)); put(junk, 0, uint64_t(66)); put(junk, kCatData_Flags, uint64_t(kAway)); entries[0x71000002ull].cat = junk;
+    sync_list();
+    notes_ready = true;
+    CHECK(catsync_relocate_squatters("noted") == 0 && entries[0x71000003ull].cat == theirs);
+    notes_ready = false;
+    CHECK(catsync_relocate_squatters("unnoted") == 1 && entries[0x71000003ull].cat != theirs);
+    CHECK(entries[0x71000002ull].cat == junk && get<uint64_t>(junk, kCatData_Flags) == kAway && counter == 0x302);   // the saved copy stayed; only two ids were handed out
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
+    catsync_origin_clear();
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
 void recorded_origin_beats_the_seed_search() {
     // 2026-10-02: setup records which original each clone came from; the merge trusts the record first and keeps the seed search as the fallback.
     auto fresh = [] {
@@ -970,6 +1092,8 @@ bool roster_setup_replace_party(const uint64_t* ids, uint32_t count, const char*
 void roster_setup_set_ready(bool) {}
 bool roster_add_familiars(const uint64_t*, uint32_t, const char*) { return true; }
 uint64_t* rng_global_stream() { return rng; }
+void log_stage(const char*, ...) {}
+void log_stage_quiet(const char*, ...) {}
 void log_line(const char* tag, const char* fmt, ...) { if (!std::getenv("MGMP_TEST_LOG")) return; va_list a; va_start(a, fmt); std::printf("[%s] ", tag); std::vprintf(fmt, a); std::putchar(10); va_end(a); }
 void log_line_lvl(LogLevel, const char* tag, const char* fmt, ...) { if (!std::getenv("MGMP_TEST_LOG")) return; va_list a; va_start(a, fmt); std::printf("[%s] ", tag); std::vprintf(fmt, a); std::putchar(10); va_end(a); }
 bool net_send_catdata(const CatDataMsg& m) {
@@ -1010,7 +1134,7 @@ int main() {
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
     in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals();
-    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
+    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);
     std::free(ids->data);

@@ -72,6 +72,13 @@ struct NetMsg {
     InventoryMsg inventory;   // owns up to kInvBuckets buffers
     RunHistMsg   runhist;     // owns its buffer, same contract as catdata
     StateDumpMsg statedump;   // owns its buffer, same contract as catdata
+    PeerLogMsg   peerlog;     // owns its buffer, same contract as catdata (proto 76)
+    AuditMsg     audit;       // the pre-battle audit of the player cats (proto 76): flat
+    UqdMsg       uqd;         // one action's unlock-query digest (proto 79): flat
+    PropsMsg     props;       // a chunk of the host's save-property table (proto 79): flat
+    RnglMsg      rngl;        // one action's ledger of draws on the shared stream (proto 80): flat
+    ChatMsg      chat;        // a line of text one player typed (proto 81): flat
+    DeepMsg      deep;        // one turn's per-unit digest of derived values (proto 80): flat
     NodeHashMsg  nodehash;
     CatDigestMsg catdigest;  // per-cat hash digest, see MSG_CATDIGEST
     HostLeftMsg  hostleft;
@@ -83,6 +90,7 @@ struct NetMsg {
     MapSeedsMsg  mapseeds;  // the chapter map's node seeds, host -> clients, see MSG_MAPSEEDS
     UnlocksMsg   unlocks;   // the host's unlock answers, host -> clients, see MSG_UNLOCKS
     BoardMsg     board;     // the host's battle board and stream, host -> clients, see MSG_BOARD
+    RollMsg      roll;      // a host-decided chance roll, host -> clients, see MSG_ROLL
     HaltMsg   halt;
     char      refuse[192] = {};
 };
@@ -225,6 +233,9 @@ bool net_host_level(uint64_t node_id, char* out, size_t cap);
 bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n);   // out[kPendingQueues][kPendingMax], n[kPendingQueues]
 // The host's battle board (MSG_BOARD): host-authored, net_send reaches every client; _to is the replay for a peer that joins late.
 bool net_send_board(const BoardMsg& m);
+// A roll the host decided (MSG_ROLL): sent to every client; a client looks it up by (battle, seq, site).
+bool net_send_roll(const RollMsg& m);
+bool net_host_roll(uint64_t battle, uint32_t seq, uint8_t site, RollMsg& out);
 bool net_send_board_to(uint8_t peer, const BoardMsg& m);
 // The board of battle `battle` as the receive thread assembled it from the host's chunks (the game thread may be parked waiting for it, so it cannot
 // come through the frame queue): true once every chunk is in.
@@ -237,6 +248,13 @@ bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n);
 // budget to respect and no dedupe to do -- by the time it goes out the run is
 // already over.
 bool net_send_statedump(const StateDumpMsg& m);
+bool net_send_peerlog(const PeerLogMsg& m);
+bool net_send_audit(const AuditMsg& m);
+bool net_send_uqd(const UqdMsg& m);
+bool net_send_props(const PropsMsg& m);
+bool net_send_rngl(const RnglMsg& m);
+bool net_send_chat(const ChatMsg& m);
+bool net_send_deep(const DeepMsg& m);
 bool net_send_halt(const HaltMsg& h);
 bool net_send_refuse(const char* reason);
 // Point-to-point variants, for the handshake: with several clients, a WELCOME

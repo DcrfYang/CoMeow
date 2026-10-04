@@ -3,6 +3,7 @@
 #include "mgmp_menu.h"
 #include "mgmp_uitest.h"      // the player-facing menus: drawn in this same frame
 #include "mgmp_leave.h"      // the co-op session decision -- see the panel section below
+#include "mgmp_chat.h"       // Enter: the room chat
 
 #include <windows.h>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include "mgmp_session.h"
 #include "mgmp_signal.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_spawntest.h"   // the unit spawn / remove experiment
 #include "mgmp_cursor.h"     // cursor_hovered_tile, for the debug action
 #include "mgmp_battleid.h"   // kNoBattle
 #include "mgmp_follow.h"
@@ -632,6 +634,13 @@ void draw_session() {
             "and the session stays readable afterwards.\n\n"
             "Players' cats and the run's familiars are left alone.");
 
+        if (ImGui::Button("simulate a HALT (tests the halt notice and the auto-finish)")) lockstep_dev_force_halt();
+        ImGui::SetItemTooltip(
+            "Halts the battle as a real desync would: HALT RECORD in the log, the other peer is told\n"
+            "and halts too, both show the halt notice with the upload offer, and from 2 s on every\n"
+            "enemy still standing is struck down every 2 s on each peer until the fight is won.\n\n"
+            "Needs a session with a battle in progress. Nothing is really out of sync.");
+
         if (!armed) {
             if (ImGui::Button("999 damage to the enemy: arm, then click it")) {
                 lockstep_arm_enemy_hit(999);
@@ -655,6 +664,23 @@ void draw_session() {
                                 armed ? "click it" : "arm first, then click it");
         else
             ImGui::TextDisabled("no board under the mouse (not in a battle?)");
+    }
+
+    // THE UNIT EXPERIMENT (mgmp_spawntest.h): single player, or either peer of a session (a deliberate desync the host's board must repair). A button requests; the next turn boundary runs it on
+    // the first eligible enemy, and the units it touched are followed in the log (SPAWNTEST) for four boundaries.
+    ImGui::SeparatorText("unit spawn / remove test (either peer; in a session the host's board repairs the difference)");
+    {
+        if (ImGui::Button("transform an enemy")) spawntest_request(SpawnTestOp::Transform);
+        ImGui::SameLine();
+        if (ImGui::Button("spawn an enemy")) spawntest_request(SpawnTestOp::Spawn);
+        if (ImGui::Button("remove (silent)")) spawntest_request(SpawnTestOp::RemoveSilent);
+        ImGui::SameLine();
+        if (ImGui::Button("remove (game way)")) spawntest_request(SpawnTestOp::RemoveGameWay);
+        if (ImGui::Button("corrupt my cat's stats (layer-2 test)")) spawntest_request(SpawnTestOp::CorruptStats);
+        const SpawnTestOp p = spawntest_pending();
+        if (p != SpawnTestOp::None)
+            ImGui::TextColored(level_colour(LogLevel::Warn), "pending: %s -- end the turn to run it", spawntest_op_name(p));
+        ImGui::TextWrapped("last: %s", spawntest_last_result());
     }
     }   // cfg().dev_tools
 
@@ -777,6 +803,17 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ImGui::GetIO().ClearInputKeys();
         }
         return 0;
+    }
+
+    // ENTER IS THE ROOM'S CHAT (mgmp_chat): the first press opens the input and the history (and the game stops getting the keyboard and the mouse while it is open), the second sends what was typed and closes it.
+    // Read before ImGui and the game, like the two keys above. It is only taken when there is somebody to talk to and no text box already has the keyboard; otherwise Enter is the game's as always. The rest of the
+    // press (its key-up and its character) is eaten as well, so the game never sees half of one.
+    if (g.ready) {
+        if (chat_swallow_enter_remains(msg, (uintptr_t)wp)) return 0;
+        if (msg == WM_KEYDOWN && wp == VK_RETURN) {
+            if (chat_input_open()) { if (!(lp & 0x40000000)) chat_enter_key(false); return 0; }      // a held key's repeats do nothing
+            if (!(lp & 0x40000000) && chat_enter_key(ImGui::GetIO().WantTextInput)) return 0;
+        }
     }
 
     // THE CONTEXT IS UP WHENEVER THE MOD IS: the player-facing menus (mgmp_menu)

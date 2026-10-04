@@ -1,6 +1,7 @@
 // mgmp_nodehash -- see mgmp_nodehash.h for why the meta layer needs its own
 // hash and why it reports rather than halts.
 #include "mgmp_nodehash.h"
+#include "mgmp_lockstep.h"   // lockstep_share_log
 #include "mgmp_checkpoint.h"
 
 #include "mgmp_addresses.h"
@@ -323,6 +324,7 @@ void report(uint8_t from, const NodeHashMsg& a, const NodeHashMsg& b) {
     log_line("NODEHASH", "!! MISMATCH at %s of node %u (%016llx) against peer %u",
              point_name(a.point), a.node_index,
              (unsigned long long)a.node_seed, (unsigned)from);
+    lockstep_share_log("a map-node hash mismatch");
 
     // One line per differing component, with both values. The whole reason this
     // message carries five separate hashes instead of one is that "they differ"

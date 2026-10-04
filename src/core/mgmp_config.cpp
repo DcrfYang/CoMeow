@@ -1,6 +1,7 @@
 #include "mgmp_config.h"
 #include "mgmp_addresses.h"
 #include "mgmp_tuning.h"
+#include "mgmp_paths.h"
 
 #include "json.hpp"
 
@@ -94,6 +95,22 @@ void read_path(const json& o, const char* key, const wchar_t* dll_dir,
     else                                         swprintf_s(out, cap, L"%s\\%s", dll_dir, w);
 }
 
+// The "log" setting. A bare file name ("mgmp_trace.log", what every shipped mgmp.json says) goes into the log folder; a relative path with a folder in it is relative to the DLL's
+// folder as before; an absolute path is used as it is.
+void read_log_path(const json& o, const wchar_t* dll_dir, const wchar_t* log_dir, wchar_t* out, size_t cap) {
+    const json* v = member(o, "log");
+    if (!v) return;
+    if (!v->is_string()) { warn("log is not a string, kept the default"); return; }
+    const std::string s = v->get<std::string>();
+    if (s.empty()) { out[0] = 0; return; }
+    wchar_t w[512];
+    size_t conv = 0;
+    mbstowcs_s(&conv, w, s.c_str(), _TRUNCATE);
+    if (w[0] && (w[1] == L':' || w[0] == L'\\')) wcsncpy_s(out, cap, w, _TRUNCATE);
+    else if (wcschr(w, L'\\') || wcschr(w, L'/')) swprintf_s(out, cap, L"%s\\%s", dll_dir, w);
+    else swprintf_s(out, cap, L"%s\\%s", log_dir, w);
+}
+
 // ui.key accepts "F1".."F12" or a raw virtual-key code. The names exist because
 // 0x70 is precisely the kind of value that made the old file unreadable.
 void read_vkey(const json& o, const char* key, uint32_t& out) {
@@ -171,7 +188,8 @@ void hook_defaults() {
     g_cfg.hook[T_RandInt]    = false;
     g_cfg.hook[T_RandFloat]  = false;
     g_cfg.hook[T_Rand2]      = false;
-    g_cfg.hook[T_RollChance] = false;
+    // RollChance stays ON: besides the recorder, its detour decides the coin a kill drops (the host's answer, MSG_ROLL). With no recording it does nothing else.
+    g_cfg.hook[T_RollChance] = true;
 
     // The two that MODIFY the game -- see mgmp_tuning.h.
     g_cfg.hook[T_SaveScumPenalty] = tune::kHookSaveScum;
@@ -304,7 +322,9 @@ void config_load(const wchar_t* dll_dir) {
     g_cfg = Config{};
     wcsncpy_s(g_dir, dll_dir, _TRUNCATE);
     hook_defaults();
-    swprintf_s(g_cfg.log_path, L"%s\\mgmp_trace.log", dll_dir);
+    wchar_t log_dir[MAX_PATH] = {};
+    paths_log_dir(dll_dir, log_dir, MAX_PATH);      // <dll_dir>\log, so the logs do not pile up in the launcher's own folder
+    swprintf_s(g_cfg.log_path, L"%s\\mgmp_trace.log", log_dir);
 
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\mgmp.json", dll_dir);
@@ -333,7 +353,7 @@ void config_load(const wchar_t* dll_dir) {
         return;
     }
 
-    read_path(j, "log", dll_dir, g_cfg.log_path, 512);
+    read_log_path(j, dll_dir, log_dir, g_cfg.log_path, 512);
 
     if (const json* net = member(j, "net")) {
         read_str (*net, "role", g_cfg.net_role, sizeof(g_cfg.net_role));
@@ -371,6 +391,7 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*ui, "dev_tools", g_cfg.dev_tools);
         read_bool(*ui, "beta_notice", g_cfg.beta_notice);
         read_bool(*ui, "block_new_cats", g_cfg.block_new_cats);
+        read_bool(*ui, "auto_upload_crash_log", g_cfg.auto_upload_crash_log);
     }
 
     if (const json* d = member(j, "debug")) {

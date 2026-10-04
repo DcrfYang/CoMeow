@@ -35,7 +35,52 @@ bool atomic_write(const std::wstring& path, const Bytes& bytes) {
     if(ok) ok=MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
     if(!ok) DeleteFileW(tmp.c_str()); return ok;
 }
-bool identity(uint64_t& id) {
+// The only identity folder (a decimal number) under `root`, or 0 when there are none or several.
+static uint64_t only_identity_dir(const wchar_t* root) {
+    if(!root || !root[0]) return 0;
+    std::wstring pat=std::wstring(root)+L"\\*";
+    WIN32_FIND_DATAW fd{}; HANDLE h=FindFirstFileW(pat.c_str(),&fd);
+    if(h==INVALID_HANDLE_VALUE) return 0;
+    uint64_t found=0; unsigned n=0;
+    do {
+        if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0]==L'.') continue;
+        bool digits=fd.cFileName[0]!=0;
+        for(const wchar_t* c=fd.cFileName;*c;++c) if(*c<L'0'||*c>L'9') digits=false;
+        if(!digits) continue;
+        wchar_t* end=nullptr; const uint64_t v=_wcstoui64(fd.cFileName,&end,10);
+        if(!v) continue;
+        {   // an identity folder with nothing in it (made by an install that never got as far as a save) is not a candidate
+            std::wstring inner=std::wstring(root)+L"\\"+fd.cFileName+L"\\*";
+            WIN32_FIND_DATAW f2{}; HANDLE h2=FindFirstFileW(inner.c_str(),&f2);
+            bool any=false;
+            if(h2!=INVALID_HANDLE_VALUE) { do { if(wcscmp(f2.cFileName,L".")&&wcscmp(f2.cFileName,L"..")) any=true; } while(!any && FindNextFileW(h2,&f2)); FindClose(h2); }
+            if(!any) continue;
+        }
+        found=v; ++n;
+    } while(FindNextFileW(h,&fd));
+    FindClose(h);
+    return n==1 ? found : 0;
+}
+
+uint64_t steam_id_from_dir(const wchar_t* dir) {
+    if(!dir) return 0;
+    uint64_t found=0;
+    const wchar_t* p=dir;
+    while(*p) {
+        while(*p==L'\\'||*p==L'/') ++p;
+        const wchar_t* b=p;
+        while(*p && *p!=L'\\' && *p!=L'/') ++p;
+        const size_t len=(size_t)(p-b);
+        if(len!=17 || wcsncmp(b,L"7656119",7)!=0) continue;
+        bool digits=true; for(size_t i=0;i<len;++i) if(b[i]<L'0'||b[i]>L'9') digits=false;
+        if(!digits) continue;
+        found=_wcstoui64(std::wstring(b,len).c_str(),nullptr,10);
+    }
+    return found;
+}
+
+bool identity(uint64_t& id, const wchar_t* adopt_root, bool* adopted) {
+    if(adopted) *adopted=false;
     HMODULE module=nullptr; wchar_t file[MAX_PATH]{};
     if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(&identity),&module) || !GetModuleFileNameW(module,file,MAX_PATH)) return false;
@@ -48,7 +93,9 @@ bool identity(uint64_t& id) {
     }
     // Do not replace a corrupt identity: it could orphan existing recovery data.
     if(GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES) return false;
-    id=nonce(); if(!id) return false;
+    id=only_identity_dir(adopt_root);
+    if(id) { if(adopted) *adopted=true; }
+    else { id=nonce(); if(!id) return false; }
     bytes.resize(16); memcpy(bytes.data(),&id,8);
     uint64_t hash=savefile_hash(bytes.data(),8); memcpy(bytes.data()+8,&hash,8);
     HANDLE h=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -213,6 +260,19 @@ static int prop_row(void* result,int n,char** vals,char**) {
     auto* r=static_cast<std::pair<bool*,std::string*>*>(result);
     if(n>=1 && vals[0]) { *r->first=true; *r->second=vals[0]; }
     return 0;
+}
+static int all_prop_row(void* result,int n,char** vals,char**) {
+    auto* v=static_cast<std::vector<std::pair<std::string,std::string>>*>(result);
+    if(n>=2 && vals[0]) v->emplace_back(vals[0], vals[1]?vals[1]:"");
+    return 0;
+}
+bool read_all_properties(const std::wstring& source,std::vector<std::pair<std::string,std::string>>& out) {
+    out.clear(); if(!sql.load()) return false;
+    void* db=nullptr;
+    bool ok=sql.open(utf8(source).c_str(),&db,1,nullptr)==0;
+    if(ok) ok=sql.exec(db,"SELECT key, data FROM properties",all_prop_row,&out,nullptr)==0;
+    if(db) sql.close(db);
+    return ok;
 }
 bool read_property(const std::wstring& source,const char* key,bool& have,std::string& out) {
     have=false; out.clear(); if(!key || !sql.load()) return false;

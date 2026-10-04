@@ -16,6 +16,7 @@ namespace mgmp {
 bool savefile_save_dir(wchar_t* out, size_t cap) { wcsncpy_s(out, cap, g_root.c_str(), _TRUNCATE); return true; }
 void log_line(const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
 void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
+bool leave_scene_live(const char*) { return false; }     // the warehouse trigger is not under test: no scene is ever live here
 }
 
 static void sql_exec(const std::wstring& file, const char* command) {
@@ -131,6 +132,43 @@ int main() {
             CHECK(!saveslots_import(9, ep.c_str()));
             CHECK(!present(g_root + L"\\evil.txt"));
         }
+    }
+
+    {   // THE AUTO SAVE QUEUE (2026-10-04): three positions apart from the twenty, newest first, the oldest is replaced; load or export only
+        printf("-- the auto save queue keeps three, newest first, apart from the twenty --\n");
+        const std::wstring root = g_root + L"\\mgmp_saveslots";
+        CHECK(kAutoSaveCount == 3);
+        for (int n = 1; n <= 7; ++n) {
+            sql_exec(g_root + L"\\" + kGameFile[0], ("UPDATE properties SET data=" + std::to_string(100 + n) + " WHERE key='v';").c_str());
+            CHECK(saveslots_auto_push());
+        }
+        saveslots_refresh();
+        for (int i = 0; i < kAutoSaveCount; ++i) CHECK(saveslots_auto_get(i).used);
+        CHECK(!present(root + L"\\auto_04") && !present(root + L"\\auto_new"));           // three, and no staging folder left behind
+        const wchar_t* dirs[3] = { L"\\auto_01", L"\\auto_02", L"\\auto_03" };
+        for (int i = 0; i < kAutoSaveCount; ++i) {                                         // 01 is the newest (107), 03 the oldest kept (105)
+            bool have = false; std::string v;
+            CHECK(checkpoint_io::read_property(root + dirs[i] + L"\\" + kGameFile[0], "v", have, v));
+            CHECK(have && v == std::to_string(107 - i));
+        }
+        CHECK(saveslots_auto_get(0).handshake >= 0);                                       // the handshake queue travels with it, like any position
+        printf("-- it can be exported, and the file imports into a position --\n");
+        const std::wstring pack = g_root + L"\\auto.mgmpsave";
+        CHECK(saveslots_auto_export(1, pack.c_str()));
+        CHECK(present(pack));
+        CHECK(!saveslots_auto_export(5, pack.c_str()));                                    // no such position
+        CHECK(saveslots_import(17, pack.c_str()));
+        {
+            bool have = false; std::string v;
+            CHECK(checkpoint_io::read_property(root + L"\\slot_18\\" + kGameFile[0], "v", have, v) && have && v == "106");
+        }
+        printf("-- loading one puts its saves back, with the undo point --\n");
+        CHECK(saveslots_auto_load(0));
+        {
+            bool have = false; std::string v;
+            CHECK(checkpoint_io::read_property(g_root + L"\\" + kGameFile[0], "v", have, v) && have && v == "107");
+        }
+        CHECK(!saveslots_auto_load(3));                                                    // out of range is refused
     }
 
     printf("saveslots: %u checks passed\n", checks);

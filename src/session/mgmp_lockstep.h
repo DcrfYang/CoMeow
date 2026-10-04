@@ -104,6 +104,8 @@ bool lockstep_fill_choice(void* brain, void* out);
 // Called from the ApplyTurnAction hook, before the original runs. Clears the
 // outstanding-send guard and validates that what landed is what we expected.
 void lockstep_on_applied(const void* action, const void* actor);
+// After Character::EndTurn: the owner's final facing of that cat (see apply_remote) is written again if the end of the turn changed it.
+void lockstep_after_endturn(void* self);
 
 // Called from the NextTurn hook. Snapshots the cat list on the first call of a
 // battle, then exchanges and compares the turn hash.
@@ -169,6 +171,26 @@ int  lockstep_debug_hit(int32_t tx, int32_t ty, int32_t amount);
 // Returns how many cats it hit. Players' cats and familiars are left alone.
 int  lockstep_debug_hit_all(int32_t amount);
 
+// A unit of the roster was replaced by another object in place (the game's transform, sub_1408D3C20, made by mgmp_spawntest's developer test): the roster entry that held `old_chr` now holds `new_chr`.
+// No-op outside a snapshotted battle or when `old_chr` is not in the roster. board_apply does the same by hand for a unit it replaces.
+void lockstep_roster_replace(const void* old_chr, void* new_chr);
+// A turn-hash mismatch happened in this battle (debounced or halted): true once per battle, with a one-line summary for the upload. The menu offers the log upload.
+bool lockstep_take_desync_notice(char* text, size_t cap);
+// Why the battle halted (this peer's own halt, or the other player's), empty while it has not.
+const char* lockstep_halt_reason();
+// LAYER 2 EXPERIMENT (dev_tools only): arm the board's writing of a player's stats, and name one of this peer's own player cats to corrupt.
+void lockstep_dev_arm_stat_repair();
+// DEVELOPER BUTTON: halt the battle on purpose, exactly as a real desync would (the log record, the other peer told, the halt notice and the upload offer in the menu, the auto-finish of the fight). False
+// when there is nothing to halt (no battle snapshotted in a session, or already halted).
+bool lockstep_dev_force_halt();
+const void* lockstep_dev_player_cat();
+
+// Send the tail of this log to the other player(s), who write it into theirs (PEERLOG lines): so that the one log a player uploads holds both sides.
+// Called on a desync, a halt and a failed checkpoint; rate-limited inside.
+void lockstep_share_log(const char* why);
+// One log line on how the battle that is over ended (who was standing, how many enemies were left). Once per battle; silent when there is none.
+void lockstep_log_battle_summary(const char* why);
+
 // A DEBUGHIT from a peer. Ignores one that names a different battle.
 void lockstep_on_debug_hit(uint8_t from, const DebugHitMsg& m);
 
@@ -185,6 +207,9 @@ void lockstep_disarm_enemy_hit();
 // Which battle this peer is in: the node seed both peers read out of
 // MapNode+0x118. kNoBattle when not in one. See mgmp_battleid.h.
 uint64_t lockstep_battle_id();
+// A chance roll whose odds are not the same on every peer (the coin a kill drops): `local` is what this peer's own roll gave. The host's answer is sent to the clients; a
+// client waits briefly for it and returns it instead (its own on a timeout). Outside a room / a battle it returns `local`. site: kRollSite* (mgmp_proto.h).
+bool lockstep_roll_resolve(uint8_t site, double chance, double luck, bool local);
 
 // From the map layer, on BOTH peers, as a node is entered. Establishes battle
 // identity without any negotiation -- both peers pass the same seed because
@@ -349,6 +374,8 @@ bool lockstep_battle_list_gone();
 // lockstep_in_battle() this survives a halt (a dropped peer halts the session), so it answers "was the player in a fight when the
 // peer went away". False at the victory screen, in the warehouse and with no session ever armed.
 bool lockstep_fight_up();
+// The fight is won: live battle, it had enemies, none is left standing (plain reads). Earlier than the list going away -- the level-up's queries come in the frame of the last kill.
+bool lockstep_enemies_all_down();
 
 // A cat's health AS THE BATTLE HAS IT, found by the cat's own identity (CatData+0xC48, the id the
 // run lists carry) rather than by roster position. Only while the fight is really up -- the same

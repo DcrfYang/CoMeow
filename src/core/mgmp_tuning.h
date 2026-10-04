@@ -773,6 +773,26 @@ constexpr bool     kAdoptHostSeed = true;    // 2026-10-02: ON -- with the map s
 // reasons (a per-save input, a frame-timed effect, a unit created with another roll), and one extra draw used to shift every roll after it for the rest of the battle. With the stream
 // derived from (battle, turn, actor) a difference can only live until the next actor begins -- and the turn hash still says it happened. false = the game's own stream continues.
 constexpr bool kReseedPerTurn = true;
+// DEBOUNCED DESYNC (2026-10-04): a STATE-ONLY turn-hash mismatch (rng and queue agree) does not halt at once. The host's board of the next boundary repairs what
+// the board carries (units, kinds, hit points, tiles, turn-order keys), so a unit that was a beat late on one side agrees again one boundary later. Only a state
+// mismatch at two CONSECUTIVE boundaries, or any rng / queue mismatch, halts. Both peers decide from the same pair of hashes, so they decide the same. Every
+// mismatch -- debounced or not -- is reported (DESYNC REPORT lines) and offers the log upload.
+constexpr bool kDesyncDebounce = true;
+// THE SIMULATION REVISION, mixed into the handshake's build hash (mgmp_session: hash_build). Raise it whenever a change alters what a battle computes (the board
+// sync, the reseeds, what is hashed): two peers on different revisions then refuse to pair instead of halting in the first battle. No wire change.
+// THE SAVES' OWN IDENTITY (2026-10-04): the handshake saves (mgmp_checkpoint) are stamped with the build identity too, and a file stamped with another one is "foreign" and unreadable. They must NOT
+// follow kSimRevision: raising it for a battle-maths change made every handshake save of a run in progress unreadable ("the save combination is invalid", the run lost). This number is mixed into
+// THEIR identity instead and changes only when what a SAVE holds changes meaning. It is 2 because the files written while kSimRevision was 2 are the oldest ones still in use.
+constexpr uint32_t kCheckpointSimIdentity = 2;
+constexpr uint32_t kSimRevision = 11;      // 11: the unlock-query digest leaves the save-property reads out (the game's own save reads them at times of its own); 10: the unlock answers also end when the fight's level-up screen is built (a normal win leaves objects standing); 9: the unlock-query record counts only the fight's own queries (no node entry, publishing, map or level-up reads); 8: the unlock answers end when every enemy is down (the level-up pool is built in that frame); 7: the property table is read at +8/+0x10 and the unlock record has the same gate on both peers; 6: the unlock answers end with the fight; 5: every save property in the host's whole table is answered with the host's in a window (proto 79); 4: a client in a battle draws ability pools from the HOST's class list (proto 78); 3: the board also repairs a player's cat
+// LAYER 1 of repairing a player's cat (2026-10-04): the host's board overwrites a client's player cats' hit points, shield, tile and facing, and writes a cat the host has dead down to 0 hit
+// points (the game's own death handling finishes it). NOT the max hit points, the seven stats, skills or gear: those are inputs the game recomputes (layer 2 is a live test, see
+// mgmp_spawntest: the dev button that corrupts one of this peer's own cats' stats).
+constexpr bool kBoardRepairPlayerCats = true;
+// AFTER A HALT THE FIGHT IS FINISHED FOR THE PLAYERS (2026-10-04): once this peer has halted, every kHaltFinishEveryMs every enemy still standing is struck down (hp written to 0; the game's own death handling
+// does the rest), on each peer by itself, until the battle is won. Without it a halted battle can only be left by quitting. Works in a release too: it does not depend on the developer tools.
+constexpr bool     kHaltAutoFinish    = true;
+constexpr uint32_t kHaltFinishEveryMs = 2000;
 constexpr uint32_t kDebugHitWaitMs = 5000;   // a debug hit whose tile holds no enemy here yet (the host's enemy move is still being played on this peer) is held this long (mgmp_lockstep: debug_hits_pump)
 constexpr bool     kBoardEveryTurn = true;    // the host publishes its board at EVERY turn boundary and a client takes it over (mgmp_lockstep: board_sync), not only at the battle start
 constexpr uint32_t kBoardTurnWaitMs = 3000;   // how long a client waits for the host's board of a later turn before playing the turn without it

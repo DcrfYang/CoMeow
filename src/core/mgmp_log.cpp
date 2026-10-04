@@ -30,6 +30,34 @@ LogEntry g_ring[kRingCap];
 uint32_t g_ring_written = 0;   // total ever written; the oldest live entry is
                                // g_ring_written - min(g_ring_written, kRingCap)
 
+namespace {
+constexpr int kStageRing = 64;
+struct StageMark { ULONGLONG at = 0; char text[160] = {}; };
+StageMark g_stage[kStageRing];
+LONG volatile g_stage_next = 0;
+
+void stage_push_text(const char* text) {
+    const LONG slot = InterlockedIncrement(&g_stage_next) - 1;
+    StageMark& m = g_stage[slot % kStageRing];
+    m.at = GetTickCount64();
+    strncpy_s(m.text, sizeof(m.text), text, _TRUNCATE);
+}
+
+void stage_push(const char* fmt, va_list ap) {
+    char text[160];
+    _vsnprintf_s(text, sizeof(text), _TRUNCATE, fmt, ap);
+    stage_push_text(text);
+}
+
+// The log tags whose lines are phase changes of a session and are remembered in the timeline without any call site naming them: a crash then says which of these came last.
+bool stage_tag(const char* tag) {
+    static const char* kTags[] = { "SETUP", "SETTLE", "DEPART", "CHECKPOINT", "SAVEFILE", "PAGE", "LEAVE", "ROSTER", "ROOM", "SESSION", "SQUATTERS" };
+    for (const char* t : kTags) if (strcmp(tag, t) == 0) return true;
+    return false;
+}
+} // namespace
+
+
 // Whether `hay` starts with `needle`, after skipping leading spaces.
 bool starts_with(const char* hay, const char* needle) {
     while (*hay == ' ') ++hay;
@@ -195,6 +223,15 @@ void log_init(const wchar_t* path, bool console) {
         // a wide-oriented stream would then refuse.
         if (g_file) fprintf(g_file, "log    : %ls\n", stamped);
         prune_old_logs(path);
+        {   // the crash dumps and the cat dumps that sit beside the logs are kept to the same count
+            wchar_t other[MAX_PATH] = {};
+            wcsncpy_s(other, path, _TRUNCATE);
+            wchar_t* d = wcsrchr(other, L'.');
+            const wchar_t* sl = wcsrchr(other, L'\\');
+            if (d && (!sl || d > sl)) { wcscpy_s(d, (size_t)(other + MAX_PATH - d), L".dmp"); prune_old_logs(other); }
+            wcsncpy_s(other, path, _TRUNCATE);
+            if (wchar_t* s2 = wcsrchr(other, L'\\')) { wcscpy_s(s2 + 1, (size_t)(other + MAX_PATH - (s2 + 1)), L"mgmp_catdump.bin"); prune_old_logs(other); }
+        }
     }
 }
 
@@ -232,6 +269,11 @@ void emit_line_v(const LogLevel* level, const char* tag, const char* fmt, va_lis
     // one -- ImGui renders a trailing newline as a blank line per entry.
     buf[n] = 0;
 
+    if (stage_tag(tag)) {                      // a phase change: remembered for the crash report (the ring is lock-free)
+        char mark[160];
+        _snprintf_s(mark, sizeof(mark), _TRUNCATE, "%s %s", tag, buf + body);
+        stage_push_text(mark);
+    }
     EnterCriticalSection(&g_cs);
     ring_push_locked((uint32_t)seq, (uint32_t)turn, tag, buf + body, lv);
     if (n < (int)sizeof(buf) - 2) { buf[n++] = '\n'; buf[n] = 0; }
@@ -277,6 +319,37 @@ uint32_t log_ring_fetch(uint32_t& cursor, LogEntry* out, uint32_t cap,
     cursor = from + written;
     LeaveCriticalSection(&g_cs);
     return written;
+}
+
+void log_stage_quiet(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    stage_push(fmt, ap);
+    va_end(ap);
+}
+
+void log_stage(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    stage_push(fmt, ap);
+    va_end(ap);
+    const LONG last = g_stage_next - 1;
+    if (last >= 0) log_line("STAGE", "%s", g_stage[last % kStageRing].text);
+}
+
+const char* log_stage_last() {
+    const LONG last = g_stage_next - 1;
+    return last >= 0 ? g_stage[last % kStageRing].text : "";
+}
+
+void log_stage_dump(const char* tag) {
+    const LONG total = g_stage_next;
+    const LONG first = total > kStageRing ? total - kStageRing : 0;
+    const ULONGLONG now = GetTickCount64();
+    for (LONG i = first; i < total; ++i) {
+        const StageMark& m = g_stage[i % kStageRing];
+        log_line(tag, "  stage -%llu ms: %s", (unsigned long long)(now - m.at), m.text);
+    }
 }
 
 void log_raw(const char* fmt, ...) {

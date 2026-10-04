@@ -250,6 +250,7 @@ DWORD WINAPI worker(LPVOID) {
     if (g != Got::Wanted) { fail(g == Got::Error ? LogUploadError::Refused : LogUploadError::Lost, err); return 0; }
     std::string id;
     { auto i = reply.find("id"); if (i != reply.end() && i->is_string()) id = i->get<std::string>(); }
+    for (int i = 0; i < req.ndelete && i < 4; ++i) DeleteFileW(req.on_ok_delete[i]);   // the server has it: the "ended badly" markers are spent
     set_status(LogUploadState::Done, LogUploadError::None, 100, id.c_str());
     closesocket(s);
     return 0;

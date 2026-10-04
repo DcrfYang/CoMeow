@@ -50,6 +50,7 @@
 namespace mgmp {
 
 constexpr int kSaveBackupCount = 20;   // positions in the list
+constexpr int kAutoSaveCount   = 3;    // the AUTO queue, a separate list (see below)
 constexpr int kGameSlots       = 3;    // steamcampaign01..03
 constexpr int kSaveNameMax     = 48;   // bytes, UTF-8, including the NUL
 
@@ -98,6 +99,16 @@ bool saveslots_rename(int index, const char* name);
 // it names are sound -- and it is written to a staging folder first, so a bad file never touches a position.
 bool saveslots_export(int index, const wchar_t* path);
 bool saveslots_import(int index, const wchar_t* path);
+
+// THE AUTO SAVE QUEUE (2026-10-04): three more positions, kept apart from the twenty (<game save dir>\mgmp_saveslots\auto_01 .. auto_05; 01 is the newest). Every time the player is back in the
+// warehouse after a run has been settled, the current three slots (and the handshake queue, like any position) are pushed in at 01 and the oldest one drops out and is deleted. The positions are the same
+// kind of folder as the others, so loading one takes the same undo point. Nothing here is ever taken from or put into the twenty.
+// The player can only LOAD or EXPORT an auto save: there is no way to overwrite, rename or delete one (the queue replaces its own oldest when a new one comes in).
+const SaveBackup& saveslots_auto_get(int index);   // 0..2, newest first; an empty one out of range
+bool saveslots_auto_push();                        // take the current saves now (also what the warehouse trigger calls)
+bool saveslots_auto_load(int index);
+bool saveslots_auto_export(int index, const wchar_t* path);
+void saveslots_auto_tick();                        // every frame: sees "a run was on the map, now the warehouse is up" and pushes once, a few seconds later (the game's own write has finished by then)
 
 bool saveslots_undo_available();
 bool saveslots_undo();                                 // put back what the last load replaced

@@ -24,7 +24,8 @@ constexpr uint32_t kMaxJournalOwners = 64;
 constexpr uint32_t kMaxJournalOrigins = 32;
 struct Entry { CheckpointMsg certificate{}; Bytes database;
                LockstepOwnerNote owners[kMaxJournalOwners]{}; uint32_t owner_count=0;
-               CloneOriginNote origins[kMaxJournalOrigins]{}; uint32_t origin_count=0; };
+               CloneOriginNote origins[kMaxJournalOrigins]{}; uint32_t origin_count=0;
+               uint32_t flags=0; };   // kCheckpointAfterBoss (disk version 4)
 struct State {
     bool on=false, host=false, failed=false, configured=false, selected=false;
     bool released=false, loadIssued=false, dirty=false, arrived=false, preparing=false;
@@ -33,7 +34,10 @@ struct State {
     // One node's checkpoint SKIPPED (not failed): see checkpoint_soft_fault.
     bool skip=false; uint64_t skipSeed=0;
     uint8_t slot=255, pos=255, mode=0;
+    uint32_t nodeType=0;           // the MapNodeType of the node in progress (8 = the chapter boss): the save confirmed after it is marked
     uint64_t identity=0, run=0, seq=0, map=0, selectionNonce=0;
+    uint64_t identity2=0;          // the player's OTHER id (see CheckpointMsg::identity2)
+    std::wstring hroot;            // the mgmp_handshake folder: one sub-folder per id
     std::wstring root, key, path;
     CheckpointMsg config{}, tx{}, selections[kMaxPeers]{}, offers[kMaxPeers]{};
     CheckpointMsg arrivals[kMaxPeers]{};
@@ -58,7 +62,6 @@ bool g_manual=false;
 // pick (that is what left a client unable to pick again: selected, not failed, and "invalid" on screen).
 ULONGLONG g_abort_at=0;
 constexpr unsigned kDiskCandidates=2;   // the journal keeps its version-39 wire shape; see enc_checkpoint
-const wchar_t* const kQueue[kCheckpointCandidates]={L".0",L".1",L".2",L".3"};
 uint64_t compatibility_build=0, compatibility_gpak=0;
 // Protocol 41 adds selection epochs. Save/journal layout and certificate inputs
 // remain generation 39 so existing certified runs can still be resumed. Bump
@@ -70,7 +73,9 @@ constexpr uint32_t kCheckpointCompatibility = 39;
 // and save semantics are unchanged.
 // kDiskVersionOrigins 3 appends, after the owner notes, [u32 count][count x (u64 clone id, u64 original id)] -- which cat each session clone
 // was made from, so a resumed run can still return it to that cat. Versions 1 and 2 are still read (no origin record: the seed search).
-constexpr uint32_t kDiskMagic=0x384b5043, kDiskVersion=1, kDiskVersionOwners=2, kDiskVersionOrigins=3;
+// kDiskVersionFlags 4 appends [u32 flags] after the origins (kCheckpointAfterBoss). Versions 1..3 are still read (no flags).
+constexpr uint32_t kDiskMagic=0x384b5043, kDiskVersion=1, kDiskVersionOwners=2, kDiskVersionOrigins=3, kDiskVersionFlags=4;
+constexpr uint32_t kBossNodeType=8;   // MapNodeType of the chapter boss (mgmp_proto: EnterNodeMsg::type)
 
 void status(const char* text) {
     if(strcmp(g.status,text)!=0) {
@@ -81,6 +86,7 @@ void status(const char* text) {
 void fail(const char* why,bool broadcast=true) {
     if(g.failed) return;
     g.failed=true; status(why);
+    if(g.on) lockstep_share_log(why);
     if(broadcast && g.on) {
         CheckpointMsg m{}; m.kind=kCheckpointReject; m.run=g.run; m.identity=g.config.identity;
         net_send_checkpoint(m);
@@ -106,8 +112,10 @@ bool membership() {
 }
 bool same_config(const CheckpointMsg& m) {
     if(m.count!=g.config.count) return false;
-    for(unsigned i=0;i<m.count;++i)
-        if(m.identities[i]!=g.config.identities[i] || m.slots[i]!=g.config.slots[i]) return false;
+    for(unsigned i=0;i<m.count;++i) {
+        const uint64_t a=m.identities[i], b=g.config.identities[i], b2=g.config.identities2[i];
+        if((a!=b && !(b2 && a==b2)) || m.slots[i]!=g.config.slots[i]) return false;   // ANY id matching is the same player
+    }
     return true;
 }
 uint64_t certificate_hash(const CheckpointMsg& m) {
@@ -120,11 +128,32 @@ uint64_t certificate_hash(const CheckpointMsg& m) {
 }
 std::wstring file(const wchar_t* suffix) { return g.root+L"\\"+g.key+suffix; }
 bool disk_exists(const std::wstring& path) { return GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES; }
+// THE QUEUE OF CONFIRMED SAVES (2026-10-04: no longer four deep). Every confirmed save of the run stays until the run settles: <key>.0 is the
+// newest, .1 the one before, and so on. The files are listed from the folder rather than probed by a fixed count.
+std::wstring qfile(unsigned k) { return file((L"."+std::to_wstring(k)).c_str()); }
+std::vector<unsigned> queue_indices() {
+    std::vector<unsigned> out;
+    const std::wstring prefix=g.key+L".";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h=FindFirstFileW((g.root+L"\\"+prefix+L"*").c_str(),&fd);
+    if(h==INVALID_HANDLE_VALUE) return out;
+    do {
+        const std::wstring name=fd.cFileName;
+        if(name.size()<=prefix.size() || name.compare(0,prefix.size(),prefix)!=0) continue;
+        const std::wstring tail=name.substr(prefix.size());
+        if(tail.empty() || tail.size()>6 || tail.find_first_not_of(L"0123456789")!=std::wstring::npos) continue;
+        out.push_back((unsigned)std::stoul(tail));
+    } while(FindNextFileW(h,&fd));
+    FindClose(h);
+    std::sort(out.begin(),out.end());
+    return out;
+}
+bool erase_index(unsigned k) { auto path=qfile(k); return DeleteFileW(path.c_str()) || GetLastError()==ERROR_FILE_NOT_FOUND; }
 Bytes encode_entry(const Entry& e) {
-    uint8_t meta[512]; uint32_t n=enc_checkpoint(meta,sizeof(meta),e.certificate,kDiskCandidates);
+    uint8_t meta[512]; uint32_t n=enc_checkpoint(meta,sizeof(meta),e.certificate,kDiskCandidates,false);
     if(!n || e.database.size()>kMaxSaveBytes) return {};
-    Bytes out(36+n+e.database.size()+4+(size_t)e.owner_count*9+4+(size_t)e.origin_count*16+8); Writer w(out.data(),(uint32_t)out.size());
-    w.u32v(kDiskMagic); w.u32v(kDiskVersionOrigins); w.u32v(kCheckpointCompatibility);
+    Bytes out(36+n+e.database.size()+4+(size_t)e.owner_count*9+4+(size_t)e.origin_count*16+4+8); Writer w(out.data(),(uint32_t)out.size());
+    w.u32v(kDiskMagic); w.u32v(kDiskVersionFlags); w.u32v(kCheckpointCompatibility);
     w.u64v(compatibility_build); w.u64v(compatibility_gpak); w.u32v(n);
     w.raw(meta,n); w.u32v((uint32_t)e.database.size());
     if(!e.database.empty()) w.raw(e.database.data(),(uint32_t)e.database.size());
@@ -136,6 +165,7 @@ Bytes encode_entry(const Entry& e) {
     // The origin section: [u32 count][count x (u64 clone, u64 original)].
     w.u32v(e.origin_count);
     for(uint32_t i=0;i<e.origin_count;++i) { w.u64v(e.origins[i].clone); w.u64v(e.origins[i].original); }
+    w.u32v(e.flags);   // version 4
     w.u64v(savefile_hash(out.data(),w.len));
     if(!w.ok) return {}; out.resize(w.len); return out;
 }
@@ -145,12 +175,12 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
     if(hash!=savefile_hash(bytes.data(),(uint32_t)bytes.size()-8)) return false;
     Reader r(bytes.data(),(uint32_t)bytes.size()-8);
     uint32_t magic=r.u32v(); uint32_t version=r.u32v();
-    if(magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins) ||
+    if(magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins && version!=kDiskVersionFlags) ||
        r.u32v()!=kCheckpointCompatibility) return false;
     if(r.u64v()!=compatibility_build || r.u64v()!=compatibility_gpak) return false;
     uint32_t n=r.u32v(); if(!r.ok || n>512 || n>r.len-r.pos) return false;
     Reader meta(r.buf+r.pos,n); if(meta.u8v()!=MSG_CHECKPOINT) return false;
-    CheckpointMsg m{}; if(!dec_checkpoint(meta,m,kDiskCandidates) || !same_config(m)) return false;
+    CheckpointMsg m{}; if(!dec_checkpoint(meta,m,kDiskCandidates,false) || !same_config(m)) return false;
     r.pos+=n; uint32_t size=r.u32v();
     if(!r.ok || size>kMaxSaveBytes) return false;
     uint32_t tail=r.len-r.pos;   // database + (version 2 only) the owner section
@@ -163,8 +193,8 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
         for(unsigned i=0;i<m.count;++i) if(!m.hashes[i]) return false;
     }
     out.certificate=m; out.database.assign(r.buf+r.pos,r.buf+r.pos+size);
-    out.owner_count=0; out.origin_count=0;
-    if(version==kDiskVersionOwners || version==kDiskVersionOrigins) {
+    out.owner_count=0; out.origin_count=0; out.flags=0;
+    if(version==kDiskVersionOwners || version==kDiskVersionOrigins || version==kDiskVersionFlags) {
         Reader o(r.buf+r.pos+size,tail-size);
         uint32_t count=o.u32v();
         if(!o.ok || count>kMaxJournalOwners || count*9>o.len-o.pos) return false;
@@ -174,7 +204,7 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
             out.owners[i].save_id=id; out.owners[i].owner_pos=pos;
         }
         out.owner_count=count;
-        if(version==kDiskVersionOrigins) {
+        if(version==kDiskVersionOrigins || version==kDiskVersionFlags) {
             const uint32_t oc=o.u32v();
             if(!o.ok || oc>kMaxJournalOrigins || (size_t)oc*16>o.len-o.pos) return false;
             for(uint32_t i=0;i<oc;++i) {
@@ -184,6 +214,7 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
             }
             out.origin_count=oc;
         }
+        if(version==kDiskVersionFlags) { out.flags=o.u32v(); if(!o.ok) return false; }
         if(o.pos!=o.len) return false;   // exact consumption, no trailing bytes
     }
     return true;
@@ -200,7 +231,7 @@ bool entry_is_foreign(const std::wstring& path) {
     Reader r(bytes.data(),(uint32_t)bytes.size()-8);
     const uint32_t magic=r.u32v(); const uint32_t version=r.u32v(); const uint32_t compat=r.u32v();
     const uint64_t build=r.u64v(); const uint64_t gpak=r.u64v();
-    if(!r.ok || magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins)) return false;
+    if(!r.ok || magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins && version!=kDiskVersionFlags)) return false;
     return compat!=kCheckpointCompatibility || build!=compatibility_build || gpak!=compatibility_gpak;
 }
 bool marker(uint8_t mode) {
@@ -213,23 +244,23 @@ bool erase(const wchar_t* suffix) {
 }
 bool cleanup() {
     // Exact pairing only. No wildcard deletion of other runs or other local instances.
-    bool ok=true; for(auto suffix:kQueue) ok=erase(suffix)&&ok;
+    bool ok=true; for(unsigned k:queue_indices()) ok=erase_index(k)&&ok;
     return erase(L".pending")&&ok;
 }
 CheckpointRef reference(const Entry& e) {
-    auto& m=e.certificate; return {m.run,m.seq,m.stamp,m.token};
+    auto& m=e.certificate; return {m.run,m.seq,m.stamp,m.token,(uint8_t)e.flags};
 }
 bool equal(const CheckpointRef& a,const CheckpointRef& b) {
     return a.run && a.seq && a.run==b.run && a.seq==b.seq && a.stamp==b.stamp && a.certificate==b.certificate;
 }
 bool find(const CheckpointRef& ref,Entry& out) {
-    for(auto suffix:kQueue)
-        if(read_entry(file(suffix),out,true) && equal(reference(out),ref)) return true;
+    for(unsigned k:queue_indices())
+        if(read_entry(qfile(k),out,true) && equal(reference(out),ref)) return true;
     return false;
 }
 bool promote(const CheckpointMsg& c) {
     Entry newest{};
-    if(read_entry(file(L".0"),newest,true) && equal(reference(newest),{c.run,c.seq,c.stamp,c.token})) return true;
+    if(read_entry(qfile(0),newest,true) && equal(reference(newest),{c.run,c.seq,c.stamp,c.token})) return true;
     if(g.pending.database.empty() || c.hashes[g.pos]!=savefile_hash(g.pending.database.data(),(uint32_t)g.pending.database.size())) return false;
     // Each entry embeds its own certificate and checksum. A torn file cannot invalidate an older
     // entry. Repeat COMMIT never rotates twice (the equal() test above).
@@ -240,37 +271,53 @@ bool promote(const CheckpointMsg& c) {
     // every file either the old one or the new one, each self-validating, and at worst a duplicate
     // that the offer's common-save test collapses.
     g.pending.certificate=c;
-    std::vector<Entry> chain; chain.push_back(g.pending);
-    for(auto suffix:kQueue) {
+    // THE WHOLE RUN IS KEPT (2026-10-04): no depth limit; the queue is cleared when the run settles (checkpoint_clear). The files already there are
+    // RENAMED one place back -- never rewritten, each is a whole save -- and the new entry is written as .0 last. Files of another run, unreadable
+    // ones and duplicates are deleted first. Each file stays self-validating, so a crash part-way loses nothing: at worst the order is off by one
+    // until the next commit, and every reader orders by seq anyway.
+    std::vector<unsigned> keep;
+    std::vector<CheckpointRef> seen; seen.push_back(reference(g.pending));
+    for(unsigned k:queue_indices()) {
         Entry e{};
-        if(!read_entry(file(suffix),e,true) || e.certificate.run!=c.run || equal(reference(e),reference(g.pending))) continue;
-        bool dup=false; for(const auto& k:chain) if(equal(reference(k),reference(e))) dup=true;
-        if(!dup && chain.size()<kCheckpointCandidates) chain.push_back(std::move(e));
+        bool ok=read_entry(qfile(k),e,true) && e.certificate.run==c.run;
+        if(ok) for(const auto& s:seen) if(equal(s,reference(e))) ok=false;
+        if(ok) { keep.push_back(k); seen.push_back(reference(e)); }
+        else if(!erase_index(k)) return false;
     }
-    for(size_t k=chain.size();k-->0;)
-        if(!checkpoint_io::atomic_write(file(kQueue[k]),encode_entry(chain[k]))) return false;
+    // keep[r] goes to r+1. The ones that move UP (keep[r]==r) are a prefix: move them newest-last (descending); the ones that move DOWN
+    // (keep[r]>r+1) move ascending. Either way the target is free when it is used.
+    auto mv=[&](unsigned from,unsigned to) {
+        return from==to || MoveFileExW(qfile(from).c_str(),qfile(to).c_str(),MOVEFILE_WRITE_THROUGH)!=0;
+    };
+    for(size_t r=keep.size();r-->0;) if(keep[r]==r && !mv(keep[r],(unsigned)r+1)) return false;
+    for(size_t r=0;r<keep.size();++r) if(keep[r]>r+1 && !mv(keep[r],(unsigned)r+1)) return false;
+    if(!checkpoint_io::atomic_write(qfile(0),encode_entry(g.pending))) return false;
+    log_line("CHECKPOINT","journal: %u confirmed save(s) of run %016llx kept%s",(unsigned)keep.size()+1,(unsigned long long)c.run,
+             (g.pending.flags&kCheckpointAfterBoss)?" -- the new one is AFTER THE CHAPTER BOSS":"");
     return erase(L".pending");
 }
-// A restore puts the chosen entry at the head and keeps only what is OLDER than it in the same run:
-// an entry newer than the restore point belongs to a timeline that has just been abandoned, and left
-// in the queue it would be offered as "the latest" next time.
+// A restore puts the chosen entry at the head and KEEPS every other save of the same run (2026-10-04; it used to delete the ones newer than the
+// restore point as an abandoned timeline). The next commit after a restore has the number chosen+1, so a kept newer save can share a number with a
+// new one: entries are told apart by their whole reference (run, seq, stamp, certificate) and listed by creation time, newest first (common_saves),
+// so the one just made is on top. Nothing is dropped but unreadable files, other runs' files and exact duplicates.
 bool restore_queue(const Entry& chosen) {
     std::vector<Entry> older;
-    for(auto suffix:kQueue) {
+    const std::vector<unsigned> had=queue_indices();
+    for(unsigned k:had) {
         Entry o{};
-        if(!read_entry(file(suffix),o,true) || o.certificate.run!=chosen.certificate.run ||
-           o.certificate.seq>=chosen.certificate.seq) continue;
+        if(!read_entry(qfile(k),o,true) || o.certificate.run!=chosen.certificate.run || equal(reference(o),reference(chosen))) continue;
         bool dup=false; for(const auto& k:older) if(equal(reference(k),reference(o))) dup=true;
         if(!dup) older.push_back(std::move(o));
     }
-    std::sort(older.begin(),older.end(),[](const Entry& a,const Entry& b){ return a.certificate.seq>b.certificate.seq; });
+    std::sort(older.begin(),older.end(),[](const Entry& a,const Entry& b){
+        return a.certificate.stamp!=b.certificate.stamp ? a.certificate.stamp>b.certificate.stamp : a.certificate.seq>b.certificate.seq; });
     std::vector<Entry> chain; chain.push_back(chosen);
-    for(auto& o:older) if(chain.size()<kCheckpointCandidates) chain.push_back(std::move(o));
+    for(auto& o:older) chain.push_back(std::move(o));
     for(size_t k=chain.size();k-->0;)
-        if(!checkpoint_io::atomic_write(file(kQueue[k]),encode_entry(chain[k]))) return false;
+        if(!checkpoint_io::atomic_write(qfile((unsigned)k),encode_entry(chain[k]))) return false;
     // Best effort: a leftover that cannot be deleted (a directory squatting on the name, a sharing
     // violation) must not fail a restore whose own entry is safely at the head.
-    for(size_t k=chain.size();k<kCheckpointCandidates;++k) erase(kQueue[k]);
+    for(unsigned k:had) if(k>=chain.size()) erase_index(k);
     return true;
 }
 bool has_candidate(const CheckpointMsg& m) { for(const auto& c:m.candidates) if(c.run) return true; return false; }
@@ -301,9 +348,13 @@ void send_offer() {
         if(offer.mode==0) offer.mode=1;
         state_marker=true;
     }
-    for(unsigned i=0;i<kCheckpointCandidates;++i) {
-        Entry e{};
-        if(read_entry(file(kQueue[i]),e,true)) offer.candidates[i]=reference(e);
+    {   // packed from index 0, newest first (the wire ends the list at the first empty one)
+        unsigned n=0;
+        for(unsigned k:queue_indices()) {
+            if(n>=kCheckpointCandidates) break;
+            Entry e{};
+            if(read_entry(qfile(k),e,true)) offer.candidates[n++]=reference(e);
+        }
     }
     // A mode-1 state is a debt: "this run still owes a recovery." The debt is
     // only redeemable through a snapshot the run CONFIRMED (.0/.1, written by
@@ -332,8 +383,65 @@ void send_offer() {
         if(!marker(3) || !cleanup()) { fail("cannot retire an already-settled recovery run"); return; }
         offer.mode=3; for(auto& c:offer.candidates) c={};
     }
+    // MID-RUN WITH NOTHING TO RECOVER (2026-10-03): the save is ON THE MAP, but its journal says "settled" (a tombstone from the previous run) or says nothing -- a run that began after the
+    // last settlement and never got a checkpoint, e.g. the host walked into the map while the other player was still choosing gear. Offered as mode 0 or 3 that save looked like a warehouse one, the
+    // host was offered the preparation stage, and apply_select then refused it with a log line nobody sees. Mode 4 says what is true: it holds an unfinished run and offers nothing to recover it with.
+    if(g.mode==1 && (offer.mode==0 || offer.mode==3)) {
+        log_line("CHECKPOINT","this save is on the map but its journal holds nothing to recover (mode %u): offered as an unfinished run without a record",(unsigned)offer.mode);
+        offer.mode=4; for(auto& c:offer.candidates) c={};
+    }
     if(g.host) { g.offers[0]=offer; g.haveOffer[0]=true; choose(); }
     else if(!net_send_checkpoint(offer)) fail("recovery offer send failed");
+}
+// Human-readable zero-based slot key; participant identity digest isolates unrelated players using the same slot numbers.
+std::wstring make_key(const CheckpointMsg& m,const uint64_t* ids) {
+    uint8_t identity_bytes[40]{}; Writer w(identity_bytes,sizeof(identity_bytes));
+    w.u8v(m.count); std::wstring key;
+    for(unsigned i=0;i<kMaxPeers;++i) {
+        if(i) key+=L"-";
+        key+=i<m.count?L"slot"+std::to_wstring(m.slots[i]):L"na";
+        if(i<m.count) w.u64v(ids[i]);
+    }
+    wchar_t digest[32]; swprintf_s(digest,L"-%016llx",savefile_hash(identity_bytes,w.len));
+    return key+digest;
+}
+bool has_record_files() {
+    if(disk_exists(file(L".state")) || disk_exists(file(L".pending"))) return true;
+    return !queue_indices().empty();
+}
+// WHERE THE RECORDS OF THIS PAIR OF SAVES LIVE. A player is known by two ids, and the records were written under whichever were in use then (the folder is this player's id, the file name
+// holds a digest of everybody's). Look for them under every combination -- this player's folder by either id, each participant by either id -- and use the first that has any; with none, start under
+// the primary ids. So a reinstall (a new fingerprint beside the DLL, the same Steam id) finds its run again, and so does one that changes the other way.
+void resolve_paths() {
+    const CheckpointMsg& m=g.config;
+    uint64_t prim[kMaxPeers]{};
+    for(unsigned i=0;i<m.count;++i) prim[i]=m.identities[i];
+    g.key=make_key(m,prim);
+    bool alts=false;
+    for(unsigned i=0;i<m.count;++i) if(m.identities2[i] && m.identities2[i]!=m.identities[i]) alts=true;
+    if(!alts || g.hroot.empty() || g.pos>=m.count) return;
+    const uint64_t mine[2]={ m.identities[g.pos], m.identities2[g.pos] };
+    for(int rr=0;rr<2;++rr) {
+        if(!mine[rr] || (rr==1 && mine[1]==mine[0])) continue;
+        const std::wstring r=g.hroot+L"\\"+std::to_wstring(mine[rr]);
+        for(unsigned mask=0;mask<(1u<<m.count);++mask) {
+            bool ok=true; uint64_t pick[kMaxPeers]{};
+            for(unsigned i=0;i<m.count;++i) {
+                const bool use_alt=((mask>>i)&1)!=0;
+                if(use_alt && (!m.identities2[i] || m.identities2[i]==m.identities[i])) ok=false;
+                pick[i]=use_alt?m.identities2[i]:m.identities[i];
+            }
+            if(!ok) continue;
+            g.root=r; g.key=make_key(m,pick);
+            if(has_record_files()) {
+                if(rr!=0 || mask!=0) log_line("CHECKPOINT","the records of this save pair were found under the other id%s -- using them",rr?" of this player":"");
+                return;
+            }
+        }
+    }
+    g.root=g.hroot+L"\\"+std::to_wstring(mine[0]);
+    CreateDirectoryW(g.root.c_str(),nullptr);
+    g.key=make_key(m,prim);
 }
 bool configure(const CheckpointMsg& m) {
     if(g.configured) return same_config(m) && m.identity==g.config.identity;
@@ -344,20 +452,10 @@ bool configure(const CheckpointMsg& m) {
         for(unsigned j=0;j<i;++j) if(m.identities[i]==m.identities[j] || m.peers[i]<=m.peers[j]) return false;
         if(m.peers[i]==net_self()) g.pos=(uint8_t)i;
     }
-    if(g.pos>=m.count || m.identities[g.pos]!=g.identity || m.slots[g.pos]!=g.slot ||
+    if(g.pos>=m.count || (m.identities[g.pos]!=g.identity && !(g.identity2 && m.identities[g.pos]==g.identity2)) || m.slots[g.pos]!=g.slot ||
        !m.identity || m.hashes[g.pos]!=g.selectionNonce || m.mode!=(g.inSession?1:0)) return false;
     g.config=m; g.configured=true;
-    // Human-readable zero-based slot key; participant identity digest isolates
-    // unrelated players using the same slot numbers.
-    uint8_t identity_bytes[40]{}; Writer w(identity_bytes,sizeof(identity_bytes));
-    w.u8v(m.count); std::wstring key;
-    for(unsigned i=0;i<kMaxPeers;++i) {
-        if(i) key+=L"-";
-        key+=i<m.count?L"slot"+std::to_wstring(m.slots[i]):L"na";
-        if(i<m.count) w.u64v(m.identities[i]);
-    }
-    wchar_t digest[32]; swprintf_s(digest,L"-%016llx",savefile_hash(identity_bytes,w.len));
-    g.key=key+digest;
+    resolve_paths();
     if(!membership()) return false;
     send_offer(); return !g.failed;
 }
@@ -375,12 +473,12 @@ void configure_host() {
             fail("save selection and in-session chapter restart differ; return both players to save selection"); return;
         }
         m.peers[i]=ids[i]; m.slots[i]=g.selections[ids[i]].slot;
-        m.identities[i]=g.selections[ids[i]].identity;
+        m.identities[i]=g.selections[ids[i]].identity; m.identities2[i]=g.selections[ids[i]].identity2;
         m.hashes[i]=g.selections[ids[i]].token; // selection nonce, not a DB hash yet
     }
     if(!net_send_checkpoint(m) || !configure(m)) fail("recovery refused: invalid participants or slot configuration");
 }
-// Every confirmed save that ALL participants hold, newest first (same run: higher seq; else later stamp).
+// Every confirmed save that ALL participants hold, newest first: by creation time, then by number (after a restore two saves of a run can share a number).
 unsigned common_saves(CheckpointRef* out) {
     unsigned n=0;
     for(const auto& candidate:g.offers[0].candidates) {
@@ -390,14 +488,14 @@ unsigned common_saves(CheckpointRef* out) {
         bool common=true;
         for(unsigned i=0;i<g.config.count;++i) {
             auto& o=g.offers[i];
-            if(o.mode==3 || (o.run && o.run!=candidate.run) || !has_ref(o,candidate)) common=false;
+            if(o.mode==3 || o.mode==4 || (o.run && o.run!=candidate.run) || !has_ref(o,candidate)) common=false;
         }
         if(common && n<kCheckpointCandidates) out[n++]=candidate;
     }
     for(unsigned i=1;i<n;++i)
         for(unsigned j=i;j>0;--j) {
             const auto& a=out[j]; const auto& b=out[j-1];
-            const bool newer=a.run==b.run ? a.seq>b.seq : a.stamp>b.stamp;
+            const bool newer=a.stamp!=b.stamp ? a.stamp>b.stamp : (a.run==b.run && a.seq>b.seq);
             if(!newer) break;
             std::swap(out[j],out[j-1]);
         }
@@ -406,14 +504,17 @@ unsigned common_saves(CheckpointRef* out) {
 // A refused round, on the record: what each player offered. Without this the log says "no common confirmed save" and nothing about WHO
 // carries the unfinished run that makes the saves incompatible; the mask goes to the panel (and to the guests in the SAVEWAIT).
 void note_refusal() {
-    uint8_t holders=0;
+    uint8_t holders=0; bool noRecord=false, withRecord=false;
     for(unsigned i=0;i<g.config.count;++i) {
         const auto& m=g.offers[i];
         unsigned snaps=0; for(const auto& c:m.candidates) if(c.run) ++snaps;
         log_line("CHECKPOINT","offer of player %u (peer %u): mode %u, run %016llx, %u snapshot(s)%s",i+1,(unsigned)g.config.peers[i],(unsigned)m.mode,
-                 (unsigned long long)m.run,snaps,(m.mode==1||snaps)?" -- holds an unfinished co-op record":"");
-        if((m.mode==1||snaps) && g.config.peers[i]<kMaxPeers) holders|=(uint8_t)(1u<<g.config.peers[i]);
+                 (unsigned long long)m.run,snaps,m.mode==4?" -- its save is on the map and there is no co-op record to recover it with":(m.mode==1||snaps)?" -- holds an unfinished co-op record":"");
+        if((m.mode==1||m.mode==4||snaps) && g.config.peers[i]<kMaxPeers) holders|=(uint8_t)(1u<<g.config.peers[i]);
+        if(m.mode==4) noRecord=true; else if(m.mode==1||snaps) withRecord=true;
     }
+    // bit 7 of the mask the panel gets: EVERY holder's save is on the map with no record (kHoldersNoRecord) -- a different instruction from "load the original save"
+    if(noRecord && !withRecord) holders|=kHoldersNoRecord;
     g.holders=holders;
 }
 void send_wait(uint8_t phase);
@@ -423,7 +524,7 @@ void choose() {
     for(unsigned i=0;i<g.config.count;++i) {
         const auto& m=g.offers[i];
         if(m.mode==2) { fail("recovery refused: a participant chose play alone"); return; }
-        if(m.mode==1 || has_candidate(m)) fresh=false;
+        if(m.mode==1 || m.mode==4 || has_candidate(m)) fresh=false;
     }
     CheckpointRef common[kCheckpointCandidates]{}; const unsigned nc=common_saves(common);
     if(g_manual && !g.inSession) {
@@ -432,7 +533,7 @@ void choose() {
         // never silently walk away from.
         if(g.choosing || g.invalid) return;
         bool running=false;
-        for(unsigned i=0;i<g.config.count;++i) if(g.offers[i].mode==1) running=true;
+        for(unsigned i=0;i<g.config.count;++i) if(g.offers[i].mode==1 || g.offers[i].mode==4) running=true;
         g.listN=nc; for(unsigned i=0;i<nc;++i) g.list[i]=common[i];
         g.listPrep=!running;
         if(!nc && !g.listPrep) {
@@ -519,7 +620,11 @@ void apply_select(const CheckpointMsg& m) {
             catsync_origin_import(e.origins,e.origin_count);
             log_line("CHECKPOINT","restored %u clone-origin note(s) from the journal",e.origin_count);
         }
-    } else if(g.mode!=0 || m.seq) { fail("recovery refused: unfinished local save cannot start a fresh session"); return; }
+    } else if(g.mode!=0 || m.seq) {
+        // The round is invalid for everybody, and the panel says so (it used to be a log line only: both players stood at the save screen with no explanation).
+        if(g.host && g_manual && !g.inSession) { note_refusal(); g.invalid=true; send_wait(kSaveWaitInvalid); }
+        fail("recovery refused: unfinished local save cannot start a fresh session"); return;
+    }
     log_line("CHECKPOINT", "%s run=%016llx seq=%llu key=%ls", m.mode?"RESTORE":"NEW", m.run, m.seq, g.key.c_str());
     g.run=m.run; g.seq=m.seq;
     if(!marker(1)) { fail("cannot persist active recovery run"); return; }
@@ -594,14 +699,27 @@ void checkpoint_on_chaptermap(uint8_t from,const ChapterMapMsg& m) {
     send_loaded();
 }
 
-void checkpoint_init(uint64_t build_hash,uint64_t gpak_hash) {
+void checkpoint_init(uint64_t build_hash,uint64_t gpak_hash,bool dev_tools) {
     compatibility_build=build_hash; compatibility_gpak=gpak_hash;
     g=State{}; g.on=net_active(); g.host=net_role()==NetRole::Host;
     if(!g.on) return;
     wchar_t dir[MAX_PATH]{};
-    if(!checkpoint_io::identity(g.identity) || !savefile_save_dir(dir,MAX_PATH)) { fail("cannot read persistent player fingerprint"); return; }
+    if(!savefile_save_dir(dir,MAX_PATH)) { fail("cannot read persistent player fingerprint"); return; }
     std::wstring root=std::wstring(dir)+L"\\mgmp_handshake";
     if(!CreateDirectoryW(root.c_str(),nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS) { fail("cannot create checkpoint directory"); return; }
+    bool adopted=false;
+    uint64_t fingerprint=0;
+    if(!checkpoint_io::identity(fingerprint,root.c_str(),&adopted)) { fail("cannot read persistent player fingerprint"); return; }
+    g.identity=fingerprint; g.identity2=0; g.hroot=root;
+    {   // The Steam id is the primary id: it survives a reinstall. Two instances on one account (a local test, dev_tools on) are told apart by the fingerprint beside each DLL, so there
+        // it stays primary and the Steam id only backs it up.
+        const uint64_t steam=checkpoint_io::steam_id_from_dir(dir);
+        if(steam && steam!=fingerprint) {
+            if(dev_tools) g.identity2=steam;
+            else { g.identity=steam; g.identity2=fingerprint; }
+        }
+    }
+    if(adopted) log_line("CHECKPOINT","no player fingerprint beside the mod (a fresh folder?) -- took over the only earlier one on this machine (%llu), so the recovery records of the run in progress are found",(unsigned long long)fingerprint);
     // Same-machine host/client tests must never rotate or clear each other's queue.
     g.root=root+L"\\"+std::to_wstring(g.identity);
     if(!CreateDirectoryW(g.root.c_str(),nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS) fail("cannot create player checkpoint directory");
@@ -614,10 +732,15 @@ bool checkpoint_active() { return g.on; }
 // Volatile negotiation only: never remove certified snapshots or tombstones.
 // A client may pick its save before the host returns to the menu; keep that
 // next-round request, but never reuse the old round's selection table.
+// What survives a started-over round: who we are (both ids) and where our records live (back at the primary id's folder; the pair of saves is resolved again).
+static void keep_identity(State& old) {
+    g.on=old.on; g.host=old.host; g.identity=old.identity; g.identity2=old.identity2; g.hroot=std::move(old.hroot);
+    g.root=g.hroot.empty() ? std::move(old.root) : g.hroot+L"\\"+std::to_wstring(g.identity);
+}
 static void reset_selection() {
     State old=std::move(g);
     g=State{};
-    g.on=old.on; g.host=old.host; g.identity=old.identity; g.root=std::move(old.root);
+    keep_identity(old);
     if(g.host) for(unsigned i=1;i<kMaxPeers;++i) {
         if(old.haveNextSelection[i]) {
             g.selections[i]=old.nextSelections[i]; g.haveSelection[i]=true;
@@ -671,7 +794,7 @@ static bool select_impl(uint8_t slot,const wchar_t* path,bool inSession) {
     g.slot=slot; g.path=selected_path; g.mode=running?1:0; g.selected=true;
     g.selectionNonce=checkpoint_io::nonce();
     if(!g.selectionNonce) { fail("cannot allocate save-selection identity"); return false; }
-    CheckpointMsg m{}; m.kind=kCheckpointSlot; m.slot=slot; m.identity=g.identity; m.mode=g.mode;
+    CheckpointMsg m{}; m.kind=kCheckpointSlot; m.slot=slot; m.identity=g.identity; m.identity2=g.identity2; m.mode=g.mode;
     m.token=g.selectionNonce;
     m.seq=inSession?1:0;
     if(g.host) { g.selections[0]=m; g.haveSelection[0]=true; configure_host(); }
@@ -685,8 +808,9 @@ int checkpoint_autoselect() {
     if(!membership()) { status("save load waiting: reconnect the original participants"); return -1; }
     g.loadIssued=true; return g.slot;
 }
-void checkpoint_on_node(uint64_t seed,uint32_t) {
+void checkpoint_on_node(uint64_t seed,uint32_t,uint32_t type) {
     if(!g.on || !g.released) return;
+    g.nodeType=type;
     g.dirty=true; g.arrived=g.preparing=g.capture=g.committed=g.advancing=false;
     g.map=0; g.pending=Entry{};
     memset(g.haveArrival,0,sizeof(g.haveArrival)); memset(g.ack,0,sizeof(g.ack)); memset(g.committedAck,0,sizeof(g.committedAck));
@@ -697,7 +821,10 @@ void checkpoint_on_node(uint64_t seed,uint32_t) {
     status(g.skip ? "node in progress; this node's checkpoint is skipped (roster disagreement), previous confirmed saves retained"
                   : "node in progress; previous confirmed saves retained");
 }
-bool checkpoint_run_restored() { return g.on && g.mode==1; }
+// A run that was RESTORED from a checkpoint and has not been settled yet. Once it is settled (g.finished) the session is free for the next run, and that run is a NEW one that comes through the gear screen
+// like any other: g.mode keeps its 1 until the next chapter is committed (checkpoint_restart_run), and answering "restored" through that whole stretch let the host's gear-screen lock of the second run go
+// straight to the map without the setup hold (2026-10-03: a restored first run, settled in-session, then a new run -- the host started its map while the client was still choosing its gear).
+bool checkpoint_run_restored() { return g.on && g.mode==1 && !g.finished; }
 bool checkpoint_needs_map() { return g.on && g.released && !g.failed && g.dirty && !g.skip; }
 void checkpoint_on_map(uint64_t map_hash) {
     if(!checkpoint_needs_map() || !map_hash) return;
@@ -722,6 +849,7 @@ void checkpoint_on_map(uint64_t map_hash) {
     // a future restore imports it back from (2026-09-28).
     g.pending.owner_count=lockstep_owner_note_export(g.pending.owners,kMaxJournalOwners);
     g.pending.origin_count=catsync_origin_export(g.pending.origins,kMaxJournalOrigins);
+    g.pending.flags=(g.nodeType==kBossNodeType)?kCheckpointAfterBoss:0;   // back on the map after the chapter boss: next floor or home from here
     if(!checkpoint_io::atomic_write(file(L".pending"),encode_entry(g.pending))) { fail("checkpoint staging failed; previous saves retained"); return; }
     log_line("CHECKPOINT", "STAGED run=%016llx seq=%llu map=%016llx local-hash=%016llx bytes=%u", g.run, g.tx.seq, g.tx.map, hash, size);
     g.capture=false;
@@ -885,7 +1013,7 @@ bool checkpoint_abort_round() {
     const bool had=g.selected || g.failed || g.invalid;
     State old=std::move(g);
     g=State{};
-    g.on=old.on; g.host=old.host; g.identity=old.identity; g.root=std::move(old.root);
+    keep_identity(old);
     g_abort_at=GetTickCount64();
     if(had) log_line("CHECKPOINT","save selection round started over -- every player picks again");
     status("waiting for all players to select saves");
@@ -902,7 +1030,7 @@ bool checkpoint_sync_view(SaveSyncView& v) {
         v.selected=selected_mask();
         if(g.choosing) {
             v.phase=kSyncHostChoosing; v.prep=g.listPrep; v.n=g.listN;
-            for(unsigned i=0;i<g.listN && i<4;++i) v.entry[i]={g.list[i].run,g.list[i].seq,g.list[i].stamp};
+            for(unsigned i=0;i<g.listN && i<kCheckpointCandidates;++i) v.entry[i]={g.list[i].run,g.list[i].seq,g.list[i].stamp,g.list[i].flags};
         } else v.phase=kSyncWaiting;
         return true;
     }

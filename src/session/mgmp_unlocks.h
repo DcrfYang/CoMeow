@@ -59,6 +59,20 @@ void unlocks_window_open(const char* why, bool event = false);
 void unlocks_on_map(bool ready);
 void unlocks_window_close(const char* why);
 bool unlocks_window_active();
+// The class-list function ran (both peers, from its hook): record this peer's list and, on a client in a battle's window, replace it by the host's. See mgmp_unlocks.cpp.
+void unlocks_classes_after(void* out_vector, bool with_colorless);
+// A level-up screen is about to be built (its constructor builds the option pool, the unlock queries of which come BEFORE any log line of ours): if this is the reward of a fight, the fight is over -- both the
+// per-name unlock answers and the class list answer with this save's own from here on. A normal win leaves objects and summons standing, so "every enemy is down" alone is not seen.
+void unlocks_level_screen_opens();
+// THE UNLOCK-QUERY RECORD (both peers, every battle): see mgmp_unlocks.cpp. `local` is what this save says, `answer` what the game was told.
+void unlockq_query(UnlockList list, const char* name, bool local, bool answer);
+void unlockq_prop(const char* key, int64_t local, int64_t answer);
+void unlockq_flush(uint32_t turn, uint32_t actions_done);     // one UQ line for the queries since the last one; the digest also goes to the other peers (MSG_UQD)
+struct UqdMsg;
+void unlockq_on_peer(uint8_t from, const UqdMsg& m);          // another peer's digest of the same flush: compared with this peer's
+void unlockq_stats(uint32_t& compared, uint32_t& mismatched);  // this battle's comparisons, for the summary line
+struct PropsMsg;
+void unlocks_props_on_message(uint8_t from, const PropsMsg& m);  // a chunk of the host's save-property table (client)
 // Every frame: notes that the battle has been built (the window then stays open until the map is ready again).
 void unlocks_tick();
 // The detours' answer for a check made inside the window: `local` is what this save said. Returns the HOST's answer for a name on a blacklist, and `local`
@@ -72,6 +86,8 @@ void unlocks_spawn_sort(void** first, void** last, bool sorted);
 
 // The battle build is starting (T_BattleBuild): in a room the shared stream is set from the battle id, the same on every peer -- the draws
 // made between the node entry and here differ per save (measured 2026-10-02), and the board is placed from this stream.
+// One player cat as text and a fingerprint of that text (the stats, every input they come from, class, abilities, gear): what the pre-battle audit compares.
+bool unlocks_describe_cat(void* catdata, uint64_t& id, char* text, size_t cap, uint64_t& fp);
 void unlocks_battle_build();
 // The battle build has returned / a definition is being loaded: inside the build every load starts from a stream derived from the battle id and the
 // load's number, so a draw that differs inside one load (per-save state) cannot move the loads after it. Only in a room.
@@ -80,6 +96,10 @@ void unlocks_build_load();
 // The same, when the definition load has returned, and at the end of each build stage: the shared stream is set from the battle id, so a draw count
 // that differs between saves (a random cat's name ...) cannot reach the bird roll, the pickup counts or the first turn.
 void unlocks_build_load_done();
+// THE SAME FENCE FOR A DEFINITION LOADED MID-BATTLE (a summon, a pickup, a returning enemy) -- see the definitions. No-ops outside a fight of a room with two or more peers, and while the
+// battle build's own fence is up. The _done must be called after every _load, whatever it returned.
+void unlocks_midbattle_load(const char* what);
+void unlocks_midbattle_load_done();
 void unlocks_build_stage_end(const char* stage);
 // Start of the battle build's enemy stage (0x35D0B0), before the original runs: both peers log the director's queue of returning enemies; a client
 // aligns its queue with the host's (the host sent it with the level).

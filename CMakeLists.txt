@@ -43,6 +43,7 @@ add_library(mgmp SHARED
     src/core/mgmp_config.cpp
     src/core/mgmp_debug.cpp
     src/core/mgmp_crash.cpp
+    src/core/mgmp_prevrun.cpp
     src/core/mgmp_gpak.cpp
     src/core/mgmp_sigscan.cpp
     src/core/mgmp_resolve.cpp
@@ -72,8 +73,11 @@ add_library(mgmp SHARED
     src/session/mgmp_checkpoint_io.cpp
     src/session/mgmp_setup.cpp
     src/session/mgmp_unlocks.cpp
+    src/session/mgmp_diag.cpp
+    src/session/mgmp_chat.cpp
     src/session/mgmp_leave.cpp
     src/session/mgmp_listprobe.cpp
+    src/session/mgmp_spawntest.cpp
     src/session/mgmp_catsync.cpp
     src/session/mgmp_invsync.cpp
     src/session/mgmp_runhist.cpp
@@ -85,6 +89,7 @@ add_library(mgmp SHARED
     src/session/mgmp_overlay.cpp
     src/ui/mgmp_ui.cpp
     src/ui/mgmp_menu.cpp
+    src/ui/mgmp_roomhist.cpp
     src/ui/mgmp_uitest.cpp
     src/session/mgmp_saveslots.cpp
     # Dear ImGui, compiled straight into mgmp.dll -- same rule as minhook and

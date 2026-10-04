@@ -1,5 +1,7 @@
 {
   "game": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Mewgenics\\Mewgenics.exe",
+  // The trace log. A bare file name goes into the "log" folder beside mgmp.dll (one file per run, stamped with the time; the crash dumps, mgmp_boot.log and the
+  // launcher's and updater's logs are there too). A path with a folder in it is relative to this folder; an absolute path is used as it is.
   "log": "mgmp_trace.log",
 
   // THE LOBBY. Every instance launches neutral now: this block is how it finds
@@ -38,6 +40,9 @@
     // The "test release -- back up your saves" dialog shown at startup. Its "do not show again" box writes false here;
     // set it back to true to see the dialog again.
     "beta_notice": true,
+    // When the game crashes, or an earlier run ended without a clean exit (crash, freeze, killed), send its log (and crash dump) to the server named in "signal" above
+    // by itself. false: nothing is sent unless you press "Upload log" (F2).
+    "auto_upload_crash_log": true,
     // Developer tools (the panel's 999-damage and node-jump buttons, debug mode, roster_shrink, test_weaken, the UI
     // harness, and the debug.* switches that make two peers play differently). OFF for players: with false they are
     // ignored even if named below. Only turn it on for testing, and on BOTH machines.

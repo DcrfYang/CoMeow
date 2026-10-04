@@ -11,7 +11,9 @@
 
 #include "json.hpp"
 
+#include "mgmp_addresses.h"
 #include "mgmp_checkpoint_io.h"
+#include "mgmp_leave.h"
 #include "mgmp_log.h"
 #include "mgmp_savefile.h"
 
@@ -27,6 +29,7 @@ constexpr const wchar_t* kSidecar[] = { L"-wal", L"-shm", L"-journal" };
 
 struct State {
     SaveBackup list[kSaveBackupCount];
+    SaveBackup autos[kAutoSaveCount];
     char       msg[640] = {};
     bool       msg_load = false;
 };
@@ -71,6 +74,13 @@ std::wstring slot_dir(const std::wstring& game, int i) {
 }
 
 std::wstring undo_dir(const std::wstring& game) { return root_of(game) + L"\\_undo"; }
+
+// the auto queue: auto_01 (newest) .. auto_03
+std::wstring auto_dir(const std::wstring& game, int i) {
+    wchar_t leaf[32];
+    swprintf_s(leaf, L"\\auto_%02d", i + 1);
+    return root_of(game) + leaf;
+}
 
 // Empties a directory of plain files and removes it. Only ever pointed at our
 // own folders, and only ever removes files directly inside them.
@@ -525,14 +535,25 @@ void saveslots_format_time(int64_t timer, char* out, size_t cap) {
 
 void saveslots_refresh() {
     for (auto& b : g.list) b = SaveBackup{};
+    for (auto& b : g.autos) b = SaveBackup{};
     std::wstring game;
     if (!game_dir(game)) return;
+    for (int i = 0; i < kAutoSaveCount; ++i) {
+        const std::wstring d = auto_dir(game, i);
+        SaveBackup b;
+        if (exists(d) && load_meta(d, b)) g.autos[i] = b;
+    }
     for (int i = 0; i < kSaveBackupCount; ++i) {
         const std::wstring d = slot_dir(game, i);
         if (!exists(d)) continue;
         SaveBackup b;
         if (load_meta(d, b)) g.list[i] = b;
     }
+}
+
+const SaveBackup& saveslots_auto_get(int index) {
+    static const SaveBackup kEmpty;
+    return (index >= 0 && index < kAutoSaveCount) ? g.autos[index] : kEmpty;
 }
 
 const SaveBackup& saveslots_get(int index) {
@@ -574,12 +595,9 @@ bool saveslots_save(int index, const char* name) {
     return true;
 }
 
-bool saveslots_load(int index) {
-    if (index < 0 || index >= kSaveBackupCount) { say(tr(Tx::SS_NO_POS)); return false; }
-    std::wstring game;
-    if (!game_dir(game)) { say(tr(Tx::SS_NO_DIR)); return false; }
-
-    const std::wstring dir = slot_dir(game, index);
+namespace {
+// Puts the position in `dir` over the game's three slots, with the undo point first. `autoq` only picks the words of the confirmation.
+bool load_dir(const std::wstring& game, const std::wstring& dir, int index, bool autoq) {
     SaveBackup meta;
     if (!exists(dir) || !load_meta(dir, meta)) { say(tr(Tx::SS_EMPTY_POS), index + 1); return false; }
 
@@ -602,10 +620,102 @@ bool saveslots_load(int index) {
     if (!write_folder(game, undo_dir(game), cur, have, undo, have_cur_hs ? &cur_hs : nullptr)) return false;
 
     if (!install_from(game, dir, meta)) return false;
-    if (meta.handshake >= 0) say(tr(Tx::SS_LOADED_HS), index + 1, meta.name, meta.handshake);
-    else                     say(tr(Tx::SS_LOADED), index + 1, meta.name);
+    if (autoq)                      say(tr(Tx::SS_AUTO_LOADED), index + 1, meta.name);
+    else if (meta.handshake >= 0)   say(tr(Tx::SS_LOADED_HS), index + 1, meta.name, meta.handshake);
+    else                            say(tr(Tx::SS_LOADED), index + 1, meta.name);
     g.msg_load = true;
     return true;
+}
+} // namespace
+
+bool saveslots_load(int index) {
+    if (index < 0 || index >= kSaveBackupCount) { say(tr(Tx::SS_NO_POS)); return false; }
+    std::wstring game;
+    if (!game_dir(game)) { say(tr(Tx::SS_NO_DIR)); return false; }
+    return load_dir(game, slot_dir(game, index), index, false);
+}
+
+bool saveslots_auto_load(int index) {
+    if (index < 0 || index >= kAutoSaveCount) { say(tr(Tx::SS_NO_POS)); return false; }
+    std::wstring game;
+    if (!game_dir(game)) { say(tr(Tx::SS_NO_DIR)); return false; }
+    return load_dir(game, auto_dir(game, index), index, true);
+}
+
+bool saveslots_auto_export(int index, const wchar_t* path) {
+    if (index < 0 || index >= kAutoSaveCount || !path || !path[0]) { say(tr(Tx::SS_NO_POS)); return false; }
+    std::wstring game;
+    if (!game_dir(game)) { say(tr(Tx::SS_NO_DIR)); return false; }
+    const std::wstring dir = auto_dir(game, index);
+    SaveBackup meta;
+    if (!exists(dir) || !load_meta(dir, meta)) { say(tr(Tx::SS_EMPTY_POS), index + 1); return false; }
+    std::vector<PackFile> files;
+    if (!collect(dir, L"", files)) return false;
+    if (!write_pack(path, files)) { say(tr(Tx::SS_EXPORT_FAIL), path); return false; }
+    say(tr(Tx::SS_AUTO_EXPORTED), index + 1, path);
+    return true;
+}
+
+namespace {
+// A folder rename can fail for a moment right after files were written into it (a virus scanner or the search indexer holds the new files open): tried again for about a second before it counts as failed.
+bool move_retry(const std::wstring& from, const std::wstring& to) {
+    for (int tries = 0; tries < 20; ++tries) {
+        if (MoveFileW(from.c_str(), to.c_str())) return true;
+        Sleep(50);
+    }
+    return false;
+}
+void wipe_retry(const std::wstring& dir) {
+    for (int tries = 0; tries < 20 && exists(dir); ++tries) { wipe_dir(dir); if (exists(dir)) Sleep(50); }
+}
+} // namespace
+
+bool saveslots_auto_push() {
+    std::wstring game;
+    if (!game_dir(game)) { log_line("SAVESLOTS", "auto save skipped: the game's save folder is not known"); return false; }
+    Bytes bytes[kGameSlots]; bool have[kGameSlots] = {};
+    if (!capture_current(game, bytes, have)) return false;
+    if (!have[0] && !have[1] && !have[2]) { log_line("SAVESLOTS", "auto save skipped: no save slot has a file"); return false; }
+    HsList hs; bool have_hs = false;
+    if (!capture_handshake(game, hs, have_hs)) return false;
+
+    SaveBackup b;
+    b.saved_at = (int64_t)time(nullptr);
+    char when[40] = {};
+    { time_t t = (time_t)b.saved_at; tm lt{}; localtime_s(&lt, &t); strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &lt); }
+    _snprintf_s(b.name, sizeof(b.name), _TRUNCATE, tr(Tx::AUTO_NAME), when);
+
+    // the new one is written whole into its own folder first; only then does the queue shift (the oldest is deleted, each other one moves back a place, the new one becomes 01)
+    const std::wstring fresh = root_of(game) + L"\\auto_new";
+    if (!write_folder(game, fresh, bytes, have, b, have_hs ? &hs : nullptr)) return false;
+    wipe_retry(auto_dir(game, kAutoSaveCount - 1));
+    for (int i = kAutoSaveCount - 2; i >= 0; --i)
+        if (exists(auto_dir(game, i)) && !move_retry(auto_dir(game, i), auto_dir(game, i + 1)))
+            log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! auto save queue: position %d could not move back one place", i + 1);
+    if (!move_retry(fresh, auto_dir(game, 0))) {
+        log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! auto save could not be placed as position 1 (the new copy stays in auto_new)");
+        return false;
+    }
+    saveslots_refresh();
+    say(tr(Tx::SS_AUTO_SAVED), b.name);
+    return true;
+}
+
+void saveslots_auto_tick() {
+    // A RUN SETTLED AND THE PLAYER IS BACK IN THE WAREHOUSE: the map scene was live (a run), and now the House scene is, with no map. Two scene walks a second at most; the push waits a few seconds so the
+    // game's own save at that moment has been written. The title screen disarms it (a run that was left, then a save loaded into the House, is not a settlement).
+    static ULONGLONG next = 0, push_at = 0;
+    static bool armed = false;
+    const ULONGLONG t = GetTickCount64();
+    if (t < next) return;
+    next = t + 500;
+    if (push_at) {
+        if (t >= push_at) { push_at = 0; log_line("SAVESLOTS", "back in the warehouse after a settled run: the current saves go into the auto save queue"); saveslots_auto_push(); }
+        return;
+    }
+    if (leave_scene_live(kScene_Map)) { armed = true; return; }
+    if (leave_scene_live(kScene_MainMenu)) { armed = false; return; }
+    if (armed && leave_scene_live(kScene_House)) { armed = false; push_at = t + 3000; }
 }
 
 bool saveslots_delete(int index) {

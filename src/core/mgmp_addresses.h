@@ -123,6 +123,13 @@ enum Target : int {
     T_PropSetInt,         // the save-properties int setter (0x140938F40: std::string* name [destroyed by the callee], int value): increment/decrement_legacy_counter write through it -- seen inside an event window, so the answers follow the event's own writes
     T_HouseSave,          // the House state writer (0x1401E6810, `files.house_state`): it writes each House cat entity's OWN id (entity+0x80) -- the ids of cats swapped with their clones are put right first (mgmp_catsync)
     T_EvItemPick,         // the pool item picker (0x1408DEC40: pool, out, node, luck in xmm3) that get_item_from_pool & co. call: hooked ONLY for calls made by the WorldEvent code (return address in 0x9173A0-0x919752 / 0x91F5F0-0x9205F7) -- the stream is reset from the node first (unlocks_event_roll), so what the party_damage etc. before it drew on each peer's own party cannot change the pick (Baphomet, 2026-10-03)
+    T_UnlockedClasses,    // MewSaveFile: the list of unlocked CLASS names (0x1402322B0: save, out std::vector<std::string>*, bool with_colorless) -> out: the ability pools of "any unlocked class" are built from it; a client in a battle window answers like the host
+    T_ResSetLegacyToken,     // the event result `set_legacy_token` (0x140934C40: result context, node): writes the property `mapflag_<token>` = 1 straight into the save-properties map
+    T_ResUnlockItemQuest,    // the event result `unlock_item_quest` (0x140934FD0: context, node): unlocks an item quest in the save
+    T_ResAdventureUnlock,    // the event result `trigger_adventure_unlock` (0x140935060: context, node): unlocks content through the save
+    T_ResCompleteItemQuest,  // the House method `complete_item_quest` (0x1401CF6F0: House*, quest name, flag), called by the event result of the same name
+    T_ResGiveItem,        // the event results' common item giver (0x140920600: result context, item name, equip flag, flag): get_item, get_item_from_pool, get_and_equip_item(_from_pool), get_parasite_from_pool -- inventory insert, the equip on the subject cat, the message
+    T_ResDejaVu,             // the event result `increment_deja_vu` (0x140937930: context, node): the deja-vu legacy counter
     T_COUNT
 };
 
@@ -645,6 +652,13 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x00938F40, "PROPSETINT", "save property int setter (event legacy counters)" },
     { 0x001E6810, "HOUSESAVE", "House state writer (house_state)" },
     { 0x008DEC40, "EVITEMPICK", "event: pick an item from a pool (get_item_from_pool)" },
+    { 0x002322B0, "UNLCLASSES", "MewSaveFile: the unlocked class names" },
+    { 0x00934C40, "RESLEGACYTOKEN", "event result set_legacy_token: writes mapflag_<token> = 1 into the save properties" },
+    { 0x00934FD0, "RESUNLOCKQUEST", "event result unlock_item_quest" },
+    { 0x00935060, "RESADVUNLOCK", "event result trigger_adventure_unlock" },
+    { 0x001CF6F0, "RESCOMPLETEQUEST", "event result complete_item_quest" },
+    { 0x00920600, "RESGIVEITEM", "event result item giver (get_item & co: Inventory::insert_item + equip)" },
+    { 0x00937930, "RESDEJAVU", "event result increment_deja_vu" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -742,7 +756,17 @@ enum Call : int {
     C_StartTransition,       // void(MewDirector*, std::string* name, std::function<void()>* done, double delay)
     C_PropGetInt,            // int64(MewSaveFile* props, std::string key BY VALUE, int64 default) -- sub_14022C5E0, reads one `properties` row
     C_CatStats,              // int* (CatData*, int out[7], const int filter[7] (16-aligned, -1 = all), bool full, bool no_kitten_penalty) -- sub_1400C1820
+    C_CharacterFace,         // void(Character*, iVec2D dir, bool, bool) -- sub_14010CE50. Turns a cat: writes Character+0x388 AND plays the turn animation; every caller passes (dir, 0, 0). The peer's end-turn facing goes through it (mgmp_lockstep.cpp apply_remote)
     C_SaveGame,              // void(MewDirector*) -- sub_1403BDCF0: writes the whole save (cats table, house_state, properties). The native settlement calls it as its last step (0x1403B5F6E), BEFORE the clone merge
+    // --- making, replacing and removing battle units (mgmp_spawntest.cpp; RESEARCH-spawn-destroy-20261003.md) ---
+    C_SpawnCharacter,        // Character*(void* unused, std::string name BY VALUE, World*) -- sub_1407ACF70; null while the world is being torn down
+    C_TransformUnit,         // Character*(Character* old, std::string name BY VALUE, bool take_turn_slot, bool keep_hp, bool end_turn [stack]) -- sub_1408D3C20
+    C_TObjRemove,            // void(TacticsObject*, bool move_sprites) -- sub_140832B80: sets +0x60 (removed), unregisters from the board, tile = off-board
+    C_EntityStart,           // void(Entity*) -- sub_140969F30: runs Start (+0x30) on every child not yet started; a Character's Start builds its brain
+    C_TurnOrderAdd,          // void(TurnControl*, Character*, int spawn_in, void*) -- sub_1408E5520; the summons pass (3, null)
+    C_CharTurnControl,       // TurnControl*(Character*) -- sub_140049750, through the world's type table 0x855
+    C_CharDie,               // void(Character*, bool, const CustomVectorInterface<Character*>*, bool) -- sub_140115070: the death events (drops, deathrattles) run from here
+    C_CorpsePop,             // void(Character*, bool) -- sub_140115E10
     C_COUNT
 };
 
@@ -1007,7 +1031,16 @@ static const CallDesc kCalls[C_COUNT] = {
     { 0x003C0210, "MewDirector::start_transition" },
     { 0x0022C5E0, "SaveProps::get_int" },
     { 0x000C1820, "CatData::total_stats" },
+    { 0x0010CE50, "Character::Face" },
     { 0x003BDCF0, "MewDirector::SaveGame" },
+    { 0x007ACF70, "spawn a character by name" },
+    { 0x008D3C20, "transform a unit into another kind" },
+    { 0x00832B80, "TacticsObject::Remove" },
+    { 0x00969F30, "Entity: start its components" },
+    { 0x008E5520, "TurnControl: add to the turn order" },
+    { 0x00049750, "Character -> TurnControl" },
+    { 0x00115070, "Character::Die" },
+    { 0x00115E10, "Character::OnCorpsePop" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -1141,6 +1174,8 @@ constexpr uintptr_t kCatData_Killed  = 0x7AC;   // u8
 constexpr uint64_t  kCatFlag_Perished = 0x40000;
 // The instruction after the call that picks a WorldEvent's subject cat (sub_140913A90, `call sub_1400AB770` at 0x1409150F3): T_PickRandom only acts when it returns here.
 constexpr uintptr_t kRet_EventSubject = 0x009150F8;
+constexpr uintptr_t kCatData_BirthDay    = 0xC38;  // int32: the day the cat was born (T_IsKitten: the save's day - this <= 1 means kitten)
+constexpr uintptr_t kCatData_DayOverride = 0xC40;  // int64: replaces the save's day in that test when not -1
 constexpr uint64_t  kCatFlag_OnAdventure = 0x80000; // set by set_party_and_go (0x3B1504) on the cats that leave; 0xD2D40 clears it
 constexpr uintptr_t kCatData_StatusEffects = 0x7B8; // RVA 0x22F301 appends; 0xFD44D restores each entry into battle.
 constexpr uintptr_t kCatStatusEffectSize = 0xB8; // RVA 0x237368 append stride and 0x617B9 destructor stride.

@@ -10,6 +10,7 @@
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_lockstep.h"   // lockstep_probe_roster_ids -- TEMPORARY, see kLevelUpProbe
+#include "mgmp_unlocks.h"    // unlocks_level_screen_opens
 #include "mgmp_rtti.h"       // rtti_class_name, so the probe can name the screen
 #include "mgmp_catsync.h"    // serialize_cat -- the cat's own serialized image, the only
                              // way the level-up probe can see a change behind a pointer
@@ -384,6 +385,8 @@ struct State {
     // two agree -- the single check that stops a choice outliving its node.
     uint64_t pending_seed[2]     = {0, 0};
     uint64_t here_seed           = 0;
+    uint64_t story_block_seed    = 0;     // the node whose event this client replays from the host: its save is not changed by the result (see choice_story_event_block_active)
+    uint32_t story_block_said    = 0;     // bit per kind already logged for that node
 
     // NODES THIS PEER WILL NEVER ENTER, so a choice that arrives for one after
     // the fact can be refused instead of held forever.
@@ -864,6 +867,18 @@ void apply_event_pending(void* screen) {
             log_line_lvl(LogLevel::Error, "CHOICE", "!! event page '%s' step=%u options differ; choice not applied", page, m.level_step);
             return;
         }
+        // A STORY EVENT, AND ONLY THAT (2026-10-04): the "?" events are shared too now (kPerPlayerNodes is off), so the client replays the host's click on every event -- but a random event is as much the client's own as
+        // the host's (its tokens, counters and unlocks are progress this save earns), while a story event is the host's: one of its options is a quest or home option, or the host chose one. For the rest of a story
+        // event's node the result of the host's choice may not change THIS peer's save (the commit below runs the option's result script on it).
+        // THE QUEST EVENTS ARE NAMED "Quest_<name>" (maps/*.gon: `quest_event { type special_event level Quest_X }`), and their options carry ordinary stat keys ('lck', 'int', ...): the first live test of a story
+        // node (Quest_DeadKing, option 'lck') was taken for a random event by the option keys alone. So the name counts first.
+        const bool story = strncmp(page, "Quest_", 6) == 0 || event_is_story(begin, count) || strcmp(m.name, "quest") == 0 || strcmp(m.name, "home") == 0;
+        if (story) {
+            if (g.story_block_seed != g.here_seed) { g.story_block_seed = g.here_seed; g.story_block_said = 0; }
+            log_line("CHOICE", "STORY EVENT '%s' (option '%s') replayed from the host: until this node ends the result's changes to THIS peer's save (legacy tokens, quest progress, adventure unlocks, legacy counters, the items it gives) are skipped", page, m.name);
+        } else {
+            log_line("CHOICE", "event '%s' (option '%s') replayed from the host is a RANDOM one: its result is applied to this peer's save as it always was", page, m.name);
+        }
         if (!inject_event(m.index)) return;
         // The native commit must close the choice phase. Do not count a mere
         // callback invocation as success, nor retry an ambiguous partial commit.
@@ -1043,6 +1058,7 @@ void choice_reset_run() {
     install_level_screen_hooks();     // the build site found by the offline byte scan
     follow_reset_run();
     g.here_seed = 0;
+    g.story_block_seed = 0;
     g.level_step = 0;
     g.level_pending_count = 0;
     g.world_event = nullptr;
@@ -1174,6 +1190,19 @@ bool choice_on_event_commit(void* cap) {
     ++g.event_step; ++g.sent;
     log_line("CHOICE", "-> event '%s' step=%u option=%u/%u ('%s')", m.event_name, m.level_step, m.index, m.count, m.name);
     return true;
+}
+
+bool choice_story_event_block_active() {
+    return g.on && g.is_client && g.story_block_seed != 0 && g.story_block_seed == g.here_seed;
+}
+
+void choice_story_event_blocked(const char* what) {
+    uint32_t bit = 0;
+    for (const char* c = what ? what : ""; *c; ++c) bit = bit * 31 + (unsigned char)*c;
+    bit = 1u << (bit % 31);
+    if (g.story_block_said & bit) return;
+    g.story_block_said |= bit;
+    log_line_lvl(LogLevel::Warn, "CHOICE", "STORY EVENT: this peer's save was NOT changed -- skipped %s (the host's choice, replayed here)", what ? what : "?");
 }
 
 void choice_on_event_update(void* world_event) {
@@ -2311,6 +2340,7 @@ constexpr bool kOpenerSubst = true;
 // panel/options. Redirect the argument, never deserialize onto the drawn cat
 // and never retarget the screen after that increment.
 static void* __fastcall h_lvl_opener(void* screen, void* cat, void* host) {
+    if (g.on) unlocks_level_screen_opens();       // before the constructor builds the option pool
     if (g.on && kPerPeerLevelTarget && cat) {
         uint64_t drawn = 0;
         uint8_t owner = kNoPeer;

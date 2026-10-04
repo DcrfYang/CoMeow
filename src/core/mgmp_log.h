@@ -26,6 +26,14 @@ bool log_current_path(wchar_t* out, size_t cap);
 // Emits one complete line (newline appended, flushed).
 void log_line(const char* tag, const char* fmt, ...);
 
+// THE STAGE TIMELINE (2026-10-03). Every phase of a session -- departure, the setup barrier, a node, a battle, the settlement and each step inside it -- leaves one marker here. log_stage also writes
+// a "STAGE" line; log_stage_quiet only remembers it. The last markers (with how long ago each was) are printed when the process dies, so a crash says WHICH phase it died in without anyone having to
+// read the log back to find out.
+void log_stage(const char* fmt, ...);
+void log_stage_quiet(const char* fmt, ...);
+void log_stage_dump(const char* tag);                 // the remembered markers, oldest first, through log_line
+const char* log_stage_last();                          // the newest marker (empty before the first)
+
 // No seq/turn prefix -- used for the startup banner.
 void log_raw(const char* fmt, ...);
 

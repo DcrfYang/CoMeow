@@ -132,6 +132,8 @@ bool savefile_save_dir(wchar_t* out, size_t out_len);
 // Flush and capture this player's local SQLite database at a safe map boundary.
 // The returned buffer is malloc-owned by the caller.
 bool savefile_read_checkpoint(uint8_t** data, uint32_t* size, uint64_t* hash);
+// The full path of the save file this peer is playing from (the host's chosen slot), as the game last wrote it. False before a slot is chosen.
+bool savefile_live_path(wchar_t* out, size_t out_len);
 bool savefile_selected_slot(uint8_t* slot);
 
 // From h_ButtonUpdate, at the tail: PRESS PLAY FOR A CLIENT THAT IS SITTING ON

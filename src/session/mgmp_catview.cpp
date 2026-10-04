@@ -100,6 +100,13 @@ void catview_tick() {
     if (t < g_next_read) return;
     g_next_read = t + kReadMs;
 
+    // BEFORE the cards are read: a real cat that sits on a reserved clone id would be read as somebody else's. The party is already chosen on these two pages (the House's box is
+    // gone), which is the moment it is safe to give such a cat another id; see catsync_relocate_squatters. A scan is a handful of lookups.
+    if (session_live() && (page_self() == PageState::Collar || page_self() == PageState::Equipment)) {
+        static ULONGLONG s_next_scan = 0;
+        if (t >= s_next_scan) { s_next_scan = t + 1500; catsync_relocate_squatters("collar/gear page"); }
+    }
+
     // NOT gated on the fight (an earlier version was, and the cards froze at the first battle for
     // good: lockstep_in_battle() stays true until the NEXT fight re-snapshots). The lists are read
     // whole and validated, a failed read keeps the previous cards, and a fight's own numbers come

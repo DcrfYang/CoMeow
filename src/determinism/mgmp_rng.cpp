@@ -2,10 +2,12 @@
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_record.h"
+#include "mgmp_lockstep.h"
 
 #include <windows.h>
 #include <intrin.h>
 #include <cstring>
+#include <utility>
 
 namespace mgmp {
 namespace {
@@ -25,6 +27,15 @@ uintptr_t g_base = 0;
 volatile LONG64 g_total  = 0;
 volatile LONG64 g_global = 0;
 
+// the ledger (see the header). Single writer: only the thread that armed it adds, so there is no lock; the take also runs on that thread.
+volatile LONG g_led_on = 0;
+DWORD    g_led_tid = 0;
+uint32_t g_led_n = 0, g_led_dig = 2166136261u, g_led_over = 0, g_led_sites = 0;
+uint32_t g_led_nl = 0, g_led_digl = 2166136261u;
+bool     g_led_apply = false;
+uint32_t g_led_key[kLedgerSites] = {}, g_led_cnt[kLedgerSites] = {};
+uint32_t g_led_last = 0;               // index of the site hit last: draws come in runs from one site
+
 // Return address -> RVA. Absolute addresses would differ between runs under
 // ASLR and make every record differ; the RVA is stable for a pinned build.
 inline uint32_t site_rva(void* ret) {
@@ -41,10 +52,23 @@ inline uint32_t site_rva(void* ret) {
 // Ordering note: `s0` must be sampled BEFORE the original runs, because the
 // original mutates the state in place. That is the entire reason these detours
 // cannot be written as a simple "call original, then log".
+inline void ledger_add(uint8_t fn, uint32_t rva) {
+    const uint32_t key = (rva & 0x07FFFFFFu) | (g_led_apply ? 0u : 0x08000000u) | ((uint32_t)(fn & 15) << 28);
+    if (g_led_apply) { ++g_led_n; g_led_dig = (g_led_dig ^ key) * 16777619u; }
+    else { ++g_led_nl; g_led_digl = (g_led_digl ^ key) * 16777619u; }
+    if (g_led_last < g_led_sites && g_led_key[g_led_last] == key) { ++g_led_cnt[g_led_last]; return; }
+    for (uint32_t i = 0; i < g_led_sites; ++i) if (g_led_key[i] == key) { g_led_last = i; ++g_led_cnt[i]; return; }
+    if (g_led_sites < kLedgerSites) { g_led_key[g_led_sites] = key; g_led_cnt[g_led_sites] = 1; g_led_last = g_led_sites++; }
+    else ++g_led_over;
+}
+
 inline void note(uint8_t fn, void* ret, uint64_t s0, uint64_t result, bool global,
                  const void* state) {
     InterlockedIncrement64(&g_total);
-    if (global) InterlockedIncrement64(&g_global);
+    if (global) {
+        InterlockedIncrement64(&g_global);
+        if (g_led_on && GetCurrentThreadId() == g_led_tid) ledger_add(fn, site_rva(ret));
+    }
 
     if (!record_active()) return;
     if (!global && tune::kRngGlobalOnly) {
@@ -121,6 +145,9 @@ bool __fastcall h_rollchance(double p, double scale, uint64_t* state) {
     uint64_t s0  = state ? state[0] : 0;
     bool     r   = o_rollchance(p, scale, state);
     note(RNG_ROLL, ret, s0, (uint64_t)r, glb, state);
+    // The coin a melee kill drops (the effect at 0x2C3060): this roll's odds come from data that is not the same on every peer, so the HOST's answer is the one everybody uses.
+    const uint32_t rva = site_rva(ret);
+    if (glb && rva >= 0x2C3060 && rva < 0x2C3488) r = lockstep_roll_resolve(kRollSiteCoinDrop, p, scale, r);
     return r;
 }
 
@@ -140,5 +167,22 @@ void rng_counters(uint64_t* total, uint64_t* global) {
 }
 
 void rng_set_base(uintptr_t base) { g_base = base; }
+
+void rng_ledger_arm(bool on) {
+    InterlockedExchange(&g_led_on, 0);
+    g_led_n = 0; g_led_dig = 2166136261u; g_led_over = 0; g_led_sites = 0; g_led_last = 0; g_led_nl = 0; g_led_digl = 2166136261u; g_led_apply = false;
+    g_led_tid = on ? GetCurrentThreadId() : 0;
+    if (on) InterlockedExchange(&g_led_on, 1);
+}
+bool rng_ledger_armed() { return g_led_on != 0 && g_led_tid == GetCurrentThreadId(); }
+void rng_ledger_take(RngLedger& out) {
+    out = RngLedger{};
+    out.n = g_led_n; out.digest = g_led_dig; out.n_loose = g_led_nl; out.digest_loose = g_led_digl; out.sites = g_led_sites; out.over = g_led_over;
+    for (uint32_t i = 0; i < g_led_sites; ++i) { out.key[i] = g_led_key[i]; out.count[i] = g_led_cnt[i]; }
+    for (uint32_t i = 1; i < out.sites; ++i)          // insertion sort by key: the same table on both peers reads the same
+        for (uint32_t j = i; j > 0 && out.key[j] < out.key[j - 1]; --j) { std::swap(out.key[j], out.key[j - 1]); std::swap(out.count[j], out.count[j - 1]); }
+    g_led_n = 0; g_led_dig = 2166136261u; g_led_over = 0; g_led_sites = 0; g_led_last = 0; g_led_nl = 0; g_led_digl = 2166136261u;
+}
+void rng_ledger_phase(bool in_apply) { if (g_led_on && g_led_tid == GetCurrentThreadId()) g_led_apply = in_apply; }
 
 } // namespace mgmp

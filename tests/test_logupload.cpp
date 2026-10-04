@@ -28,6 +28,8 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc && req.nfiles < kLogUploadMaxFiles; ++i)
         MultiByteToWideChar(CP_UTF8, 0, argv[i], -1, req.files[req.nfiles++], MAX_PATH);
 
+    // CM_TEST_DELETE=<file>: the file the worker must delete once (and only once) the server has saved the upload (LogUploadRequest::on_ok_delete)
+    if (const char* d = getenv("CM_TEST_DELETE")) MultiByteToWideChar(CP_UTF8, 0, d, -1, req.on_ok_delete[req.ndelete++], MAX_PATH);
     if (!logupload_start(req)) { printf("could not start\n"); return 2; }
     if (logupload_start(req)) { printf("FAIL a second upload started while one was running\n"); return 2; }
     logupload_wait(60000);

@@ -165,6 +165,9 @@ struct Config {
     // ui.block_new_cats: the event effect "a new cat joins the run" does nothing. Off by default (the game as it is); set from the main menu's
     // mod settings. Part of the handshake's ruleset: both players must agree.
     bool     block_new_cats = false;
+    // ui.auto_upload_crash_log: when the game crashes (the crash handler runs) or an earlier run ended without a clean exit (crash, freeze, killed), its log is sent to the configured
+    // server by itself -- from the crash handler at once, and from the next start for what could not be sent then (mgmp_prevrun.h). False: nothing is sent unless the player presses "upload" in F2.
+    bool     auto_upload_crash_log = true;
     // debug.test_weaken: every enemy to 1 hp at the first usable turn (a test aid). Needs dev_tools, and both peers
     // must agree -- it is part of the ruleset the handshake compares.
     bool     test_weaken = false;

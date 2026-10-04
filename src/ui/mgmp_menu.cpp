@@ -27,6 +27,8 @@
 #include "mgmp_log.h"
 #include "mgmp_net.h"
 #include "mgmp_saveslots.h"
+#include "mgmp_roomhist.h"
+#include "mgmp_chat.h"
 #include "mgmp_page.h"
 #include "mgmp_abandon.h"
 #include "mgmp_room.h"
@@ -40,6 +42,7 @@
 #include "mgmp_upnp.h"
 #include "mgmp_steambridge.h"
 #include "mgmp_logupload.h"
+#include "mgmp_prevrun.h"
 
 namespace mgmp {
 namespace {
@@ -203,6 +206,11 @@ struct Menu {
     bool      room_connected = false;   // this client has been linked to the host at least once in the room it is in
     // The F2 log-upload panel.
     bool     log_open   = false;
+    bool     log_halt   = false;   // ...and the battle has HALTED: the window leads with what the players can do now
+    bool     log_desync = false;   // the window was raised by a battle desync (lockstep_take_desync_notice): no description to write, the summary goes instead
+    char     log_desync_text[192] = {};
+    bool     log_prev   = false;   // the window shows the PREVIOUS run (it ended badly): its log and dump, not this run's (mgmp_prevrun.h)
+    int      prev_stage = 0;       // 0 not looked yet, 1 an automatic upload of it is running, 2 handled
     bool     log_inited = false;
     char     log_addr[64] = {};
     char     log_desc[kLogUploadDescMax + 1] = {};
@@ -1006,12 +1014,15 @@ void draw_multi_window(const View& v) {
     const uint32_t total = signal_rooms(g.rooms, 32);
     // The rows that match the search: open rooms first, locked ones after them (the server sends them that way
     // already; sorting here as well keeps the list right whatever sent it).
-    uint32_t order[32]; uint32_t n = 0;
-    for (int pass = 0; pass < 2; ++pass)
-        for (uint32_t i = 0; i < total && i < 32; ++i)
-            if (g.rooms[i].pw == (pass == 1) &&
-                (contains_ci(g.rooms[i].name, g.search) || contains_ci(g.rooms[i].host, g.search) || contains_ci(g.rooms[i].id, g.search)))
-                order[n++] = i;
+    // THE ROOMS JOINED WITHIN A DAY, AND THE ROOMS OF THEIR HOSTS, come first (and are highlighted); inside each group the open rooms are before the locked ones.
+    uint32_t order[32]; bool recent[32] = {}; uint32_t n = 0;
+    for (uint32_t i = 0; i < total && i < 32; ++i) recent[i] = roomhist_recent(g.rooms[i].id, g.rooms[i].host);
+    for (int grp = 0; grp < 2; ++grp)
+        for (int pass = 0; pass < 2; ++pass)
+            for (uint32_t i = 0; i < total && i < 32; ++i)
+                if (recent[i] == (grp == 0) && g.rooms[i].pw == (pass == 1) &&
+                    (contains_ci(g.rooms[i].name, g.search) || contains_ci(g.rooms[i].host, g.search) || contains_ci(g.rooms[i].id, g.search)))
+                    order[n++] = i;
     if (n == 0) {
         text_c(dl, X(W / 2), Y(300), 30 * k, kInkSoft, total == 0 ? tr(Tx::NO_ROOMS) : tr(Tx::NO_MATCH));
     } else {
@@ -1026,6 +1037,10 @@ void draw_multi_window(const View& v) {
         for (uint32_t oi = 0; oi < n; ++oi) {
             const SignalRoom& r = g.rooms[order[oi]];
             const ImVec2 rp = ImGui::GetCursorScreenPos();
+            if (recent[order[oi]]) {      // joined within a day, or its host's other room: a tinted band with a bar at its left edge
+                cdl->AddRectFilled(ImVec2(rp.x + 2 * k, rp.y + 2 * k), ImVec2(rp.x + (lx1 - lx0) - 2 * k, rp.y + rowh - 2 * k), IM_COL32(120, 200, 120, 70), 6 * k);
+                cdl->AddRectFilled(ImVec2(rp.x + 2 * k, rp.y + 2 * k), ImVec2(rp.x + 10 * k, rp.y + rowh - 2 * k), IM_COL32(60, 150, 70, 200), 4 * k);
+            }
             float name_x = rp.x + 20 * k;
             if (r.pw) { draw_lock(cdl, ImVec2(name_x + 14 * k, rp.y + rowh * 0.5f), 30 * k, kInk); name_x += 40 * k; }
             text_at(cdl, ImVec2(name_x, rp.y + 10 * k), 28 * k, kInk, r.name[0] ? r.name : r.id);
@@ -1036,6 +1051,7 @@ void draw_multi_window(const View& v) {
             if (paper_button(r.id, ImVec2(X(730), rp.y + 6 * k), ImVec2(X(W - 70), rp.y + rowh - 6 * k),
                              full ? tr(Tx::FULL) : tr(Tx::JOIN), 26 * k, !full && !busy && !g.pw_ask, Tone::Good)) {
                 strncpy_s(g.room_name, sizeof(g.room_name), r.name[0] ? r.name : r.id, _TRUNCATE);
+                roomhist_set_pending(r.id, r.host);        // noted once the lobby has really put this peer in it
                 if (r.pw) {
                     // A locked room: ask for the password first.
                     g.pw_ask = true; g.pw_wrong = false; g.pw_sent = false; g.pw_buf[0] = 0;
@@ -1379,17 +1395,7 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
                           : (host ? tr(Tx::UNLOCKED_HOST) : tr(Tx::UNLOCKED_CLIENT)));
     y += 34 * k;
 
-    // The host's game port is closed to the outside (the server tried it): the one thing a host must be told. Not while the
-    // router mapping is still being set up -- that may fix it a moment from now.
-    // Not in a server-relay room: its bytes go through the lobby server, the game port is not needed.
-    if (host && signal_reach() == 2 && upnp_state() != UpnpState::Working && strcmp(signal_room_transport(), "relay") != 0) {
-        const bool via_steam = steam_bridge_ready(), nat2 = upnp_double_nat();
-        char warn[400];
-        if (via_steam) _snprintf_s(warn, sizeof(warn), _TRUNCATE, "%s", tr(nat2 ? Tx::REACH_STEAM_NAT : Tx::REACH_STEAM));
-        else if (nat2) _snprintf_s(warn, sizeof(warn), _TRUNCATE, "%s", tr(Tx::REACH_WARN_NAT));
-        else           _snprintf_s(warn, sizeof(warn), _TRUNCATE, tr(Tx::REACH_WARN), (unsigned)config().net_port);
-        y = wrap_text(dl, o.x, y, w, 21 * k, 25 * k, via_steam ? kGreen : kAmber, warn) + 8 * k;
-    }
+    // (The notice that the host's game port is closed to the outside, with the router-forwarding advice, is gone for good (2026-10-04): it misled -- the server relay and Steam carry a room without the port.)
 
     // Session line.
     y += 2 * k;
@@ -1611,7 +1617,8 @@ void file_dialog_open(bool save, int index, const char* default_name) {
 bool file_dialog_take() {
     if (InterlockedCompareExchange(&g_fd.state, 0, 0) != 2) return false;
     if (g_fd.ok && g_fd.path[0]) {
-        if (g_fd.save) saveslots_export(g_fd.index, g_fd.path);
+        if (g_fd.save && g_fd.index >= 100) saveslots_auto_export(g_fd.index - 100, g_fd.path);     // an auto save
+        else if (g_fd.save)                 saveslots_export(g_fd.index, g_fd.path);
         else           saveslots_import(g_fd.index, g_fd.path);
     }
     InterlockedExchange(&g_fd.state, 0);
@@ -1684,6 +1691,47 @@ void draw_backup_window(const View& v) {
     ImDrawList* cdl = ImGui::GetWindowDrawList();
     const float rowh = 80 * k;
     const float rx = X(56), rw = (W - 112) * k;
+    // THE AUTO SAVE QUEUE, ABOVE THE TWENTY: the newest first, taken each time the player is back in the warehouse after a settled run; the oldest is replaced by the next one. Load and export only -- an
+    // auto save can be neither overwritten nor deleted by the player.
+    {
+        const ImVec2 hp = ImGui::GetCursorScreenPos();
+        text_at(cdl, ImVec2(hp.x + 18 * k, hp.y + 10 * k), 24 * k, kInk, tr(Tx::AUTO_HEADER));
+        ImGui::SetCursorScreenPos(hp);
+        ImGui::Dummy(ImVec2(rw, 48 * k));
+        for (int i = 0; i < kAutoSaveCount; ++i) {
+            const SaveBackup& b = saveslots_auto_get(i);
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            cdl->AddLine(ImVec2(rp.x + 10 * k, rp.y + rowh - 2), ImVec2(rp.x + rw - 10 * k, rp.y + rowh - 2), IM_COL32(30, 30, 30, 60), 1.5f);
+            char idx[8]; _snprintf_s(idx, sizeof(idx), _TRUNCATE, "A%d", i + 1);
+            text_at(cdl, ImVec2(rp.x + 18 * k, rp.y + 20 * k), 36 * k, b.used ? kInk : kGrey, idx);
+            if (b.used) {
+                text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 5 * k), 30 * k, kInk, b.name);
+                char sl[256]; fmt_slots(b, sl, sizeof(sl));
+                text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 46 * k), 20 * k, kInkSoft, sl);
+            } else {
+                text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 22 * k), 28 * k, kGrey, tr(Tx::EMPTY_POS));
+            }
+            if (b.used) {
+                const float by0 = rp.y + 12 * k, by1 = rp.y + rowh - 14 * k;
+                char id[24];
+                _snprintf_s(id, sizeof(id), _TRUNCATE, "al%d", i);
+                const bool ld = confirm_armed(Confirm::Load, 100 + i);
+                if (paper_button(id, ImVec2(rp.x + 904 * k, by0), ImVec2(rp.x + 1008 * k, by1), ld ? tr(Tx::CONFIRM_LOAD) : tr(Tx::LOAD), 24 * k, !locked, Tone::Good, ld)) {
+                    if (!ld) arm(Confirm::Load, 100 + i);
+                    else { saveslots_auto_load(i); refresh_backup_view(); }
+                }
+                _snprintf_s(id, sizeof(id), _TRUNCATE, "ax%d", i);
+                if (paper_button(id, ImVec2(rp.x + 1014 * k, by0), ImVec2(rp.x + 1118 * k, by1), tr(Tx::EXPORT), 24 * k, !dialog_open))
+                    file_dialog_open(true, 100 + i, b.name);       // an index of 100 and up in the file dialog is an auto save
+            }
+            ImGui::SetCursorScreenPos(rp);
+            ImGui::Dummy(ImVec2(rw, rowh));
+        }
+        const ImVec2 dp = ImGui::GetCursorScreenPos();
+        cdl->AddLine(ImVec2(dp.x + 10 * k, dp.y + 6 * k), ImVec2(dp.x + rw - 10 * k, dp.y + 6 * k), IM_COL32(30, 30, 30, 140), 2.5f);
+        ImGui::SetCursorScreenPos(dp);
+        ImGui::Dummy(ImVec2(rw, 20 * k));
+    }
     for (int i = 0; i < kSaveBackupCount; ++i) {
         const SaveBackup& b = saveslots_get(i);
         const ImVec2 rp = ImGui::GetCursorScreenPos();
@@ -1757,6 +1805,7 @@ void draw_backup_window(const View& v) {
         ImGui::SetCursorScreenPos(rp);
         ImGui::Dummy(ImVec2(rw, rowh));   // see the room list: no bare SetCursorScreenPos at a child's end
     }
+
     ImGui::EndChild();
 
     // Feedback line.
@@ -1791,6 +1840,129 @@ void draw_cursor(const View& v) {
     const ImVec2 p0(io.MousePos.x - hx * s, io.MousePos.y - hy * s);
     const ImVec2 p1(p0.x + 128.0f * s, p0.y + 128.0f * s);
     ImGui::GetForegroundDrawList()->AddImage(t.ref(), p0, p1);
+}
+
+// ---------------------------------------------------------------------------
+// THE ROOM CHAT (mgmp_chat). Enter opens the input with the whole history on a dimmed screen (the game gets neither mouse nor keyboard meanwhile); Enter again sends what was typed and closes it (an empty
+// box only closes). Whenever a line is sent or arrives, the history is shown at the lower left of every screen for ten seconds and then fades.
+// ---------------------------------------------------------------------------
+
+// The same breaking rule as wrap_text (a space when the line has one, between characters otherwise, always on a UTF-8 boundary), into lines instead of onto the screen.
+void wrap_split(const char* text, float fs, float maxw, std::vector<std::string>& out) {
+    const char* s = text;
+    while (*s) {
+        const char* e = s;
+        const char* fit = s;
+        const char* space = nullptr;
+        while (*e) {
+            const unsigned char c = (unsigned char)*e;
+            const int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
+            const char* nx = e + len;
+            std::string part(s, nx);
+            if (text_size(fs, part.c_str()).x > maxw) break;
+            fit = nx; e = nx;
+            if (c == ' ') space = nx;
+        }
+        const char* cut = fit;
+        if (*e && *e != ' ' && space && space > s) cut = space;
+        if (cut == s) cut = s + 1;
+        std::string ln(s, cut);
+        while (!ln.empty() && ln.back() == ' ') ln.pop_back();
+        out.push_back(ln);
+        s = cut;
+        while (*s == ' ') ++s;
+    }
+}
+
+// One chat line as "name: text", wrapped, in the colour of its sender's P1..P4 tag in the room panel (the room list's order, host first; the same four colours).
+struct ChatRow { std::string text; ImU32 col; };
+void chat_rows(float fs, float maxw, int first, std::vector<ChatRow>& rows) {
+    static const ImU32 kPlayer[4] = { IM_COL32(205, 58, 52, 255), IM_COL32(58, 108, 205, 255), IM_COL32(214, 168, 24, 255), IM_COL32(56, 150, 68, 255) };
+    SignalPeer peers[8];
+    const uint32_t np = signal_peers(peers, 8);
+    for (int i = first; i < chat_count(); ++i) {
+        const ChatLine& l = chat_line(i);
+        ImU32 col = kInk;                                           // somebody no longer in the room: plain ink
+        for (uint32_t pi = 0; pi < np; ++pi) if (strcmp(peers[pi].name, l.name) == 0) { col = kPlayer[pi & 3]; break; }
+        std::string full = std::string(l.name) + ": " + l.text;
+        std::vector<std::string> parts;
+        wrap_split(full.c_str(), fs, maxw, parts);
+        for (const std::string& p : parts) rows.push_back({ p, col });
+    }
+}
+
+void draw_chat(const View& v) {
+    const float k = v.k;
+    bool open = chat_input_open();
+    if (open && !chat_available()) { chat_set_input_open(false); open = false; }       // the room ended under it
+    static char buf[kChatTextMax];
+    static bool was_open = false;
+    static int seen = 0;
+
+    if (open) {
+        if (!was_open) { was_open = true; buf[0] = 0; seen = -1; }
+        g.hovering_button = true;
+        // Enter again: send what was typed (an empty box only closes), then the history is shown for ten seconds on every screen. Esc closes without sending.
+        const bool enter = chat_take_enter_while_open();
+        const bool esc = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+        if (enter || esc) {
+            if (enter) chat_submit(buf);
+            buf[0] = 0; was_open = false;
+            chat_set_input_open(false);
+            ImGui::GetIO().ClearInputKeys();
+            return;
+        }
+        if (!modal_begin("##mgmp_chat")) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float W = 1100, H = 700;
+        const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+        paper(dl, v, a, ImVec2(a.x + W * k, a.y + H * k));
+        auto X = [&](float x) { return a.x + x * k; };
+        auto Y = [&](float y) { return a.y + y * k; };
+        text_c(dl, X(W / 2), Y(22), 40 * k, kInk, tr(Tx::CHAT_TITLE));
+
+        const float fs = 28 * k, lh = 38 * k, cw = (W - 120) * k;
+        std::vector<ChatRow> rows;
+        chat_rows(fs, cw, 0, rows);
+        const float hy0 = Y(84), hy1 = Y(H - 120);
+        rough_rect(dl, ImVec2(X(40), hy0), ImVec2(X(W - 40), hy1), IM_COL32(255, 255, 250, 60), kInk, 2.2f, 31, 1.2f);
+        ImGui::SetCursorScreenPos(ImVec2(X(48), hy0 + 6 * k));
+        ImGui::BeginChild("##chat_hist", ImVec2((W - 96) * k, hy1 - hy0 - 12 * k), false, ImGuiWindowFlags_NoBackground);
+        ImDrawList* cdl = ImGui::GetWindowDrawList();
+        const ImVec2 cp = ImGui::GetCursorScreenPos();
+        if (rows.empty()) text_at(cdl, ImVec2(cp.x + 12 * k, cp.y + 10 * k), fs, kGrey, tr(Tx::CHAT_EMPTY));
+        for (size_t i = 0; i < rows.size(); ++i)
+            text_at(cdl, ImVec2(cp.x + 12 * k, cp.y + 6 * k + lh * (float)i), fs, rows[i].col, rows[i].text.c_str());
+        ImGui::Dummy(ImVec2(cw, lh * (float)(rows.empty() ? 1 : rows.size()) + 12 * k));
+        if (seen != chat_count()) { seen = chat_count(); ImGui::SetScrollHereY(1.0f); }      // the newest line is the one in view
+        ImGui::EndChild();
+
+        ImGui::SetKeyboardFocusHere();                                    // the box keeps the keyboard, so the game never gets a key while this is open
+        paper_input("##chat_in", ImVec2(X(40), Y(H - 100)), ImVec2(X(W - 40), Y(H - 44)), buf, sizeof(buf), tr(Tx::CHAT_HINT), 28 * k);
+        ImGui::End();
+        return;
+    }
+    was_open = false;
+
+    // Not typing: the history for ten seconds after the last line, then a fade.
+    const uint64_t until = chat_show_until();
+    if (!until || !chat_available()) return;
+    const uint64_t t = GetTickCount64();
+    if (t >= until + kChatFadeMs) return;
+    const float a = t <= until ? 1.0f : 1.0f - (float)(t - until) / (float)kChatFadeMs;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const float fs = 26 * k, lh = 34 * k, cw = 820 * k;
+    std::vector<ChatRow> rows;
+    chat_rows(fs, cw, chat_count() > 24 ? chat_count() - 24 : 0, rows);
+    if (rows.empty()) return;
+    const size_t maxrows = 16;
+    const size_t first = rows.size() > maxrows ? rows.size() - maxrows : 0;
+    const float h = lh * (float)(rows.size() - first) + 24 * k;
+    const ImVec2 pa(v.org.x + 28 * k, v.org.y + v.h - 150 * k - h), pb(pa.x + cw + 40 * k, pa.y + h);
+    rough_rect(dl, pa, pb, mul_alpha(IM_COL32(217, 217, 210, 225), a), mul_alpha(kInk, a), 2.6f, 9, 1.4f);
+    ImFont* f = g.font ? g.font : ImGui::GetFont();
+    for (size_t i = first; i < rows.size(); ++i)
+        dl->AddText(f, fs, ImVec2(pa.x + 20 * k, pa.y + 12 * k + lh * (float)(i - first)), mul_alpha(rows[i].col, a), rows[i].text.c_str());
 }
 
 void draw_toast(const View& v) {
@@ -1960,6 +2132,8 @@ void format_filetime(uint64_t ft, char* out, size_t cap) {
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 }
 
+constexpr uint32_t kSyncRowsShown = 6;   // rows of the handshake list shown at once; the rest scroll
+
 void draw_save_sync(const View& v) {
     SaveSyncView sv;
     static bool was_up = false;
@@ -1977,9 +2151,9 @@ void draw_save_sync(const View& v) {
 
     const float W = 780;
     float H = 300;
-    if (sv.phase == kSyncInvalid && sv.selected) H = 400;
+    if (sv.phase == kSyncInvalid && sv.selected) H = (sv.selected & kHoldersNoRecord) ? 500 : 400;   // the no-record text is longer
     if (show_rows)     H = 170 + (np ? np : 1) * 62 + 40 + 76;
-    else if (choosing) H = 190 + (items ? items : 1) * 76 + 40 + 76;
+    else if (choosing) H = 190 + (items ? (items < kSyncRowsShown ? items : kSyncRowsShown) : 1) * 76 + 40 + 76;   // more than that scroll
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
     const ImVec2 sz(W * k, H * k);
     if (!overlay_window_begin("##mgmp_sync", a, sz)) { ImGui::End(); return; }
@@ -2013,24 +2187,29 @@ void draw_save_sync(const View& v) {
     } else if (choosing) {
         text_c(dl, X(W / 2), Y(40), 44 * k, kInk, tr(Tx::CHOOSE_SYNC));
         text_c(dl, X(W / 2), Y(102), 22 * k, kInkSoft, tr(Tx::CHOOSE_SYNC_HINT));
-        float y = 150;
-        int index = -1;
-        if (sv.prep) {
-            if (paper_button("hs_prep", ImVec2(X(50), Y(y)), ImVec2(X(W - 50), Y(y + 64)),
-                             tr(Tx::PREP_STAGE), 28 * k, true, Tone::Good))
-                checkpoint_host_pick(-1);
-            y += 76;
-        }
-        for (uint32_t i = 0; i < sv.n; ++i, ++index) {
-            char when[40], label[160], id[24];
+        // THE LIST SCROLLS (2026-10-04): the journal keeps the whole run now, so it can be far longer than the window. The wheel or the bar moves it.
+        const uint32_t shown = items ? (items < kSyncRowsShown ? items : kSyncRowsShown) : 1;
+        ImGui::SetCursorScreenPos(ImVec2(X(44), Y(146)));
+        ImGui::BeginChild("##hs_list", ImVec2((W - 88) * k, (shown * 76 - 4) * k), false, ImGuiWindowFlags_NoBackground);
+        const float lx = ImGui::GetCursorScreenPos().x + 6 * k, lw = (W - 100 - 24) * k;
+        auto row = [&](const char* id, const char* label, Tone tone, bool armed) {
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            const bool hit = paper_button(id, ImVec2(lx, rp.y + 2 * k), ImVec2(lx + lw, rp.y + 66 * k), label, 22 * k, true, tone, armed);
+            ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + 76 * k));
+            ImGui::Dummy(ImVec2(1, 0));
+            return hit;
+        };
+        if (sv.prep && row("hs_prep", tr(Tx::PREP_STAGE), Tone::Good, false)) checkpoint_host_pick(-1);
+        for (uint32_t i = 0; i < sv.n && i < kCheckpointCandidates; ++i) {
+            char when[40], label[220], id[24], tail[160];
             format_filetime(sv.entry[i].stamp, when, sizeof(when));
-            _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY),
-                        i + 1, (unsigned long long)sv.entry[i].seq, when, i == 0 ? tr(Tx::LATEST) : "");
+            const bool boss = (sv.entry[i].flags & kCheckpointAfterBoss) != 0;      // right after the chapter boss: next floor or home from here
+            _snprintf_s(tail, sizeof(tail), _TRUNCATE, "%s%s", i == 0 ? tr(Tx::LATEST) : "", boss ? tr(Tx::SYNC_AFTER_BOSS) : "");
+            _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY), i + 1, (unsigned long long)sv.entry[i].seq, when, tail);
             _snprintf_s(id, sizeof(id), _TRUNCATE, "hs_%u", i);
-            if (paper_button(id, ImVec2(X(50), Y(y)), ImVec2(X(W - 50), Y(y + 64)), label, 22 * k))
-                checkpoint_host_pick((int)i);
-            y += 76;
+            if (row(id, label, Tone::Normal, boss)) checkpoint_host_pick((int)i);
         }
+        ImGui::EndChild();
         if (paper_button("hs_repick", ImVec2(X(W / 2 - 150), Y(H - 96)), ImVec2(X(W / 2 + 150), Y(H - 40)),
                          tr(Tx::REPICK), 26 * k))
             room_abort_selection();
@@ -2045,8 +2224,9 @@ void draw_save_sync(const View& v) {
                     const size_t at = strlen(who);
                     _snprintf_s(who + at, sizeof(who) - at, _TRUNCATE, "%s%s", at ? ", " : "", peers[i].name);
                 }
-            char line[360];
-            _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::COMBO_INVALID_3), who[0] ? who : "?");
+            char line[480];
+            // bit 7: every one of them is on the map with no co-op record to recover it (kHoldersNoRecord) -- the way out is back to the warehouse, not "load the original save"
+            _snprintf_s(line, sizeof(line), _TRUNCATE, tr((sv.selected & kHoldersNoRecord) ? Tx::COMBO_INVALID_4 : Tx::COMBO_INVALID_3), who[0] ? who : "?");
             wrap_text(dl, X(50), Y(204), (W - 100) * k, 22 * k, 28 * k, kInkSoft, line);
         }
         // OK starts the round over on EVERY peer: nobody is left holding a pick the host refused.
@@ -2302,6 +2482,11 @@ void format_size(char* out, size_t cap, uint32_t n) {
 // The files an upload carries: this run's trace log, and the boot log beside it when there is one.
 int collect_log_files(wchar_t files[kLogUploadMaxFiles][MAX_PATH]) {
     int n = 0;
+    if (g.log_prev) {       // the run that ended badly: its log and its crash dump
+        LogUploadRequest pr;
+        if (prevrun_request(pr)) { for (int i = 0; i < pr.nfiles; ++i) wcsncpy_s(files[n++], MAX_PATH, pr.files[i], _TRUNCATE); return n; }
+        g.log_prev = false;
+    }
     wchar_t cur[MAX_PATH] = {};
     if (!log_current_path(cur, MAX_PATH)) return 0;
     wcsncpy_s(files[n++], MAX_PATH, cur, _TRUNCATE);
@@ -2323,7 +2508,8 @@ void draw_log_window(const View& v) {
         strncpy_s(g.log_addr, sizeof(g.log_addr), g.addr[0] ? g.addr : "localhost", _TRUNCATE);
     }
     const float k = v.k;
-    const float W = 860, H = 760;
+    const float o = g.log_halt ? 300.0f : 0.0f;   // the halt notice (the advice and the auto-finish note) takes this much above the upload part
+    const float W = 860, H = 760 + o;
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
     const ImVec2 sz(W * k, H * k);
     if (!overlay_window_begin("##mgmp_logup", a, sz)) { ImGui::End(); return; }
@@ -2332,17 +2518,26 @@ void draw_log_window(const View& v) {
     auto X = [&](float x) { return a.x + x * k; };
     auto Y = [&](float y) { return a.y + y * k; };
 
-    text_c(dl, X(W / 2), Y(36), 46 * k, kInk, tr(Tx::LOG_TITLE));
-    wrap_text(dl, X(60), Y(104), (W - 120) * k, 24 * k, 34 * k, kInkSoft, tr(Tx::LOG_HINT));
+    text_c(dl, X(W / 2), Y(36), 46 * k, g.log_halt ? kRed : kInk, tr(g.log_halt ? Tx::HALT_TITLE : (g.log_desync ? Tx::LOG_DESYNC_TITLE : Tx::LOG_TITLE)));
+    if (g.log_halt) {                                                                                      // what the players can do now, and what the game does for them meanwhile
+        const float ay = wrap_text(dl, X(60), Y(104), (W - 120) * k, 24 * k, 33 * k, kInk, tr(Tx::HALT_AUTOFINISH));     // wrap_text returns the y just below its last line
+        wrap_text(dl, X(60), ay + 16 * k, (W - 120) * k, 26 * k, 36 * k, kRed, tr(Tx::HALT_ADVICE));
+    }
+    wrap_text(dl, X(60), Y(104 + o), (W - 120) * k, 24 * k, 34 * k, g.log_desync ? kAmber : kInkSoft,
+              tr(g.log_desync ? Tx::LOG_DESYNC_HINT : (g.log_prev ? Tx::LOG_PREV_HINT : Tx::LOG_HINT)));
 
     const LogUploadStatus st = logupload_status();
     const bool working = st.state == LogUploadState::Working;
 
-    text_at(dl, ImVec2(X(60), Y(190)), 26 * k, kInk, tr(Tx::LOG_ADDR));
-    paper_input("##logaddr", ImVec2(X(290), Y(178)), ImVec2(X(W - 60), Y(236)), g.log_addr, sizeof(g.log_addr), "localhost", 28 * k);
+    text_at(dl, ImVec2(X(60), Y(190 + o)), 26 * k, kInk, tr(Tx::LOG_ADDR));
+    paper_input("##logaddr", ImVec2(X(290), Y(178 + o)), ImVec2(X(W - 60), Y(236 + o)), g.log_addr, sizeof(g.log_addr), "localhost", 28 * k);
 
-    text_at(dl, ImVec2(X(60), Y(262)), 26 * k, kInk, tr(Tx::LOG_DESC));
-    paper_multiline("##logdesc", ImVec2(X(60), Y(302)), ImVec2(X(W - 60), Y(500)), g.log_desc, sizeof(g.log_desc), tr(Tx::LOG_DESC_HINT), 26 * k);
+    if (g.log_desync) {
+        wrap_text(dl, X(60), Y(270 + o), (W - 120) * k, 22 * k, 30 * k, kGrey, g.log_desync_text);     // what happened, in place of the description
+    } else {
+        text_at(dl, ImVec2(X(60), Y(262 + o)), 26 * k, kInk, tr(Tx::LOG_DESC));
+        paper_multiline("##logdesc", ImVec2(X(60), Y(302 + o)), ImVec2(X(W - 60), Y(500 + o)), g.log_desc, sizeof(g.log_desc), tr(Tx::LOG_DESC_HINT), 26 * k);
+    }
 
     // what will be sent
     wchar_t files[kLogUploadMaxFiles][MAX_PATH] = {};
@@ -2355,16 +2550,16 @@ void draw_log_window(const View& v) {
         for (int i = 0; i < nfiles; ++i) total += logupload_file_size(files[i]);
         char sizes[32]; format_size(sizes, sizeof(sizes), total);
         char line[256]; _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::LOG_FILES), nm, sizes);
-        text_at(dl, ImVec2(X(60), Y(516)), 22 * k, kGrey, line);
+        text_at(dl, ImVec2(X(60), Y(516 + o)), 22 * k, kGrey, line);
     }
-    text_at(dl, ImVec2(X(60), Y(548)), 20 * k, kGrey, tr(Tx::LOG_PRIVACY));
+    text_at(dl, ImVec2(X(60), Y(548 + o)), 20 * k, kGrey, tr(Tx::LOG_PRIVACY));
 
     // the result of the last upload
     char msg[320] = {};
     ImU32 mcol = kInkSoft;
     if (working) {
         _snprintf_s(msg, sizeof(msg), _TRUNCATE, tr(Tx::LOG_BUSY), (unsigned)st.percent);
-        const ImVec2 b0(X(60), Y(592)), b1(X(W - 60), Y(612));
+        const ImVec2 b0(X(60), Y(592 + o)), b1(X(W - 60), Y(612 + o));
         dl->AddRectFilled(b0, b1, IM_COL32(255, 255, 250, 140), 2.0f);
         dl->AddRectFilled(b0, ImVec2(b0.x + (b1.x - b0.x) * (st.percent / 100.0f), b1.y), IM_COL32(120, 170, 120, 220), 2.0f);
         dl->AddRect(b0, b1, kInk, 2.0f, 0, 1.6f);
@@ -2381,7 +2576,7 @@ void draw_log_window(const View& v) {
             default:                        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "%s", tr(Tx::LOG_FAIL_LOST)); break;
         }
     }
-    if (msg[0]) wrap_text(dl, X(60), Y(working ? 624 : 596), (W - 120) * k, 26 * k, 34 * k, mcol, msg);
+    if (msg[0]) wrap_text(dl, X(60), Y((working ? 624 : 596) + o), (W - 120) * k, 26 * k, 34 * k, mcol, msg);
 
     if (paper_button("log_go", ImVec2(X(60), Y(H - 100)), ImVec2(X(W / 2 - 10), Y(H - 36)), tr(Tx::LOG_UPLOAD), 30 * k, !working && nfiles > 0, Tone::Good)) {
         LogUploadRequest req;
@@ -2391,17 +2586,43 @@ void draw_log_window(const View& v) {
         req.port = port;
         const char* who = g.pname[0] ? g.pname : (signal_name()[0] ? signal_name() : "player");
         strncpy_s(req.player, sizeof(req.player), who, _TRUNCATE);
-        strncpy_s(req.desc, sizeof(req.desc), g.log_desc, _TRUNCATE);
+        if (g.log_desync) _snprintf_s(req.desc, sizeof(req.desc), _TRUNCATE, "[battle desync] %s", g.log_desync_text);
+        else strncpy_s(req.desc, sizeof(req.desc), g.log_desc, _TRUNCATE);
         _snprintf_s(req.info, sizeof(req.info), _TRUNCATE, "proto %u, role %s, room %s", (unsigned)kProtoVersion,
                     signal_role()[0] ? signal_role() : "-", signal_room()[0] ? signal_room() : "-");
         for (int i = 0; i < nfiles; ++i) wcsncpy_s(req.files[i], MAX_PATH, files[i], _TRUNCATE);
         req.nfiles = nfiles;
+        if (g.log_prev) {       // the "ended badly" markers go once the server has the files
+            LogUploadRequest pr;
+            if (prevrun_request(pr)) { for (int i = 0; i < pr.ndelete; ++i) wcsncpy_s(req.on_ok_delete[i], MAX_PATH, pr.on_ok_delete[i], _TRUNCATE); req.ndelete = pr.ndelete; }
+        }
         log_line("MENU", "log upload to %s:%u (%d file(s), description %u bytes)", host, (unsigned)port, nfiles, (unsigned)strlen(g.log_desc));
         logupload_start(req);
     }
-    if (paper_button("log_close", ImVec2(X(W / 2 + 10), Y(H - 100)), ImVec2(X(W - 60), Y(H - 36)), tr(Tx::LOG_CLOSE), 30 * k))
+    if (paper_button("log_close", ImVec2(X(W / 2 + 10), Y(H - 100)), ImVec2(X(W - 60), Y(H - 36)), tr(Tx::LOG_CLOSE), 30 * k)) {
         g.log_open = false;
+        g.log_desync = false;
+        g.log_halt = false;
+        if (g.log_prev) { prevrun_dismiss(); g.log_prev = false; }      // closing the previous run's window forgets it: it is not offered again at every start
+    }
     ImGui::End();
+}
+
+// The previous run ended badly (crash, freeze, killed): its log was sent in the background at startup (prevrun_auto_start) -- say how that went -- or, when it was not (the setting is off, no server
+// configured, or it failed), open the upload window on that run's files so one press sends them.
+void prevrun_tick() {
+    if (g.prev_stage == 0) {
+        if (prevrun_auto_started()) g.prev_stage = 1;
+        else {
+            LogUploadRequest r;
+            if (prevrun_request(r)) { g.log_prev = true; g.log_open = true; logupload_reset(); }
+            g.prev_stage = 2;
+        }
+    } else if (g.prev_stage == 1) {
+        const LogUploadStatus st = logupload_status();
+        if (st.state == LogUploadState::Done) { say(tr(Tx::LOG_PREV_AUTO_DONE), st.detail); prevrun_dismiss(); logupload_reset(); g.prev_stage = 2; }
+        else if (st.state == LogUploadState::Failed) { say("%s", tr(Tx::LOG_PREV_AUTO_FAIL)); g.log_prev = true; g.log_open = true; logupload_reset(); g.prev_stage = 2; }
+    }
 }
 
 void room_toasts() {
@@ -2426,12 +2647,38 @@ void abandon_toasts() {
 
 void menu_toggle_log_window() {
     g.log_open = !g.log_open;
+    g.log_desync = false;
+    g.log_halt = false;
     if (g.log_open) logupload_reset();   // a finished result from last time is not news
 }
 
 void menu_draw() {
     g.hovering_button = false;
     poll_language();
+    prevrun_tick();
+    roomhist_tick();                // a room joined: remembered for a day (the list puts it first)
+    saveslots_auto_tick();          // back in the warehouse after a settled run: the auto save queue takes the current saves
+    {   // a battle desync (debounced or halted): offer the log upload at once, the F2 window without the description
+        char text[192] = {};
+        if (lockstep_take_desync_notice(text, sizeof(text)) && logupload_status().state != LogUploadState::Working) {
+            g.log_open = true; g.log_prev = false; g.log_desync = true;
+            strncpy_s(g.log_desync_text, sizeof(g.log_desync_text), text, _TRUNCATE);
+            logupload_reset();
+            log_line("MENU", "battle desync: the log upload is offered (%s)", text);
+        }
+        // THE BATTLE HALTED (this peer's halt or the other player's): the game cannot go on. Say so, and what to do, in the same window, once per halt.
+        static bool halt_seen = false;
+        if (lockstep_halted() && !halt_seen) {
+            halt_seen = true;
+            if (!(g.log_open && g.log_desync)) {
+                g.log_open = true; g.log_prev = false; g.log_desync = true;
+                if (logupload_status().state != LogUploadState::Working) logupload_reset();
+            }
+            g.log_halt = true;
+            _snprintf_s(g.log_desync_text, sizeof(g.log_desync_text), _TRUNCATE, "halted: %s", lockstep_halt_reason());
+            log_line("MENU", "battle HALTED: the players are told the game cannot go on, and offered the log upload (%s)", lockstep_halt_reason());
+        } else if (!lockstep_halted()) { halt_seen = false; g.log_halt = false; }      // the halt was lifted at the end of the fight: the notice's wording goes with it
+    }
     const View v = view();
     if (v.h < 100.0f) return;
 
@@ -2456,7 +2703,16 @@ void menu_draw() {
     if (title && g.title_a > 0.001f) {
         // Above the game's own four (which start at 65% of the height, 100 px
         // apart on the 1080 stage), in the same left column and the same face.
-        if (menu_entry(v, "##e_multi", tr(Tx::MENU_MULTI), 375)) { g.win = (g.win == Win::Multi) ? Win::None : Win::Multi; g.next_list = 0; }
+        if (menu_entry(v, "##e_multi", tr(Tx::MENU_MULTI), 375)) {
+            if (in_room()) {
+                // ALREADY IN A ROOM (2026-10-04): the next thing is a save slot, not the room form again. The room panel stays one click away on its tag.
+                g.win = Win::None;
+                g.auto_play_until = GetTickCount64() + 10000;
+                log_line("MENU", "multiplayer pressed while in a room -- going to the save screen");
+            } else {
+                g.win = (g.win == Win::Multi) ? Win::None : Win::Multi; g.next_list = 0;
+            }
+        }
         if (menu_entry(v, "##e_settings", tr(Tx::MENU_SETTINGS), 585)) g.win = (g.win == Win::Settings) ? Win::None : Win::Settings;
         if (menu_entry(v, "##e_backup", tr(Tx::MENU_BACKUP), 480)) {
             g.win = (g.win == Win::Backup) ? Win::None : Win::Backup;
@@ -2509,6 +2765,7 @@ void menu_draw() {
     draw_room_notice(v);
     if (g.log_open) draw_log_window(v);
     room_toasts();
+    draw_chat(v);
 
     // A room just opened or closed: the connect window has done its job.
     static bool prev_room = false;
@@ -2522,7 +2779,7 @@ void menu_draw() {
         // needs from them. Bounded, in case the menu is still fading in.
         g.auto_play_until = GetTickCount64() + 10000;
     }
-    if (!room_now && prev_room) { g.room_name[0] = 0; say(tr(Tx::LEFT_ROOM)); }
+    if (!room_now && prev_room) { g.room_name[0] = 0; say(tr(Tx::LEFT_ROOM)); chat_reset(); }
     prev_room = room_now;
 
     // The dial to the host gave up on every address. A player who never got through is told why and walked out of the room

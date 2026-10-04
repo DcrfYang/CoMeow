@@ -16,6 +16,9 @@ using namespace mgmp;
 static std::mt19937_64 rng(0x5eed);
 static unsigned long long runs = 0, accepted = 0;
 
+// Messages that own a buffer after a successful decode free it here (the harness would otherwise leak it 40000 times).
+template <class Msg> static void release_decoded(Msg&) {}
+static void release_decoded(PeerLogMsg& m) { free(m.data); m.data = nullptr; }
 template <class Msg, class Fn> static void fuzz_one(const char* name, Fn dec, unsigned iterations) {
     unsigned long long ok = 0;
     for (unsigned it = 0; it < iterations; ++it) {
@@ -28,6 +31,7 @@ template <class Msg, class Fn> static void fuzz_one(const char* name, Fn dec, un
         Reader r(b.data(), len);
         Msg m{};
         if (dec(r, m)) ++ok;
+        release_decoded(m);
         ++runs;
     }
     accepted += ok;
@@ -70,8 +74,16 @@ int main(int argc, char** argv) {
     F(PageMsg, "page", dec_page);
     F(CatsMsg, "cats", dec_cats);
     F(SaveWaitMsg, "savewait", dec_savewait);
+    F(RollMsg, "roll", dec_roll);
     F(AbandonMsg, "abandon", dec_abandon);
     F(RoomCtlMsg, "roomctl", dec_roomctl);
+    F(PeerLogMsg, "peerlog", dec_peerlog);
+    F(AuditMsg, "audit", dec_audit);
+    F(UqdMsg, "uqd", dec_uqd);
+    F(RnglMsg, "rngl", dec_rngl);
+    F(DeepMsg, "deep", dec_deep);
+    F(ChatMsg, "chat", dec_chat);
+    F(PropsMsg, "props", dec_props);
 #undef F
     (void)drop;
     std::printf("fuzz: %llu inputs, %llu accepted, no fault\n", runs, accepted);

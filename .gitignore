@@ -72,3 +72,6 @@ desktop.ini
 docs/*.orig-*
 *.out
 docs/.ctx_index_cache.json
+
+# saved copies of the game executable (reverse-engineering reference; the game is not ours to publish)
+/game_exe/

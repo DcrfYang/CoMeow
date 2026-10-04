@@ -439,7 +439,7 @@ void follow_after_enter_node() {
     nodehash_on_node(g.here_seed, g.here_index);
     roster_party_swap_after_node(g.here_type);
 #if defined(MGMP_WITH_CHECKPOINT)
-    checkpoint_on_node(g.here_seed, g.here_index);
+    checkpoint_on_node(g.here_seed, g.here_index, g.here_type);
 #endif
 }
 

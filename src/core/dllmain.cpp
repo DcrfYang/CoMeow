@@ -11,6 +11,8 @@
 #include "mgmp_hooks.h"
 #include "mgmp_resolve.h"
 #include "mgmp_log.h"
+#include "mgmp_prevrun.h"
+#include "mgmp_paths.h"
 #include "mgmp_record.h"
 #include "mgmp_replay.h"
 #include "mgmp_session.h"
@@ -24,14 +26,15 @@
 namespace {
 
 wchar_t g_dll_dir[MAX_PATH] = {};
+wchar_t g_log_dir[MAX_PATH] = {};     // <dll dir>\log (mgmp_paths.h); the dll dir itself when that could not be made
 
 // Raw-Win32 breadcrumb, independent of the CRT and of the trace log itself.
 // When injection goes wrong the interesting failures happen before the logger
 // exists, and "no log file" is indistinguishable from "the thread never ran".
 void breadcrumb(const char* what) {
     wchar_t path[MAX_PATH];
-    if (g_dll_dir[0])
-        swprintf_s(path, L"%s\\mgmp_boot.log", g_dll_dir);
+    if (g_log_dir[0])
+        swprintf_s(path, L"%s\\mgmp_boot.log", g_log_dir);
     else
         wcscpy_s(path, L"mgmp_boot.log");
 
@@ -49,6 +52,7 @@ void compute_dll_dir(HMODULE self) {
     GetModuleFileNameW(self, g_dll_dir, MAX_PATH);
     wchar_t* slash = wcsrchr(g_dll_dir, L'\\');
     if (slash) *slash = 0;
+    mgmp::paths_log_dir(g_dll_dir, g_log_dir, MAX_PATH);
 }
 
 DWORD WINAPI init_thread(LPVOID) {
@@ -57,9 +61,15 @@ DWORD WINAPI init_thread(LPVOID) {
 
     config_load(g_dll_dir);
     breadcrumb("init_thread: config loaded");
+    {   // an older build left its logs in the folder itself: they move into the log folder
+        static const wchar_t* const old_files[] = { L"mgmp_trace_*.log", L"mgmp_trace_*.dmp", L"mgmp_catdump_*.bin", L"mgmp_boot.log" };
+        paths_move_legacy(g_dll_dir, g_log_dir, old_files, sizeof(old_files) / sizeof(old_files[0]));
+    }
 
     log_init(config().log_path, tune::kConsole);
     breadcrumb("init_thread: log open");
+    prevrun_init(g_dll_dir);       // notes runs that ended badly, and marks this one (removed again on a clean exit)
+    prevrun_auto_start();          // and sends the last bad run's log in the background (ui.auto_upload_crash_log)
 
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -70,6 +80,17 @@ DWORD WINAPI init_thread(LPVOID) {
     log_raw("host   : %S", exe);
     log_raw("base   : %p  (pinned imagebase 0x140000000)", (void*)base);
     log_raw("pid    : %lu", GetCurrentProcessId());
+    {   // WHICH mgmp.dll THIS IS: the file's own write time and size, so a log says which build produced it (the other peer's folder is updated by a launcher and cannot be assumed current)
+        wchar_t self[MAX_PATH] = {};
+        HMODULE me = nullptr;
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&init_thread, &me) &&
+            GetModuleFileNameW(me, self, MAX_PATH) && GetFileAttributesExW(self, GetFileExInfoStandard, &fa)) {
+            SYSTEMTIME st{};
+            FileTimeToSystemTime(&fa.ftLastWriteTime, &st);
+            log_raw("build  : mgmp.dll written %04d-%02d-%02d %02d:%02d:%02d UTC, %lu bytes", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (unsigned long)fa.nFileSizeLow);
+        }
+    }
     log_raw("dumping %u bytes of TurnAction, pointers=%d",
             tune::kTaDump, (int)tune::kPointers);
 
@@ -252,6 +273,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         mgmp::replay_shutdown();
         mgmp::record_shutdown();
         mgmp::log_shutdown();
+        mgmp::prevrun_shutdown();      // a clean exit: this run's "ended badly" marker goes away
         break;
     }
     return TRUE;

@@ -16,6 +16,7 @@
 #include "mgmp_lockstep.h"
 #include "mgmp_follow.h"
 #include "mgmp_unlocks.h"
+#include "mgmp_chat.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_page.h"
@@ -50,6 +51,7 @@ struct State {
     char     status[192] = "off";
     uint64_t gpak_hash = 0;
     uint64_t build_hash = 0;
+    uint64_t build_hash_saves = 0;      // the same identity with the SAVES' sim number (tune::kCheckpointSimIdentity): what the handshake saves are stamped with
     // One bit per message type already reported as dropped pre-Ready, so the
     // warning is one line and not one line per frame.
     uint32_t dropped_types = 0;
@@ -113,7 +115,7 @@ uint64_t hash_gpak() {
 // Identity of the executable: its size and PE timestamp. Enough to catch "one
 // of us updated the game", which is the case that matters -- every address the
 // mod hooks is pinned to one build.
-uint64_t hash_build() {
+uint64_t hash_build(uint32_t sim_revision) {
     HMODULE base = GetModuleHandleW(nullptr);
     if (!base) return 0;
     auto* dos = (IMAGE_DOS_HEADER*)base;
@@ -126,6 +128,8 @@ uint64_t hash_build() {
     uint64_t h = fnv1a(&id, sizeof(id));
     const uint64_t rules = balance_ruleset_id();
     h ^= rules + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    const uint64_t sim = 0x51A1000000000000ull | sim_revision;     // the simulation revision (see the tuning note): same game and rules, other battle maths -> no pairing
+    h ^= sim + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
     return h;
 }
 
@@ -187,7 +191,7 @@ void go_ready(const char* how) {
     lockstep_init();
     follow_init();
     savefile_init();
-    checkpoint_init(g.build_hash, g.gpak_hash);
+    checkpoint_init(g.build_hash_saves, g.gpak_hash, config().dev_tools);
     setup_init();
     leave_init();
     catsync_init();
@@ -266,8 +270,9 @@ void handle_hello(uint8_t from, const Hello& h) {
         refuse_peer(from, why);
         return;
     }
-    log_line("SESSION", "peer %u '%s' accepted (proto %u)",
-             (unsigned)from, h.name[0] ? h.name : "?", h.proto);
+    log_line("SESSION", "peer %u '%s' accepted (proto %u, build+rules+sim %016llx, gpak %016llx; this peer: %016llx / %016llx, sim revision %u)",
+             (unsigned)from, h.name[0] ? h.name : "?", h.proto, (unsigned long long)h.build_hash, (unsigned long long)h.gpak_hash,
+             (unsigned long long)g.build_hash, (unsigned long long)g.gpak_hash, (unsigned)tune::kSimRevision);
 
     // A client plays by the HOST's rules (ui.block_new_cats), whatever its own setting says.
     if (net_role() == NetRole::Client && from == kHostPeer) {
@@ -442,7 +447,8 @@ bool begin(bool host, const char* addr, uint16_t port) {
     // ~1 MiB of file read and neither hash can change while the process lives.
     if (!g.gpak_hash && !g.build_hash) {
         g.gpak_hash  = hash_gpak();
-        g.build_hash = hash_build();
+        g.build_hash = hash_build(tune::kSimRevision);
+        g.build_hash_saves = hash_build(tune::kCheckpointSimIdentity);
         log_line("SESSION", "data identity: gpak %016llx build %016llx",
                  (unsigned long long)g.gpak_hash, (unsigned long long)g.build_hash);
     }
@@ -668,6 +674,14 @@ void session_update() {
 
             case MSG_UNLOCKS:
                 unlocks_on_message(m.from, m.unlocks);
+                break;
+
+            case MSG_PROPS:
+                unlocks_props_on_message(m.from, m.props);
+                break;
+
+            case MSG_CHAT:
+                chat_on_message(m.from, m.chat);
                 break;
 
             case MSG_BOARD:   // taken by the receive thread into a mailbox (net_host_board): the game thread waits for it inside the turn boundary

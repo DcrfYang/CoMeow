@@ -169,6 +169,17 @@ bool catsync_prepare_settlement(void* director);
 // after the native settlement and, as a safety net for saves the old behaviour left behind, before a new run's
 // clones are made. Returns how many clones were merged.
 unsigned catsync_merge_session_cats(const char* why);
+// Real cats whose ids fall among the ids reserved for clones (older builds left such cats in saves) are moved to ordinary ids, and the run's party list is re-pointed. Returns how many were moved.
+// Cheap when there is nothing to do; called from the collar/gear pages and before the party exchange.
+unsigned catsync_relocate_squatters(const char* why);
+// Whether this cat id is in the run's party list (the cats chosen at the House's departure box). False when the list cannot be read.
+bool catsync_in_run_party(uint64_t id);
+// Whether the run's lists hold clones this peer knows (an owner or origin note names them): the run is a shared one, whatever the network says.
+bool catsync_run_is_shared();
+// The log's picture of the session's cat bookkeeping (lists, day, counter, every clone slot of every player). Reading only.
+void catsync_log_snapshot(const char* stage);
+// After a settlement: the other players' leftover copies (flagged out on adventure, not in the run's lists) are retired so the save does not keep them. Returns how many.
+unsigned catsync_retire_peer_copies(const char* why);
 
 // The House is about to write its state (T_HouseSave; `house` = the writer's first argument). Every House cat entity whose id is a clone's that the merge swapped into its original
 // gets the ORIGINAL's id, so `house_state` names the cats that came home -- see swap_identity.

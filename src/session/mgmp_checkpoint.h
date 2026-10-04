@@ -4,13 +4,15 @@ namespace mgmp {
 struct CheckpointMsg;
 struct ChapterMapMsg;
 struct SaveWaitMsg;
-void checkpoint_init(uint64_t build_hash=0, uint64_t gpak_hash=0);
+// dev_tools: two instances on one Steam account are told apart by their fingerprints (the fingerprint stays the primary id); otherwise the Steam id is.
+void checkpoint_init(uint64_t build_hash=0, uint64_t gpak_hash=0, bool dev_tools=false);
 void checkpoint_shutdown();
 bool checkpoint_active();
 // Swallow native selection until every participant has validated/restored.
 bool checkpoint_select(uint8_t slot, const wchar_t* path);
 int checkpoint_autoselect();
-void checkpoint_on_node(uint64_t node_seed, uint32_t node_index);
+// node_type: the MapNodeType (8 = the chapter boss); the save confirmed after that node is marked kCheckpointAfterBoss.
+void checkpoint_on_node(uint64_t node_seed, uint32_t node_index, uint32_t node_type = 0);
 void checkpoint_on_map(uint64_t map_hash);
 // Fresh-session map pre-sync (MSG_CHAPTERMAP): the host's serialized
 // files.chapter_map row, written into this peer's save before load. A fresh
@@ -53,7 +55,7 @@ const char* checkpoint_status();
 // exists to be clicked. In-session chapter restarts never wait: nobody is on a save screen then.
 void checkpoint_set_manual(bool on);
 
-struct SaveSyncEntry { uint64_t run = 0, seq = 0, stamp = 0; };   // stamp = FILETIME of the confirmation
+struct SaveSyncEntry { uint64_t run = 0, seq = 0, stamp = 0; uint8_t flags = 0; };   // stamp = FILETIME of the confirmation; flags: kCheckpointAfterBoss
 enum SaveSyncPhase : uint8_t {
     kSyncNone = 0,      // nothing to show
     kSyncWaiting,       // this player picked; not everyone has
@@ -67,7 +69,7 @@ struct SaveSyncView {
     uint8_t  selected = 0;          // bit n = the peer with transport id n has picked (kSyncInvalid: ... holds an unfinished co-op record)
     bool     prep = false;          // the preparation stage is allowed (host choosing)
     unsigned n = 0;                 // handshake saves listed (host choosing), newest first
-    SaveSyncEntry entry[4];
+    SaveSyncEntry entry[96];        // = kCheckpointCandidates (mgmp_proto.h), newest first
 };
 bool checkpoint_sync_view(SaveSyncView& out);
 // Host: -1 = the preparation stage, 0..n-1 = that handshake save. False when nothing is being chosen.

@@ -140,6 +140,13 @@ bool choice_level_note(char* out, uint32_t n);
 
 // Per-frame ticks. Both cache the screen pointer and apply a held choice.
 void choice_on_event_update(void* world_event);
+
+// A STORY EVENT THIS PEER REPLAYS (2026-10-04): a client that applied the host's choice of a story event (the host decided it; the client has only the host's click) must not have its OWN save changed by
+// what that choice does -- the legacy tokens, the quest progress and the adventure unlocks the option's result writes belong to whoever earned them. True for the rest of that event's node, on a client; the
+// hooks of the save-changing results (mgmp_hooks: h_Res*, h_PropSetInt) ask this and skip their work. The host and any event the client chose for itself are never blocked.
+bool choice_story_event_block_active();
+// A blocked change, for the log (once per kind per node).
+void choice_story_event_blocked(const char* what);
 void choice_on_level_update(void* level_screen);
 
 void choice_on_message(uint8_t from, const ChoiceMsg& m);

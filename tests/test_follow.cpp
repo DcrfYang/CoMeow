@@ -482,7 +482,7 @@ void unlocks_on_map(bool) {}
 bool net_send_mapseeds(const MapSeedsMsg&) { ++seeds_published; return true; }
 int room_troubles = 0;
 void room_sync_trouble(const char*) { ++room_troubles; }   // a sync that ran out of time tells the player (mgmp_room)
-void checkpoint_on_node(uint64_t,uint32_t) {}
+void checkpoint_on_node(uint64_t,uint32_t,uint32_t) {}
 bool setup_runtime_ready() { return setup_ready; }
 bool setup_has_shared_roster() { return shared_setup; }
 bool setup_host_can_enter() { return setup_ready; }

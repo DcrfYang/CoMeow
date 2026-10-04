@@ -747,7 +747,7 @@ int wmain(int argc, wchar_t** argv) {
             // practice -- but it is the less-exercised route, and saying so here
             // is what makes an odd log afterwards interpretable.
             wprintf(L"[+] injected into the re-launched game (late attach). "
-                    L"trace -> %s\\mgmp_trace.log\n", dir);
+                    L"trace -> %s\\log\\mgmp_trace_<time>.log\n", dir);
             return 0;
         }
         if (!parked) {
@@ -815,7 +815,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!ok) return abort_launch(L"injection failed");
     }
 
-    wprintf(L"[+] resumed. trace -> %s\\mgmp_trace.log\n", dir);
+    wprintf(L"[+] resumed. trace -> %s\\log\\mgmp_trace_<time>.log\n", dir);
 
     int rc = 0;
     if (wait_exit) {

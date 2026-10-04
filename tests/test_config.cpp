@@ -58,6 +58,19 @@ int main() {
     swprintf_s(g_dir, L"%smgmp_test_config", tmp);
     CreateDirectoryW(g_dir, nullptr);
 
+    printf("-- where the trace log goes: the log folder beside the dll --\n");
+    {
+        const std::wstring logdir = std::wstring(g_dir) + L"\\log";
+        const std::wstring want = logdir + L"\\mgmp_trace.log";
+        check(std::wstring(load(R"({})").log_path) == want, "the default is <dll dir>\\log\\mgmp_trace.log");
+        check(GetFileAttributesW(logdir.c_str()) != INVALID_FILE_ATTRIBUTES, "and the folder is created");
+        check(std::wstring(load(R"({ "log": "mgmp_trace.log" })").log_path) == want, "a bare name (what every shipped mgmp.json says) goes into the log folder");
+        check(std::wstring(load(R"({ "log": "other.log" })").log_path) == logdir + L"\\other.log", "any bare name does");
+        check(std::wstring(load(R"({ "log": "sub/x.log" })").log_path) == std::wstring(g_dir) + L"\\sub/x.log", "a path with a folder is relative to the dll dir, as before");
+        check(std::wstring(load(R"({ "log": "C:\\logs\\x.log" })").log_path) == L"C:\\logs\\x.log", "an absolute path is used as it is");
+        check(load(R"({ "log": "" })").log_path[0] == 0, "an empty value still means no log file");
+    }
+
     printf("-- a missing file is a working configuration, but it says so --\n");
     {
         const Config& c = load(nullptr);
