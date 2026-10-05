@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "mgmp_config.h"
 #include "mgmp_log.h"
 #include "mgmp_signal.h"
 
@@ -24,14 +25,15 @@ bool        g_loaded = false;
 char        g_pending_id[16] = {}, g_pending_host[32] = {};
 char        g_noted_id[16] = {};
 
+// Beside mgmp.dll (the mod's own folder, from the config) and nowhere else: an unknown folder means no history, never a file in the game's folder. (The first version looked for the last backslash with
+// L"\/" -- an escape that is only a slash -- found none, and so wrote a RELATIVE name, which landed in the game's folder, where the launcher reported it as another mod.)
 std::wstring file_path() {
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&file_path, &self);
-    wchar_t p[MAX_PATH] = {};
-    if (!self || !GetModuleFileNameW(self, p, MAX_PATH)) return std::wstring();
-    std::wstring s = p;
-    const size_t cut = s.find_last_of(L"\/");
-    return (cut == std::wstring::npos ? std::wstring() : s.substr(0, cut + 1)) + L"mgmp-rooms.txt";
+    const wchar_t* dir = config_dll_dir();
+    if (!dir || !dir[0]) return std::wstring();
+    std::wstring p(dir);
+    p.push_back(static_cast<wchar_t>(92));         // a backslash, spelled so no shell or editor can eat it
+    p += L"mgmp-rooms.txt";
+    return p;
 }
 
 std::string clean(const char* s) {

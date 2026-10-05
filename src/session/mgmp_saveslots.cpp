@@ -2,6 +2,7 @@
 #include "mgmp_i18n.h"
 
 #include <windows.h>
+#include <algorithm>
 #include <ctime>
 #include <cstring>
 #include <cstdarg>
@@ -12,6 +13,7 @@
 #include "json.hpp"
 
 #include "mgmp_addresses.h"
+#include "mgmp_checkpoint.h"
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_leave.h"
 #include "mgmp_log.h"
@@ -27,9 +29,13 @@ constexpr const wchar_t* kGameFile[kGameSlots] = {
 };
 constexpr const wchar_t* kSidecar[] = { L"-wal", L"-shm", L"-journal" };
 
+struct SyncRef { std::wstring path; uint64_t folder = 0, stamp = 0; };
+
 struct State {
     SaveBackup list[kSaveBackupCount];
     SaveBackup autos[kAutoSaveCount];
+    std::vector<SyncSave> sync[kGameSlots];
+    std::vector<SyncRef>  syncref[kGameSlots];
     char       msg[640] = {};
     bool       msg_load = false;
 };
@@ -315,10 +321,17 @@ bool capture_current(const std::wstring& game, Bytes out[kGameSlots], bool have[
         const std::wstring f = game + L"\\" + kGameFile[s];
         have[s] = false;
         if (!exists(f)) continue;
-        if (checkpoint_io::snapshot(f, out[s])) { have[s] = true; continue; }
+        // A save the game is writing at this moment (a hot journal beside it) fails a snapshot once and not the next time: ask a few times before settling for less.
+        bool got = false;
+        for (int attempt = 0; attempt < 4 && !got; ++attempt) {
+            if (attempt) Sleep(150);
+            got = checkpoint_io::snapshot(f, out[s]);
+        }
+        if (got) { have[s] = true; continue; }
         // The database would not open cleanly (corrupt, or locked exclusively).
         // Still worth having: a byte copy of a damaged save beats no copy when
         // this is the undo point for a load.
+        log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls could not be copied cleanly (%s) -- taking its bytes as they are", kGameFile[s], checkpoint_io::snapshot_why());
         if (checkpoint_io::read(f, out[s], 64u << 20)) { have[s] = true; continue; }
         say(tr(Tx::SS_READ_FAIL), kGameFile[s]);
         return false;
@@ -392,8 +405,16 @@ bool install_from(const std::wstring& game, const std::wstring& dir, const SaveB
         const std::wstring f = dir + L"\\" + kGameFile[s];
         if (!exists(f)) { say(tr(Tx::SS_MISSING), kGameFile[s]); return false; }
         if (!checkpoint_io::snapshot(f, bytes[s])) {
-            say(tr(Tx::SS_CORRUPT), kGameFile[s]);
-            return false;
+            // The backup may be a byte copy of a save that fails sqlite's integrity check and that the game loads all the same (a save copied while the game was writing it, or one from a sqlite the check
+            // is stricter than). It is the player's own save: hand it over when it is a database at all, and say so in the log; refuse only what is not one.
+            const std::string why = checkpoint_io::snapshot_why();
+            if (checkpoint_io::loadable(f, bytes[s])) {
+                log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls in the backup fails the integrity check (%s) but is a readable database -- loading it as it is", kGameFile[s], why.c_str());
+            } else {
+                log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls in the backup is not a readable database (%s)", kGameFile[s], why.c_str());
+                say(tr(Tx::SS_CORRUPT), kGameFile[s]);
+                return false;
+            }
         }
         want[s] = true;
     }
@@ -710,12 +731,18 @@ void saveslots_auto_tick() {
     if (t < next) return;
     next = t + 500;
     if (push_at) {
-        if (t >= push_at) { push_at = 0; log_line("SAVESLOTS", "back in the warehouse after a settled run: the current saves go into the auto save queue"); saveslots_auto_push(); }
+        if (t >= push_at) {
+            push_at = 0;
+            log_line("SAVESLOTS", "back in the warehouse after a settled run: the current saves go into the auto save queue");
+            saveslots_auto_push();                              // first: the auto save takes the handshake saves with it
+            checkpoint_cleanup_deferred("back in the warehouse");   // then the run's handshake saves that were kept for this moment go
+        }
         return;
     }
     if (leave_scene_live(kScene_Map)) { armed = true; return; }
     if (leave_scene_live(kScene_MainMenu)) { armed = false; return; }
-    if (armed && leave_scene_live(kScene_House)) { armed = false; push_at = t + 3000; }
+    if (armed && leave_scene_live(kScene_House)) { armed = false; push_at = t + 3000; return; }
+    if (checkpoint_cleanup_due() && leave_scene_live(kScene_House) && !leave_scene_live(kScene_Map)) checkpoint_cleanup_deferred("in the warehouse");   // a solo run left some other way (quit to the menu, loaded into the House)
 }
 
 bool saveslots_delete(int index) {
@@ -796,6 +823,144 @@ bool saveslots_import(int index, const wchar_t* path) {
     if (!swap_dir(stage, slot_dir(game, index))) { say(tr(Tx::SS_PLACE_FAIL), stage.c_str()); return false; }
     saveslots_refresh();
     say(tr(Tx::SS_IMPORTED), index + 1, meta.name);
+    return true;
+}
+
+// --- restore from a handshake save ------------------------------------------------------------------
+
+namespace {
+constexpr uint64_t kFileTimeUnixEpoch = 116444736000000000ull;   // 1601 -> 1970, in 100 ns
+
+// The save on disk as a throw-away file, so the game's own numbers can be read from it. Removed again, with whatever sqlite put beside it.
+std::wstring sync_probe_path(const std::wstring& game) { return root_of(game) + L"\\_sync_probe.sav"; }
+void sync_probe_drop(const std::wstring& f) {
+    for (const wchar_t* sfx : { L"", L"-wal", L"-shm", L"-journal" }) DeleteFileW((f + sfx).c_str());
+}
+bool sync_probe(const std::wstring& game, const Bytes& db, SaveSlotInfo& info) {
+    if (!ensure_dir(root_of(game))) return false;
+    const std::wstring f = sync_probe_path(game);
+    sync_probe_drop(f);
+    if (!checkpoint_io::atomic_write(f, db)) return false;
+    info = describe(f);
+    sync_probe_drop(f);
+    return true;
+}
+} // namespace
+
+void saveslots_sync_refresh() {
+    for (int s = 0; s < kGameSlots; ++s) { g.sync[s].clear(); g.syncref[s].clear(); }
+    std::wstring game;
+    if (!game_dir(game)) return;
+    const std::wstring root = hs_root(game);
+
+    struct Found { int slot; SyncSave info; SyncRef ref; };
+    std::vector<Found> all;
+    WIN32_FIND_DATAW sub;
+    HANDLE hs = FindFirstFileW((root + L"\\*").c_str(), &sub);
+    if (hs == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(sub.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !plain_name(sub.cFileName) ||
+            (sub.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        const uint64_t folder = _wcstoui64(sub.cFileName, nullptr, 10);
+        const std::wstring d = root + L"\\" + sub.cFileName;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            // the queue files are "<pairing>.<number>"; the .state tombstone and a staged .pending are not saves
+            const wchar_t* dot = wcsrchr(fd.cFileName, L'.');
+            if (!dot || !dot[1] || wcslen(dot + 1) > 6 || wcsspn(dot + 1, L"0123456789") != wcslen(dot + 1)) continue;
+            const std::wstring path = d + L"\\" + fd.cFileName;
+            HandshakeSaveInfo hi;
+            if (!checkpoint_peek_file(path, folder, hi, nullptr) || hi.slot >= kGameSlots) continue;
+            bool dup = false;      // the same save held under two ids of this player
+            for (const Found& f : all)
+                if (f.slot == hi.slot && f.info.run == hi.run && f.info.seq == hi.seq && f.ref.stamp == hi.stamp) { dup = true; break; }
+            if (dup) continue;
+            Found f;
+            f.slot = hi.slot;
+            f.info.saved_at = hi.stamp > kFileTimeUnixEpoch ? (int64_t)((hi.stamp - kFileTimeUnixEpoch) / 10000000ull) : 0;
+            f.info.run = hi.run; f.info.seq = hi.seq; f.info.players = hi.players; f.info.after_boss = hi.after_boss; f.info.stage = hi.stage;
+            f.ref.path = path; f.ref.folder = folder; f.ref.stamp = hi.stamp;
+            all.push_back(std::move(f));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    } while (FindNextFileW(hs, &sub));
+    FindClose(hs);
+
+    std::sort(all.begin(), all.end(), [](const Found& a, const Found& b) {
+        return a.ref.stamp != b.ref.stamp ? a.ref.stamp > b.ref.stamp : a.info.seq > b.info.seq; });   // newest first
+    for (Found& f : all) {
+        if ((int)g.sync[f.slot].size() >= kSyncMax) continue;
+        HandshakeSaveInfo hi; Bytes db; SaveSlotInfo si;
+        if (checkpoint_peek_file(f.ref.path, f.ref.folder, hi, &db) && sync_probe(game, db, si)) { f.info.day = si.day; f.info.percent = si.percent; }
+        g.sync[f.slot].push_back(f.info);
+        g.syncref[f.slot].push_back(std::move(f.ref));
+    }
+    log_line("SAVESLOTS", "handshake saves found: slot 1 %d, slot 2 %d, slot 3 %d", (int)g.sync[0].size(), (int)g.sync[1].size(), (int)g.sync[2].size());
+}
+
+int saveslots_sync_count(int slot) { return (slot >= 0 && slot < kGameSlots) ? (int)g.sync[slot].size() : 0; }
+
+const SyncSave& saveslots_sync_get(int slot, int index) {
+    static const SyncSave kEmpty;
+    return (slot >= 0 && slot < kGameSlots && index >= 0 && index < (int)g.sync[slot].size()) ? g.sync[slot][index] : kEmpty;
+}
+
+bool saveslots_sync_restore(int slot, int index) {
+    if (slot < 0 || slot >= kGameSlots || index < 0 || index >= (int)g.sync[slot].size()) { say(tr(Tx::SS_NO_POS)); return false; }
+    std::wstring game;
+    if (!game_dir(game)) { say(tr(Tx::SS_NO_DIR)); return false; }
+    const SyncRef ref = g.syncref[slot][index];
+    const SyncSave want = g.sync[slot][index];
+
+    // 1. The save itself, read again and checked against what the list showed: a file that was replaced or deleted since the page opened is not the one that was picked.
+    HandshakeSaveInfo hi; Bytes db;
+    if (!checkpoint_peek_file(ref.path, ref.folder, hi, &db) || hi.slot != slot || hi.stamp != ref.stamp || hi.seq != want.seq) {
+        say(tr(Tx::SS_SYNC_GONE)); saveslots_sync_refresh(); return false;
+    }
+    const std::wstring target = game + L"\\" + kGameFile[slot];
+    if (!target_free(target)) { say(tr(Tx::SS_IN_USE), kGameFile[slot]); return false; }
+
+    // 2. It must be a database the game can be given (the same test a backup gets).
+    {
+        if (!ensure_dir(root_of(game))) { say(tr(Tx::SS_CREATE_FAIL), root_of(game).c_str()); return false; }
+        const std::wstring probe = sync_probe_path(game);
+        sync_probe_drop(probe);
+        Bytes checked;
+        bool ok = checkpoint_io::atomic_write(probe, db);
+        if (ok) {
+            ok = checkpoint_io::snapshot(probe, checked);
+            if (!ok) {
+                const std::string why = checkpoint_io::snapshot_why();
+                ok = checkpoint_io::loadable(probe, checked);
+                if (ok) log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! the handshake save fails the integrity check (%s) but is a readable database -- restoring it as it is", why.c_str());
+                else    log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! the handshake save is not a readable database (%s)", why.c_str());
+            }
+        }
+        sync_probe_drop(probe);
+        if (!ok) { say(tr(Tx::SS_CORRUPT), kGameFile[slot]); return false; }
+        db = std::move(checked);
+    }
+
+    // 3. The undo point, exactly as a load takes it.
+    Bytes cur[kGameSlots]; bool have[kGameSlots] = {};
+    if (!capture_current(game, cur, have)) return false;
+    HsList cur_hs; bool have_cur_hs = false;
+    if (!capture_handshake(game, cur_hs, have_cur_hs)) return false;
+    SaveBackup undo;
+    strncpy_s(undo.name, sizeof(undo.name), tr(Tx::SS_UNDO_NAME), _TRUNCATE);
+    undo.saved_at = (int64_t)time(nullptr);
+    if (!write_folder(game, undo_dir(game), cur, have, undo, have_cur_hs ? &cur_hs : nullptr)) return false;
+
+    // 4. Put it over the slot. The handshake folders are not touched: the queue keeps every save of the run.
+    if (!checkpoint_io::atomic_write(target, db)) { say(tr(Tx::SS_WRITE_PARTIAL), kGameFile[slot]); return false; }
+    log_line("SAVESLOTS", "slot %d restored from the handshake save of run %016llx node %llu (%s)", slot + 1,
+             (unsigned long long)want.run, (unsigned long long)want.seq, utf8(ref.path).c_str());
+    if (want.stage) say(tr(Tx::SS_SYNC_DONE_STAGE), slot + 1, tr(want.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
+    else            say(tr(Tx::SS_SYNC_DONE), slot + 1, (unsigned)want.seq);
+    g.msg_load = true;
     return true;
 }
 

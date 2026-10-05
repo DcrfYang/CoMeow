@@ -19,7 +19,7 @@ std::deque<MapPacket> map_packets;
 struct WaitPacket { unsigned to; SaveWaitMsg msg; };
 std::deque<WaitPacket> wait_packets;
 std::wstring testroot;
-bool capture_ok=true, connected=true;
+bool capture_ok=true, connected=true, stage_capture_ok=true;
 void at(unsigned who,const std::function<void()>& fn) {
     current=who; g=states[who]; fn(); states[who]=g;
 }
@@ -50,7 +50,7 @@ void sql_exec(const std::wstring& file,const char* command) {
     FreeLibrary(mod);
 }
 void reset(const wchar_t* name,unsigned count=2) {
-    participants=live=count; packets.clear(); map_packets.clear(); capture_ok=true; connected=true;
+    participants=live=count; packets.clear(); map_packets.clear(); capture_ok=true; connected=true; stage_capture_ok=true;
     wchar_t cwd[MAX_PATH]{}; GetCurrentDirectoryW(MAX_PATH,cwd);
     testroot=std::wstring(cwd)+L"\\_buildcheck\\checkpoint-tests-"+std::to_wstring(checkpoint_io::nonce());
     CHECK(CreateDirectoryW(testroot.c_str(),nullptr));
@@ -162,6 +162,11 @@ bool savefile_read_checkpoint(uint8_t** data,uint32_t* size,uint64_t* hash) {
     Bytes bytes; if(!checkpoint_io::snapshot(g.path,bytes))return false;
     *size=(uint32_t)bytes.size(); *hash=savefile_hash(bytes.data(),*size); *data=(uint8_t*)malloc(*size); memcpy(*data,bytes.data(),*size); return true;
 }
+bool savefile_read_stage(uint8_t** data,uint32_t* size,uint64_t* hash) {
+    if(!stage_capture_ok)return false;
+    Bytes bytes; if(!checkpoint_io::snapshot(g.path,bytes))return false;
+    *size=(uint32_t)bytes.size(); *hash=savefile_hash(bytes.data(),*size); *data=(uint8_t*)malloc(*size); memcpy(*data,bytes.data(),*size); return true;
+}
 void log_line(const char*,const char* fmt,...) {
     va_list a; va_start(a,fmt); vprintf(fmt,a); va_end(a); putchar('\n');
 }
@@ -193,6 +198,7 @@ static void test_identity_adoption() {
 }
 
 int main() {
+    checkpoint_set_capture_patience(0);   // a failing capture latches at once in the tests below; the retry has its own test
     test_identity_adoption();
     reset(L"four participants / independent DBs / latest common restore",4); start(); boundary(1000); certified(1);
     CHECK(states[0].tx.hashes[0]!=states[0].tx.hashes[1]);
@@ -262,6 +268,29 @@ int main() {
     reset(L"play alone invalidation survives process restart"); start(); boundary(4000);
     at(1,[]{CHECK(checkpoint_on_alone());}); restart(); CHECK(states[0].failed && states[1].failed);
 
+    // 2026-10-05: "continue alone" and a solo settlement keep the run's handshake saves until the warehouse; the tombstone is written at once
+    reset(L"play alone keeps the handshake saves until the warehouse"); start(); boundary(4500);
+    at(1,[]{
+        CHECK(disk_exists(file(L".0")));
+        CHECK(checkpoint_on_alone());
+        CHECK(disk_exists(file(L".0")) && disk_exists(file(L".state")));          // the save is still there, and the tombstone that vetoes a resume is too
+        CHECK(checkpoint_cleanup_due());
+        CHECK(checkpoint_io::atomic_write(g.root+L"\\"+g.key+L".7",Bytes{9}));       // a file this build cannot read as an entry: not ours to delete
+    });
+    at(1,[]{ checkpoint_cleanup_deferred("a room is still up"); CHECK(disk_exists(file(L".0")) && checkpoint_cleanup_due()); });
+    live=1;                                                                         // no room: the player is alone in the warehouse
+    at(1,[]{
+        checkpoint_cleanup_deferred("warehouse");
+        CHECK(!disk_exists(file(L".0")) && !checkpoint_cleanup_due());
+        CHECK(disk_exists(file(L".state")) && disk_exists(g.root+L"\\"+g.key+L".7"));
+    });
+    live=participants;
+    reset(L"a solo settlement keeps the handshake saves until the warehouse"); start(); boundary(4600);
+    live=1;
+    at(0,[]{ checkpoint_clear(); CHECK(disk_exists(file(L".0")) && checkpoint_cleanup_due()); });
+    at(0,[]{ checkpoint_cleanup_deferred("warehouse"); CHECK(!disk_exists(file(L".0"))); });
+    live=participants;
+
     reset(L"missing confirmed files refuse an existing run"); start(); boundary(5000);
     at(1,[]{CHECK(erase(L".0"));}); restart(); CHECK(states[0].failed && states[1].failed);
 
@@ -296,8 +325,39 @@ int main() {
     at(1,[]{checkpoint_on_map(7199);});at(0,[]{checkpoint_on_map(7100);});drain(); CHECK(!states[1].failed && !states[0].failed);
     certified(1);
 
+    // A journal file is readable with no room up (2026-10-05, the main menu's "restore from a handshake save"): it names the slot, the node and the time, and hands over the database.
+    reset(L"a journal file can be read without the room"); start(); boundary(7700); certified(1);
+    for(unsigned i=0;i<2;++i)at(i,[]{
+        HandshakeSaveInfo hi; Bytes db;
+        CHECK(checkpoint_peek_file(file(L".0"),g.identity,hi,&db));
+        CHECK(hi.seq==1 && hi.run==g.run && hi.players==2 && hi.stamp && hi.slot==g.slot && !hi.after_boss && !db.empty());
+        Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.database==db);                  // the same save the room itself would restore
+        HandshakeSaveInfo none; CHECK(!checkpoint_peek_file(file(L".state"),g.identity,none,nullptr));   // the tombstone is not a save
+        Bytes torn; CHECK(checkpoint_io::read(file(L".0"),torn)); torn[torn.size()/2]^=1;
+        CHECK(checkpoint_io::atomic_write(file(L".torn.0"),torn)); CHECK(!checkpoint_peek_file(file(L".torn.0"),g.identity,none,nullptr));   // a damaged file is refused
+        CHECK(!checkpoint_peek_file(file(L".absent.0"),g.identity,none,nullptr));
+    });
+
     reset(L"SQLite snapshot failure preserves confirmed queue"); start();boundary(8000); capture_ok=false;next(8001);
     at(0,[]{Entry e{};CHECK(read_entry(file(L".0"),e,true));CHECK(e.certificate.seq==1);CHECK(!checkpoint_can_enter());});
+
+    // 2026-10-04: a Steam Deck's first capture at the first map failed once and every player sat on "next node held". A capture that fails is retried for a few seconds before it latches.
+    checkpoint_set_capture_patience(4000);
+    reset(L"a capture that fails once is retried and does not latch the room"); start();boundary(8500); capture_ok=false; next(8501);
+    CHECK(!states[0].failed && !states[1].failed);
+    capture_ok=true; Sleep(700); boundary(8501);
+    certified(2);
+    checkpoint_set_capture_patience(0);
+
+    // 2026-10-04: a save the game holds open for writing must still be readable (the raw copy used to ask for FILE_SHARE_READ only and was refused: a four-player host held every player at the first node)
+    {
+        reset(L"a save held open for writing is still read"); start();
+        HANDLE w=CreateFileW(states[0].path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr);
+        CHECK(w!=INVALID_HANDLE_VALUE);
+        Bytes held; CHECK(checkpoint_io::read(states[0].path,held,16u<<20) && held.size()>0);
+        Bytes snap; CHECK(checkpoint_io::snapshot(states[0].path,snap) && snap.size()>0);
+        if(w!=INVALID_HANDLE_VALUE) CloseHandle(w);
+    }
 
     reset(L"all settle clears exactly the current run and permits a new warehouse run");start();boundary(9000);
     for(unsigned i=0;i<2;++i)at(i,[]{checkpoint_clear();sql_exec(g.path,"UPDATE properties SET data=0 WHERE key='on_adventure'");});
@@ -628,6 +688,105 @@ int main() {
             for(unsigned k:queue_indices()) { Entry x{}; CHECK(read_entry(qfile(k),x,true)); if(x.certificate.seq==3) ++threes; }
             CHECK(threes==2);
         });
+    }
+
+    // ---- the two saves before the map (2026-10-05) ----
+    {
+        auto loaded=[&]{ for(unsigned i=0;i<participants;++i) at(i,[i]{ CHECK(g.released && !g.failed); CHECK(checkpoint_autoselect()==int(i+1)); }); };
+        auto tick=[&](uint8_t page){ for(unsigned i=0;i<participants;++i) at(i,[page]{ checkpoint_stage_tick(page); }); drain(); };
+        auto onmap=[&]{ for(unsigned i=0;i<participants;++i) at(i,[i]{ std::string cmd="UPDATE properties SET data=1 WHERE key='on_adventure'; INSERT INTO properties VALUES('coins',"+std::to_string(100+i)+");"; sql_exec(g.path,cmd.c_str()); }); };
+
+        reset(L"the two saves before the map are certified like a node's and never move the node counter");
+        selections(); loaded();
+        tick(0);
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(queue_indices().empty() && g.stage==0); });                       // on neither page: nothing
+        at(1,[]{ checkpoint_stage_tick(kStagePrep); }); drain();                                                  // the client is in the warehouse first: the host keeps its arrival
+        at(1,[]{ CHECK(g.stage==kStagePrep); });
+        tick(kStagePrep); tick(kStagePrep);                                                                       // the host arrives and prepares; both copy; commit
+        for(unsigned i=0;i<2;++i) at(i,[]{
+            CHECK(g.stageDone[kStagePrep] && !g.stage && g.seq==0 && g.dirty && !checkpoint_can_enter() && !g.failed);   // the first map's save is still owed
+            Entry e{}; CHECK(read_entry(qfile(0),e,true)); CHECK(e.certificate.seq==kStageSeqBase+kStagePrep && e.owner_count==0 && e.origin_count==0 && e.flags==0);
+            HandshakeSaveInfo hi; CHECK(checkpoint_peek_file(qfile(0),g.identity,hi,nullptr) && hi.stage==kStagePrep && hi.slot==g.slot && hi.players==2 && hi.seq==e.certificate.seq);
+            CHECK(!disk_exists(file(L".pending")));
+        });
+        tick(kStagePrep);                                                                                         // still in the warehouse: not made twice
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(queue_indices().size()==1 && g.stage==0); });
+        tick(kStageReady); tick(kStageReady);                                                                     // the chapter page
+        for(unsigned i=0;i<2;++i) at(i,[]{
+            CHECK(g.stageDone[kStageReady] && g.seq==0 && g.dirty && queue_indices().size()==2);
+            Entry e{}; CHECK(read_entry(qfile(0),e,true)); CHECK(e.certificate.seq==kStageSeqBase+kStageReady);
+            CHECK(read_entry(qfile(1),e,true)); CHECK(e.certificate.seq==kStageSeqBase+kStagePrep);
+        });
+        onmap(); boundary(30000); certified(1);                                                                    // the first map's save is number 1, as it always was
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(queue_indices().size()==3); checkpoint_stage_tick(kStagePrep); CHECK(g.stage==0); });   // a run with a node save takes no more of them
+
+        reset(L"a stage waiting for the others has no clock: the host reaches the page long before a player still choosing gear");
+        selections(); loaded();
+        at(0,[]{ checkpoint_stage_tick(kStageReady); CHECK(g.stage==kStageReady && checkpoint_stage_holding()); g.stageAt-=60000; });   // 60 s alone on the chapter page
+        at(0,[]{ checkpoint_stage_tick(kStageReady); CHECK(g.stage==kStageReady && !g.failed); });                                        // still waiting, not given up
+        at(0,[]{ checkpoint_stage_tick(0); CHECK(!g.stage && !g.stageDone[kStageReady]); });                                              // steps out when it leaves the page, and may come back
+        at(0,[]{ checkpoint_stage_tick(kStageReady); CHECK(g.stage==kStageReady); });
+        tick(kStageReady); tick(kStageReady);                                                                                              // the client arrives at last
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(g.stageDone[kStageReady] && !g.stage && queue_indices().size()==1 && !checkpoint_stage_holding()); });
+
+        reset(L"a stage still in flight is given up when the map comes first");
+        selections(); loaded();
+        at(1,[]{ checkpoint_stage_tick(kStageReady); }); drain();                                                  // only the client reached the chapter page
+        onmap(); boundary(30100); certified(1);
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(!g.stage && queue_indices().size()==1 && !g.failed); });
+        at(1,[]{ CHECK(g.stageDone[kStageReady]); });                                                               // the client gave its half up; the host never began
+
+        reset(L"a player who leaves the page before the copy gives the stage up; nobody latches");
+        selections(); loaded();
+        for(unsigned i=0;i<2;++i) at(i,[]{ checkpoint_stage_tick(kStagePrep); }); drain();                        // both arrived, the host prepared
+        at(1,[]{ CHECK(g.capture); checkpoint_stage_tick(0); CHECK(!g.stage && g.stageDone[kStagePrep] && !g.failed); });   // the client moved on
+        at(0,[]{ checkpoint_stage_tick(kStagePrep); CHECK(g.stage==kStagePrep && !g.capture); }); drain();         // the host copied and waits for an answer that never comes
+        onmap(); boundary(30200); certified(1);
+        at(0,[]{ CHECK(!g.stage && queue_indices().size()==1); });
+
+        reset(L"a copy that fails gives the stage up and does not latch the room");
+        selections(); loaded();
+        for(unsigned i=0;i<2;++i) at(i,[]{ checkpoint_stage_tick(kStagePrep); }); drain();
+        stage_capture_ok=false;
+        for(unsigned i=0;i<2;++i) at(i,[]{ checkpoint_stage_tick(kStagePrep); CHECK(!g.stage && g.stageDone[kStagePrep] && !g.failed); }); drain();
+        stage_capture_ok=true;
+        onmap(); boundary(30300); certified(1);
+
+        // restoring one starts the run over from there
+        reset(L"a save from before the map restarts the run from that page");
+        selections(); loaded();
+        tick(kStagePrep); tick(kStagePrep); tick(kStageReady); tick(kStageReady);
+        onmap(); boundary(30400); certified(1); next(30401); certified(2);
+        {
+            struct Guard { Guard(){g_manual=true;} ~Guard(){g_manual=false;} } manual;
+            restart();
+            static int prep_index=-1; prep_index=-1;
+            at(0,[]{ SaveSyncView v; CHECK(checkpoint_sync_view(v)); CHECK(v.phase==kSyncHostChoosing && !v.prep && v.n==4);
+                     CHECK(v.entry[0].seq==2 && v.entry[1].seq==1);
+                     CHECK(v.entry[2].seq==kStageSeqBase+kStageReady && v.entry[3].seq==kStageSeqBase+kStagePrep);
+                     for(unsigned s=0;s<v.n;++s) if(v.entry[s].seq==kStageSeqBase+kStagePrep) prep_index=(int)s; });
+            CHECK(prep_index==3);
+            at(0,[]{ CHECK(checkpoint_host_pick(prep_index)); }); drain();
+            for(unsigned i=0;i<2;++i) at(i,[]{
+                CHECK(g.released && !g.failed && g.run!=0 && g.seq==0 && g.mode==0 && !checkpoint_run_restored());   // a fresh start, not a resumed map
+                bool running=true; CHECK(checkpoint_io::in_run(g.path,running) && !running);                      // the warehouse save is back in the slot
+                Entry e{}; CHECK(read_entry(qfile(0),e,true)); CHECK(e.certificate.seq==kStageSeqBase+kStagePrep);
+                CHECK(queue_indices().size()==4);                                                                  // nothing was dropped
+            });
+        }
+        loaded();
+        tick(kStagePrep);                                                                                           // the warehouse again: its save is made again
+        tick(kStagePrep);
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(queue_indices().size()==5 && g.stageDone[kStagePrep]); });
+        onmap(); boundary(30500); certified(1);                                                                    // and the node counter starts from 0 again
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(queue_indices().size()==6); });
+
+        // a journal that holds only saves from before a map is a leftover: the fresh start stays open, and a save on the map is offered them
+        reset(L"stage-only leftovers do not hold a warehouse save back");
+        selections(); loaded();
+        tick(kStagePrep); tick(kStagePrep);
+        restart();
+        for(unsigned i=0;i<2;++i) at(i,[]{ CHECK(g.released && !g.failed && g.mode==0 && queue_indices().size()==1); });   // its own offer was mode 0 with no candidates: a fresh start
     }
 
     // ---- preparation stage, and who sees what while people are still picking ----

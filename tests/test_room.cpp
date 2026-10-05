@@ -75,11 +75,16 @@ void session_request_host(uint16_t) { ++asked_host; }
 void session_request_join(const char*, uint16_t) { ++asked_join; }
 void session_request_disconnect() { ++asked_disc; }
 PageState page_self() { return self_page; }
+const char* page_name(PageState p) { return p == PageState::Collar ? "collar" : p == PageState::Equipment ? "gear" : p == PageState::Chapter ? "chapter" : "other"; }
+uint32_t cats_chosen = 0;                                   // what the panel's own cards say this peer brings
+uint32_t catview_self(const CatBrief** out) { if (out) *out = nullptr; return cats_chosen; }
+uint32_t catview_of(uint8_t, const CatBrief** out) { if (out) *out = nullptr; return 0; }
 PageState page_of(uint8_t id) { return id < 4 ? pages[id] : PageState::Unknown; }
 MenuScreen leave_menu_screen() { return screen; }
 void menu_request_slot(int s) { requested_slot = s; }
 bool checkpoint_abort_round() { ++aborts; round_open = false; return true; }
 bool checkpoint_round_open() { return round_open; }
+void checkpoint_stage_tick(uint8_t) {}
 uintptr_t addr_of_data(DataSym d) { return d == D_MewDirectorPtr ? (uintptr_t)&director_ptr : 0; }
 bool mem_read(const void* src, void* dst, size_t n) { memcpy(dst, src, n); return true; }
 const Config& config() { static Config c; return c; }
@@ -218,6 +223,31 @@ int main() {
     lobby[0].away = true; room_tick();
     active = false; lobby[0].away = false; room_tick();
     CHECK(asked_join == 1);
+
+    printf("-- a save already past the departure box, with more cats than the room allows (2026-10-05) --\n");
+    for (int players : { 3, 4 }) {
+        const uint32_t limit = players == 4 ? 2u : 3u;
+        for (PageState pg : { PageState::Collar, PageState::Equipment, PageState::Chapter }) {
+            fresh(); nids = (uint8_t)players; self_page = PageState::House; cats_chosen = 0; Sleep(520); room_tick();   // leaving the setup pages forgets what was said
+            self_page = pg; cats_chosen = limit + 1;
+            Sleep(520); room_tick();
+            CHECK(!notice_text().empty());                               // told to choose the save again
+            room_notice_dismiss(); Sleep(520); room_tick(); CHECK(notice_text().empty());   // said once for this count
+        }
+        fresh(); nids = (uint8_t)players; self_page = PageState::House; cats_chosen = 0; Sleep(520); room_tick();
+        self_page = PageState::Collar; cats_chosen = limit;    // within the limit: nothing
+        Sleep(520); room_tick(); CHECK(notice_text().empty());
+        fresh(); nids = (uint8_t)players; self_page = PageState::House; cats_chosen = limit + 1;  // not past the box yet: the box checks it
+        Sleep(520); room_tick(); CHECK(notice_text().empty());
+    }
+    fresh(); nids = 2; self_page = PageState::Collar; cats_chosen = 4; Sleep(520); room_tick(); CHECK(notice_text().empty());   // two players: no limit
+    cats_chosen = 0;
+    // the readings the gear screen, the client's READY and the host's choice use
+    fresh(); nids = 4; self_page = PageState::Chapter; cats_chosen = 3;
+    { uint32_t n = 0; CHECK(room_self_over_limit(&n) && n == 3); }
+    cats_chosen = 2; CHECK(!room_self_over_limit());
+    self_page = PageState::House; cats_chosen = 3; CHECK(!room_self_over_limit());
+    cats_chosen = 0;
 
     printf("-- a second pick while one is open; the main menu drops the pick --\n");
     fresh(); locked = true; round_open = true;

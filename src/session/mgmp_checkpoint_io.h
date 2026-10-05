@@ -7,6 +7,11 @@ using Bytes = std::vector<uint8_t>;
 bool read(const std::wstring& path, Bytes& out, uint32_t limit = 5u << 20);
 bool atomic_write(const std::wstring& path, const Bytes& bytes);
 bool snapshot(const std::wstring& source, Bytes& out);
+// What the last snapshot() did when it failed, or how it succeeded if it had to take the file as it is (empty after a plain backup). For a caller's log line.
+const char* snapshot_why();
+// Whether a file is a SQLite database the game can be given: it has the SQLite header and opens and answers a query -- WITHOUT sqlite's full integrity check, which snapshot() applies and which a save the game
+// itself loads happily can still fail. Fills `out` with the bytes. For restoring a backup, where refusing a save the game would have opened is worse than handing it over.
+bool loadable(const std::wstring& source, Bytes& out);
 bool in_run(const std::wstring& source, bool& running);
 // True when this save's adventure has already ENTERED the map: files.trollengine_state's event count is
 // nonzero, OR properties.adventure_started is 1 (the count stays 0 until the first node resolves, so on
@@ -21,7 +26,8 @@ bool on_map(const std::wstring& source, bool& started);
 // blob literal so no new sqlite entry points are needed.
 bool read_file_row(const std::wstring& source, const char* key, int& have, Bytes& out);
 bool write_file_row(const std::wstring& target, const char* key, const Bytes& in);
-bool restore(const std::wstring& target, const Bytes& bytes);
+// require_run: the database must be a save that is in a run (on_adventure) -- every node save is. The two saves from before the map (mgmp_checkpoint kStagePrep / kStageReady) are not necessarily.
+bool restore(const std::wstring& target, const Bytes& bytes, bool require_run = true);
 // One `properties` row as text (integers and reals arrive as their decimal
 // spelling). have=false when the row is absent; a false RETURN means the
 // database itself could not be opened or read. Read-only, so it is safe on a

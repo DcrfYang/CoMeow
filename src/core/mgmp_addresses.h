@@ -130,6 +130,7 @@ enum Target : int {
     T_ResCompleteItemQuest,  // the House method `complete_item_quest` (0x1401CF6F0: House*, quest name, flag), called by the event result of the same name
     T_ResGiveItem,        // the event results' common item giver (0x140920600: result context, item name, equip flag, flag): get_item, get_item_from_pool, get_and_equip_item(_from_pool), get_parasite_from_pool -- inventory insert, the equip on the subject cat, the message
     T_ResDejaVu,             // the event result `increment_deja_vu` (0x140937930: context, node): the deja-vu legacy counter
+    T_SettingGetFloat,    // Settings::get_float (0x1409D3B40: settings, std::string* key, default in xmm2) -> float in xmm0: the turn layer reads "combat_speed" through it every frame
     T_COUNT
 };
 
@@ -659,6 +660,7 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x001CF6F0, "RESCOMPLETEQUEST", "event result complete_item_quest" },
     { 0x00920600, "RESGIVEITEM", "event result item giver (get_item & co: Inventory::insert_item + equip)" },
     { 0x00937930, "RESDEJAVU", "event result increment_deja_vu" },
+    { 0x009D3B40, "SETTINGGETFLOAT", "Settings::get_float (the combat speed is read through it)" },
 };
 
 // Coarse module guard, checked before the per-target signatures.

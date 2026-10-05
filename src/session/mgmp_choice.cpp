@@ -419,6 +419,7 @@ struct State {
         ChoiceMsg message;
         uint8_t from = kNoPeer;
         bool warned = false;
+        bool checked = false;     // "held upgrade check" was logged for THIS message (one line per held message, not per frame)
     };
     static constexpr uint32_t kPendingPerPeer = 64;
     static constexpr uint32_t kPendingLevels = kPendingPerPeer * kMaxPeers;
@@ -715,13 +716,12 @@ void apply_level_pending(void* screen) {
         // step, and whether the screen's subject is the cat the message names. One line per
         // (node, step, cat), because this runs every frame while the screen is up.
         {
-            static uint64_t said_node = 0;
-            static uint64_t said_cat  = 0;
-            static uint32_t said_step = 0xFFFFFFFFu;
-            if (said_node != m.node_seed || said_step != m.level_step || said_cat != m.cat_id) {
-                said_node = m.node_seed; said_step = m.level_step; said_cat = m.cat_id;
-                log_line_lvl(LogLevel::Warn, "CHOICE",
-                             "!! held upgrade check: cat=%016llX from=%u owner=%u | node"
+            // Once per held MESSAGE. The old guard remembered only the LAST (node, step, cat), so with two or more peers' upgrades held at the same time (three players) the messages took turns
+            // overwriting it and the line was written on every frame: 1212 lines in one three-player log (2026-10-05).
+            if (!held.checked) {
+                held.checked = true;
+                log_line_lvl(LogLevel::Info, "CHOICE",
+                             "held upgrade check: cat=%016llX from=%u owner=%u | node"
                              " msg=%016llX here=%016llX | step msg=%u here=%u | subject"
                              " %016llX/%016llX vs msg %016llX/%016llX",
                              (unsigned long long)m.cat_id, (unsigned)held.from, (unsigned)owner,

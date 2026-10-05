@@ -61,6 +61,13 @@ int     room_self_row();
 // Balance for bigger rooms: with 3 players each brings at most 3 cats, with 4 players at most 2; 2 players
 // (and single player) are unchanged. 0 = no limit.
 int  room_party_limit();
+// A PEER'S CATS OVER THE ROOM'S LIMIT (2026-10-05). The party-size rule is checked at the departure box; a save stored on the collar, gear or chapter page skips it. These read the cats a peer has chosen (its cards, shown on
+// those pages) against the limit of a 3/4-player room: _self for this peer (true: over, count filled), _other for the others (the 0-based ROW of the first player that is over, -1 for none). The gear screen's
+// done button, a client's READY and the host's chapter choice refuse while they are true.
+bool room_self_over_limit(uint32_t* count = nullptr);
+int  room_other_over_limit(uint32_t* count = nullptr);
+void room_say_party_over();            // to this peer: your cats exceed the limit, choose the save again
+void room_say_peer_over(int row);      // to the host: that player must choose the save again
 // From the House's departure (T_TryDepart) with the number of cats in the box. False = refused (and the
 // player has been told the limit).
 bool room_depart_allowed(uint32_t cats);

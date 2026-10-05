@@ -219,6 +219,7 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_PROPS:     return dec_props(r, m.props);
         case MSG_RNGL:      return dec_rngl(r, m.rngl);
         case MSG_CHAT:      return dec_chat(r, m.chat);
+        case MSG_SETTING:   return dec_setting(r, m.setting);
         case MSG_DEEP:      return dec_deep(r, m.deep);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
@@ -303,6 +304,9 @@ bool relayed(uint8_t type) {
         // Authored by every peer and read by every peer -- the vote has no arbiter.
         case MSG_ABANDON:
         case MSG_ROOMCTL:
+        // DEBUGHIT (developer tools): authored by whichever peer clicks, and every peer must write the same hp or the next turn's hash halts. Without this a client's hit reached the host only,
+        // and the second client fought on against enemies the other two had already struck down (2026-10-05, three players).
+        case MSG_DEBUGHIT:
             return true;
         default:
             return false;
@@ -1306,6 +1310,7 @@ bool net_send_statedump(const StateDumpMsg& m) {
 }
 
 bool net_send_uqd(const UqdMsg& m) { uint8_t p[128]; const uint32_t n = enc_uqd(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_setting(const SettingMsg& m) { uint8_t p[16]; const uint32_t n = enc_setting(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_chat(const ChatMsg& m) { uint8_t p[320]; const uint32_t n = enc_chat(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_rngl(const RnglMsg& m) { uint8_t p[512]; const uint32_t n = enc_rngl(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_deep(const DeepMsg& m) { uint8_t p[384]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }

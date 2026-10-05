@@ -1,3 +1,5 @@
+#include <chrono>
+#include <thread>
 #include "mgmp_catsync.h"
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
@@ -26,6 +28,10 @@ bool battle_up = false, known_owners = false;
 bool setup_ready = true, resume_owners = false;
 bool notes_ready = false, split_flipped = false;
 uint8_t peer_position = 0, peer_count = 2;
+bool net_active_flag = true;                         // the session exists (false: left / never joined)
+uint8_t member_ids[4] = {0, 1, 2, 3};                // net_peer_ids: who is in the session (peer ids), as many as peer_count says
+int drop_calls = 0; uint32_t drop_mask = 0;          // roster_drop_positions, as the membership watch calls it
+int prune_calls = 0, prune_keep = -1;                // roster_leave_prune, as the catsync alone-check calls it
 uint64_t rng[4] = {1, 2, 3, 4}, counter = 10;
 unsigned char director[0x800]{}, registry[0x200]{};
 const void* director_ptr = director;
@@ -541,6 +547,63 @@ void clones_return_to_their_originals() {
     }
     CHECK(catsync_merge_session_cats("again") == 0);                                 // idempotent
     entries.clear(); peer_position = 0;
+}
+
+// A RUN LEFT IN A ROOM THAT THE PROCESS DID NOT SEE END (2026-10-05): loaded alone, the other players' cats are recognised by having no original in this registry.
+void alone_check_finds_this_players_position() {
+    entries.clear(); peer_position = 1; peer_count = 2; net_active_flag = true; initialize(); depart_all(4);
+    SetupMsg first{};
+    CHECK(catsync_prepare_party_setup(first, 1)); free_msg_cats(first);                       // this player's clones: 71000001..4, with originals out on adventure
+    static uint64_t own[4] = {0x71000001ull, 0x71000002ull, 0x71000003ull, 0x71000004ull};
+    static uint64_t fam[2] = {0x70000001ull, 0x70000002ull};
+    for (unsigned i = 0; i < 2; ++i) {                                                       // another player's clones: no original here
+        void* cat = allocate(0xC58); put(cat, kCatData_SaveId, fam[i]); put(cat, 0, uint64_t(0x5000 + i)); put(cat, kCatData_Flags, uint64_t(kAway));
+        entries[fam[i]].cat = cat;
+    }
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)own);
+    put(director, kDir_CatFamiliars, uint32_t(4)); put(director, kDir_CatFamiliars + 4, uint32_t(2)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    peer_count = 1; net_active_flag = true; prune_calls = 0; prune_keep = -1;
+    catsync_leave_tick();
+    CHECK(prune_calls == 0);                                                                  // a session is still up: it may get its player back
+    net_active_flag = false; std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    catsync_leave_tick();
+    CHECK(prune_calls == 1 && prune_keep == 1);                                               // position 1's cats have originals: they are this player's
+    // nobody's cats have originals: which are this player's cannot be told, so nothing is removed
+    entries.clear(); initialize();
+    for (unsigned i = 0; i < 2; ++i) {
+        void* cat = allocate(0xC58); put(cat, kCatData_SaveId, fam[i]); put(cat, 0, uint64_t(0x6000 + i)); put(cat, kCatData_Flags, uint64_t(kAway));
+        entries[fam[i]].cat = cat;
+        void* c2 = allocate(0xC58); put(c2, kCatData_SaveId, own[i]); put(c2, 0, uint64_t(0x7000 + i)); put(c2, kCatData_Flags, uint64_t(kAway));
+        entries[own[i]].cat = c2;
+    }
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_CatIdData, (const uint64_t*)own);
+    put(director, kDir_CatFamiliars, uint32_t(4)); put(director, kDir_CatFamiliars + 4, uint32_t(2)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    prune_calls = 0; std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    catsync_leave_tick();
+    CHECK(prune_calls == 0);
+    entries.clear(); peer_position = 0; peer_count = 2; net_active_flag = true;
+}
+
+// A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05): the two who stay take the leaver's cats out of the run; nobody else's.
+void a_player_who_drops_out_loses_their_cats_for_everyone_else() {
+    entries.clear(); peer_position = 0; peer_count = 3; net_active_flag = true; initialize();
+    member_ids[0] = 0; member_ids[1] = 1; member_ids[2] = 2;
+    drop_calls = 0; drop_mask = 0;
+    catsync_leave_tick();                                   // the room is whole: its members and their positions are remembered
+    CHECK(drop_calls == 0);
+    peer_count = 2; member_ids[0] = 0; member_ids[1] = 2;    // peer id 1 (position 1) left; peer id 2 is now second in the list
+    catsync_leave_tick();
+    CHECK(drop_calls == 1 && drop_mask == (1u << 1));        // position 1's cats, not position 2's (whose index in the list changed)
+    drop_calls = 0; drop_mask = 0;
+    catsync_leave_tick();
+    CHECK(drop_calls == 0);                                 // done once
+    peer_count = 2; member_ids[0] = 0; member_ids[1] = 1; member_ids[2] = 2;
+    net_active_flag = false; catsync_leave_tick();            // the session is gone: the next one starts clean
+    net_active_flag = true; peer_count = 3; catsync_leave_tick();
+    peer_count = 2; member_ids[0] = 1; member_ids[1] = 2;    // now the HOST (peer id 0, position 0) is the one gone
+    catsync_leave_tick();
+    CHECK(drop_calls == 1 && drop_mask == 1u);
+    entries.clear(); peer_count = 2; net_active_flag = true;
 }
 
 void legacy_clones_are_merged_before_they_are_overwritten() {
@@ -1059,7 +1122,7 @@ void digest_heals_from_owner() {
 }
 namespace mgmp {
 const Config& config() { return cfg; }
-bool net_active() { return true; }
+bool net_active() { return net_active_flag; }
 bool setup_runtime_ready() { return setup_ready; }
 uint8_t net_peer_pos() { return peer_position; }
 uint8_t net_peer_count() { return peer_count; }
@@ -1091,6 +1154,10 @@ bool roster_setup_replace_party(const uint64_t* ids, uint32_t count, const char*
 }
 void roster_setup_set_ready(bool) {}
 bool roster_add_familiars(const uint64_t*, uint32_t, const char*) { return true; }
+int roster_leave_prune(uint8_t keep, const char*) { ++prune_calls; prune_keep = keep; return 0; }
+int roster_drop_positions(uint32_t mask, const char*) { ++drop_calls; drop_mask |= mask; return 0; }
+bool net_peer_ids(uint8_t* out, uint8_t cap) { if (cap < peer_count) return false; for (unsigned i = 0; i < peer_count; ++i) out[i] = member_ids[i]; return true; }
+void roster_party_swap_reset() {}
 uint64_t* rng_global_stream() { return rng; }
 void log_stage(const char*, ...) {}
 void log_stage_quiet(const char*, ...) {}
@@ -1133,7 +1200,7 @@ int main() {
     wide_names(); initialize(); imports_and_membership(); entry_replacement(); rejected_inputs();
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
-    in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals();
+    in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals(); alone_check_finds_this_players_position(); a_player_who_drops_out_loses_their_cats_for_everyone_else();
     legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);

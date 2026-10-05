@@ -110,6 +110,22 @@ bool saveslots_auto_load(int index);
 bool saveslots_auto_export(int index, const wchar_t* path);
 void saveslots_auto_tick();                        // every frame: sees "a run was on the map, now the warehouse is up" and pushes once, a few seconds later (the game's own write has finished by then)
 
+// RESTORE FROM A HANDSHAKE SAVE (2026-10-05). Every confirmed save of a multiplayer run is a whole copy of this player's slot (mgmp_checkpoint: <save dir>\\mgmp_handshake\\<id>\\<pairing>.N). The page lists
+// them per slot, newest first, and puts one back over its slot -- with the undo point first, like any load. The queue and its records are left as they are.
+constexpr int kSyncMax = 64;                           // listed per slot
+struct SyncSave {
+    int64_t  saved_at = 0;                             // unix seconds
+    uint64_t run = 0, seq = 0;                         // the run and the node (seq) it was confirmed at
+    int      players = 0;
+    bool     after_boss = false;
+    uint8_t  stage = 0;                                // 1 / 2: one of the two saves from before the map (mgmp_checkpoint kStagePrep / kStageReady), whose seq is not a node count; 0 = a node's save
+    int      day = -1, percent = -1;                   // what the game's save screen would show; -1 = unreadable
+};
+void saveslots_sync_refresh();                         // rescans the folders (reads every save; call it when the page opens and after an action, not every frame)
+int  saveslots_sync_count(int slot);                   // slot 0..2
+const SyncSave& saveslots_sync_get(int slot, int index);
+bool saveslots_sync_restore(int slot, int index);
+
 bool saveslots_undo_available();
 bool saveslots_undo();                                 // put back what the last load replaced
 

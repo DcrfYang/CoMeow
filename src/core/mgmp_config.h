@@ -202,6 +202,9 @@ struct Config {
 
 // dll_dir must be the directory containing mgmp.dll (no trailing slash).
 void        config_load(const wchar_t* dll_dir);
+// The folder that holds mgmp.dll (no trailing slash), as config_load was given it; empty before that. Files the mod writes for the player to keep (the recent rooms) go here -- never into the GAME's folder,
+// where the launcher takes any unknown file for another mod.
+const wchar_t* config_dll_dir();
 const Config& config();
 
 // THE PANEL'S CONNECT BUTTONS ARE A ROLE, AND THE ROLE IS READ FROM HERE.

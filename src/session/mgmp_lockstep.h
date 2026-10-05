@@ -151,6 +151,13 @@ void lockstep_set_turn_control(void* turn_control);
 
 // In a room: set the shared simulation stream from (battle, turn, actor) -- called by the NextTurn hook after the turn boundary (`actor` = null) and by the BeginTurn hook
 // (`actor` = the character, `arg` its argument). The same call on every peer gives the same stream whatever was drawn before it. A no-op outside a room or a snapshotted battle.
+// THE ACTION TRACE (ACTRACE, 2026-10-05). A state-only desync names the cat and the turn, never the ACTION that did it: the 2026-10-05 halt was five arrow shots at one tile where a spiked cat died on one peer
+// and survived on the other, and the log held only the turn's total. For every applied action in a session this logs, from DoAction: who acts, with what, at which tile, and which units stand on that tile
+// (roster index, position in the game's live character list -- the order a tile lookup may walk -- hp, shield); and, when the next action or the turn boundary comes, what that action changed (hp, shield,
+// tile, life, new units). The same lines on both peers, so the first line that differs is the action. Reading only.
+void lockstep_action_trace(const void* actor, const void* turn_action);
+void lockstep_action_trace_flush(const char* why);
+
 void lockstep_reseed(const void* actor, int arg);
 
 // The armed click's landing point: apply AND broadcast, so both peers write the

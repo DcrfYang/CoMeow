@@ -1002,17 +1002,21 @@ static bool replace_three(const uint32_t* party,uint32_t pn,const uint32_t* fam,
     bool ok=true;
     for(auto& e:v) {
         if(e.n==e.want_n && !memcmp(e.old,e.want,e.n*8)) continue;
+        // A vector that becomes EMPTY has no elements to write or read back, and the real mem_write / mem_read refuse a length of 0 -- which made every attempt to empty the familiar list
+        // (leaving a room, 2026-10-05) a "refused transaction". Only the count is written then.
         uint64_t check[16]{};uint32_t cn=0;
-        if(!mem_write((void*)e.data,e.want,e.want_n*8)||!mem_write((uint8_t*)e.vec+4,&e.want_n,4)||
-           !mem_read((void*)e.data,check,e.want_n*8)||memcmp(check,e.want,e.want_n*8)||
+        const bool body=e.want_n==0 ||
+            (mem_write((void*)e.data,e.want,e.want_n*8)&&mem_read((void*)e.data,check,e.want_n*8)&&!memcmp(check,e.want,e.want_n*8));
+        if(!body||!mem_write((uint8_t*)e.vec+4,&e.want_n,4)||
            !mem_read((uint8_t*)e.vec+4,&cn,4)||cn!=e.want_n) {ok=false;break;}
     }
     if(!ok) {
         bool rollback=true;
         for(auto& e:v) {
             uint64_t check[16]{};uint32_t cn=0;
-            const bool restored=mem_write((void*)e.data,e.old,e.n*8)&&mem_write((uint8_t*)e.vec+4,&e.n,4)&&
-                mem_read((void*)e.data,check,e.n*8)&&!memcmp(check,e.old,e.n*8)&&
+            const bool body=e.n==0 ||
+                (mem_write((void*)e.data,e.old,e.n*8)&&mem_read((void*)e.data,check,e.n*8)&&!memcmp(check,e.old,e.n*8));
+            const bool restored=body&&mem_write((uint8_t*)e.vec+4,&e.n,4)&&
                 mem_read((uint8_t*)e.vec+4,&cn,4)&&cn==e.n;
             rollback=restored&&rollback;
         }
@@ -1623,6 +1627,47 @@ bool roster_normalize_shared(const char* why) {
     log_line("ROSTER", "!! %s: native promotion undone -- party %u -> %u, familiars %u -> %u "
              "(every cat back on its owner's side)", why, pn, npn, fn, nfn);
     return true;
+}
+
+template <class F> static int prune_lists(F foreign, const char* why) {
+    uintptr_t pd = 0, fd = 0; uint32_t pn = 0, fn = 0;
+    if (!swap_director(&pd, &fd, &pn, &fn) || pn == 0 || pn > kSwapIds || fn > kSwapIds || (fn && !fd)) return -1;
+    uint32_t pa[kSwapIds]{}, fa[kSwapIds]{};
+    if (!swap_read_ids(pd, pa, pn) || !swap_read_ids(fd, fa, fn)) return -1;
+    uint32_t kp[kSwapIds]{}, kf[kSwapIds]{}, nkp = 0, nkf = 0, removed = 0;
+    for (uint32_t i = 0; i < pn; ++i) { if (foreign(pa[i])) ++removed; else kp[nkp++] = pa[i]; }
+    for (uint32_t i = 0; i < fn; ++i) {
+        bool dup = false;
+        for (uint32_t j = 0; j < nkp; ++j) dup = dup || kp[j] == fa[i];
+        if (foreign(fa[i])) ++removed; else if (!dup) kf[nkf++] = fa[i];
+    }
+    if (!removed) return 0;
+    uint32_t np[4]{}, nf[kSwapIds]{}, cp = 0, cf = 0;
+    for (uint32_t i = 0; i < nkp; ++i) { if (cp < 4) np[cp++] = kp[i]; else nf[cf++] = kp[i]; }   // a party longer than four cannot be written: the rest become familiars
+    for (uint32_t i = 0; i < nkf; ++i) {
+        if (!cp || (cp < 4 && !nkp)) np[cp++] = kf[i];       // nothing of the party was this peer's own: its own familiars move up
+        else nf[cf++] = kf[i];
+    }
+    char before[200]{}, after[200]{};
+    int bo = 0, ao = 0;
+    for (uint32_t i = 0; i < pn + fn && bo < (int)sizeof(before) - 12; ++i) bo += _snprintf_s(before + bo, sizeof(before) - bo, _TRUNCATE, "%s%x", i == pn ? " |" : " ", i < pn ? pa[i] : fa[i - pn]);
+    for (uint32_t i = 0; i < cp + cf && ao < (int)sizeof(after) - 12; ++i) ao += _snprintf_s(after + ao, sizeof(after) - ao, _TRUNCATE, "%s%x", i == cp ? " |" : " ", i < cp ? np[i] : nf[i - cp]);
+    if (!cp) {
+        log_line_lvl(LogLevel::Error, "ROSTER", "!! %s: no cat of this peer's own is in the run's lists (party | familiars:%s) -- the other players' cats are LEFT, an empty party is not a state the game builds", why, before);
+        return -1;
+    }
+    if (!replace_three(np, cp, nf, cf)) { log_line_lvl(LogLevel::Error, "ROSTER", "!! %s: the other players' cats could not be taken out of the run's lists", why); return -1; }
+    log_line_lvl(LogLevel::Warn, "ROSTER", "!! %s: %u cat(s) of other players taken out of the run -- (party | familiars)%s ->%s", why, removed, before, after);
+    return (int)removed;
+}
+
+int roster_leave_prune(uint8_t keep_pos, const char* why) {
+    return prune_lists([&](uint32_t id) { const int o = session_cat_owner(id); return o >= 0 && o != (int)keep_pos; }, why);
+}
+
+// A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05): the cats of the positions in `mask` (bit p = position p) leave this peer's run; everybody else's stay.
+int roster_drop_positions(uint32_t mask, const char* why) {
+    return prune_lists([&](uint32_t id) { const int o = session_cat_owner(id); return o >= 0 && o < 32 && ((mask >> o) & 1u); }, why);
 }
 
 // THE HOST DECIDES WHICH CATS ARE IN THE RUN (2026-09-29). Measured Host3/Client2:

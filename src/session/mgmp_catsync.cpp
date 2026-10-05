@@ -489,6 +489,42 @@ void ensure_state() {
 // records the first time). Everything they use -- bs_construct, safe_serialize, safe_bs_dtor and
 // the kBS_* offsets -- is still visible from here, because an anonymous namespace's names are
 // usable in the namespace that encloses it.
+// WHAT ELSE A CLONE DOES NOT HAVE: the numeric region of the cat data (0x60..0x788: the body, the three stat arrays, the floats) of the original and of its clone, word by word; the first differences are
+// logged (offset: original -> clone). Strings and pointers live above 0x788 and are not compared. A clone that is a faithful copy prints "no difference".
+static void log_cat_diff(const void* original, const void* clone) {
+    if (!original || !clone) return;
+    char text[600] = {};
+    int off = 0, shown = 0, total = 0;
+    for (uint32_t o = 0x60; o + 4 <= 0x788; o += 4) {
+        int32_t a = 0, b = 0;
+        if (!mem_read((const uint8_t*)original + o, &a, 4) || !mem_read((const uint8_t*)clone + o, &b, 4) || a == b) continue;
+        ++total;
+        if (shown < 24 && off < (int)sizeof(text) - 40) { ++shown; off += _snprintf_s(text + off, sizeof(text) - off, _TRUNCATE, "%s%X:%d>%d", shown > 1 ? " " : "", o, a, b); }
+    }
+    if (!total) log_line("PARTS", "setup: the clone's numeric region equals its original's (0x60..0x788)");
+    else log_line("PARTS", "setup: the clone differs from its original in %d word(s) of 0x60..0x788 [offset:original>clone]: %s", total, text);
+}
+
+void catsync_log_cat_parts(const void* cat, const char* what) {
+    if (!cat) { log_line("PARTS", "%s: no cat", what ? what : "?"); return; }
+    char text[320] = {};
+    int off = 0, muts = 0;
+    uint64_t h = 1469598103934665603ULL;
+    for (int k = 0; k < 14; ++k) {
+        int32_t id = 0, mut = 0;
+        uint8_t has = 0;
+        const uint8_t* base = (const uint8_t*)cat + 0x54 * k;
+        if (!mem_read(base + 0x8C, &id, 4) || !mem_read(base + 0x90, &mut, 4) || !mem_read(base + 0xA4, &has, 1)) { id = -1; mut = -1; has = 0; }
+        if (has) ++muts;
+        const int32_t row[3] = { id, has ? mut : 0, has ? 1 : 0 };
+        for (int q = 0; q < 3; ++q) { h ^= (uint32_t)row[q]; h *= 1099511628211ULL; }
+        if (off < (int)sizeof(text) - 24) off += _snprintf_s(text + off, sizeof(text) - off, _TRUNCATE, has ? "%s%d*%d" : "%s%d", k ? " " : "", id, mut);
+    }
+    uint64_t cid = 0;
+    mem_read((const uint8_t*)cat + kCatData_SaveId, &cid, sizeof(cid));
+    log_line("PARTS", "%s: cat %016llx has %d mutation(s) [%s] hash %016llx", what ? what : "?", (unsigned long long)cid, muts, text, (unsigned long long)h);
+}
+
 uint32_t serialize_cat(void* cat, uint8_t** out) {
     *out = nullptr;
     uint8_t bs[kByteStreamSize];
@@ -514,6 +550,23 @@ uint32_t serialize_cat(void* cat, uint8_t** out) {
 // See the declaration in the header: the cat-sync apply path's read-mode recipe, against an
 // address the caller names rather than one the run resolves. Same two checks afterwards, so a
 // truncated image cannot be acknowledged as successfully loaded.
+// THE PART TYPES THE IMAGE DOES NOT CARRY (2026-10-04, found from two live logs: "all of one player's cats have the same mutations"). Each of a cat's 14 body-part slots (CatData+0x8C + 0x54*k) starts with a
+// part TYPE, which the cat serializer does not write (it saves the five ints after it). The cat constructor sets every one to 0x15 (21, "unset"); the game's own generators (0x1407387D0 and 0x1407374C0)
+// assign the real per-slot types as immediates, and a cat the game loads or makes has them. A session cat is built here as allocate + construct + read + post-load, which never runs a generator, so its
+// 14 types stayed 21: the mutation list the cat card builds from (type, value) pairs (0x1400CB690) then showed the same type for every slot -- while the saved values after it were fine. The types are the
+// same constants for every cat (they are in the code as immediates), so they are put back wherever a slot still holds the constructor's 21; a slot that holds anything else is the game's own and is left.
+static const int32_t kPartType[14] = { 0, 1, 2, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 9 };
+static unsigned restore_part_types(void* cat) {
+    unsigned fixed = 0;
+    for (int k = 0; k < 14; ++k) {
+        uint8_t* slot = (uint8_t*)cat + 0x8C + 0x54 * k;
+        int32_t now = 0;
+        if (!mem_read(slot, &now, sizeof(now)) || now != 0x15) continue;
+        if (mem_write(slot, &kPartType[k], sizeof(int32_t))) ++fixed;
+    }
+    return fixed;
+}
+
 bool catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len) {
     if (!cat || !image || !len || len > kMaxCatBytes) return false;
 
@@ -536,6 +589,7 @@ bool catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len) {
     if (ok) ok = safe_serialize(cat, bs);
     ok = ok && *(uint32_t*)(bs + kBS_ReadPos) == len;
     safe_bs_dtor(bs);
+    if (ok) restore_part_types(cat);
     return ok;
 }
 
@@ -1378,6 +1432,8 @@ unsigned catsync_merge_session_cats(const char* why) {
         bool swapped = false;
         if (have_origin) {
             uint8_t* backup = nullptr;
+            catsync_log_cat_parts(o.cat, "merge: the original, before it takes the run's cat");
+            catsync_log_cat_parts(clone, "merge: the session cat that comes home");
             // A cat that survived: the clone the House holds BECOMES the original (see swap_identity). A dead one has nothing in the House: its image is copied.
             if (!clone_dead && swap_identity(registry, id, clone, o.id, o.cat)) {
                 swapped = true; ok = true;
@@ -1417,6 +1473,7 @@ unsigned catsync_merge_session_cats(const char* why) {
                                      why, (unsigned long long)o.id, (unsigned long long)chk_seed, (unsigned long long)chk_flags);
                 }
                 if (recorded) ++by_record; else ++by_seed;
+                catsync_log_cat_parts(o.cat, "merge: the cat at home afterwards");
                 origin_forget(id);
                 log_line("CATSYNC", "merge (%s): session cat %016llx returned to %016llx%s%s%s%s (flags %llx -> %llx), clone retired",
                          why, (unsigned long long)id, (unsigned long long)o.id, o.legacy ? " (an older build's clone)" : "",
@@ -1592,6 +1649,66 @@ unsigned catsync_relocate_squatters(const char* why) {
 // A PICTURE OF EVERYTHING THE SESSION'S CAT BOOKKEEPING DEPENDS ON, in the log, at the moments that matter (2026-10-03): the run's lists, the save's day, the id counter, and for every
 // clone slot of every player (1..6, so the older builds' leftovers show too) the cat that sits there -- its flags, seed, birth day, owner note, recorded origin, whether it was swapped or adopted.
 // Reading only; every read is guarded. One line per namespace that holds anything, so a settlement's before/after can be diffed by eye.
+void catsync_log_audit(const char* stage) {
+    ensure_state();
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!g.resolved || !g.director_slot || !mem_read(g.director_slot, &dir, sizeof(dir)) || !dir ||
+        !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) {
+        log_line("AUDIT", "%s: the director / registry is not readable", stage ? stage : "?");
+        return;
+    }
+    const bool room = net_peer_count() >= 2;
+    const uint8_t me = my_session_pos();
+    log_line("AUDIT", "%s: %s -- this peer's position %u (%s)", stage ? stage : "?", room ? "IN A ROOM" : "ALONE (no room)", (unsigned)me, s_run_pos_known ? "learned in a room" : "never in a room this run");
+
+    struct Entry { const char* list; uint64_t id; };
+    Entry held[24]; unsigned nheld = 0;
+    {
+        uint32_t pc = 0; const uint64_t* pd = nullptr;
+        if (mem_read(dir + kDir_CatIdCount, &pc, 4) && mem_read(dir + kDir_CatIdData, &pd, sizeof(pd)) && pd && pc <= 12)
+            for (uint32_t i = 0; i < pc && nheld < 24; ++i) { uint64_t id = 0; if (mem_read(pd + i, &id, 8)) held[nheld++] = { "party", id }; }
+        uint32_t fcap = 0, fc = 0; const uint64_t* fd = nullptr;
+        if (mem_read(dir + kDir_CatFamiliars, &fcap, 4) && mem_read(dir + kDir_CatFamiliars + 4, &fc, 4) && mem_read(dir + kDir_CatFamiliars + 8, &fd, sizeof(fd)) && fd && fc <= fcap && fc <= 12)
+            for (uint32_t i = 0; i < fc && nheld < 24; ++i) { uint64_t id = 0; if (mem_read(fd + i, &id, 8)) held[nheld++] = { "familiar", id }; }
+    }
+    unsigned foreign = 0;
+    for (unsigned i = 0; i < nheld; ++i) {
+        const uint64_t id = held[i].id;
+        const bool session = (id >> 28) == 7;
+        const unsigned owner = (unsigned)((id >> 24) & 0xF);
+        void* cat = nullptr; uint64_t fl = 0, seed = 0; int32_t birth = 0; uint8_t note = 0xFF;
+        const bool have = safe_by_id((void*)registry, id, &cat) && cat;
+        if (have) {
+            mem_read((const uint8_t*)cat + kCatData_Flags, &fl, sizeof(fl));
+            mem_read(cat, &seed, sizeof(seed));
+            mem_read((const uint8_t*)cat + kCatData_BirthDay, &birth, sizeof(birth));
+            lockstep_owner_pos(id, note);
+        }
+        const bool other = session && owner != me;
+        if (other && !room) ++foreign;
+        char whose[64];
+        if (session) _snprintf_s(whose, sizeof(whose), _TRUNCATE, "a session cat of position %u%s", owner, owner == me ? " (this peer's own)" : " (ANOTHER player's)");
+        else         _snprintf_s(whose, sizeof(whose), _TRUNCATE, "an ordinary cat");
+        log_line_lvl(other && !room ? LogLevel::Warn : LogLevel::Info, "AUDIT", "%s%s[%u] %016llx: %s; %s flags %llx seed %08llx birth %d note %d origin %llx", other && !room ? "!! " : "  ", held[i].list, i, (unsigned long long)id, whose,
+                     have ? "registered," : "NOT IN THE REGISTRY,", (unsigned long long)fl, (unsigned long long)(seed & 0xFFFFFFFFull), birth, note == 0xFF ? -1 : (int)note, (unsigned long long)catsync_origin_of(id));
+    }
+    // Other players' clones that are alive, not retired and not out on adventure: what the House shows and an adventure box can pick.
+    unsigned visible = 0; char vis[300] = {}; int w = 0;
+    for (uint32_t p = 0; p < kMaxPeers; ++p) {
+        if (p == me) continue;
+        for (uint32_t slot = 1; slot <= kCloneSlots; ++slot) {
+            const uint64_t id = 0x70000000ull + ((uint64_t)p << 24) + slot;
+            void* cat = nullptr; uint64_t fl = 0;
+            if (!safe_by_id((void*)registry, id, &cat) || !cat || !mem_read((const uint8_t*)cat + kCatData_Flags, &fl, sizeof(fl))) continue;
+            if (!(fl & 0x1) || (fl & 0x2) || (fl & kCatFlag_OnAdventure)) continue;
+            ++visible;
+            if (w >= 0 && (size_t)w < sizeof(vis) - 40) w += _snprintf_s(vis + w, sizeof(vis) - w, _TRUNCATE, " %llx(fl%llx)", (unsigned long long)id, (unsigned long long)fl);
+        }
+    }
+    if (visible) log_line_lvl(room ? LogLevel::Info : LogLevel::Warn, "AUDIT", "%s%u clone(s) of OTHER players are alive, not retired and not out on adventure -- the House shows them and an adventure box can pick them:%s", room ? "  " : "!! ", visible, vis);
+    log_line("AUDIT", "%s: %u cat(s) in the run's lists, %u of them another player's session cat while alone, %u foreign clone(s) visible", stage ? stage : "?", nheld, foreign, visible);
+}
+
 void catsync_log_snapshot(const char* stage) {
     ensure_state();
     const uint8_t* dir = nullptr; const void* registry = nullptr;
@@ -1634,9 +1751,9 @@ void catsync_log_snapshot(const char* stage) {
 // session range (the host's save held 71000001-3 and 71000004-6; the client's 70000001-4). Nobody can pick them, but they sit on the ids the next run's clones need, and the "real cat on a reserved id"
 // scare came from exactly such leftovers. Once the run is over a peer's copy has no purpose: it is retired the way this player's own clones are (flags 0; the next run's import rewrites it whole).
 // Not touched: anything in the run's lists, anything that is not flagged out on adventure, and this peer's own namespace.
-unsigned catsync_retire_peer_copies(const char* why) {
+unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions) {
     ensure_state();
-    if (!g.on || !g.director_slot) return 0;
+    if (!g.resolved || !g.director_slot) return 0;      // not g.on: also after the session is gone (leaving a room)
     const uint8_t* dir = nullptr; const void* registry = nullptr;
     if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return 0;
     uint64_t busy[32] = {}; uint32_t nbusy = 0;
@@ -1650,7 +1767,7 @@ unsigned catsync_retire_peer_copies(const char* why) {
     const uint8_t me = my_session_pos();
     unsigned retired = 0; char ids_text[220] = {}; int w = 0;
     for (uint32_t p = 0; p < kMaxPeers; ++p) {
-        if (p == me) continue;
+        if (p == me || !((only_positions >> p) & 1u)) continue;
         for (uint32_t slot = 1; slot <= kCloneSlots; ++slot) {
             const uint64_t id = 0x70000000ull + ((uint64_t)p << 24) + slot;
             bool in_lists = false;
@@ -1799,6 +1916,9 @@ bool catsync_prepare_party_setup(SetupMsg& out, uint8_t owner_pos) {
             log_line("SETUP", "cloned selected cat %016llx -> session cat %016llx (owner %u slot %u)",
                      (unsigned long long)original.cats[i].id, (unsigned long long)id,
                      (unsigned)owner_pos, (unsigned)i);
+            catsync_log_cat_parts(source, "setup: the original");
+            catsync_log_cat_parts(clone, "setup: its clone");
+            log_cat_diff(source, clone);
         }
         session_ids[i] = id;
         adopted_clear(id);                                          // this slot is a new selection now
@@ -2103,7 +2223,14 @@ void catsync_init() {
                            "client's own edits are applied here");
 }
 
+static bool s_leave_pending = false;
+static unsigned s_leave_tries = 0;
+
 void catsync_shutdown() {
+    if (g.announced) {
+        catsync_log_audit("the session ends");
+        if (s_run_pos_known && net_peer_count() >= 1) { s_leave_pending = true; s_leave_tries = 0; log_line("CATSYNC", "the session ended: the other players' cats leave the run at the next map update (now if this peer is on the map, after the fight if it is in one)"); }
+    }
     const uint32_t stranded = g.pend_count;
     free_pending();
     if (!g.announced) return;
@@ -2150,6 +2277,127 @@ void catsync_forget() {
 }
 
 static bool publish_impl(uint8_t target, const char* why, bool quiet_if_nothing, bool force);
+
+// A RUN LEFT IN A ROOM THAT THE PROCESS DID NOT SEE END (2026-10-05): the game was closed or crashed, or the player quit to the menu and the process was restarted. The save then holds the run as it stood
+// in the room -- the other players' session cats in the party / familiar lists -- and loading it ALONE plays with them. Nothing remembered which position this peer was, so it is read off the cats:
+// this player's own clones are the ones with an ORIGINAL in this registry (an ordinary cat out on adventure with the same seed, which is what the merge-back matches on); another player's clones have none
+// here. When exactly one position's cats have originals, that is this peer's, and the rest are taken out the same way as when a room is left. Not decidable (none / several): left alone, said once.
+static void alone_check() {
+    static ULONGLONG s_next = 0;
+    static uint64_t s_refused_sig = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < s_next) return;
+    s_next = now + 1000;
+    if (net_active() || !g.resolved || !g.director_slot) return;     // a session still up may get its player back: only a run with no session at all is looked at
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return;
+    uint64_t ids[24]; unsigned n = 0;
+    {
+        uint32_t pc = 0; const uint64_t* pd = nullptr;
+        if (mem_read(dir + kDir_CatIdCount, &pc, 4) && mem_read(dir + kDir_CatIdData, &pd, sizeof(pd)) && pd && pc && pc <= 12)
+            for (uint32_t i = 0; i < pc && n < 24; ++i) { uint64_t id = 0; if (mem_read(pd + i, &id, 8)) ids[n++] = id; }
+        uint32_t fcap = 0, fc = 0; const uint64_t* fd = nullptr;
+        if (mem_read(dir + kDir_CatFamiliars, &fcap, 4) && mem_read(dir + kDir_CatFamiliars + 4, &fc, 4) && mem_read(dir + kDir_CatFamiliars + 8, &fd, sizeof(fd)) && fd && fc && fc <= fcap && fc <= 12)
+            for (uint32_t i = 0; i < fc && n < 24; ++i) { uint64_t id = 0; if (mem_read(fd + i, &id, 8)) ids[n++] = id; }
+    }
+    unsigned positions = 0;                                       // bit p: a session cat of position p is in the lists
+    for (unsigned i = 0; i < n; ++i) if ((ids[i] >> 28) == 7) positions |= 1u << ((ids[i] >> 24) & 0xF);
+    if (__popcnt(positions) < 2) return;                          // one player's cats (or none): nothing foreign to find
+    const uint64_t sig = positions ^ ((uint64_t)n << 32) ^ (ids[0] * 0x9E3779B97F4A7C15ull);
+    if (sig == s_refused_sig) return;
+    unsigned mine = 0, with_origin = 0;                           // bit p: a session cat of position p has an original here
+    for (unsigned i = 0; i < n; ++i) {
+        if ((ids[i] >> 28) != 7) continue;
+        void* cat = nullptr; uint64_t seed = 0;
+        if (!safe_by_id((void*)registry, ids[i], &cat) || !cat || !mem_read(cat, &seed, sizeof(seed))) continue;
+        Origin o;
+        if (find_origin_by_seed(registry, seed, ids, n, o)) { mine |= 1u << ((ids[i] >> 24) & 0xF); ++with_origin; }
+    }
+    if (__popcnt(mine) != 1) {
+        s_refused_sig = sig;
+        log_line_lvl(LogLevel::Warn, "CATSYNC", "!! alone, and the run's lists hold session cats of positions %#x, but which of them is this player's cannot be read off the cats (positions with an original here: %#x, %u cat(s)) -- left as they are", positions, mine, with_origin);
+        catsync_log_audit("alone, the run holds several players' cats");
+        return;
+    }
+    unsigned pos = 0; while (!((mine >> pos) & 1u)) ++pos;
+    s_run_pos = (uint8_t)pos; s_run_pos_known = true;
+    log_line("CATSYNC", "alone, and the run's lists hold session cats of positions %#x: this player's are those of position %u (their originals are in this save) -- the others' leave the run now", positions, pos);
+    const int removed = roster_leave_prune((uint8_t)pos, "alone, the run was left in a room");
+    if (removed < 0) { s_next = now + 5000; return; }
+    const unsigned retired = catsync_retire_peer_copies("alone, the run was left in a room");
+    roster_party_swap_reset();
+    log_line("CATSYNC", "alone: %d cat(s) of other players taken out of the run's lists, %u of their copies retired in the registry", removed, retired);
+    catsync_log_audit("alone, the other players' cats removed");
+}
+
+// A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05, a three-player test: the player who left lost the others' cats, the two who stayed kept the leaver's). The membership is watched on the map tick: the
+// ids of the session as last seen with the position each one holds (its index in the list while the room was whole -- the namespace of its clones), and an id that is gone puts its position in the mask. The leaver's
+// cats are then taken out of this run's lists and their copies retired, on the map and not in a fight, as for a player who leaves.
+static uint8_t  s_seen_ids[kMaxPeers] = {};
+static uint8_t  s_seen_n = 0;
+static uint8_t  s_pos_of[kMaxPeers] = {};            // by peer id: the position it had when the room was whole
+static bool     s_dropped_any = false;
+static uint32_t s_drop_mask = 0;
+static unsigned s_drop_tries = 0;
+
+static void members_watch() {
+    uint8_t ids[kMaxPeers] = {};
+    if (!net_peer_ids(ids, kMaxPeers)) return;
+    const uint8_t n = net_peer_count();
+    if (n < 2 || n > kMaxPeers) return;
+    if (n >= s_seen_n && !s_dropped_any) {                       // the room is as whole as it has been: remember who holds which position
+        for (uint8_t i = 0; i < n; ++i) if (ids[i] < kMaxPeers) s_pos_of[ids[i]] = i;
+        memcpy(s_seen_ids, ids, n); s_seen_n = n;
+        return;
+    }
+    if (n >= s_seen_n) { memcpy(s_seen_ids, ids, n); s_seen_n = n; return; }
+    uint32_t gone = 0;
+    for (uint8_t k = 0; k < s_seen_n; ++k) {
+        bool still = false;
+        for (uint8_t i = 0; i < n; ++i) if (ids[i] == s_seen_ids[k]) still = true;
+        if (!still && s_seen_ids[k] < kMaxPeers) gone |= 1u << s_pos_of[s_seen_ids[k]];
+    }
+    memcpy(s_seen_ids, ids, n); s_seen_n = n;
+    if (!gone) return;
+    s_dropped_any = true;
+    s_drop_mask |= gone; s_drop_tries = 0;
+    log_line("CATSYNC", "player(s) of position mask %#x left the room, which goes on with %u player(s): their cats leave this run at the next map update", gone, (unsigned)n);
+}
+
+static void drop_apply() {
+    if (!s_drop_mask) return;
+    ensure_state();
+    if (!g.resolved) { s_drop_mask = 0; return; }
+    const int removed = roster_drop_positions(s_drop_mask, "a player left the room");
+    if (removed < 0) {
+        if (++s_drop_tries >= 120) { log_line_lvl(LogLevel::Error, "CATSYNC", "!! a player left the room: their cats could not be taken out of the run after %u tries -- giving up", s_drop_tries); s_drop_mask = 0; }
+        return;
+    }
+    const unsigned retired = catsync_retire_peer_copies("a player left the room", s_drop_mask);
+    roster_party_swap_reset();
+    log_line("CATSYNC", "a player left the room: %d cat(s) of position mask %#x taken out of the run's lists, %u of their copies retired", removed, s_drop_mask, retired);
+    s_drop_mask = 0;
+    catsync_log_audit("a player left the room, on the map");
+}
+
+void catsync_leave_tick() {
+    if (!net_active()) { s_seen_n = 0; s_dropped_any = false; s_drop_mask = 0; }     // no session: the next one starts with a clean membership
+    if (net_active() && net_peer_count() >= 2) { members_watch(); drop_apply(); return; }
+    if (!s_leave_pending) { if (net_peer_count() < 2) alone_check(); return; }
+    if (net_peer_count() >= 2) { s_leave_pending = false; return; }       // a new session began: the leaving is moot
+    ensure_state();
+    if (!g.resolved || !s_run_pos_known) { s_leave_pending = false; return; }
+    const int removed = roster_leave_prune(s_run_pos, "left the room");
+    if (removed < 0) {
+        if (++s_leave_tries >= 120) { s_leave_pending = false; log_line_lvl(LogLevel::Error, "CATSYNC", "!! left the room: the other players' cats could not be taken out of the run after %u tries -- giving up", s_leave_tries); }
+        return;
+    }
+    s_leave_pending = false;
+    const unsigned retired = catsync_retire_peer_copies("left the room");
+    roster_party_swap_reset();           // the shared layout the swap remembered no longer exists
+    log_line("CATSYNC", "left the room: %d cat(s) of other players taken out of the run's lists, %u of their copies retired in the registry", removed, retired);
+    catsync_log_audit("left the room, on the map");
+}
 
 bool catsync_publish(const char* why, bool quiet_if_nothing, bool force) {
     return publish_impl(kNoPeer, why, quiet_if_nothing, force);
@@ -2455,6 +2703,7 @@ bool catsync_apply_snapshot(const CatDataMsg& m, const char* when, bool allow_cr
         if (uint64_t* base = baseline(m.id)) *base = m.hash;
         log_line("CATSYNC", "<- applied cat %016llx (%u bytes, %s)",
                  (unsigned long long)m.id, m.size, when);
+        if (when && strcmp(when, "all-player setup exchange") == 0) catsync_log_cat_parts(cat, "setup: as applied here");
     }
     return ok;
 }

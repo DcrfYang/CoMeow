@@ -18,6 +18,7 @@
 #include "mgmp_session.h"
 #include "mgmp_signal.h"
 #include "mgmp_ui.h"
+#include "mgmp_savemirror.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -240,6 +241,8 @@ DWORD WINAPI init_thread(LPVOID) {
         SetEvent(ev);
         // Deliberately leaked: the loader may not have waited on it yet.
     }
+    // The game's save folders, copied once to <the mod's folder>\原存档 (when that does not exist yet). After the unpark, on a thread of its own.
+    savemirror_start();
     return 0;
 }
 

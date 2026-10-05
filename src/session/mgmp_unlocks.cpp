@@ -568,13 +568,17 @@ void describe_cat_inputs(void* cat, char* out, size_t cap, uint64_t& fp) {
         if (mem_read(slot + 8 + 0x10, &len, sizeof(len)) && len && len < 64) mem_read_std_string(slot + 8, name, sizeof(name));
         off += _snprintf_s(gear + off, sizeof(gear) - off, _TRUNCATE, "%s%s", k ? "," : "", name);
     }
-    _snprintf_s(out, cap, _TRUNCATE, "%s STR %d DEX %d CON %d INT %d SPD %d CHA %d LCK %d | image %016llx | flags %016llx | kitten %d | class '%s' |"
-                      " +6F0 [%d %d %d %d %d %d %d] +70C [%d %d %d %d %d %d %d] +728 [%d %d %d %d %d %d %d] | +910 [%s] | gear [%s]",
+    // GEAR AND ABILITIES BEFORE THE LONG ARRAYS (2026-10-05): the audit's text travels in a fixed-size field (about 270 characters) and was cut inside the gear list, so "this cat's gear differs" -- the one
+    // thing a pre-battle difference usually is -- could not be read in the log. The fingerprint is taken over the whole text, the copy that travels is cut.
+    char full[900] = {};
+    _snprintf_s(full, sizeof(full), _TRUNCATE, "%s STR %d DEX %d CON %d INT %d SPD %d CHA %d LCK %d | image %016llx | flags %016llx | kitten %d | class '%s' |"
+                      " gear [%s] | +910 [%s] | +6F0 [%d %d %d %d %d %d %d] +70C [%d %d %d %d %d %d %d] +728 [%d %d %d %d %d %d %d]",
              have ? "stats" : "STATS UNREADABLE", s[0], s[1], s[2], s[3], s[4], s[5], s[6],
-             (unsigned long long)catsync_image_hash(cat), (unsigned long long)flags, kitten_answer(cat), cls,
-             a[0], a[1], a[2], a[3], a[4], a[5], a[6], b[0], b[1], b[2], b[3], b[4], b[5], b[6], c[0], c[1], c[2], c[3], c[4], c[5], c[6], list, gear);
+             (unsigned long long)catsync_image_hash(cat), (unsigned long long)flags, kitten_answer(cat), cls, gear, list,
+             a[0], a[1], a[2], a[3], a[4], a[5], a[6], b[0], b[1], b[2], b[3], b[4], b[5], b[6], c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+    strncpy_s(out, cap, full, _TRUNCATE);
     fp = 1469598103934665603ULL;                         // FNV-1a, the same as mgmp_lockstep's: only this peer's text against the other's
-    for (const char* c = out; *c; ++c) { fp ^= (uint8_t)*c; fp *= 1099511628211ULL; }
+    for (const char* c = full; *c; ++c) { fp ^= (uint8_t)*c; fp *= 1099511628211ULL; }
 }
 
 void log_cat_inputs(void* cat) {
@@ -1501,6 +1505,42 @@ bool unlocks_fight_released() {
                  won ? "every enemy is down" : "the battle's character list is gone");
     }
     return cls.released;
+}
+
+// --- the combat speed (proto 82) --------------------------------------------------------------------------------------------------------------------------
+namespace {
+float g_host_speed = 0.0f;           // client: what the host told us (0 = nothing yet)
+float g_sent_speed = 0.0f;           // host: what was last sent
+uint8_t g_sent_peers = 0;            // host: how many players there were then (a player who joined must be told again)
+bool g_speed_said = false;
+}
+bool settings_override(const char* key, float own, float& out) {
+    if (!key || strcmp(key, "combat_speed") != 0) return false;
+    if (!net_active() || net_peer_count() < 2) { g_host_speed = 0.0f; g_sent_speed = 0.0f; g_sent_peers = 0; g_speed_said = false; return false; }
+    if (net_role() == NetRole::Host) {
+        const uint8_t peers = net_peer_count();
+        if (own != g_sent_speed || peers != g_sent_peers) {
+            SettingMsg m; m.id = kSettingCombatSpeed; m.value = own;
+            if (net_send_setting(m)) {
+                g_sent_speed = own; g_sent_peers = peers;
+                log_line("SETTING", "the host's combat speed %.2f is sent to the other players (their game uses it, so every animation takes the same time)", (double)own);
+            }
+        }
+        return false;
+    }
+    if (g_host_speed <= 0.0f) return false;
+    if (!g_speed_said || own != g_host_speed) {
+        if (!g_speed_said) log_line("SETTING", "this game uses the HOST's combat speed %.2f while in the room (this player's own setting is %.2f and is not changed)", (double)g_host_speed, (double)own);
+        g_speed_said = true;
+    }
+    out = g_host_speed;
+    return true;
+}
+
+void settings_on_message(uint8_t from, const SettingMsg& m) {
+    if (net_role() == NetRole::Host || from != kHostPeer || m.id != kSettingCombatSpeed) return;
+    if (m.value != g_host_speed) log_line("SETTING", "the host's combat speed is now %.2f", (double)m.value);
+    g_host_speed = m.value;
 }
 
 void unlocks_level_screen_opens() {

@@ -180,6 +180,13 @@ bool roster_normalize_shared(const char* why);
 // leave_party_temporarily was the measured case. Rewrites the three lists and
 // re-bases the local map view. False only when the write itself failed; lists
 // that do not validate are logged and left alone (the node hash reports them).
+// LEAVING THE ROOM (2026-10-05): the run keeps only this peer's own session cats. Every id of another player's session range (0x70..0x7F, owner != keep_pos) is taken out of the party, the mirror and the familiar
+// list; ordinary ids (a cat the game itself brought in) stay, because their owner cannot be proven. If the party would be left empty the own cats of the familiar list move up. Map phase only. Returns the number
+// of ids removed, 0 when there was nothing to remove, -1 when the lists could not be read or written (the caller may try again).
+int roster_leave_prune(uint8_t keep_pos, const char* why);
+// The same for a player who dropped out of a room that goes on: only the cats of the positions in `mask` (bit p = position p) are taken out. Same return convention.
+int roster_drop_positions(uint32_t mask, const char* why);
+
 bool roster_adopt_host_shared(const uint64_t* cats, uint32_t cat_count,
                               const uint64_t* familiars, uint32_t familiar_count,
                               const char* why);

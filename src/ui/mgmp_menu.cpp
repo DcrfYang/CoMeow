@@ -61,6 +61,7 @@ constexpr ImU32 kPaperLo = IM_COL32(190, 190, 182, 255);
 constexpr ImU32 kGreen   = IM_COL32(74, 140, 84, 255);
 constexpr ImU32 kAmber   = IM_COL32(196, 146, 40, 255);
 constexpr ImU32 kRed     = IM_COL32(180, 62, 58, 255);
+constexpr ImU32 kYellow  = IM_COL32(222, 164, 10, 255);   // the closed-port notice
 constexpr ImU32 kGrey    = IM_COL32(120, 120, 116, 255);
 constexpr ImU32 kPink    = IM_COL32(226, 150, 146, 255);   // the save screen's knob
 
@@ -228,13 +229,22 @@ struct Menu {
     SignalRoom rooms[32];
     SignalPeer peers[8];
 
+    // --- the lobby: the room list and, on a page of its own, the form that creates a room ---
+    bool create_page = false;
+
     // --- backup window ---
     char save_name[kSaveNameMax] = {};
     Confirm confirm = Confirm::None;
     int     confirm_idx = -1;
     double  confirm_until = 0;
+    // The dialog that asks before a backup is loaded, overwritten or deleted (None = closed). idx 0.. = the twenty, 100.. = the auto saves.
+    Confirm dlg = Confirm::None;
+    int     dlg_idx = -1;
     SaveSlotInfo current[kGameSlots];
     double  refreshed_at = 0;
+    // The page that restores a slot from a handshake save (inside the backup window); sync_slot/sync_idx = the entry the confirm dialog is about (-1 = closed).
+    bool    sync_page = false;
+    int     sync_slot = -1, sync_idx = -1;
 
     // --- toast ---
     char   toast[512] = {};
@@ -910,11 +920,85 @@ void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
 
 void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_out, bool compact);
 
+// THE CREATE-ROOM PAGE (2026-10-05): the connection method, the room's name and an optional password, on a page of their own -- they shared the room list's page and it was too crowded.
+void draw_create_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H, bool busy) {
+    const float k = v.k;
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(150), 36 * k, kInk, tr(Tx::CREATE_ROOM));
+
+    // THE CARRIER (2026-10-03): the game port (direct) or Steam's relay. "Direct" is only offered once the server has seen the port from outside.
+    RoomTransport chosen = RoomTransport::Any;
+    float y = 200;
+    if (!signal_server_private()) {      // a lobby on this network needs no choosing
+        const DirectCheck ds = signal_direct_check();
+        const bool direct_ok = ds == DirectCheck::Open || ds == DirectCheck::NoAnswer;
+        const bool steam_ok = signal_steam_usable();
+        int relay_used = 0, relay_max = 0;
+        const bool relay_known = signal_relay_info(&relay_used, &relay_max);
+        const bool relay_ok = relay_known && relay_used < relay_max;
+        int eff = g.transport;
+        if (eff == 1 && !direct_ok) eff = 0;
+        if (eff == 2 && !steam_ok) eff = 0;
+        if (eff == 3 && !relay_ok) eff = 0;
+        if (eff == 0) eff = direct_ok ? 1 : (steam_ok ? 2 : 0);
+        const unsigned port = (unsigned)config().net_port;
+        char lbl[96];
+        text_at(dl, ImVec2(X(50), Y(y + 14)), 26 * k, kInk, tr(Tx::TR_LABEL));
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, tr(Tx::TR_DIRECT), port);
+        if (paper_button("tr_direct", ImVec2(X(190), Y(y)), ImVec2(X(400), Y(y + 52)), lbl, 22 * k, direct_ok && !busy, eff == 1 ? Tone::Good : Tone::Normal)) g.transport = 1;
+        if (paper_button("tr_steam", ImVec2(X(410), Y(y)), ImVec2(X(620), Y(y + 52)), tr(Tx::TR_STEAM), 22 * k, steam_ok && !busy, eff == 2 ? Tone::Good : Tone::Normal)) g.transport = 2;
+        if (relay_known) _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s %u/%u", tr(Tx::TR_RELAY), (unsigned)relay_used, (unsigned)relay_max);
+        else             _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s", tr(Tx::TR_RELAY));
+        if (paper_button("tr_relay", ImVec2(X(630), Y(y)), ImVec2(X(W - 50), Y(y + 52)), lbl, 22 * k, relay_ok && !busy && !g.relay_warn, eff == 3 ? Tone::Good : Tone::Normal)) {
+            // The project's own server is small: say so before the server is chosen as the carrier
+            if (strncmp(signal_server(), "49.233.209.67:", 14) == 0) g.relay_warn = true;
+            else g.transport = 3;
+        }
+        char hint[400] = {};
+        ImU32 col = kInkSoft;
+        if (eff == 3) {
+            _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_RELAY_SEL), (unsigned)relay_used, (unsigned)relay_max);
+        } else {
+            switch (ds) {
+                case DirectCheck::Unknown:
+                case DirectCheck::Checking: _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_CHECKING), port); break;
+                case DirectCheck::Open:     _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_OPEN), port); col = kGreen; break;
+                case DirectCheck::Closed:   _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_CLOSED), port); col = kYellow; break;
+                case DirectCheck::Busy:     _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_BUSY), port); col = kRed; break;
+                case DirectCheck::NoAnswer: _snprintf_s(hint, sizeof(hint), _TRUNCATE, "%s", tr(Tx::TR_NOANSWER)); col = kAmber; break;
+            }
+            if (!steam_ok) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_STEAM_NA)); }
+        }
+        if (!relay_known) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_RELAY_NA)); }
+        else if (!relay_ok) { const size_t n = strlen(hint); char full[200]; _snprintf_s(full, sizeof(full), _TRUNCATE, tr(Tx::TR_RELAY_FULL), (unsigned)relay_used, (unsigned)relay_max); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", full); }
+        wrap_text(dl, X(50), Y(y + 70), (W - 100 - 180) * k, 22 * k, 26 * k, col, hint);
+        if (paper_button("tr_recheck", ImVec2(X(W - 190), Y(y + 66)), ImVec2(X(W - 50), Y(y + 116)), tr(Tx::TR_RECHECK), 22 * k, ds != DirectCheck::Checking && !busy)) signal_request_direct_check();
+        chosen = eff == 1 ? RoomTransport::Direct : eff == 2 ? RoomTransport::Steam : eff == 3 ? RoomTransport::Relay : RoomTransport::Any;
+        y += 160;
+    }
+
+    // the name, and an optional password (empty = an open room)
+    text_at(dl, ImVec2(X(50), Y(y + 12)), 26 * k, kInk, tr(Tx::ROOM_NAME));
+    paper_input("##room", ImVec2(X(190), Y(y)), ImVec2(X(W - 50), Y(y + 52)), g.room, sizeof(g.room), tr(Tx::ROOM_NAME_HINT), 26 * k);
+    text_at(dl, ImVec2(X(50), Y(y + 84)), 26 * k, kInk, tr(Tx::ROOM_PW));
+    paper_input("##roompw", ImVec2(X(190), Y(y + 72)), ImVec2(X(W - 50), Y(y + 124)), g.create_pw, sizeof(g.create_pw), tr(Tx::ROOM_PW_HINT), 26 * k, ImGuiInputTextFlags_Password);
+
+    if (paper_button("create", ImVec2(X(70), Y(H - 130)), ImVec2(X(W / 2 - 10), Y(H - 58)), tr(Tx::CREATE_ROOM), 34 * k, !busy && !g.pw_ask, Tone::Good)) {
+        signal_request_create(g.room, g.create_pw, chosen);
+        strncpy_s(g.room_name, sizeof(g.room_name), g.room, _TRUNCATE);
+        log_line("MENU", "create requested: '%s'%s, carrier %s", g.room, g.create_pw[0] ? " (password)" : "",
+                 chosen == RoomTransport::Direct ? "direct" : chosen == RoomTransport::Steam ? "Steam" : chosen == RoomTransport::Relay ? "server relay" : "any");
+    }
+    if (paper_button("create_back", ImVec2(X(W / 2 + 10), Y(H - 130)), ImVec2(X(W - 70), Y(H - 58)), tr(Tx::BACK), 34 * k)) g.create_page = false;
+}
+
 void draw_multi_window(const View& v) {
     ensure_inited();
     const SignalState st0 = signal_state();
     const bool disconnected = st0 == SignalState::Off || st0 == SignalState::Failed || st0 == SignalState::Closed;
-    const float W = 900, H = in_room() ? (lan_host_running() ? 886.0f : 860.0f) : (st0 == SignalState::Connected ? (signal_server_private() ? 800.0f : 900.0f) : (disconnected && g.lan_tab ? 880.0f : 760.0f));
+    if (in_room() || st0 != SignalState::Connected) g.create_page = false;      // the form belongs to the connected lobby
+    const float W = 900, H = in_room() ? (lan_host_running() ? 886.0f : 860.0f) : (st0 == SignalState::Connected ? (g.create_page ? (signal_server_private() ? 560.0f : 700.0f) : 780.0f) : (disconnected && g.lan_tab ? 880.0f : 760.0f));
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f + 20);
     const ImVec2 sz(W * v.k, H * v.k);
     if (!overlay_window_begin("##mgmp_multi", a, sz)) { ImGui::End(); return; }
@@ -1005,11 +1089,13 @@ void draw_multi_window(const View& v) {
     _snprintf_s(who, sizeof(who), _TRUNCATE, tr(Tx::CONNECTED_AS), signal_server(), signal_name());
     text_c(dl, X(W / 2), Y(112), 26 * k, kGreen, who);
 
+    if (g.create_page) { draw_create_page(dl, v, a, W, H, busy); ImGui::End(); return; }
+
     // search
     text_at(dl, ImVec2(X(50), Y(150)), 26 * k, kInk, tr(Tx::SEARCH));
     paper_input("##search", ImVec2(X(190), Y(138)), ImVec2(X(W - 50), Y(190)), g.search, sizeof(g.search), tr(Tx::SEARCH_HINT), 26 * k);
 
-    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(204), ly1 = Y(H - (signal_server_private() ? 270 : 450));
+    const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(204), ly1 = Y(H - 140);
     rough_rect(dl, ImVec2(lx0, ly0), ImVec2(lx1, ly1), IM_COL32(255, 255, 250, 70), kInk, 2.2f, 91, 1.2f);
     const uint32_t total = signal_rooms(g.rooms, 32);
     // The rows that match the search: open rooms first, locked ones after them (the server sends them that way
@@ -1069,75 +1155,19 @@ void draw_multi_window(const View& v) {
         ImGui::EndChild();
     }
 
-    // THE CARRIER (2026-10-03): the game port (direct) or Steam's relay. "Direct" is only offered once the server has seen the port from outside.
-    RoomTransport chosen = RoomTransport::Any;
-    if (!signal_server_private()) {      // a lobby on this network needs no choosing
-        const DirectCheck ds = signal_direct_check();
-        const bool direct_ok = ds == DirectCheck::Open || ds == DirectCheck::NoAnswer;
-        const bool steam_ok = signal_steam_usable();
-        int relay_used = 0, relay_max = 0;
-        const bool relay_known = signal_relay_info(&relay_used, &relay_max);
-        const bool relay_ok = relay_known && relay_used < relay_max;
-        int eff = g.transport;
-        if (eff == 1 && !direct_ok) eff = 0;
-        if (eff == 2 && !steam_ok) eff = 0;
-        if (eff == 3 && !relay_ok) eff = 0;
-        if (eff == 0) eff = direct_ok ? 1 : (steam_ok ? 2 : 0);
-        const unsigned port = (unsigned)config().net_port;
-        char lbl[96];
-        text_at(dl, ImVec2(X(50), Y(H - 426)), 26 * k, kInk, tr(Tx::TR_LABEL));
-        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, tr(Tx::TR_DIRECT), port);
-        if (paper_button("tr_direct", ImVec2(X(190), Y(H - 440)), ImVec2(X(400), Y(H - 388)), lbl, 22 * k, direct_ok && !busy, eff == 1 ? Tone::Good : Tone::Normal)) g.transport = 1;
-        if (paper_button("tr_steam", ImVec2(X(410), Y(H - 440)), ImVec2(X(620), Y(H - 388)), tr(Tx::TR_STEAM), 22 * k, steam_ok && !busy, eff == 2 ? Tone::Good : Tone::Normal)) g.transport = 2;
-        if (relay_known) _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s %u/%u", tr(Tx::TR_RELAY), (unsigned)relay_used, (unsigned)relay_max);
-        else             _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s", tr(Tx::TR_RELAY));
-        if (paper_button("tr_relay", ImVec2(X(630), Y(H - 440)), ImVec2(X(W - 50), Y(H - 388)), lbl, 22 * k, relay_ok && !busy && !g.relay_warn, eff == 3 ? Tone::Good : Tone::Normal)) {
-            // The project's own server is small: say so before the server is chosen as the carrier
-            if (strncmp(signal_server(), "49.233.209.67:", 14) == 0) g.relay_warn = true;
-            else g.transport = 3;
+    // the bottom row: create (opens the form on its own page), refresh, disconnect, back
+    {
+        const float bw = (W - 100 - 30) / 4;
+        auto bx = [&](int i) { return 50 + i * (bw + 10); };
+        if (paper_button("open_create", ImVec2(X(bx(0)), Y(H - 120)), ImVec2(X(bx(0) + bw), Y(H - 56)), tr(Tx::CREATE_ROOM), 28 * k, !busy && !g.pw_ask, Tone::Good)) g.create_page = true;
+        if (paper_button("refresh", ImVec2(X(bx(1)), Y(H - 120)), ImVec2(X(bx(1) + bw), Y(H - 56)), tr(Tx::REFRESH), 28 * k, !busy)) {
+            signal_request_list(); g.next_list = now() + 3.0;
         }
-        char hint[400] = {};
-        ImU32 col = kInkSoft;
-        if (eff == 3) {
-            _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_RELAY_SEL), (unsigned)relay_used, (unsigned)relay_max);
-        } else {
-            switch (ds) {
-                case DirectCheck::Unknown:
-                case DirectCheck::Checking: _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_CHECKING), port); break;
-                case DirectCheck::Open:     _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_OPEN), port); col = kGreen; break;
-                case DirectCheck::Closed:   _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_CLOSED), port, port); col = kRed; break;
-                case DirectCheck::Busy:     _snprintf_s(hint, sizeof(hint), _TRUNCATE, tr(Tx::TR_BUSY), port); col = kRed; break;
-                case DirectCheck::NoAnswer: _snprintf_s(hint, sizeof(hint), _TRUNCATE, "%s", tr(Tx::TR_NOANSWER)); col = kAmber; break;
-            }
-            if (!steam_ok) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_STEAM_NA)); }
-        }
-        if (!relay_known) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_RELAY_NA)); }
-        else if (!relay_ok) { const size_t n = strlen(hint); char full[200]; _snprintf_s(full, sizeof(full), _TRUNCATE, tr(Tx::TR_RELAY_FULL), (unsigned)relay_used, (unsigned)relay_max); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", full); }
-        wrap_text(dl, X(50), Y(H - 376), (W - 100 - 180) * k, 20 * k, 24 * k, col, hint);
-        if (paper_button("tr_recheck", ImVec2(X(W - 190), Y(H - 372)), ImVec2(X(W - 50), Y(H - 322)), tr(Tx::TR_RECHECK), 22 * k, ds != DirectCheck::Checking && !busy)) signal_request_direct_check();
-        chosen = eff == 1 ? RoomTransport::Direct : eff == 2 ? RoomTransport::Steam : eff == 3 ? RoomTransport::Relay : RoomTransport::Any;
+        if (paper_button("disc", ImVec2(X(bx(2)), Y(H - 120)), ImVec2(X(bx(2) + bw), Y(H - 56)), tr(Tx::DISCONNECT_SERVER), 28 * k, !busy, Tone::Danger))
+            signal_request_disconnect();
+        if (paper_button("back", ImVec2(X(bx(3)), Y(H - 120)), ImVec2(X(bx(3) + bw), Y(H - 56)), tr(Tx::BACK), 28 * k))
+            g.win = Win::None;
     }
-
-    // create rows: the name, and an optional password (empty = an open room)
-    text_at(dl, ImVec2(X(50), Y(H - 252)), 26 * k, kInk, tr(Tx::ROOM_NAME));
-    paper_input("##room", ImVec2(X(190), Y(H - 264)), ImVec2(X(W - 320), Y(H - 212)), g.room, sizeof(g.room), tr(Tx::ROOM_NAME_HINT), 26 * k);
-    text_at(dl, ImVec2(X(50), Y(H - 190)), 26 * k, kInk, tr(Tx::ROOM_PW));
-    paper_input("##roompw", ImVec2(X(190), Y(H - 202)), ImVec2(X(W - 320), Y(H - 150)), g.create_pw, sizeof(g.create_pw), tr(Tx::ROOM_PW_HINT), 26 * k,
-                ImGuiInputTextFlags_Password);
-    if (paper_button("create", ImVec2(X(W - 300), Y(H - 264)), ImVec2(X(W - 50), Y(H - 150)), tr(Tx::CREATE_ROOM), 30 * k, !busy && !g.pw_ask, Tone::Good)) {
-        signal_request_create(g.room, g.create_pw, chosen);
-        strncpy_s(g.room_name, sizeof(g.room_name), g.room, _TRUNCATE);
-        log_line("MENU", "create requested: '%s'%s, carrier %s", g.room, g.create_pw[0] ? " (password)" : "",
-                 chosen == RoomTransport::Direct ? "direct" : chosen == RoomTransport::Steam ? "Steam" : chosen == RoomTransport::Relay ? "server relay" : "any");
-    }
-
-    if (paper_button("refresh", ImVec2(X(50), Y(H - 120)), ImVec2(X(50 + (W - 100 - 20) / 3), Y(H - 56)), tr(Tx::REFRESH), 30 * k, !busy)) {
-        signal_request_list(); g.next_list = now() + 3.0;
-    }
-    if (paper_button("disc", ImVec2(X(50 + (W - 100 - 20) / 3 + 10), Y(H - 120)), ImVec2(X(50 + 2 * (W - 100 - 20) / 3 + 10), Y(H - 56)), tr(Tx::DISCONNECT_SERVER), 30 * k, !busy, Tone::Danger))
-        signal_request_disconnect();
-    if (paper_button("back", ImVec2(X(50 + 2 * (W - 100 - 20) / 3 + 20), Y(H - 120)), ImVec2(X(W - 50), Y(H - 56)), tr(Tx::BACK), 30 * k))
-        g.win = Win::None;
     ImGui::End();
 }
 
@@ -1636,6 +1666,141 @@ bool confirm_armed(Confirm kind, int idx) {
     return g.confirm == kind && g.confirm_idx == idx && now() < g.confirm_until;
 }
 void arm(Confirm kind, int idx) { g.confirm = kind; g.confirm_idx = idx; g.confirm_until = now() + 3.0; }
+void ask(Confirm kind, int idx) { g.dlg = kind; g.dlg_idx = idx; }   // open the confirm dialog (draw_backup_confirm)
+
+// ---------------------------------------------------------------------------
+// RESTORE FROM A HANDSHAKE SAVE (2026-10-05): a page of its own inside the backup window. The three game slots side by side, each with every handshake save made for it (newest first); "Restore" asks, then
+// puts that save over the slot (saveslots_sync_restore takes the undo point first).
+// ---------------------------------------------------------------------------
+void fmt_when(int64_t at, char* out, size_t cap) {
+    out[0] = 0;
+    if (!at) return;
+    time_t t = (time_t)at; tm lt{};
+    localtime_s(&lt, &t);
+    strftime(out, cap, "%Y-%m-%d %H:%M", &lt);
+}
+
+void fmt_one_slot(const SaveSlotInfo& si, int s, char* out, size_t cap) {
+    char t[24];
+    if (!si.present) { _snprintf_s(out, cap, _TRUNCATE, tr(Tx::SLOT_EMPTY), s + 1); return; }
+    saveslots_format_time(si.timer, t, sizeof(t));
+    if (si.percent >= 0) _snprintf_s(out, cap, _TRUNCATE, tr(Tx::SLOT_PCT), s + 1, si.percent, t);
+    else                 _snprintf_s(out, cap, _TRUNCATE, tr(Tx::SLOT_NOPCT), s + 1, t);
+}
+
+void draw_sync_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H, bool locked) {
+    const float k = v.k;
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+
+    text_c(dl, X(W / 2), Y(38), 50 * k, kInk, tr(Tx::SYNC_TITLE));
+    wrap_text(dl, X(60), Y(112), (W - 120) * k, 22 * k, 30 * k, kGrey, tr(Tx::SYNC_HINT));
+    if (locked) text_c(dl, X(W / 2), Y(186), 24 * k, kRed, tr(Tx::ROOM_NO_WRITE));
+
+    const float colw = 406, gap = 20, top = 222, bot = H - 156;
+    for (int s = 0; s < kGameSlots; ++s) {
+        const float cx = 50 + s * (colw + gap);
+        char head[64]; _snprintf_s(head, sizeof(head), _TRUNCATE, tr(Tx::SYNC_SLOT_H), s + 1);
+        text_at(dl, ImVec2(X(cx + 8), Y(top - 38)), 30 * k, kInk, head);
+        char cur[96]; fmt_one_slot(g.current[s], s, cur, sizeof(cur));
+        text_r(dl, X(cx + colw - 6), Y(top - 30), 18 * k, kInkSoft, cur);
+        rough_rect(dl, ImVec2(X(cx), Y(top)), ImVec2(X(cx + colw), Y(bot)), IM_COL32(255, 255, 250, 60), kInk, 2.2f, 17 + s, 1.2f);
+        ImGui::SetCursorScreenPos(ImVec2(X(cx + 4), Y(top) + 4 * k));
+        char cid[24]; _snprintf_s(cid, sizeof(cid), _TRUNCATE, "##sync%d", s);
+        ImGui::BeginChild(cid, ImVec2((colw - 8) * k, (bot - top) * k - 8 * k), false, ImGuiWindowFlags_NoBackground);
+        ImDrawList* cdl = ImGui::GetWindowDrawList();
+        const float rowh = 112 * k, rw = (colw - 8) * k;
+        const int n = saveslots_sync_count(s);
+        if (!n) {
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            text_at(cdl, ImVec2(rp.x + 16 * k, rp.y + 20 * k), 26 * k, kGrey, tr(Tx::SYNC_NONE));
+            ImGui::Dummy(ImVec2(rw, rowh));
+        }
+        for (int i = 0; i < n; ++i) {
+            const SyncSave& e = saveslots_sync_get(s, i);
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            cdl->AddLine(ImVec2(rp.x + 8 * k, rp.y + rowh - 2), ImVec2(rp.x + rw - 8 * k, rp.y + rowh - 2), IM_COL32(30, 30, 30, 60), 1.5f);
+            char when[40]; fmt_when(e.saved_at, when, sizeof(when));
+            text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 8 * k), 26 * k, kInk, when);
+            char d1[96];
+            if (e.stage) _snprintf_s(d1, sizeof(d1), _TRUNCATE, "%s", tr(e.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
+            else         _snprintf_s(d1, sizeof(d1), _TRUNCATE, tr(Tx::SYNC_DETAIL), (unsigned)e.seq, (unsigned)e.players);
+            text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 44 * k), 20 * k, kInkSoft, d1);
+            char d2[128] = {};
+            if (e.after_boss) strncat_s(d2, sizeof(d2), tr(Tx::SYNC_BOSS), _TRUNCATE);
+            if (e.day >= 0) {
+                char part[40]; _snprintf_s(part, sizeof(part), _TRUNCATE, tr(Tx::SYNC_DAY), e.day);
+                if (d2[0]) strncat_s(d2, sizeof(d2), " | ", _TRUNCATE);
+                strncat_s(d2, sizeof(d2), part, _TRUNCATE);
+            }
+            if (e.percent >= 0) {
+                char part[16]; _snprintf_s(part, sizeof(part), _TRUNCATE, "%d%%", e.percent);
+                if (d2[0]) strncat_s(d2, sizeof(d2), " | ", _TRUNCATE);
+                strncat_s(d2, sizeof(d2), part, _TRUNCATE);
+            }
+            if (d2[0]) text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 72 * k), 20 * k, kInkSoft, d2);
+            char id[32]; _snprintf_s(id, sizeof(id), _TRUNCATE, "syr%d_%d", s, i);
+            if (paper_button(id, ImVec2(rp.x + rw - 118 * k, rp.y + 24 * k), ImVec2(rp.x + rw - 14 * k, rp.y + 80 * k), tr(Tx::SYNC_DO), 24 * k, !locked, Tone::Good)) {
+                g.sync_slot = s; g.sync_idx = i;
+            }
+            ImGui::SetCursorScreenPos(rp);
+            ImGui::Dummy(ImVec2(rw, rowh));
+        }
+        ImGui::EndChild();
+    }
+
+    const char* m = saveslots_message();
+    if (m[0]) {
+        char line[300];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "%s%s", m[0] == '!' ? m + 1 : m, saveslots_message_is_load() ? tr(Tx::LOADED_HINT) : "");
+        text_c(dl, X(W / 2), Y(H - 136), 26 * k, m[0] == '!' ? kRed : kGreen, line);
+    }
+    if (paper_button("sync_back", ImVec2(X(W / 2 - 150), Y(H - 96)), ImVec2(X(W / 2 + 150), Y(H - 36)), tr(Tx::BACK), 30 * k)) {
+        g.sync_page = false; g.sync_slot = g.sync_idx = -1;
+    }
+}
+
+// The question before a handshake save goes over a slot: which save, which slot, and what happens first (the undo point).
+void draw_sync_confirm(const View& v) {
+    if (g.sync_slot < 0) return;
+    const bool in_range = g.sync_idx >= 0 && g.sync_idx < saveslots_sync_count(g.sync_slot);
+    if (!in_range || g.win != Win::Backup || !g.sync_page || in_room()) { g.sync_slot = g.sync_idx = -1; return; }
+    const SyncSave& e = saveslots_sync_get(g.sync_slot, g.sync_idx);
+    const float k = v.k;
+    const float W = 900, H = 500;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_sync_ask")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+
+    text_c(dl, X(W / 2), Y(40), 50 * k, kRed, tr(Tx::SYNC_TITLE));
+    char when[40]; fmt_when(e.saved_at, when, sizeof(when));
+    char line[480];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::DLG_SYNC_B), when, g.sync_slot + 1);
+    const float ey = wrap_text(dl, X(60), Y(140), (W - 120) * k, 30 * k, 42 * k, kInk, line);
+    char d1[96];
+    if (e.stage) _snprintf_s(d1, sizeof(d1), _TRUNCATE, "%s", tr(e.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
+    else         _snprintf_s(d1, sizeof(d1), _TRUNCATE, tr(Tx::SYNC_DETAIL), (unsigned)e.seq, (unsigned)e.players);
+    wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, d1);
+
+    const float by0 = H - 120, by1 = H - 44;
+    bool done = false;
+    if (paper_button("sync_yes", ImVec2(X(60), Y(by0)), ImVec2(X(W / 2 - 14), Y(by1)), tr(Tx::SYNC_DO), 34 * k, true, Tone::Danger)) {
+        log_line("MENU", "handshake save restore: slot %d, entry %d (node %u) confirmed", g.sync_slot + 1, g.sync_idx + 1, (unsigned)e.seq);
+        saveslots_sync_restore(g.sync_slot, g.sync_idx);
+        done = true;
+    }
+    if (paper_button("sync_no", ImVec2(X(W / 2 + 14), Y(by0)), ImVec2(X(W - 60), Y(by1)), tr(Tx::CANCEL), 34 * k)) done = true;
+    ImGui::End();
+    if (done) {
+        g.sync_slot = g.sync_idx = -1;
+        saveslots_sync_refresh();
+        saveslots_current(g.current);
+    }
+}
 
 void draw_backup_window(const View& v) {
     const float W = 1360, H = 980;
@@ -1652,6 +1817,8 @@ void draw_backup_window(const View& v) {
     if (file_dialog_take()) refresh_backup_view();
     const bool dialog_open = InterlockedCompareExchange(&g_fd.state, 0, 0) != 0;
 
+    if (g.sync_page) { draw_sync_page(dl, v, a, W, H, in_room()); ImGui::End(); return; }
+
     text_c(dl, X(W / 2), Y(38), 50 * k, kInk, tr(Tx::MENU_BACKUP));
 
     const bool locked = in_room();
@@ -1666,9 +1833,15 @@ void draw_backup_window(const View& v) {
 
     // Name box + global actions.
     text_at(dl, ImVec2(X(60), Y(170)), 26 * k, kInk, tr(Tx::BACKUP_NAME));
-    paper_input("##sname", ImVec2(X(190), Y(158)), ImVec2(X(760), Y(214)), g.save_name, sizeof(g.save_name),
+    paper_input("##sname", ImVec2(X(190), Y(158)), ImVec2(X(500), Y(214)), g.save_name, sizeof(g.save_name),
                 tr(Tx::BACKUP_NAME_HINT), 26 * k);
-    if (paper_button("undo", ImVec2(X(800), Y(158)), ImVec2(X(1090), Y(214)),
+    // The handshake saves of the three slots, on a page of their own.
+    if (paper_button("sync_open", ImVec2(X(520), Y(158)), ImVec2(X(810), Y(214)), tr(Tx::SYNC_BTN), 24 * k)) {
+        g.sync_page = true; g.sync_slot = g.sync_idx = -1;
+        saveslots_sync_refresh();
+        saveslots_current(g.current);
+    }
+    if (paper_button("undo", ImVec2(X(830), Y(158)), ImVec2(X(1090), Y(214)),
                      confirm_armed(Confirm::Undo, 0) ? tr(Tx::CLICK_AGAIN) : tr(Tx::UNDO_LOAD), 24 * k,
                      saveslots_undo_available() && !locked, Tone::Normal, confirm_armed(Confirm::Undo, 0))) {
         if (confirm_armed(Confirm::Undo, 0)) {
@@ -1715,11 +1888,8 @@ void draw_backup_window(const View& v) {
                 const float by0 = rp.y + 12 * k, by1 = rp.y + rowh - 14 * k;
                 char id[24];
                 _snprintf_s(id, sizeof(id), _TRUNCATE, "al%d", i);
-                const bool ld = confirm_armed(Confirm::Load, 100 + i);
-                if (paper_button(id, ImVec2(rp.x + 904 * k, by0), ImVec2(rp.x + 1008 * k, by1), ld ? tr(Tx::CONFIRM_LOAD) : tr(Tx::LOAD), 24 * k, !locked, Tone::Good, ld)) {
-                    if (!ld) arm(Confirm::Load, 100 + i);
-                    else { saveslots_auto_load(i); refresh_backup_view(); }
-                }
+                if (paper_button(id, ImVec2(rp.x + 904 * k, by0), ImVec2(rp.x + 1008 * k, by1), tr(Tx::LOAD), 24 * k, !locked, Tone::Good))
+                    ask(Confirm::Load, 100 + i);
                 _snprintf_s(id, sizeof(id), _TRUNCATE, "ax%d", i);
                 if (paper_button(id, ImVec2(rp.x + 1014 * k, by0), ImVec2(rp.x + 1118 * k, by1), tr(Tx::EXPORT), 24 * k, !dialog_open))
                     file_dialog_open(true, 100 + i, b.name);       // an index of 100 and up in the file dialog is an auto save
@@ -1759,10 +1929,9 @@ void draw_backup_window(const View& v) {
         char id[24];
         // save / overwrite
         _snprintf_s(id, sizeof(id), _TRUNCATE, "s%d", i);
-        const bool ow = confirm_armed(Confirm::Overwrite, i);
         if (paper_button(id, ImVec2(rp.x + 794 * k, by0), ImVec2(rp.x + 898 * k, by1),
-                         ow ? tr(Tx::CONFIRM_OVERWRITE) : (b.used ? tr(Tx::OVERWRITE) : tr(Tx::SAVE)), 24 * k, !locked, b.used ? Tone::Normal : Tone::Good, ow)) {
-            if (b.used && !ow) arm(Confirm::Overwrite, i);
+                         b.used ? tr(Tx::OVERWRITE) : tr(Tx::SAVE), 24 * k, !locked, b.used ? Tone::Normal : Tone::Good)) {
+            if (b.used) ask(Confirm::Overwrite, i);       // a used position asks first (the dialog)
             else {
                 saveslots_save(i, g.save_name);
                 refresh_backup_view();
@@ -1770,31 +1939,16 @@ void draw_backup_window(const View& v) {
         }
         if (b.used) {
             _snprintf_s(id, sizeof(id), _TRUNCATE, "l%d", i);
-            const bool ld = confirm_armed(Confirm::Load, i);
-            if (paper_button(id, ImVec2(rp.x + 904 * k, by0), ImVec2(rp.x + 1008 * k, by1),
-                             ld ? tr(Tx::CONFIRM_LOAD) : tr(Tx::LOAD), 24 * k, !locked, Tone::Good, ld)) {
-                if (!ld) arm(Confirm::Load, i);
-                else {
-                    saveslots_load(i);
-                    refresh_backup_view();
-                }
-            }
-            _snprintf_s(id, sizeof(id), _TRUNCATE, "d%d", i);
-            const bool dd = confirm_armed(Confirm::Delete, i);
+            if (paper_button(id, ImVec2(rp.x + 904 * k, by0), ImVec2(rp.x + 1008 * k, by1), tr(Tx::LOAD), 24 * k, !locked, Tone::Good))
+                ask(Confirm::Load, i);
             // One file out: the whole position (see saveslots_export).
             _snprintf_s(id, sizeof(id), _TRUNCATE, "x%d", i);
             if (paper_button(id, ImVec2(rp.x + 1014 * k, by0), ImVec2(rp.x + 1118 * k, by1), tr(Tx::EXPORT), 24 * k,
                              !dialog_open))
                 file_dialog_open(true, i, b.name);
             _snprintf_s(id, sizeof(id), _TRUNCATE, "d%d", i);
-            if (paper_button(id, ImVec2(rp.x + 1124 * k, by0), ImVec2(rp.x + 1228 * k, by1),
-                             dd ? tr(Tx::CONFIRM_DELETE) : tr(Tx::DELETE_BTN), 24 * k, true, Tone::Danger, dd)) {
-                if (!dd) arm(Confirm::Delete, i);
-                else {
-                    saveslots_delete(i);
-                    refresh_backup_view();
-                }
-            }
+            if (paper_button(id, ImVec2(rp.x + 1124 * k, by0), ImVec2(rp.x + 1228 * k, by1), tr(Tx::DELETE_BTN), 24 * k, true, Tone::Danger))
+                ask(Confirm::Delete, i);
         } else {
             // One file in: an exported position becomes this one (then "Load" it as usual).
             _snprintf_s(id, sizeof(id), _TRUNCATE, "i%d", i);
@@ -1818,6 +1972,54 @@ void draw_backup_window(const View& v) {
     }
     text_c(dl, X(W / 2), Y(H - 46), 22 * k, kGrey, tr(Tx::BACKUP_FOOT));
     ImGui::End();
+}
+
+// THE QUESTION BEFORE A BACKUP IS LOADED, OVERWRITTEN OR DELETED (2026-10-04): a dimmed whole-screen dialog with the action in its title, what it does to which backup, and a button for it and one to
+// cancel -- in place of the old button that only turned into "confirm" for three seconds and was easy to hit twice without reading. The window under it cannot be clicked meanwhile.
+void draw_backup_confirm(const View& v) {
+    if (g.dlg == Confirm::None) return;
+    const bool is_auto = g.dlg_idx >= 100;
+    const int pos = is_auto ? g.dlg_idx - 100 : g.dlg_idx;
+    const bool in_range = pos >= 0 && pos < (is_auto ? kAutoSaveCount : kSaveBackupCount);
+    const SaveBackup* b = !in_range ? nullptr : (is_auto ? &saveslots_auto_get(pos) : &saveslots_get(pos));
+    // gone: the position emptied meanwhile, the window closed, or a room opened (loading and overwriting are refused in a room)
+    if (!b || !b->used || g.win != Win::Backup || (in_room() && g.dlg != Confirm::Delete)) { g.dlg = Confirm::None; return; }
+
+    const float k = v.k;
+    const float W = 900, H = 500;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_backup_ask")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+
+    const bool load = g.dlg == Confirm::Load, del = g.dlg == Confirm::Delete;
+    const char* title = load ? tr(Tx::DLG_LOAD_T) : del ? tr(Tx::DLG_DEL_T) : tr(Tx::DLG_OW_T);
+    const char* body  = load ? tr(Tx::DLG_LOAD_B) : del ? tr(Tx::DLG_DEL_B) : tr(Tx::DLG_OW_B);
+    const char* act   = load ? tr(Tx::LOAD)       : del ? tr(Tx::DELETE_BTN) : tr(Tx::OVERWRITE);
+    text_c(dl, X(W / 2), Y(40), 50 * k, load ? kInk : kRed, title);
+
+    char line[400];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, body, b->name);
+    const float ey = wrap_text(dl, X(60), Y(140), (W - 120) * k, 30 * k, 42 * k, kInk, line);
+    // what the backup holds, so the right one is certain
+    char sl[256]; fmt_slots(*b, sl, sizeof(sl));
+    wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, sl);
+
+    const float by0 = H - 120, by1 = H - 44;
+    bool done = false;
+    if (paper_button("bk_yes", ImVec2(X(60), Y(by0)), ImVec2(X(W / 2 - 14), Y(by1)), act, 34 * k, true, load ? Tone::Good : Tone::Danger)) {
+        if (g.dlg == Confirm::Load)           { if (is_auto) saveslots_auto_load(pos); else saveslots_load(pos); }
+        else if (g.dlg == Confirm::Overwrite) saveslots_save(pos, g.save_name);
+        else if (g.dlg == Confirm::Delete)    saveslots_delete(pos);
+        log_line("MENU", "backup %s%d: %s confirmed", is_auto ? "A" : "", pos + 1, load ? "load" : del ? "delete" : "overwrite");
+        done = true;
+    }
+    if (paper_button("bk_no", ImVec2(X(W / 2 + 14), Y(by0)), ImVec2(X(W - 60), Y(by1)), tr(Tx::CANCEL), 34 * k)) done = true;
+    ImGui::End();
+    if (done) { g.dlg = Confirm::None; refresh_backup_view(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -2205,7 +2407,9 @@ void draw_save_sync(const View& v) {
             format_filetime(sv.entry[i].stamp, when, sizeof(when));
             const bool boss = (sv.entry[i].flags & kCheckpointAfterBoss) != 0;      // right after the chapter boss: next floor or home from here
             _snprintf_s(tail, sizeof(tail), _TRUNCATE, "%s%s", i == 0 ? tr(Tx::LATEST) : "", boss ? tr(Tx::SYNC_AFTER_BOSS) : "");
-            _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY), i + 1, (unsigned long long)sv.entry[i].seq, when, tail);
+            const uint8_t stage = checkpoint_stage_of_seq(sv.entry[i].seq);       // one of the two saves from before the map: the run starts over from that page
+            if (stage) _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY_STAGE), i + 1, tr(stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY), when, tail);
+            else       _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY), i + 1, (unsigned long long)sv.entry[i].seq, when, tail);
             _snprintf_s(id, sizeof(id), _TRUNCATE, "hs_%u", i);
             if (row(id, label, Tone::Normal, boss)) checkpoint_host_pick((int)i);
         }
@@ -2716,13 +2920,15 @@ void menu_draw() {
         if (menu_entry(v, "##e_settings", tr(Tx::MENU_SETTINGS), 585)) g.win = (g.win == Win::Settings) ? Win::None : Win::Settings;
         if (menu_entry(v, "##e_backup", tr(Tx::MENU_BACKUP), 480)) {
             g.win = (g.win == Win::Backup) ? Win::None : Win::Backup;
+            g.sync_page = false; g.sync_slot = g.sync_idx = -1;
             if (g.win == Win::Backup) refresh_backup_view();
         }
         if (g.win == Win::Multi)  draw_multi_window(v);
-        if (g.win == Win::Backup) draw_backup_window(v);
+        if (g.win == Win::Backup) { draw_backup_window(v); draw_backup_confirm(v); draw_sync_confirm(v); }
         if (g.win == Win::Settings) draw_settings_window(v);
     } else {
         g.win = Win::None;
+        g.dlg = Confirm::None;
     }
 
     // A locked room refused the password (or asked for one the list did not know about): ask again, or say why not.

@@ -10,6 +10,7 @@
 #include "mgmp_follow.h"
 #include "mgmp_unlocks.h"
 #include "mgmp_room.h"
+#include "mgmp_page.h"       // page_of / page_age_ms -- is another player on the gear screen
 #include "mgmp_roster.h"     // roster_tick -- the run edit point is this tick
 #include "mgmp_lockstep.h"
 #if defined(MGMP_WITH_SETUP)
@@ -479,6 +480,27 @@ void remember_node(uint32_t index, uint32_t count, uint32_t type, uint64_t seed)
 
 }
 
+// A PLAYER WHO IS CHANGING GEAR HOLDS THE NODE (2026-10-05). The client opened the backpack / gear panel on the map; the host clicked the next node while it was still open; the battle was built from the
+// host's copies of the client's cats, taken BEFORE the gear change (a map update, which is what publishes a peer's cats, does not run under that panel). Result: the pre-battle audit found three of the
+// client's cats different, and the first action of a cat with the new weapon halted the battle ("cat 30 slot 4:4 holds 'cm_Heal', peer sent 'wp_SleepDart'"). The node waits while any OTHER player's page is
+// the gear or collar screen and for a moment after it leaves it (its map ticks again, publishes, and the host applies before the node's own publish). Capped, so a player who walks away from the gear
+// screen cannot hold the run for ever.
+static bool others_changing_gear() {
+    static ULONGLONG s_last = 0, s_first = 0;
+    const ULONGLONG t = GetTickCount64();
+    bool any = false;
+    for (uint8_t p = 0; p < kMaxPeers; ++p) {
+        if (p == net_self()) continue;
+        const PageState s = page_of(p);
+        if ((s == PageState::Equipment || s == PageState::Collar) && page_age_ms(p) < 4000) any = true;
+    }
+    if (any) { s_last = t; if (!s_first) s_first = t; }
+    const bool settling = !any && s_last && t - s_last < 1500;
+    if (!any && !settling) { s_first = 0; return false; }
+    if (s_first && t - s_first > 90000) return false;          // 90 s: let the run go on
+    return true;
+}
+
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
     if (!g.on || !map_screen || !node) return true;
@@ -541,6 +563,13 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
         return false;
     }
 #endif
+    if (others_changing_gear()) {
+        queue_host_retry(map_screen, known, index, "a player is changing gear");
+        static ULONGLONG s_said = 0;
+        const ULONGLONG t = GetTickCount64();
+        if (t - s_said > 3000) { s_said = t; log_line("FOLLOW", "holding host node %u (%s): another player is on the gear screen (or has just left it) -- its cats must reach this peer before the battle is built", known ? index : 0xFFFFFFFFu, node_type_name(type)); }
+        return false;
+    }
     // --- the host: publish it --------------------------------------------
     if (!known) {
         // Nothing to send that the client could resolve. Do not block the host
@@ -1551,6 +1580,7 @@ void* follow_map_update(void* map_screen) {
     // MapScreen::update, which runs only while the map is up, i.e. between nodes
     // and never during a battle.
     roster_tick();
+    catsync_leave_tick();                  // after a room was left: the other players' cats go, here between nodes (no session needed)
 
     if (g.on) roster_party_swap_on_map();
     roster_party_tick();

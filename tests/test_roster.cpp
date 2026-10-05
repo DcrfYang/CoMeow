@@ -212,6 +212,55 @@ void familiar_import_membership() {
     initialize(); const uint64_t invalid[] = {0};
     CHECK(!roster_add_familiars(invalid, 1, "invalid id"));
 }
+// LEAVING THE ROOM (2026-10-05): the run keeps only this peer's own session cats.
+void leave_prune() {
+    auto count = [&](size_t off) { uint32_t n = 0; std::memcpy(&n, director + off, 4); return n; };
+    initialize();
+    const uint64_t mixed[4] = {0x70000001, 0x70000002, 0x71000001, 0x71000002};
+    const uint64_t fams[4] = {0x72000001, 0x72000002, 0, 0};
+    std::memcpy(party, mixed, sizeof(party)); std::memcpy(mirror, mixed, sizeof(mirror)); std::memcpy(familiars, fams, sizeof(familiars));
+    put(kDir_CatFamiliars + 4, uint32_t(2));
+    CHECK(roster_leave_prune(1, "client leaves") == 4);
+    CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x71000001 && party[1] == 0x71000002);
+    CHECK(count(kDir_MirrorCount) == 2 && mirror[0] == 0x71000001 && mirror[1] == 0x71000002);
+    CHECK(count(kDir_CatFamiliars + 4) == 0);
+    CHECK(roster_leave_prune(1, "again") == 0);                       // nothing left to remove
+    // the host leaves: its own cats stay, the clients' go
+    initialize();
+    const uint64_t hostparty[4] = {0x70000001, 0x70000002, 0, 0};
+    const uint64_t clients[4] = {0x71000001, 0x71000002, 0x72000001, 0x72000002};
+    std::memcpy(party, hostparty, sizeof(party)); std::memcpy(mirror, hostparty, sizeof(mirror)); std::memcpy(familiars, clients, sizeof(familiars));
+    put(kDir_CatIdCount, uint32_t(2)); put(kDir_MirrorCount, uint32_t(2));
+    CHECK(roster_leave_prune(0, "host leaves") == 4);
+    CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x70000001 && party[1] == 0x70000002 && count(kDir_CatFamiliars + 4) == 0);
+    // own cats only in the familiar list: they move up into the party
+    initialize();
+    std::memcpy(party, hostparty, sizeof(party)); std::memcpy(mirror, hostparty, sizeof(mirror)); std::memcpy(familiars, clients, sizeof(familiars));
+    put(kDir_CatIdCount, uint32_t(2)); put(kDir_MirrorCount, uint32_t(2));
+    CHECK(roster_leave_prune(1, "own cats were familiars") == 4);
+    CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x71000001 && party[1] == 0x71000002 && count(kDir_CatFamiliars + 4) == 0);
+    // a cat the game brought in (an ordinary id) is kept
+    initialize();
+    const uint64_t withordinary[4] = {0x70000001, 0x2da, 0x71000001, 0};
+    std::memcpy(party, withordinary, sizeof(party)); std::memcpy(mirror, withordinary, sizeof(mirror));
+    put(kDir_CatIdCount, uint32_t(3)); put(kDir_MirrorCount, uint32_t(3)); put(kDir_CatFamiliars + 4, uint32_t(0));
+    CHECK(roster_leave_prune(0, "ordinary kept") == 1);
+    CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x70000001 && party[1] == 0x2da);
+    // a player dropped out of a room that goes on: only that position's cats go
+    initialize();
+    const uint64_t three[4] = {0x70000001, 0x70000002, 0, 0}, others[4] = {0x71000001, 0x71000002, 0x72000001, 0x72000002};
+    std::memcpy(party, three, sizeof(party)); std::memcpy(mirror, three, sizeof(mirror)); std::memcpy(familiars, others, sizeof(familiars));
+    put(kDir_CatIdCount, uint32_t(2)); put(kDir_MirrorCount, uint32_t(2)); put(kDir_CatFamiliars + 4, uint32_t(4));
+    CHECK(roster_drop_positions(1u << 2, "position 2 left") == 2);
+    CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x70000001 && count(kDir_CatFamiliars + 4) == 2 && familiars[0] == 0x71000001 && familiars[1] == 0x71000002);
+    CHECK(roster_drop_positions(1u << 2, "again") == 0);
+    // nothing of this peer's own in the lists: refused, the lists are untouched
+    initialize();
+    std::memcpy(party, hostparty, sizeof(party)); std::memcpy(mirror, hostparty, sizeof(mirror)); std::memcpy(familiars, clients, sizeof(familiars));
+    put(kDir_CatIdCount, uint32_t(2)); put(kDir_MirrorCount, uint32_t(2));
+    CHECK(roster_leave_prune(3, "no cat of mine") == -1);
+    CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x70000001 && count(kDir_CatFamiliars + 4) == 4);
+}
 void* __fastcall append_id(void* vector, const uint64_t* id) {
     ++appends;
     if (fake_append) return vector;
@@ -366,6 +415,7 @@ void log_line_lvl(LogLevel level, const char*, const char*, ...) {
     if (level == LogLevel::Warn || level == LogLevel::Error) ++warnings;
 }
 bool mem_read(const void* src, void* dst, size_t n) {
+    if (!n) return false;                                  // like the real one
     if (src == denied_read) return false;
     if ((uintptr_t)src == (uintptr_t)GetModuleHandleW(nullptr) + kRva_MewDirectorPtr)
         src = &director_ptr;
@@ -373,6 +423,7 @@ bool mem_read(const void* src, void* dst, size_t n) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool mem_write(void* dst, const void* src, size_t n) {
+    if (!n) return false;                                  // like the real one
     if (dst == denied_write) return false;
     __try { std::memcpy(dst, src, n); ++writes; return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -384,7 +435,7 @@ bool mem_read_std_string(const void* str, char* out, size_t cap) {
 }
 int main() {
     map_lists(); node_lifecycle(); refused_writes_and_reset(); initial_capture();
-    bootstrap_rejects_bad_identity(); familiar_import_membership(); no_session_and_host();
+    bootstrap_rejects_bad_identity(); familiar_import_membership(); leave_prune(); no_session_and_host();
     variable_parties();
     std::printf("test_roster: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;

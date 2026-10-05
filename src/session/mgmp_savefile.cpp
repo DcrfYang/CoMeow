@@ -6,6 +6,7 @@
 #include "mgmp_tuning.h"
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
+#include "mgmp_steambridge.h"   // steam_bridge_id: which account is logged in
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"   // follow_on_map
@@ -28,6 +29,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#pragma comment(lib, "advapi32.lib")   // RegGetValueW: the Steam client's active user
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,11 +105,47 @@ bool read_slot_names(const void* ss, Names& out) {
 //
 // The account-id component is found by ENUMERATION rather than composed,
 // because it is the Steam ID on a Steam install and we have no business
-// guessing it. Exactly one such directory exists in practice; if several ever
-// do, the most recently written one is the live account, and the choice is
-// logged either way.
-bool resolve_save_dir(wchar_t* out, size_t out_len) {
+// guessing it. Usually exactly one such directory exists; with several (two Steam
+// accounts on one PC) the live account is asked of Steam -- see live_steam_id --
+// and the choice is logged either way.
+//
+// WHICH ACCOUNT IS THE LIVE ONE (2026-10-04, reported: two Steam accounts on one PC, so two save folders, and the backup page read -- and wrote backups of -- the other player's). "The most recently
+// written directory" was the rule, and a folder's own time only moves when a file is added or removed in it, so it says nothing about who played last. The live account is now asked of Steam:
+//   1. the SteamID64 the mod's Steam bridge got from the Steam API (the same id the game names its folder after), when it is up;
+//   2. else the Steam client's "active user" in the registry (HKCU\Software\Valve\Steam\ActiveProcess\ActiveUser, the 32-bit account id; the 64-bit id is that plus 76561197960265728);
+//   3. else the folder holding the most recently written .sav FILE (what is written is what is played), and the choice is marked unsure so it is looked at again when the bridge's id arrives.
+// A folder that matches the id wins outright; one that cannot be matched by id while several exist falls to rule 3.
+uint64_t live_steam_id(const char** how) {
+    const uint64_t api = steam_bridge_id();
+    if (api) { if (how) *how = "the Steam API"; return api; }
+    DWORD acct = 0, cb = sizeof(acct), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", L"ActiveUser", RRF_RT_REG_DWORD, &type, &acct, &cb) == ERROR_SUCCESS && acct) {
+        if (how) *how = "the Steam client's active user";
+        return 76561197960265728ULL + acct;
+    }
+    return 0;
+}
+
+// The newest write time among a directory's .sav files (0 when there are none).
+uint64_t newest_save_time(const wchar_t* dir) {
+    wchar_t glob[MAX_PATH];
+    _snwprintf_s(glob, _TRUNCATE, L"%s\\*.sav", dir);
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    uint64_t best = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const uint64_t t = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (t > best) best = t;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return best;
+}
+
+bool resolve_save_dir(wchar_t* out, size_t out_len, bool* unsure = nullptr) {
     out[0] = 0;
+    if (unsure) *unsure = false;
     wchar_t appdata[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr,
                                 SHGFP_TYPE_CURRENT, appdata)) || !appdata[0]) {
@@ -136,9 +174,15 @@ bool resolve_save_dir(wchar_t* out, size_t out_len) {
         return false;
     }
 
-    wchar_t  best[MAX_PATH] = {};
-    FILETIME best_time{};
+    const char* how = "";
+    const uint64_t live = live_steam_id(&how);
+    wchar_t  live_name[24] = {};
+    if (live) _snwprintf_s(live_name, _TRUNCATE, L"%llu", (unsigned long long)live);
+
+    wchar_t  best[MAX_PATH] = {}, matched[MAX_PATH] = {};
+    uint64_t best_time = 0;
     int      found = 0;
+    wchar_t  cand_text[6][200] = {}; int cand_n = 0;
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (fd.cFileName[0] == L'.') continue;
@@ -149,9 +193,16 @@ bool resolve_save_dir(wchar_t* out, size_t out_len) {
         if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
 
         ++found;
-        if (found == 1 || CompareFileTime(&fd.ftLastWriteTime, &best_time) > 0) {
+        if (live && wcscmp(fd.cFileName, live_name) == 0) wcscpy_s(matched, cand);
+        const uint64_t t = newest_save_time(cand);
+        {   // every candidate, so a wrong pick on a two-account PC can be read off the log (printed below when there is more than one)
+            SYSTEMTIME st{}; FILETIME ft{}; ft.dwLowDateTime = (DWORD)(t & 0xFFFFFFFFull); ft.dwHighDateTime = (DWORD)(t >> 32);
+            FileTimeToSystemTime(&ft, &st);
+            if (cand_n < 6) _snwprintf_s(cand_text[cand_n++], 200, _TRUNCATE, L"%s (newest .sav %04d-%02d-%02d %02d:%02d UTC)", fd.cFileName, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+        }
+        if (found == 1 || t > best_time) {
             wcscpy_s(best, cand);
-            best_time = fd.ftLastWriteTime;
+            best_time = t;
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -160,9 +211,20 @@ bool resolve_save_dir(wchar_t* out, size_t out_len) {
         log_line("SAVEFILE", "!! found no <account>\\saves directory under %ls", root);
         return false;
     }
-    if (found > 1)
-        log_line("SAVEFILE", "%d account directories under %ls -- using the most "
-                             "recently written one", found, root);
+    if (found > 1) {
+        log_line("SAVEFILE", "%d account folders under %ls; the logged-in Steam account is %llu (from %s)", found, root, (unsigned long long)live, live ? how : "nothing -- no id known");
+        for (int i = 0; i < cand_n; ++i) log_line("SAVEFILE", "  candidate: %ls", cand_text[i]);
+    }
+    if (matched[0]) {
+        if (found > 1) log_line("SAVEFILE", "%d account directories under %ls -- using the one of the logged-in Steam account %llu (from %s)", found, root, (unsigned long long)live, how);
+        wcscpy_s(out, out_len, matched);
+        return true;
+    }
+    if (found > 1) {
+        log_line("SAVEFILE", "!! %d account directories under %ls and none is named like the Steam account (%s) -- using the one whose save file was written last; it is checked again when Steam's id is known",
+                 found, root, live ? how : "no Steam account id is known yet");
+        if (unsure) *unsure = true;
+    }
     wcscpy_s(out, out_len, best);
     return true;
 }
@@ -266,6 +328,8 @@ struct State {
     wchar_t dir[MAX_PATH] = {};
     bool    have_dir  = false;
     bool    dir_tried = false;
+    bool    dir_unsure = false;       // several account folders and none matched a Steam id: the newest-file guess
+    bool    dir_rechecked = false;    // the unsure choice was looked at again once the Steam id was known
 
     // --- host ---
     bool     have_slot   = false;
@@ -342,9 +406,21 @@ constexpr uint32_t kDepartMaxPresses  = 5;
 State g;
 
 void ensure_dir() {
-    if (g.dir_tried) return;
+    if (g.dir_tried) {
+        // A guess made before Steam's id was known is looked at once more when it is.
+        if (!g.dir_unsure || g.dir_rechecked || !steam_bridge_id()) return;
+        g.dir_rechecked = true;
+        wchar_t again[MAX_PATH] = {};
+        bool unsure = false;
+        if (resolve_save_dir(again, MAX_PATH, &unsure) && wcscmp(again, g.dir) != 0) {
+            log_line("SAVEFILE", "!! the save directory is %ls, not %ls as first guessed", again, g.dir);
+            wcscpy_s(g.dir, again);
+        }
+        g.dir_unsure = unsure;
+        return;
+    }
     g.dir_tried = true;                 // one attempt, one log line, whatever happens
-    g.have_dir = resolve_save_dir(g.dir, MAX_PATH);
+    g.have_dir = resolve_save_dir(g.dir, MAX_PATH, &g.dir_unsure);
     if (g.have_dir) log_line("SAVEFILE", "save directory: %ls", g.dir);
 }
 
@@ -594,19 +670,59 @@ bool savefile_read_checkpoint(uint8_t** data, uint32_t* size, uint64_t* hash) {
     if (size) *size = 0;
     if (hash) *hash = 0;
     ensure_state();
-    if (!data || !size || !hash || !g.on || !g.have_slot) return false;
+    // Each refusal says which one it was: the checkpoint latches on the first failure and holds the room at the map, and until 2026-10-04 the log of a peer that hit it (a Steam Deck) said only "capture failed".
+    if (!data || !size || !hash) return false;
+    if (!g.on || !g.have_slot) { log_line("SAVEFILE", "!! checkpoint capture: no save slot is selected on this peer (on %d, slot %d)", g.on ? 1 : 0, g.have_slot ? 1 : 0); return false; }
     ensure_dir();
-    if (!g.have_dir || !flush_live_run()) return false;
+    if (!g.have_dir) { log_line("SAVEFILE", "!! checkpoint capture: the save directory is not known"); return false; }
+    // Flushed once per capture, not once per retry: save_adventure writes the whole save, and asking for it again every half second while a copy is being retried only gives the game one more write to
+    // hold the file for.
+    static ULONGLONG s_flushed_at = 0;
+    const ULONGLONG tick = GetTickCount64();
+    const bool flushed_lately = s_flushed_at && tick - s_flushed_at < 6000;
+    if (!flushed_lately && !flush_live_run()) {
+        log_line("SAVEFILE", "!! checkpoint capture: the run could not be flushed to disk (save_adventure %s, director %s, adventure %s, on the map %s)",
+                 g.save_adventure ? "found" : "MISSING", g.director_slot ? "found" : "MISSING", adventure_is_loaded_impl() ? "loaded" : "NOT loaded", follow_on_map() ? "yes" : "NO");
+        return false;
+    }
+    wchar_t wname[128]; wide(g.name, wname, 128);
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%s\\%s", g.dir, wname);
+    if (!flushed_lately) s_flushed_at = tick;
+    checkpoint_io::Bytes snapshot;
+    if (!checkpoint_io::snapshot(path, snapshot)) { log_line("SAVEFILE", "!! checkpoint capture: the save '%s' could not be copied -- %s", g.name, checkpoint_io::snapshot_why()); return false; }
+    if (checkpoint_io::snapshot_why()[0]) log_line("SAVEFILE", "checkpoint capture: %s", checkpoint_io::snapshot_why());
+    *size = (uint32_t)snapshot.size();
+    *data = (uint8_t*)malloc(*size);
+    if (!*data) { *size=0; log_line("SAVEFILE", "!! checkpoint capture: out of memory for %u bytes", (unsigned)snapshot.size()); return false; }
+    memcpy(*data,snapshot.data(),*size);
+    *hash = savefile_hash(*data,*size);
+    return true;
+}
+
+bool savefile_read_stage(uint8_t** data, uint32_t* size, uint64_t* hash) {
+    if (data) *data = nullptr;
+    if (size) *size = 0;
+    if (hash) *hash = 0;
+    ensure_state();
+    if (!data || !size || !hash) return false;
+    if (!g.on || !g.have_slot) { log_line("SAVEFILE", "!! stage capture: no save slot is selected on this peer"); return false; }
+    ensure_dir();
+    if (!g.have_dir) { log_line("SAVEFILE", "!! stage capture: the save directory is not known"); return false; }
     wchar_t wname[128]; wide(g.name, wname, 128);
     wchar_t path[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%s\\%s", g.dir, wname);
     checkpoint_io::Bytes snapshot;
-    if (!checkpoint_io::snapshot(path, snapshot)) return false;
+    if (!checkpoint_io::snapshot(path, snapshot)) { log_line("SAVEFILE", "!! stage capture: the save '%s' could not be copied -- %s", g.name, checkpoint_io::snapshot_why()); return false; }
+    if (checkpoint_io::snapshot_why()[0]) log_line("SAVEFILE", "stage capture: %s", checkpoint_io::snapshot_why());
+    bool running = false;
+    const bool known = checkpoint_io::in_run(path, running);
     *size = (uint32_t)snapshot.size();
     *data = (uint8_t*)malloc(*size);
-    if (!*data) { *size=0; return false; }
-    memcpy(*data,snapshot.data(),*size);
-    *hash = savefile_hash(*data,*size);
+    if (!*data) { *size = 0; log_line("SAVEFILE", "!! stage capture: out of memory for %u bytes", (unsigned)snapshot.size()); return false; }
+    memcpy(*data, snapshot.data(), *size);
+    *hash = savefile_hash(*data, *size);
+    log_line("SAVEFILE", "stage capture: '%s', %u bytes, on_adventure %s", g.name, *size, known ? (running ? "1" : "0") : "?");
     return true;
 }
 

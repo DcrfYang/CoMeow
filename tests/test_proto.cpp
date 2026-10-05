@@ -1023,6 +1023,20 @@ int main() {
             bool ctr = true;
             for (uint32_t cut = 1; cut < cn; ++cut) { Reader c2(cb, cut); c2.u8v(); ChatMsg x{}; if (dec_chat(c2, x)) { ctr = false; break; } }
             check(ctr, "no truncated chat line decodes");
+
+            // proto 82: the host's combat speed
+            SettingMsg sm{}; sm.id = kSettingCombatSpeed; sm.value = 1.5f;
+            uint8_t sb[16];
+            uint32_t sn = enc_setting(sb, sizeof(sb), sm);
+            check(sn > 0 && sn <= 16, "a setting encodes");
+            Reader sr(sb, sn); check(sr.u8v() == MSG_SETTING, "type SETTING");
+            SettingMsg so{}; check(dec_setting(sr, so) && so.id == kSettingCombatSpeed && so.value == 1.5f, "a setting round-trips");
+            SettingMsg sbad = sm; sbad.value = 0.0f; check(enc_setting(sb, sizeof(sb), sbad) == 0, "a combat speed of zero is not sent");
+            sbad = sm; sbad.value = 5000.0f; check(enc_setting(sb, sizeof(sb), sbad) == 0, "an absurd combat speed is not sent");
+            sbad = sm; sbad.id = 9; check(enc_setting(sb, sizeof(sb), sbad) == 0, "an unknown setting is not sent");
+            bool str = true;
+            for (uint32_t cut = 1; cut < sn; ++cut) { Reader c3(sb, cut); c3.u8v(); SettingMsg x{}; if (dec_setting(c3, x)) { str = false; break; } }
+            check(str, "no truncated setting decodes");
         }
 
         PropsMsg p{}; p.epoch = 77; p.total = 250; p.first = 100; p.count = kPropsChunk;

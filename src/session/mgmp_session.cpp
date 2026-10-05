@@ -684,6 +684,10 @@ void session_update() {
                 chat_on_message(m.from, m.chat);
                 break;
 
+            case MSG_SETTING:
+                settings_on_message(m.from, m.setting);
+                break;
+
             case MSG_BOARD:   // taken by the receive thread into a mailbox (net_host_board): the game thread waits for it inside the turn boundary
                 break;
 

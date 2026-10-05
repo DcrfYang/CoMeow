@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 
+#include "mgmp_catview.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_config.h"
@@ -276,6 +277,34 @@ void tick_redial() {
     session_request_join(signal_host_addr(), signal_host_port());
 }
 
+// A SAVE THAT IS ALREADY PAST THE DEPARTURE BOX (2026-10-05): the party-size check lives at the box ("departure refused: 3 cats in the box, 4-player room allows 2 each"), and a save that was stored on the collar,
+// gear or chapter page is loaded straight onto that page with its cats chosen, so the check never runs. A player on one of those pages whose cats are more than the room allows is told to choose the save again.
+// Said once per count (and again if the count changes); the page, the room size and the numbers are in the text.
+void tick_party_limit() {
+    static ULONGLONG s_next = 0;
+    static uint32_t s_said_count = 0;
+    const ULONGLONG t = GetTickCount64();
+    if (t < s_next) return;
+    s_next = t + 500;
+    const int limit = room_party_limit();
+    const PageState pg = page_self();
+    uint32_t n = 0;
+    if (!room_self_over_limit(&n)) { s_said_count = 0; return; }
+    if (s_said_count == n) return;
+    s_said_count = n;
+    char text[640];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_PARTY_RESELECT), (int)net_peer_count(), limit, (int)n, page_name(pg));
+    push_notice(text);
+    log_line("ROOM", "!! this peer is on '%s' with %u cat(s) chosen, over the %d a %d-player room allows -- told to choose the save again (the check at the departure box was skipped)", page_name(pg), n, limit, (int)net_peer_count());
+}
+
+// THE TWO SAVES BEFORE THE MAP (2026-10-05): the handshake journal also holds a certified save of every player from the moment all are in the warehouse (the preparation stage) and from the moment all are on
+// the chapter page ("ready to start"). The checkpoint does the work; this only says, every frame, which of those pages this peer is on.
+void tick_stage() {
+    const PageState pg = page_self();
+    checkpoint_stage_tick(pg == PageState::House ? kStagePrep : pg == PageState::Chapter ? kStageReady : 0);
+}
+
 void tick_notices() {
     SignalPeer p[kRows];
     const uint32_t nrows = rows(p);
@@ -378,6 +407,8 @@ void room_tick() {
 
     tick_solo();
     tick_redial();
+    tick_party_limit();
+    tick_stage();
     tick_notices();
 }
 
@@ -508,6 +539,47 @@ int room_party_limit() {
     if (players >= 4) return 2;
     if (players == 3) return 3;
     return 0;
+}
+
+bool room_self_over_limit(uint32_t* count) {
+    const int limit = room_party_limit();
+    const PageState pg = page_self();
+    if (count) *count = 0;
+    if (!limit || !(pg == PageState::Collar || pg == PageState::Equipment || pg == PageState::Chapter)) return false;
+    const CatBrief* cats = nullptr;
+    const uint32_t n = catview_self(&cats);
+    if (count) *count = n;
+    return n > (uint32_t)limit;
+}
+
+int room_other_over_limit(uint32_t* count) {
+    const int limit = room_party_limit();
+    if (count) *count = 0;
+    if (!limit || !net_active()) return -1;
+    uint8_t ids[kMaxPeers] = {};
+    if (!net_peer_ids(ids, kMaxPeers)) return -1;
+    const uint8_t cnt = net_peer_count();
+    for (uint8_t k = 0; k < cnt && k < kMaxPeers; ++k) {
+        if (ids[k] == net_self()) continue;
+        const PageState pg = page_of(ids[k]);
+        if (!(pg == PageState::Collar || pg == PageState::Equipment || pg == PageState::Chapter)) continue;
+        const CatBrief* cats = nullptr;
+        const uint32_t n = catview_of(ids[k], &cats);
+        if (n > (uint32_t)limit) { if (count) *count = n; return room_row_of_peer(ids[k]); }
+    }
+    return -1;
+}
+
+void room_say_party_over() {
+    char text[320];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_PARTY_OVER), room_party_limit(), (int)net_peer_count());
+    toast(text);
+}
+
+void room_say_peer_over(int row) {
+    char text[320];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_PARTY_OVER_PEER), row < 0 ? 0 : row + 1, room_party_limit());
+    toast(text);
 }
 
 bool room_depart_allowed(uint32_t cats) {

@@ -313,7 +313,11 @@ void hooks_implied_by(bool net_configured) {
 
 } // namespace
 
+static wchar_t g_dll_dir_copy[MAX_PATH] = {};
+const wchar_t* config_dll_dir() { return g_dll_dir_copy; }
+
 void config_load(const wchar_t* dll_dir) {
+    wcsncpy_s(g_dll_dir_copy, MAX_PATH, dll_dir ? dll_dir : L"", _TRUNCATE);
     // Start from a fresh Config every time. The mod calls this once, so nothing
     // depended on it -- but "correct only if called exactly once" was an unstated
     // precondition, and the first thing that called it twice (tests/test_config)

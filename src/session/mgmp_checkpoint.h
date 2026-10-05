@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <string>
+#include <vector>
 namespace mgmp {
 struct CheckpointMsg;
 struct ChapterMapMsg;
@@ -14,6 +16,8 @@ int checkpoint_autoselect();
 // node_type: the MapNodeType (8 = the chapter boss); the save confirmed after that node is marked kCheckpointAfterBoss.
 void checkpoint_on_node(uint64_t node_seed, uint32_t node_index, uint32_t node_type = 0);
 void checkpoint_on_map(uint64_t map_hash);
+// How long (ms, default 4000) a capture that fails at the map is retried -- a try every half second -- before the checkpoint latches as failed and every player is held at the next node.
+void checkpoint_set_capture_patience(unsigned ms);
 // Fresh-session map pre-sync (MSG_CHAPTERMAP): the host's serialized
 // files.chapter_map row, written into this peer's save before load. A fresh
 // departure-ready save carries its own generated map, and two peers that
@@ -26,6 +30,27 @@ bool checkpoint_needs_map();
 bool checkpoint_can_enter();
 void checkpoint_on_message(uint8_t from, const CheckpointMsg& m);
 bool checkpoint_on_alone();
+
+// THE TWO SAVES BEFORE THE MAP (2026-10-05). A run used to have no handshake save until its first map. Now every player's save is also taken, and certified by everybody like a node's, at two moments:
+//   kStagePrep  -- everyone has come into the room and is in the warehouse (the preparation stage: the run can be started over from here);
+//   kStageReady -- everyone is on the chapter page ("ready to start"): cats and gear are chosen, only the start is left.
+// They sit in the same journal as the node saves and are listed with them, but they are not nodes: their seq is kStageSeqBase + the stage (a node's seq is its count), the node counter does not move, and
+// restoring one starts the run over from that page (a fresh start, not a resumed map). checkpoint_stage_tick is called every frame with the page this peer is on (0 = neither); a stage that cannot be
+// completed (a player moved on, a copy failed, too slow) is given up with a log line and never latches the room -- the node saves do not depend on it.
+constexpr uint8_t  kStagePrep = 1, kStageReady = 2;
+constexpr uint64_t kStageSeqBase = 0x40000000ull;
+inline uint8_t checkpoint_stage_of_seq(uint64_t seq) { return (seq > kStageSeqBase && seq <= kStageSeqBase + kStageReady) ? (uint8_t)(seq - kStageSeqBase) : 0; }
+void checkpoint_stage_tick(uint8_t page);
+// The host's chapter choice waits (a few seconds at most) while the ready save is being taken: the run starting would drop it.
+bool checkpoint_stage_holding();
+// One file of a player's handshake folder (<save dir>\mgmp_handshake\<id>\<pairing>.N), read with no room up: which of this player's save slots it was taken from, when (stamp = FILETIME of the
+// confirmation), which node (seq), how many players, and (database != null) the save itself. False for a file that is not a confirmed save of this player. `folder_id` is the id the folder is named after.
+struct HandshakeSaveInfo { uint8_t slot = 255, players = 0, stage = 0; bool after_boss = false; uint64_t run = 0, seq = 0, stamp = 0; };   // after_boss: confirmed right after the chapter boss; stage: kStagePrep / kStageReady, 0 = a node's save
+bool checkpoint_peek_file(const std::wstring& path, uint64_t folder_id, HandshakeSaveInfo& info, std::vector<uint8_t>* database);
+// The handshake saves of a run that went solo ("continue alone", or a settlement with no room) are kept -- the tombstone that vetoes a resume is written at once -- until the player is next in the warehouse.
+// _due: something is waiting; _deferred: do it now (called by the warehouse watch; does nothing while a room is up, and deletes only entries of that run).
+bool checkpoint_cleanup_due();
+void checkpoint_cleanup_deferred(const char* why);
 void checkpoint_clear(bool broadcast = true);
 // In-session next run: after checkpoint_clear settled this run, re-run the
 // save-validation handshake with the already-selected slot and mint a FRESH

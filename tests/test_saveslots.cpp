@@ -16,7 +16,23 @@ namespace mgmp {
 bool savefile_save_dir(wchar_t* out, size_t cap) { wcsncpy_s(out, cap, g_root.c_str(), _TRUNCATE); return true; }
 void log_line(const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
 void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
-bool leave_scene_live(const char*) { return false; }     // the warehouse trigger is not under test: no scene is ever live here
+bool leave_scene_live(const char*) { return false; }
+bool checkpoint_cleanup_due() { return false; }
+void checkpoint_cleanup_deferred(const char*) {}     // the warehouse trigger is not under test: no scene is ever live here
+// The journal's own reader is tested in test_checkpoint; here a file is a handshake save when the test says so (the file's bytes ARE the database).
+struct FakeHs { std::wstring name; uint8_t slot; uint64_t seq, stamp; bool boss; uint8_t stage = 0; };
+static std::vector<FakeHs> g_fake_hs;
+bool checkpoint_peek_file(const std::wstring& path, uint64_t, HandshakeSaveInfo& info, std::vector<uint8_t>* db) {
+    info = HandshakeSaveInfo{};
+    for (const FakeHs& f : g_fake_hs) {
+        if (path.size() < f.name.size() || path.compare(path.size() - f.name.size(), f.name.size(), f.name) != 0) continue;
+        Bytes b; if (!checkpoint_io::read(path, b, 64u << 20)) return false;
+        info.slot = f.slot; info.players = 3; info.after_boss = f.boss; info.stage = f.stage; info.run = 77; info.seq = f.seq; info.stamp = f.stamp;
+        if (db) *db = std::move(b);
+        return true;
+    }
+    return false;
+}
 }
 
 static void sql_exec(const std::wstring& file, const char* command) {
@@ -169,6 +185,61 @@ int main() {
             CHECK(checkpoint_io::read_property(g_root + L"\\" + kGameFile[0], "v", have, v) && have && v == "107");
         }
         CHECK(!saveslots_auto_load(3));                                                    // out of range is refused
+    }
+
+    printf("-- restore from a handshake save (2026-10-05) --\n");
+    {
+        const std::wstring q = hs + L"\\444";
+        CHECK(CreateDirectoryW(q.c_str(), nullptr));
+        const unsigned long long t0 = 133700000000000000ull;               // FILETIME ticks; each node 10 minutes after the one before
+        const struct { const wchar_t* f; int slot; int v; unsigned seq; bool boss; } mk[] = {
+            { L"sync.0", 0, 303, 3, false }, { L"sync.1", 0, 302, 2, false }, { L"sync.2", 1, 311, 5, true }, { L"sync.3", 0, 301, 1, false } };
+        for (const auto& m : mk) {
+            const std::wstring f = q + L"\\" + m.f;
+            sql_exec(f, ("CREATE TABLE properties(key TEXT PRIMARY KEY,data ANY); INSERT INTO properties VALUES('v'," + std::to_string(m.v) + "); INSERT INTO properties VALUES('current_day',9);").c_str());
+            g_fake_hs.push_back({ m.f, (uint8_t)m.slot, m.seq, t0 + (unsigned long long)m.seq * 6000000000ull, m.boss });
+        }
+        {   // one of the two saves from before the map: its seq is not a node count
+            const std::wstring f = q + L"\\sync.4";
+            sql_exec(f, "CREATE TABLE properties(key TEXT PRIMARY KEY,data ANY); INSERT INTO properties VALUES('v',321);");
+            g_fake_hs.push_back({ L"sync.4", 2, kStageSeqBase + kStagePrep, t0, false, kStagePrep });
+        }
+        put(q + L"\\sync.state", "the tombstone is not a save");
+        put(q + L"\\sync.9", "not a database and not in the list");     // a file the journal reader refuses
+        saveslots_sync_refresh();
+        CHECK(saveslots_sync_count(0) == 3 && saveslots_sync_count(1) == 1 && saveslots_sync_count(2) == 1);
+        CHECK(saveslots_sync_get(0, 0).seq == 3 && saveslots_sync_get(0, 1).seq == 2 && saveslots_sync_get(0, 2).seq == 1);   // newest first
+        CHECK(saveslots_sync_get(0, 0).saved_at > saveslots_sync_get(0, 1).saved_at);
+        CHECK(saveslots_sync_get(1, 0).after_boss && !saveslots_sync_get(0, 0).after_boss && saveslots_sync_get(0, 0).players == 3);
+        CHECK(saveslots_sync_get(0, 0).day == 9);                                                  // the game's own number, read from the save
+        CHECK(!present(g_root + L"\\mgmp_saveslots\\_sync_probe.sav"));                             // the probe file is gone again
+        CHECK(saveslots_sync_get(2, 0).stage == kStagePrep && saveslots_sync_get(0, 0).stage == 0 && saveslots_sync_get(0, 9).seq == 0);   // out of range is an empty one
+
+        sql_exec(g_root + L"\\steamcampaign01.sav", "UPDATE properties SET data=555 WHERE key='v'");
+        const std::string before_queue = get(hs + L"\\111\\k.0");
+        CHECK(saveslots_sync_restore(0, 1));                                                        // node 2
+        {
+            bool have = false; std::string v;
+            CHECK(checkpoint_io::read_property(g_root + L"\\" + kGameFile[0], "v", have, v) && have && v == "302");
+            CHECK(checkpoint_io::read_property(g_root + L"\\" + kGameFile[1], "v", have, v) && have && v != "311");   // the other slots are not touched
+        }
+        CHECK(saveslots_message_is_load());
+        CHECK(get(hs + L"\\111\\k.0") == before_queue && present(q + L"\\sync.0"));                  // the queue is left alone
+        CHECK(saveslots_undo_available());
+        CHECK(saveslots_undo());                                                                    // the undo point has what the restore replaced
+        {
+            bool have = false; std::string v;
+            CHECK(checkpoint_io::read_property(g_root + L"\\" + kGameFile[0], "v", have, v) && have && v == "555");
+        }
+        CHECK(DeleteFileW((q + L"\\sync.2").c_str()));                                              // gone since the page was drawn
+        CHECK(!saveslots_sync_restore(1, 0));
+        CHECK(saveslots_sync_count(1) == 0);                                                        // and the list is rescanned
+        CHECK(!saveslots_sync_restore(3, 0) && !saveslots_sync_restore(0, 7));
+        CHECK(saveslots_sync_restore(2, 0));                                                        // a save from before the map goes over its slot the same way
+        {
+            bool have = false; std::string v;
+            CHECK(checkpoint_io::read_property(g_root + L"\\" + kGameFile[2], "v", have, v) && have && v == "321");
+        }
     }
 
     printf("saveslots: %u checks passed\n", checks);

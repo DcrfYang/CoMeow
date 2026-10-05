@@ -321,6 +321,7 @@ void __fastcall h_DoAction(void* self, void* ta, unsigned char flag) {
     Who    w(self, "char");
     TaDump d(ta);
     log_line("DOACTION", "%s flag=%u %s", w.text, (unsigned)flag, d.text);
+    lockstep_action_trace(self, ta);           // who stands on the target tile, in which order of the live list -- and, at the next action, what this one changed
     o_DoAction(self, ta, flag);
 }
 
@@ -334,6 +335,7 @@ void __fastcall h_Trigger(void* self, void* ta) {
 void __fastcall h_BeginTurn(void* self, int arg) {
     Who w(self, "char");
     log_line("BEGINTURN", "%s arg=%d", w.text, arg);
+    lockstep_action_trace_flush("before the next turn begins");
     lockstep_reseed(self, arg);
     o_BeginTurn(self, arg);
 }
@@ -342,6 +344,7 @@ void __fastcall h_EndTurn(void* self) {
     Who w(self, "char");
     log_line("ENDTURN", "%s", w.text);
     o_EndTurn(self);
+    lockstep_action_trace_flush("at the end of the turn");
     lockstep_after_endturn(self);
 }
 
@@ -800,6 +803,7 @@ bool __fastcall h_TryDepart(void* box) {
     }
     if (!room_depart_allowed(n)) { log_line("DEPART", "refused by the room (party size rule)"); return true; }
     catsync_log_snapshot("departure (the box is accepted)");
+    catsync_log_audit("departure (the box is accepted)");
     // A client may not bring a main-story item (the host alone carries those): the click gate stops equipping one,
     // this stops departing with a cat that already wears one. Only while the client is still preparing.
     if (setup_client_preparing()) {
@@ -1004,11 +1008,13 @@ static void run_settled(const char* how, bool was_shared) {
     log_stage("%s: the native end of the run returned (shared run: %s)", how, was_shared ? "yes" : "no");
     lockstep_log_battle_summary(how);
     catsync_log_snapshot("after the native settlement, before the merge");
+    catsync_log_audit("after the native settlement, before the merge");
     if (was_shared) {
         const unsigned merged = catsync_merge_session_cats(how);
         catsync_release_stuck_cats(how);
         const unsigned retired = catsync_retire_peer_copies(how);
         catsync_log_snapshot("after the merge");
+        catsync_log_audit("after the merge");
         // the settlement saved BEFORE the merge: write the merged state to disk too, so a reload finds it (and the other players' leftover copies, now retired, are not kept out on adventure)
         if (merged || retired) catsync_save_game(how);
     }
@@ -1106,6 +1112,8 @@ void equip_done_go(void* director) {
 }
 
 void __fastcall h_EquipDone(void* self) {
+    // MORE CATS THAN THE ROOM ALLOWS (2026-10-05): a save stored past the departure box skipped the party-size check; its player does not get on to the chapter page.
+    if (room_self_over_limit()) { room_say_party_over(); log_line("SETUP", "the gear screen's done is refused: this player's cats are over the room's limit"); return; }
     uint8_t act_select = 1;
     void*   director   = nullptr;
     if (mem_read((const uint8_t*)self + kEquipDone_ActSelect, &act_select, sizeof(act_select)) && !act_select &&
@@ -1278,6 +1286,17 @@ fn_res_ResGiveItem o_ResGiveItem = nullptr;
 void __fastcall h_ResGiveItem(void* a, void* b, void* c, void* d) {
     if (choice_story_event_block_active()) { choice_story_event_blocked("the item a story event gives (it is not put in this peer's inventory or on a cat here)"); return; }
     o_ResGiveItem(a, b, c, d);
+}
+// THE COMBAT SPEED (proto 82): the turn layer reads the "combat_speed" setting through Settings::get_float every frame; in a room a client's read is answered with the host's value (mgmp_unlocks:
+// settings_override), and the host's own read publishes its value when it changed. Every other key goes straight through. The key is a std::string*; the default is in xmm2 (the third argument).
+typedef float (__fastcall* fn_setting_get_float)(void*, void*, float, float);
+fn_setting_get_float o_SettingGetFloat = nullptr;
+float __fastcall h_SettingGetFloat(void* self, void* key, float def, float x3) {
+    const float own = o_SettingGetFloat(self, key, def, x3);
+    char name[24] = {};
+    if (!key || !mem_read_std_string((const uint8_t*)key, name, sizeof(name)) || name[0] != 'c') return own;
+    float use = own;
+    return settings_override(name, own, use) ? use : own;
 }
 typedef void (__fastcall* fn_res_ResDejaVu)(void*, void*, void*, void*);
 fn_res_ResDejaVu o_ResDejaVu = nullptr;
@@ -1460,9 +1479,11 @@ void __fastcall h_SaveSelUpdate(void* self) {
 // reads and does not own -- so handing it a std::string of ours is exactly as
 // valid as the vector element the game would have passed.
 void* __fastcall h_MewDirInit(void* self, void* name) {
-    if (const void* sub = savefile_redirect_load())
-        return o_MewDirInit(self, (void*)sub);
-    return o_MewDirInit(self, name);
+    void* r = nullptr;
+    if (const void* sub = savefile_redirect_load()) r = o_MewDirInit(self, (void*)sub);
+    else                                              r = o_MewDirInit(self, name);
+    catsync_log_audit("a save is loaded (MewDirector::init)");     // who the run's lists hold right after a load, in a room or alone
+    return r;
 }
 
 // The two inventory blob accessors. Both bodies are one predicted branch on a
@@ -1603,6 +1624,7 @@ const Binding kBindings[] = {
     { T_ResAdventureUnlock, (void*)&h_ResAdventureUnlock, (void**)&o_ResAdventureUnlock },
     { T_ResCompleteItemQuest, (void*)&h_ResCompleteItemQuest, (void**)&o_ResCompleteItemQuest },
     { T_ResGiveItem, (void*)&h_ResGiveItem, (void**)&o_ResGiveItem },
+    { T_SettingGetFloat, (void*)&h_SettingGetFloat, (void**)&o_SettingGetFloat },
     { T_ResDejaVu, (void*)&h_ResDejaVu, (void**)&o_ResDejaVu },
     { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
     { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },

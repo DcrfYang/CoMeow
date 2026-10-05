@@ -10,7 +10,8 @@
 namespace mgmp { namespace checkpoint_io {
 bool read(const std::wstring& path, Bytes& out, uint32_t limit) {
     out.clear();
-    HANDLE h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+    // shared with writers: the game keeps its save open for writing, and a reader that does not allow that is refused (ERROR_SHARING_VIOLATION)
+    HANDLE h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
     if (h==INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER n{}; DWORD got=0;
     bool ok=GetFileSizeEx(h,&n) && n.QuadPart>0 && n.QuadPart<=limit;
@@ -136,21 +137,90 @@ static int check_row(void* result,int n,char** vals,char**) {
 static bool healthy(void* db) {
     bool ok=false; return sql.exec(db,"PRAGMA quick_check",check_row,&ok,nullptr)==0 && ok;
 }
-bool snapshot(const std::wstring& source, Bytes& out) {
-    out.clear(); if(!sql.load()) return false;
-    auto tmp=source+L".mgmp-snapshot-"+std::to_wstring(GetCurrentProcessId());
+// WHY THE LAST SNAPSHOT FAILED, for the log of a caller that has none of its own (2026-10-04: a Steam Deck peer under Proton printed only "checkpoint capture failed" at the first
+// map and held the whole room there; nothing said which of the five steps it was).
+static char g_snap_why[240] = "";
+const char* snapshot_why() { return g_snap_why; }
+static void snap_why(const char* fmt, int a = 0, int b = 0) { _snprintf_s(g_snap_why, sizeof(g_snap_why), _TRUNCATE, fmt, a, b); }
+
+// THE ONLINE BACKUP: the exact copy, and the first choice. Fills `out`; on failure the reason is in snap_why.
+static bool backup_copy(const std::wstring& source, const std::wstring& tmp, Bytes& out) {
     DeleteFileW(tmp.c_str());
     void *src=nullptr,*dst=nullptr;
-    bool ok=sql.open(utf8(source).c_str(),&src,1,nullptr)==0 &&
-            sql.open(utf8(tmp).c_str(),&dst,6,nullptr)==0;
+    bool ok=sql.open(utf8(source).c_str(),&src,1,nullptr)==0;
+    if(!ok) snap_why("the save could not be opened for reading");
+    if(ok) { ok=sql.open(utf8(tmp).c_str(),&dst,6,nullptr)==0; if(!ok) snap_why("the temporary copy could not be created beside the save"); }
     if(ok) {
         void* backup=sql.init(dst,"main",src,"main"); ok=backup!=nullptr;
-        if(backup) { int step=sql.step(backup,-1); int end=sql.finish(backup); ok=step==101 && end==0; }
+        if(!backup) snap_why("sqlite3_backup_init failed");
+        else {
+            int step=0,end=0;
+            for(int attempt=0; attempt<8; ++attempt) {      // 5 = busy, 6 = locked: the game's own connection is writing; a moment later it is not
+                step=sql.step(backup,-1);
+                if(step!=5 && step!=6) break;
+                Sleep(50);
+            }
+            end=sql.finish(backup); ok=step==101 && end==0;
+            if(!ok) snap_why("the backup stopped (step %d, finish %d)",step,end);
+        }
     }
-    if(ok) ok=healthy(dst);
-    if(dst) sql.close(dst); if(src) sql.close(src);
-    if(ok) ok=read(tmp,out,kMaxSaveBytes);
-    DeleteFileW(tmp.c_str()); return ok;
+    if(ok) { ok=healthy(dst); if(!ok) snap_why("the copy failed its integrity check"); }
+    if(dst) sql.close(dst);
+    if(src) sql.close(src);
+    if(ok) { ok=read(tmp,out,kMaxSaveBytes); if(!ok) snap_why("the copy could not be read back"); }
+    DeleteFileW(tmp.c_str());
+    return ok;
+}
+
+// THE FILE AS IT IS, for when the backup does not complete (the game's own connection holds a lock the backup cannot wait out, or sqlite does not do the backup API well -- Wine's). The game keeps
+// these saves in the default rollback-journal mode (no -wal / -shm beside them on any measured machine), so the bytes of a file that is not mid-commit ARE the database. Read twice a moment apart
+// (a commit in progress changes them), written to a temporary file and opened for the same integrity check as the backup's copy. 2026-10-04: the first version of this read with FILE_SHARE_READ only,
+// which a file the game holds open for writing refuses -- the host of a four-player room could neither back up nor read, and held every player at the first node.
+static bool raw_copy(const std::wstring& source, const std::wstring& tmp, Bytes& out, char* why, size_t cap) {
+    Bytes a, b;
+    if(!read(source,a,kMaxSaveBytes)) { _snprintf_s(why,cap,_TRUNCATE,"the file could not be read (error %lu, %s)",GetLastError(), a.empty() ? "empty or too large or locked" : "?"); return false; }
+    Sleep(60);
+    if(!read(source,b,kMaxSaveBytes) || a!=b) { _snprintf_s(why,cap,_TRUNCATE,"the file changed while it was read (the game is writing it)"); return false; }
+    HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE) { _snprintf_s(why,cap,_TRUNCATE,"the temporary file could not be created (error %lu)",GetLastError()); return false; }
+    DWORD put=0; bool w=WriteFile(h,a.data(),(DWORD)a.size(),&put,nullptr) && put==a.size();
+    CloseHandle(h);
+    bool ok=false;
+    if(w) {
+        void* db=nullptr;
+        ok=sql.open(utf8(tmp).c_str(),&db,1,nullptr)==0 && healthy(db);
+        if(db) sql.close(db);
+        if(!ok) _snprintf_s(why,cap,_TRUNCATE,"the copied bytes failed the integrity check");
+    } else _snprintf_s(why,cap,_TRUNCATE,"the temporary file could not be written");
+    DeleteFileW(tmp.c_str());
+    if(ok) out.swap(a);
+    return ok;
+}
+
+bool loadable(const std::wstring& source, Bytes& out) {
+    out.clear();
+    if(!sql.load() || !read(source,out,kMaxSaveBytes) || out.size()<512 || memcmp(out.data(),"SQLite format 3",15)!=0) { out.clear(); return false; }
+    void* db=nullptr;
+    bool ok=sql.open(utf8(source).c_str(),&db,1,nullptr)==0 && sql.exec(db,"SELECT count(*) FROM sqlite_master",nullptr,nullptr,nullptr)==0;
+    if(db) sql.close(db);
+    if(!ok) out.clear();
+    return ok;
+}
+
+bool snapshot(const std::wstring& source, Bytes& out) {
+    out.clear(); snap_why("");
+    if(!sql.load()) { snap_why("sqlite is not available (winsqlite3 did not load)"); return false; }
+    auto tmp=source+L".mgmp-snapshot-"+std::to_wstring(GetCurrentProcessId());
+    if(backup_copy(source,tmp,out)) { snap_why(""); return true; }
+    char primary[160]; _snprintf_s(primary,sizeof(primary),_TRUNCATE,"%s",g_snap_why);
+    char rawwhy[160]="";
+    if(raw_copy(source,tmp,out,rawwhy,sizeof(rawwhy))) {
+        _snprintf_s(g_snap_why,sizeof(g_snap_why),_TRUNCATE,"the file was copied as it is (the sqlite backup did not complete: %s)",primary);
+        return true;
+    }
+    out.clear();
+    _snprintf_s(g_snap_why,sizeof(g_snap_why),_TRUNCATE,"backup: %s; raw copy: %s",primary,rawwhy);
+    return false;
 }
 static int run_row(void* result,int n,char** vals,char**) {
     if(n==1 && vals[0]) *(bool*)result=strcmp(vals[0],"0")!=0; return 0;
@@ -286,14 +356,14 @@ bool read_property(const std::wstring& source,const char* key,bool& have,std::st
     }
     if(db) sql.close(db); return ok;
 }
-bool restore(const std::wstring& target,const Bytes& bytes) {
+bool restore(const std::wstring& target,const Bytes& bytes,bool require_run) {
     // Called ONLY before ContinueSlot. Never replace an open game database.
     for(auto suffix:{L"-wal",L"-shm",L"-journal"})
         if(GetFileAttributesW((target+suffix).c_str())!=INVALID_FILE_ATTRIBUTES) return false;
     auto staged=target+L".mgmp-restore";
     if(!atomic_write(staged,bytes)) return false;
     bool running=false;
-    if(!in_run(staged,running) || !running) { DeleteFileW(staged.c_str()); return false; }
+    if(!in_run(staged,running) || (require_run && !running)) { DeleteFileW(staged.c_str()); return false; }
     // Sidecar absence is insufficient: a second game can keep a rollback-mode
     // DB open without a journal. Require exclusive access before replacement.
     HANDLE lease=CreateFileW(target.c_str(),GENERIC_READ,FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);

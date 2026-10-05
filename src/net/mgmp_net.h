@@ -78,6 +78,7 @@ struct NetMsg {
     PropsMsg     props;       // a chunk of the host's save-property table (proto 79): flat
     RnglMsg      rngl;        // one action's ledger of draws on the shared stream (proto 80): flat
     ChatMsg      chat;        // a line of text one player typed (proto 81): flat
+    SettingMsg   setting;     // the host's combat speed (proto 82): flat
     DeepMsg      deep;        // one turn's per-unit digest of derived values (proto 80): flat
     NodeHashMsg  nodehash;
     CatDigestMsg catdigest;  // per-cat hash digest, see MSG_CATDIGEST
@@ -254,6 +255,7 @@ bool net_send_uqd(const UqdMsg& m);
 bool net_send_props(const PropsMsg& m);
 bool net_send_rngl(const RnglMsg& m);
 bool net_send_chat(const ChatMsg& m);
+bool net_send_setting(const SettingMsg& m);
 bool net_send_deep(const DeepMsg& m);
 bool net_send_halt(const HaltMsg& h);
 bool net_send_refuse(const char* reason);

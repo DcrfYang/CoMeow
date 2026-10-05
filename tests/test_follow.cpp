@@ -9,6 +9,9 @@
 #include "mgmp_config.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
+#include "mgmp_page.h"
+#include <chrono>
+#include <thread>
 #include "mgmp_tuning.h"
 #include <cstdio>
 #include <cstring>
@@ -18,6 +21,7 @@ using namespace mgmp;
 namespace {
 Config cfg;
 NetRole role = NetRole::Client;
+PageState peer_page = PageState::InGame; uint32_t peer_page_age = 100;      // what the other player's page report says (a_player_on_the_gear_screen_holds_the_node)
 bool apply_ok = true, send_ok = true, roster_ok = true;
 uint64_t battle = 0, remembered = 0;
 unsigned checks = 0, failures = 0, publishes = 0, map_publishes = 0, hashes = 0;
@@ -223,6 +227,21 @@ void duplicate_node_is_refused() {
     // state -- which is not that node's -- is discarded with it.
     CHECK(cat_values.size() == 1 && cat_values[0] == 1);
     CHECK(tune::kInvSync ? coins.size() == 1 && coins[0] == 1 : coins.empty());
+}
+// A PLAYER CHANGING GEAR HOLDS THE NODE (2026-10-05): the host's click waits while another player is on the gear / collar screen, and for a moment after it leaves.
+void a_player_on_the_gear_screen_holds_the_node() {
+    Fixture f; follow_shutdown(); role = NetRole::Host; follow_init();
+    peer_page = PageState::Equipment; peer_page_age = 100;
+    CHECK(!follow_on_enter_node(f.map, f.nodes[3], nullptr));      // held
+    peer_page = PageState::Collar;
+    CHECK(!follow_on_enter_node(f.map, f.nodes[3], nullptr));
+    peer_page = PageState::InGame;
+    CHECK(!follow_on_enter_node(f.map, f.nodes[3], nullptr));      // just left it: still settling (its cats are on their way)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    CHECK(follow_on_enter_node(f.map, f.nodes[3], nullptr));       // settled
+    peer_page = PageState::Equipment; peer_page_age = 9000;         // a page report that has gone stale does not hold
+    CHECK(follow_on_enter_node(f.map, f.nodes[4], nullptr));
+    peer_page = PageState::InGame; peer_page_age = 100;
 }
 // The catch-up itself: to that peer, and only once there is a node to name.
 void catchup_names_the_current_node() {
@@ -470,6 +489,8 @@ const Config& config() { return cfg; }
 NetRole net_role() { return role; }
 bool net_active() { return connected; }
 uint8_t net_self(){return 0;}
+PageState page_of(uint8_t peer) { return peer == 1 ? peer_page : PageState::Unknown; }
+uint32_t page_age_ms(uint8_t) { return peer_page_age; }
 uint8_t net_peer_count(){return 4;}
 bool net_peer_ids(uint8_t* ids,uint8_t cap){if(cap<4)return false;for(unsigned i=0;i<4;++i)ids[i]=(uint8_t)i;return true;}
 bool checkpoint_can_enter() { return checkpoint_ready; }
@@ -501,6 +522,7 @@ bool roster_normalize_shared(const char*) { return true; }
 bool roster_adopt_host_shared(const uint64_t*, uint32_t, const uint64_t*, uint32_t, const char*) { return true; }
 void catsync_on_message(const CatDataMsg&) {}
 void catsync_map_tick() { ++map_publishes; sync_order.push_back(2); }
+void catsync_leave_tick() {}
 void catsync_apply_pending(const char*) { ++drained; sync_order.push_back(1); }
 bool catsync_publish(const char*, bool, bool) { ++publishes; return send_ok; }
 bool invsync_publish(const char*, bool) { return send_ok; }
@@ -595,7 +617,7 @@ int main() {
     relayed_cat_ownership();
     queued_snapshots(); coalesce_only_within_batch(); gates_and_failures();
     reset_and_untrusted_sender(); overflow_and_host_failure();
-    reconnect_keeps_the_run(); duplicate_node_is_refused(); catchup_names_the_current_node(); roster_node_ordering();
+    reconnect_keeps_the_run(); duplicate_node_is_refused(); catchup_names_the_current_node(); a_player_on_the_gear_screen_holds_the_node(); roster_node_ordering();
     peer_updates_do_not_starve_local_publish();
     first_join_still_waits_for_snapshot();
     resume_map_gate();

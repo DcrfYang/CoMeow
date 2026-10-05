@@ -57,11 +57,16 @@ namespace mgmp {
 int say_client=0,say_wait=0,say_story=0;
 void room_say_chapter_client(){++say_client;}
 void room_say_chapter_wait(){++say_wait;}
+bool over_self=false;int over_row=-1,say_over=0,say_peer_over=0;
+bool room_self_over_limit(uint32_t*){return over_self;}
+int room_other_over_limit(uint32_t*){return over_row;}
+void room_say_party_over(){++say_over;}
+void room_say_peer_over(int){++say_peer_over;}
 void room_say_story_only_host(){++say_story;}
 int say_ready=0,say_start_wait=0;
 void room_say_no_chapter_ready(){++say_ready;}
 void room_say_no_chapter_wait(){++say_start_wait;}
-bool checkpoint_run_restored(){return false;}
+bool checkpoint_run_restored(){return false;}bool checkpoint_stage_holding(){return false;}
 int say_lock2=0,say_lock3=0;
 void room_say_chapter_locked_2(){++say_lock2;}
 void room_say_chapter_locked_3(){++say_lock3;}
@@ -145,6 +150,13 @@ void test_hints(){
  CHECK(say_wait==0);
  at(0,[]{CHECK(!setup_on_select_act(2));});                                                                           // already committed: nothing to wait for
  CHECK(say_wait==0&&say_client==1);
+ // MORE CATS THAN THE ROOM ALLOWS (2026-10-05): the host's choice is refused while its own cats, or another player's, are over the limit -- even with every player READY
+ reset(2,0);prepare();say_over=say_peer_over=0;
+ over_self=true;at(0,[]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);CHECK(!setup_on_select_act(2));});over_self=false;
+ CHECK(say_over==1&&say_peer_over==0);
+ over_row=1;at(0,[]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);CHECK(!setup_on_select_act(2));});over_row=-1;
+ CHECK(say_over==1&&say_peer_over==1);
+ at(0,[]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);CHECK(setup_on_select_act(2));});            // back within the limit: it goes through
 }
 namespace {
 int went[4]{};

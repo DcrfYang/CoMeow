@@ -54,6 +54,10 @@ struct State {
     uint8_t waitPhase=0, waitMask=0;
     uint8_t holders=0;   // bit n = the peer with transport id n holds an unfinished co-op record (mode 1 or snapshots): who refused the round
     uint8_t sentPhase=255, sentMask=255; ULONGLONG sentAt=0; unsigned invalidSends=0;
+    // The two saves before the map (checkpoint_stage_tick): the stage in flight (0 = none), when it began, which are done, the selection message it borrowed g.tx from, and the arrivals of a stage
+    // that came before this peer began it (the host keeps them, a client is not asked until all have arrived).
+    uint8_t stage=0; ULONGLONG stageAt=0; bool stageDone[3]{}; CheckpointMsg selTx{};
+    CheckpointMsg early[3][kMaxPeers]{}; bool haveEarly[3][kMaxPeers]{};
 };
 State g;
 bool g_manual=false;
@@ -169,18 +173,20 @@ Bytes encode_entry(const Entry& e) {
     w.u64v(savefile_hash(out.data(),w.len));
     if(!w.ok) return {}; out.resize(w.len); return out;
 }
-bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
-    Bytes bytes; if(!checkpoint_io::read(path,bytes) || bytes.size()<44) return false;
+// `lenient`: read the file for what it holds without this room's say-so -- another build's file, and a pairing that is not the current one -- for the "restore from a handshake save" page, which runs
+// from the main menu with no room (checkpoint_peek_file). The checksum and the layout are still checked.
+bool parse_entry(const Bytes& bytes,Entry& out,bool confirmed,bool lenient) {
+    if(bytes.size()<44) return false;
     uint64_t hash=0; memcpy(&hash,bytes.data()+bytes.size()-8,8);
     if(hash!=savefile_hash(bytes.data(),(uint32_t)bytes.size()-8)) return false;
     Reader r(bytes.data(),(uint32_t)bytes.size()-8);
     uint32_t magic=r.u32v(); uint32_t version=r.u32v();
-    if(magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins && version!=kDiskVersionFlags) ||
-       r.u32v()!=kCheckpointCompatibility) return false;
-    if(r.u64v()!=compatibility_build || r.u64v()!=compatibility_gpak) return false;
+    if(magic!=kDiskMagic || (version!=kDiskVersion && version!=kDiskVersionOwners && version!=kDiskVersionOrigins && version!=kDiskVersionFlags)) return false;
+    const uint32_t compat=r.u32v(); const uint64_t build=r.u64v(); const uint64_t gpak=r.u64v();
+    if(!lenient && (compat!=kCheckpointCompatibility || build!=compatibility_build || gpak!=compatibility_gpak)) return false;
     uint32_t n=r.u32v(); if(!r.ok || n>512 || n>r.len-r.pos) return false;
     Reader meta(r.buf+r.pos,n); if(meta.u8v()!=MSG_CHECKPOINT) return false;
-    CheckpointMsg m{}; if(!dec_checkpoint(meta,m,kDiskCandidates,false) || !same_config(m)) return false;
+    CheckpointMsg m{}; if(!dec_checkpoint(meta,m,kDiskCandidates,false) || (!lenient && !same_config(m))) return false;
     r.pos+=n; uint32_t size=r.u32v();
     if(!r.ok || size>kMaxSaveBytes) return false;
     uint32_t tail=r.len-r.pos;   // database + (version 2 only) the owner section
@@ -218,6 +224,10 @@ bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
         if(o.pos!=o.len) return false;   // exact consumption, no trailing bytes
     }
     return true;
+}
+bool read_entry(const std::wstring& path,Entry& out,bool confirmed) {
+    Bytes bytes; if(!checkpoint_io::read(path,bytes)) return false;
+    return parse_entry(bytes,out,confirmed,false);
 }
 // Is this an intact entry file written under a DIFFERENT build identity (another mod ruleset, another game build,
 // another resources.gpak, another file format)? Such a file is not corrupt -- nothing of its content can be
@@ -321,6 +331,8 @@ bool restore_queue(const Entry& chosen) {
     return true;
 }
 bool has_candidate(const CheckpointMsg& m) { for(const auto& c:m.candidates) if(c.run) return true; return false; }
+// a candidate that is a NODE's save (not one of the two before the map)
+bool has_map_candidate(const CheckpointMsg& m) { for(const auto& c:m.candidates) if(c.run && !checkpoint_stage_of_seq(c.seq)) return true; return false; }
 bool has_ref(const CheckpointMsg& m,const CheckpointRef& ref) { for(const auto& c:m.candidates) if(equal(ref,c)) return true; return false; }
 void choose();
 void prepare();
@@ -378,6 +390,12 @@ void send_offer() {
     // Native settlement can commit its database immediately before a crash
     // prevents our finalizer hook from writing the tombstone. A warehouse save
     // must never be rolled back into that completed adventure.
+    // A warehouse/chapter-page save whose journal holds ONLY the two saves before the map is the leftover of a run that never reached its first map: nothing to recover, so the fresh start stays open (the
+    // leftovers are replaced when the new run commits). They are offered only to saves that are on the map.
+    if(g.mode==0 && offer.mode==1 && has_candidate(offer) && !has_map_candidate(offer)) {
+        log_line("CHECKPOINT","this save is not on the map and its journal holds only saves from before a map (run %016llx): a fresh start is offered",(unsigned long long)offer.run);
+        offer.mode=0; offer.run=0; for(auto& c:offer.candidates) c={};
+    }
     if(g.mode==0 && offer.mode==1 && has_candidate(offer)) {
         g.run=offer.run;
         if(!marker(3) || !cleanup()) { fail("cannot retire an already-settled recovery run"); return; }
@@ -604,7 +622,7 @@ void apply_select(const CheckpointMsg& m) {
     if(g.released || g.failed || !same_config(m) || !m.run || g.loadIssued) return;
     if(m.mode==1) {
         Entry e{};
-        if(!find({m.run,m.seq,m.stamp,m.token},e) || !checkpoint_io::restore(g.path,e.database) ||
+        if(!find({m.run,m.seq,m.stamp,m.token},e) || !checkpoint_io::restore(g.path,e.database,checkpoint_stage_of_seq(m.seq)==0) ||
            !restore_queue(e)) {
             fail("recovery refused: selected snapshot unavailable, corrupt or local save is open"); return;
         }
@@ -625,14 +643,19 @@ void apply_select(const CheckpointMsg& m) {
         if(g.host && g_manual && !g.inSession) { note_refusal(); g.invalid=true; send_wait(kSaveWaitInvalid); }
         fail("recovery refused: unfinished local save cannot start a fresh session"); return;
     }
-    log_line("CHECKPOINT", "%s run=%016llx seq=%llu key=%ls", m.mode?"RESTORE":"NEW", m.run, m.seq, g.key.c_str());
-    g.run=m.run; g.seq=m.seq;
+    // A SAVE FROM BEFORE THE MAP starts the run over from that page: the databases are back in the slots, and from here it is a fresh start (the host's chapter map row goes out, the gear screen is
+    // gone through, the node counter is at 0) -- not a resumed map.
+    const bool stage_restore=m.mode==1 && checkpoint_stage_of_seq(m.seq)!=0;
+    if(stage_restore) g.mode=0;
+    log_line("CHECKPOINT", "%s run=%016llx seq=%llu key=%ls", stage_restore?"RESTORE (from before the map)":m.mode?"RESTORE":"NEW", m.run, m.seq, g.key.c_str());
+    g.run=m.run; g.seq=stage_restore?0:m.seq;
     if(!marker(1)) { fail("cannot persist active recovery run"); return; }
     g.tx=m;
+    const bool fresh_start=m.mode==0 || stage_restore;
     if(g.host) {
-        if(m.mode==0 && !g.inSession && !publish_chapter_map()) return;
+        if(fresh_start && !g.inSession && !publish_chapter_map()) return;
         g.loaded[0]=true; release();
-    } else if(m.mode==0 && !g.inSession) {
+    } else if(fresh_start && !g.inSession) {
         // Fresh: the host's chapter_map row must arrive and be written into our
         // save BEFORE the Loaded ack, or the release would let both peers load
         // two different generated maps. checkpoint_on_chaptermap sends the ack.
@@ -640,6 +663,26 @@ void apply_select(const CheckpointMsg& m) {
     } else send_loaded();
 }
 bool transaction(const CheckpointMsg& m) { return m.run==g.tx.run && m.seq==g.tx.seq && m.map==g.tx.map && m.stamp==g.tx.stamp; }
+// --- the two saves before the map (checkpoint_stage_tick): they borrow the node transaction's fields, so everything below that reads "the next seq" asks expect_seq() ---
+uint64_t expect_seq() { return g.stage ? kStageSeqBase+g.stage : g.seq+1; }
+uint64_t stage_map(uint8_t s) { return 0x5354414745000000ull+s; }   // "STAGE": what the transaction is named by in place of a map fingerprint
+void stage_idle() {                                               // the shared fields back to rest
+    g.arrived=g.preparing=g.capture=g.committed=g.advancing=false;
+    memset(g.haveArrival,0,sizeof(g.haveArrival)); memset(g.ack,0,sizeof(g.ack)); memset(g.committedAck,0,sizeof(g.committedAck));
+    g.map=0; g.pending=Entry{}; g.tx=g.selTx; g.stage=0;
+}
+void abandon_stage(const char* why) {
+    if(!g.stage) return;
+    log_line("CHECKPOINT","!! the save before the map (stage %u) was given up: %s",(unsigned)g.stage,why);
+    g.stageDone[g.stage]=true;
+    stage_idle();
+    erase(L".pending");
+}
+void stage_confirmed() {
+    log_line("CHECKPOINT","the save before the map (stage %u) is confirmed by all players",(unsigned)g.stage);
+    g.stageDone[g.stage]=true;
+    stage_idle();
+}
 void prepare() {
     if(!g.host || g.preparing || !all(g.haveArrival) || g.failed) return;
     // THE MAP FINGERPRINTS NO LONGER HAVE TO AGREE (2026-10-02). The host's map names the transaction;
@@ -651,9 +694,10 @@ void prepare() {
         log_line("CHECKPOINT","map %016llx on peer slot %u differs from the host's %016llx -- continuing",
                      (unsigned long long)g.arrivals[i].map,i,(unsigned long long)map);
     }
-    CheckpointMsg m=g.config; m.kind=kCheckpointPrepare; m.run=g.run; m.seq=g.seq+1; m.map=map; m.stamp=now();
+    CheckpointMsg m=g.config; m.kind=kCheckpointPrepare; m.run=g.run; m.seq=expect_seq(); m.map=map; m.stamp=now();
     memset(m.hashes,0,sizeof(m.hashes)); // configuration carried selection nonces
     g.tx=m; g.preparing=true; g.capture=true;
+    if(g.stage) g.stageAt=GetTickCount64();                 // the clock of a stage starts when everybody is there, not when this peer got there
     if(!net_send_checkpoint(m)) fail("checkpoint prepare send failed");
     else status("checkpoint: saving each player's local state");
 }
@@ -670,6 +714,7 @@ void advance() {
     if(!g.host || !all(g.committedAck) || g.advancing || g.failed) return;
     CheckpointMsg m=g.tx; m.kind=kCheckpointAdvance;
     if(!net_send_checkpoint(m)) { fail("checkpoint completion send failed"); return; }
+    if(g.stage) { stage_confirmed(); return; }
     g.advancing=true; g.seq=m.seq; g.dirty=false; g.capture=false;
     status("checkpoint confirmed by all players; next node unlocked");
 }
@@ -810,6 +855,7 @@ int checkpoint_autoselect() {
 }
 void checkpoint_on_node(uint64_t seed,uint32_t,uint32_t type) {
     if(!g.on || !g.released) return;
+    if(g.stage) abandon_stage("a node was entered");
     g.nodeType=type;
     g.dirty=true; g.arrived=g.preparing=g.capture=g.committed=g.advancing=false;
     g.map=0; g.pending=Entry{};
@@ -826,7 +872,33 @@ void checkpoint_on_node(uint64_t seed,uint32_t,uint32_t type) {
 // straight to the map without the setup hold (2026-10-03: a restored first run, settled in-session, then a new run -- the host started its map while the client was still choosing its gear).
 bool checkpoint_run_restored() { return g.on && g.mode==1 && !g.finished; }
 bool checkpoint_needs_map() { return g.on && g.released && !g.failed && g.dirty && !g.skip; }
+static unsigned g_capture_patience_ms=8000;   // how long a failing capture is retried before it latches the room; the tests set 0 (a failure there is meant to be immediate)
+void checkpoint_set_capture_patience(unsigned ms) { g_capture_patience_ms=ms; }
+// What follows a successful capture, for a node and for a stage alike: the entry is staged under the transaction's name and this peer says so.
+static void finish_capture(uint8_t* data,uint32_t size,uint64_t hash) {
+    g.pending.certificate=g.tx; g.pending.certificate.hashes[g.pos]=hash;
+    g.pending.database.assign(data,data+size); free(data);
+    if(g.stage) {   // before the map there is no battle behind the save: no ownership notes, no clone origins, never "after the boss"
+        g.pending.owner_count=0; g.pending.origin_count=0; g.pending.flags=0;
+    } else {
+        // The staged entry snapshots the ownership table too: the journal is what
+        // a future restore imports it back from (2026-09-28).
+        g.pending.owner_count=lockstep_owner_note_export(g.pending.owners,kMaxJournalOwners);
+        g.pending.origin_count=catsync_origin_export(g.pending.origins,kMaxJournalOrigins);
+        g.pending.flags=(g.nodeType==kBossNodeType)?kCheckpointAfterBoss:0;   // back on the map after the chapter boss: next floor or home from here
+    }
+    if(!checkpoint_io::atomic_write(file(L".pending"),encode_entry(g.pending))) {
+        if(g.stage) abandon_stage("staging failed"); else fail("checkpoint staging failed; previous saves retained");
+        return;
+    }
+    log_line("CHECKPOINT", "STAGED run=%016llx seq=%llu map=%016llx local-hash=%016llx bytes=%u", g.run, g.tx.seq, g.tx.map, hash, size);
+    g.capture=false;
+    if(g.host) { g.tx.hashes[0]=hash; g.ack[0]=true; commit_if_ready(); }
+    else { CheckpointMsg m=g.tx; m.kind=kCheckpointAck; m.hashes[g.pos]=hash;
+        if(!net_send_checkpoint(m)) { if(g.stage) abandon_stage("staging acknowledgement failed"); else fail("checkpoint staging acknowledgement failed"); } }
+}
 void checkpoint_on_map(uint64_t map_hash) {
+    if(g.stage && map_hash) abandon_stage("the map arrived");
     if(!checkpoint_needs_map() || !map_hash) return;
     if(lockstep_halted()) { fail("checkpoint refused: battle lockstep halted"); return; }
     if(!membership()) { status("checkpoint waiting: a participant disconnected"); return; }
@@ -841,21 +913,75 @@ void checkpoint_on_map(uint64_t map_hash) {
         log_line("CHECKPOINT","this peer's map changed from %016llx to %016llx during preparation (the map sync) -- continuing",(unsigned long long)g.map,(unsigned long long)map_hash);
         g.map=map_hash;
     }
+    // A capture that fails is tried again for a few seconds before it latches the whole room (2026-10-04: a Steam Deck's first capture failed once at the first map and every player sat on "next node
+    // held"). The first refusal is a line in the log that says why (SAVEFILE "checkpoint capture: ..."); every try after it flushes the run to disk again, so they are spaced.
+    static ULONGLONG s_first_fail=0, s_next_try=0;
+    const ULONGLONG tick=GetTickCount64();
+    if(s_next_try && tick<s_next_try) return;
     uint8_t* data=nullptr; uint32_t size=0; uint64_t hash=0;
-    if(!savefile_read_checkpoint(&data,&size,&hash)) { fail("checkpoint capture failed; next node held"); return; }
-    g.pending.certificate=g.tx; g.pending.certificate.hashes[g.pos]=hash;
-    g.pending.database.assign(data,data+size); free(data);
-    // The staged entry snapshots the ownership table too: the journal is what
-    // a future restore imports it back from (2026-09-28).
-    g.pending.owner_count=lockstep_owner_note_export(g.pending.owners,kMaxJournalOwners);
-    g.pending.origin_count=catsync_origin_export(g.pending.origins,kMaxJournalOrigins);
-    g.pending.flags=(g.nodeType==kBossNodeType)?kCheckpointAfterBoss:0;   // back on the map after the chapter boss: next floor or home from here
-    if(!checkpoint_io::atomic_write(file(L".pending"),encode_entry(g.pending))) { fail("checkpoint staging failed; previous saves retained"); return; }
-    log_line("CHECKPOINT", "STAGED run=%016llx seq=%llu map=%016llx local-hash=%016llx bytes=%u", g.run, g.tx.seq, g.tx.map, hash, size);
-    g.capture=false;
-    if(g.host) { g.tx.hashes[0]=hash; g.ack[0]=true; commit_if_ready(); }
-    else { CheckpointMsg m=g.tx; m.kind=kCheckpointAck; m.hashes[g.pos]=hash;
-        if(!net_send_checkpoint(m)) fail("checkpoint staging acknowledgement failed"); }
+    if(!savefile_read_checkpoint(&data,&size,&hash)) {
+        if(!s_first_fail) s_first_fail=tick;
+        if(tick-s_first_fail<g_capture_patience_ms) { s_next_try=tick+500; return; }
+        s_first_fail=s_next_try=0;
+        fail("checkpoint capture failed; next node held");
+        return;
+    }
+    s_first_fail=s_next_try=0;
+    finish_capture(data,size,hash);
+}
+// EVERY FRAME, with the page this peer is on: kStagePrep in the warehouse, kStageReady on the chapter page, 0 anywhere else. The first time a peer is on one of them (and the run has no node save yet) it
+// says so like a node's arrival; once all have, the host prepares, each peer copies its own save AS IT IS ON DISK (savefile_read_stage) and the usual stage / acknowledge / commit / advance follows.
+// A stage that cannot finish is given up (logged), never latched: the node saves do not depend on it.
+static constexpr ULONGLONG kStageGiveUpMs=15000, kStageHoldMs=12000;
+void checkpoint_stage_tick(uint8_t page) {
+    if(!g.on || g.failed || g.finished || !g.released || !g.configured || g.skip || g.seq!=0) return;
+    if(!g.loadIssued && !g.inSession) return;
+    if(page>kStageReady) page=0;
+    const ULONGLONG t=GetTickCount64();
+    static ULONGLONG s_first_fail=0, s_next_try=0;
+    if(g.stage) {
+        // WAITING FOR THE OTHERS TO ARRIVE has no clock (2026-10-05: the host reached the chapter page 14 s before a player who was still choosing gear and gave up at 15 s, one second before that player
+        // arrived). A peer that leaves its page meanwhile just steps out; it takes the stage again if it comes back.
+        if(!g.preparing) {
+            if(page!=g.stage) {
+                log_line("CHECKPOINT","this player left the page before the others arrived: the save before the map (stage %u) waits for the next time",(unsigned)g.stage);
+                stage_idle(); erase(L".pending");
+            }
+            return;
+        }
+        // From here on, everybody has arrived and the clock runs (stageAt = the preparation).
+        if(t-g.stageAt>kStageGiveUpMs) { s_first_fail=s_next_try=0; abandon_stage("it did not finish in time"); return; }
+        if(!g.capture) return;                                   // staged: the others are still to answer
+        if(page!=g.stage) { s_first_fail=s_next_try=0; abandon_stage("this player left the page before the save was taken"); return; }
+        if(s_next_try && t<s_next_try) return;
+        uint8_t* data=nullptr; uint32_t size=0; uint64_t hash=0;
+        if(!savefile_read_stage(&data,&size,&hash)) {
+            if(!s_first_fail) s_first_fail=t;
+            if(t-s_first_fail<g_capture_patience_ms) { s_next_try=t+500; return; }
+            s_first_fail=s_next_try=0; abandon_stage("the save could not be copied"); return;
+        }
+        s_first_fail=s_next_try=0;
+        finish_capture(data,size,hash);
+        return;
+    }
+    if(!page || g.stageDone[page] || g.arrived || g.preparing || !membership()) return;
+    g.selTx=g.tx; g.stage=page; g.stageAt=t; g.map=stage_map(page); g.arrived=true;
+    log_line("CHECKPOINT","this player is %s: the save before the map (stage %u) is arranged",page==kStagePrep?"in the warehouse":"on the chapter page",(unsigned)page);
+    CheckpointMsg m{}; m.kind=kCheckpointArrive; m.run=g.run; m.seq=kStageSeqBase+page; m.map=g.map; m.identity=g.config.identity;
+    if(g.host) {
+        g.arrivals[0]=m; g.haveArrival[0]=true;
+        for(unsigned i=1;i<g.config.count && i<kMaxPeers;++i) if(g.haveEarly[page][i]) { g.arrivals[i]=g.early[page][i]; g.haveArrival[i]=true; }
+        prepare();
+    } else if(!net_send_checkpoint(m)) abandon_stage("arrival send failed");
+}
+// The host's chapter choice waits while the ready save is arranged -- the others reaching the chapter page, then the copies -- but never longer than kStageHoldMs from the first time it was asked to wait: a
+// player whose page is not seen must not hold the run up.
+bool checkpoint_stage_holding() {
+    static ULONGLONG s_since=0;
+    if(!g.on || g.failed || g.stage!=kStageReady) { s_since=0; return false; }
+    const ULONGLONG t=GetTickCount64();
+    if(!s_since) s_since=t;
+    return t-s_since<kStageHoldMs;
 }
 bool checkpoint_can_enter() {
     return !g.on || (!g.failed && !g.finished && !lockstep_halted() && g.released && (!g.dirty || g.skip) && membership());
@@ -904,7 +1030,16 @@ void checkpoint_on_message(uint8_t from,const CheckpointMsg& m) {
             if(m.run!=g.run || m.seq!=g.seq || !g.run) return;
             g.loaded[pos]=true; release(); break;
         case kCheckpointArrive:
-            if(!g.released || m.run!=g.run || m.seq!=g.seq+1 || !m.map) return;
+            if(!g.released || m.run!=g.run || !m.map) return;
+            if(checkpoint_stage_of_seq(m.seq)) {      // a save before the map: kept until this peer is at that stage itself (a client is often there first)
+                const uint8_t s=checkpoint_stage_of_seq(m.seq);
+                if(g.stageDone[s] || m.seq!=kStageSeqBase+s) return;
+                g.early[s][pos]=m; g.haveEarly[s][pos]=true;
+                if(g.stage==s) { g.arrivals[pos]=m; g.haveArrival[pos]=true; prepare(); }
+                return;
+            }
+            if(g.stage) abandon_stage("a player reached the map");
+            if(m.seq!=g.seq+1) return;
             g.arrivals[pos]=m; g.haveArrival[pos]=true; prepare(); break;
         case kCheckpointAck:
             if(!g.preparing || !transaction(m) || !m.hashes[pos]) return;
@@ -922,30 +1057,87 @@ void checkpoint_on_message(uint8_t from,const CheckpointMsg& m) {
             if(m.run!=g.run || m.seq!=g.seq || !g.run) return;
             g.released=true; g.dirty=true; status("all saves validated; loading local save"); break;
         case kCheckpointPrepare:
-            if(!g.released || !g.arrived || g.preparing || m.run!=g.run || m.seq!=g.seq+1 || !m.map || !same_config(m)) return;
+            if(!g.released || !g.arrived || g.preparing || m.run!=g.run || m.seq!=expect_seq() || !m.map || !same_config(m)) return;
             if(m.map!=g.map) log_line("CHECKPOINT","the host's map %016llx differs from this peer's %016llx -- continuing",
                                           (unsigned long long)m.map,(unsigned long long)g.map);
-            g.tx=m; g.preparing=true; g.capture=true; break;
+            g.tx=m; g.preparing=true; g.capture=true; if(g.stage) g.stageAt=GetTickCount64(); break;
         case kCheckpointCommit: apply_commit(m); break;
         case kCheckpointAdvance:
             if(!g.committed || !transaction(m) || m.token!=g.tx.token) return;
+            if(g.stage) { stage_confirmed(); break; }
             g.seq=m.seq; g.dirty=false; status("checkpoint confirmed by all players; next node unlocked"); break;
         default: break;
         }
     }
 }
+// THE SNAPSHOTS OF A RUN THAT WENT SOLO ARE KEPT UNTIL THE WAREHOUSE (2026-10-05). "Continue alone" and a solo settlement used to delete the run's handshake saves on the spot; a player who wanted one of them
+// (to go back, or to have it in a backup) had no chance. The tombstone is still written at once -- it is what vetoes a resume of a run that has moved on -- but the files stay until the player is next in the
+// warehouse (checkpoint_cleanup_deferred, called from there). What is to be cleaned is remembered by folder, key and run, because the selection state is reset before then; only entries of THAT run are deleted.
+static std::wstring g_due_root, g_due_key;
+static uint64_t     g_due_run=0;
+static void defer_cleanup(const char* why) {
+    g_due_root=g.root; g_due_key=g.key; g_due_run=g.run;
+    log_line("CHECKPOINT","%s: the run's handshake saves are kept until the player is back in the warehouse",why);
+}
+bool checkpoint_cleanup_due() { return g_due_run!=0 && !g_due_key.empty(); }
+void checkpoint_cleanup_deferred(const char* why) {
+    if(!checkpoint_cleanup_due()) return;
+    if(net_active() && net_peer_count()>=2) return;               // a room is up again: this is not the moment, and not this peer's call alone
+    const std::wstring root=g_due_root, key=g_due_key; const uint64_t run=g_due_run;
+    g_due_root.clear(); g_due_key.clear(); g_due_run=0;
+    unsigned erased=0, kept=0;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h=FindFirstFileW((root+L"\\"+key+L".*").c_str(),&fd);
+    if(h!=INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name=fd.cFileName;
+            const std::wstring tail=name.size()>key.size()+1 ? name.substr(key.size()+1) : L"";
+            const bool queue=!tail.empty() && tail.size()<=6 && tail.find_first_not_of(L"0123456789")==std::wstring::npos;
+            if(!queue && tail!=L"pending") continue;                  // the tombstone (.state) and anything else stays
+            const std::wstring path=root+L"\\"+name;
+            Entry e{};
+            if(!read_entry(path,e,false) || e.certificate.run!=run) { ++kept; continue; }   // another run's file, or one this build cannot read: not ours to delete
+            if(DeleteFileW(path.c_str())) ++erased; else ++kept;
+        } while(FindNextFileW(h,&fd));
+        FindClose(h);
+    }
+    log_line("CHECKPOINT","%s: the run's handshake saves are cleaned now (%u file(s) deleted, %u left)",why?why:"warehouse",erased,kept);
+}
+// ONE JOURNAL FILE, READ WITHOUT A ROOM (2026-10-05): the main menu's "restore from a handshake save" page lists what the folders hold and puts one save back over a slot. Every file is a whole,
+// self-checking save of this player's own slot: its certificate says which slot (the position whose hash is the database's) and when it was confirmed. The build identity is not required to match -- the
+// database is a plain game save either way -- but a file whose database does not match its certificate is refused.
+bool checkpoint_peek_file(const std::wstring& path,uint64_t folder_id,HandshakeSaveInfo& info,std::vector<uint8_t>* database) {
+    info=HandshakeSaveInfo{};
+    Bytes bytes; if(!checkpoint_io::read(path,bytes)) return false;
+    Entry e{}; if(!parse_entry(bytes,e,false,true)) return false;
+    const CheckpointMsg& m=e.certificate;
+    if(m.kind!=kCheckpointCommit || !m.run || !m.seq || m.count<2 || m.count>kMaxPeers || e.database.empty()) return false;
+    const uint64_t h=savefile_hash(e.database.data(),(uint32_t)e.database.size());
+    int pos=-1;
+    for(unsigned i=0;i<m.count;++i) if(m.hashes[i]==h && (pos<0 || m.identities[i]==folder_id)) pos=(int)i;
+    if(pos<0 || m.slots[pos]>31) return false;
+    info.slot=m.slots[pos]; info.players=m.count; info.after_boss=(e.flags&kCheckpointAfterBoss)!=0; info.stage=checkpoint_stage_of_seq(m.seq); info.run=m.run; info.seq=m.seq; info.stamp=m.stamp;
+    if(database) *database=std::move(e.database);
+    return true;
+}
 bool checkpoint_on_alone() {
     if(!g.configured || !g.run) return true;
-    // Tombstone FIRST. A crash between this write and deletion still vetoes resume.
+    // Tombstone FIRST. A crash between this write and the later cleanup still vetoes resume.
     if(!marker(2)) { fail("play alone held: cannot persist recovery invalidation"); return false; }
-    cleanup(); g.failed=true; status("play alone: this recovery run is permanently invalid"); return true;
+    defer_cleanup("play alone");
+    g.failed=true; status("play alone: this recovery run is permanently invalid; its saves are kept until the warehouse"); return true;
 }
 void checkpoint_clear(bool broadcast) {
     if(!g.configured || !g.run || g.finished) return;
     // Called after native EndRunFinalize returns, including solo finalization.
     // This is scoped to the run+participants+slots, never the whole save directory.
     if(!marker(3)) { fail("settlement finished but recovery tombstone write failed"); return; }
-    if(!cleanup()) { fail("settlement complete; recovery invalidated but file cleanup failed"); return; }
+    if(net_active() && net_peer_count()>=2) {
+        if(!cleanup()) { fail("settlement complete; recovery invalidated but file cleanup failed"); return; }
+    } else {
+        defer_cleanup("solo settlement");                     // nobody to certify with: the saves wait for the warehouse like those of a run that went solo
+        erase(L".pending");                                    // a half-written staging file is not a save
+    }
     g.finished=true; g.dirty=false; g.pending=Entry{};
     g.loadIssued=true; // never replay the chapter handshake at a later save menu
     if(broadcast && g.on) { CheckpointMsg m{}; m.kind=kCheckpointFinished; m.run=g.run; m.identity=g.config.identity; net_send_checkpoint(m); }
@@ -983,6 +1175,7 @@ void checkpoint_fault(const char* reason) { if(g.on) fail(reason); }
 // recovery point. The next node arms the checkpoint again.
 void checkpoint_soft_fault(uint64_t node_seed,const char* reason) {
     if(!g.on || g.failed || g.finished || !g.released) return;
+    if(g.stage) abandon_stage("a node's checkpoint was skipped");
     g.skip=true; g.skipSeed=node_seed;
     g.capture=g.arrived=g.preparing=g.advancing=false; g.pending=Entry{};
     status(reason);

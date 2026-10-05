@@ -83,6 +83,9 @@ void progress(){
     if(!freeze()||!(g.chapter_seen||g.resume))return;
     if(g.retry_ticks){--g.retry_ticks;return;}g.retry_ticks=120;
     if(g.is_client){
+        if(!g.sent && room_self_over_limit()){      // more cats than the room allows: nothing is exported, so the room is never READY and the host cannot start
+            static bool said=false; if(!said){said=true;log_line("SETUP","!! this player's cats are over the room's limit -- the export is held until the save is chosen again");}
+            return;}
         if(!g.sent){
             if(!g.outgoing.count){
                 if(!(g.resume?catsync_export_resume(g.outgoing,net_peer_pos()):catsync_prepare_party_setup(g.outgoing,net_peer_pos()))){
@@ -168,6 +171,11 @@ int chapter_locked_for(int act){
 bool setup_on_select_act(int act){
     refresh();if(g.client_lock||(g.on&&g.is_client)){room_say_chapter_client();return false;}if(!g.on)return true;
     if(g.resume)return false;setup_on_chapter_page();
+    // the host does not start while any player's cats are over the limit (its own included)
+    if(room_self_over_limit()){room_say_party_over();log_line("SETUP","chapter %d refused: the host's cats are over the room's limit",act);return false;}
+    {const int over=room_other_over_limit();if(over>=0){room_say_peer_over(over);log_line("SETUP","chapter %d refused: the cats of row %d are over the room's limit",act,over+1);return false;}}
+    // the ready save (every player on the chapter page, cats and gear chosen) is being taken: a moment, or the run starting would drop it
+    if(checkpoint_stage_holding()){log_line("SETUP","chapter %d held: the save before the map is being taken",act);room_say_chapter_wait();return false;}
     if(!all_ready()||g.committed||act<1||act>3||!g.have_difficulty[act-1]){
         if(!g.said_blocked)log_line("SETUP","chapter held: waiting for every player's preparation/READY");g.said_blocked=true;
         if(!g.committed)room_say_chapter_wait();

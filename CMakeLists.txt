@@ -90,6 +90,7 @@ add_library(mgmp SHARED
     src/ui/mgmp_ui.cpp
     src/ui/mgmp_menu.cpp
     src/ui/mgmp_roomhist.cpp
+    src/core/mgmp_savemirror.cpp
     src/ui/mgmp_uitest.cpp
     src/session/mgmp_saveslots.cpp
     # Dear ImGui, compiled straight into mgmp.dll -- same rule as minhook and

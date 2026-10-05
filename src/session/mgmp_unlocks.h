@@ -48,6 +48,7 @@ bool unlocks_override_lookup(const char* key, int64_t local, int64_t& value);
 // available to everybody and is never touched.
 enum class UnlockList : uint8_t { Ability, Passive, Item, LevelGroup, Boss };
 struct UnlocksMsg;
+struct SettingMsg;
 // Host: read this game's own answers and send them to the clients (a no-op without a session).
 void unlocks_publish();
 // Client: the host's answers arrived.
@@ -64,6 +65,12 @@ void unlocks_classes_after(void* out_vector, bool with_colorless);
 // A level-up screen is about to be built (its constructor builds the option pool, the unlock queries of which come BEFORE any log line of ours): if this is the reward of a fight, the fight is over -- both the
 // per-name unlock answers and the class list answer with this save's own from here on. A normal win leaves objects and summons standing, so "every enemy is down" alone is not seen.
 void unlocks_level_screen_opens();
+
+// THE COMBAT SPEED IS THE HOST'S (proto 82). The game reads its "combat_speed" setting through Settings::get_float (0x1409D3B40) every frame in the turn layer, and it scales how long the animations take; two
+// peers on different speeds finish an action at different times. `own` is what this player's game would have answered. Returns true with `out` set when the host's value is to be used instead (a client in a
+// room that has been told one); the HOST'S call also publishes its value when it changed. False for any other key.
+bool settings_override(const char* key, float own, float& out);
+void settings_on_message(uint8_t from, const SettingMsg& m);
 // THE UNLOCK-QUERY RECORD (both peers, every battle): see mgmp_unlocks.cpp. `local` is what this save says, `answer` what the game was told.
 void unlockq_query(UnlockList list, const char* name, bool local, bool answer);
 void unlockq_prop(const char* key, int64_t local, int64_t answer);

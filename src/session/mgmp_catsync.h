@@ -169,6 +169,11 @@ bool catsync_prepare_settlement(void* director);
 // after the native settlement and, as a safety net for saves the old behaviour left behind, before a new run's
 // clones are made. Returns how many clones were merged.
 unsigned catsync_merge_session_cats(const char* why);
+
+// A cat's BODY PARTS AND MUTATIONS, as one log line (PARTS): the game's own mutation lister (0x1400CB690, the one the cat card uses) walks 14 slots of 0x54 bytes in the cat data, each with a part
+// id at +0x8C, a mutation value at +0x90 and a "has a mutation" byte at +0xA4 (slot k: add 0x54*k). Written as `id` or `id*mutation`, with the count in front and a hash of the whole table behind it.
+// Logged where a cat is copied (clone, setup apply, merge-back) so that "this end's cats all have the same mutations" can be traced to the step that did it.
+void catsync_log_cat_parts(const void* cat, const char* what);
 // Real cats whose ids fall among the ids reserved for clones (older builds left such cats in saves) are moved to ordinary ids, and the run's party list is re-pointed. Returns how many were moved.
 // Cheap when there is nothing to do; called from the collar/gear pages and before the party exchange.
 unsigned catsync_relocate_squatters(const char* why);
@@ -178,8 +183,19 @@ bool catsync_in_run_party(uint64_t id);
 bool catsync_run_is_shared();
 // The log's picture of the session's cat bookkeeping (lists, day, counter, every clone slot of every player). Reading only.
 void catsync_log_snapshot(const char* stage);
+
+// WHOSE CATS THE RUN HOLDS, in the log (AUDIT), at the moments a player can end up with someone else's: when a session ends, when a save is loaded, at a departure and after a settlement. One line for the
+// situation (in a room or alone, this peer's position), one per cat of the run's party and familiar lists (its id and which player's session range that is, flags, seed, birth day, owner note, recorded origin),
+// one per clone slot of OTHER players that is still alive and not out on adventure -- the ones the House would show or an adventure box could pick -- and a "!!" line for every cat that is another player's
+// while this peer is not in a room. Reading only; every read is guarded.
+void catsync_log_audit(const char* stage);
+
+// LEAVING A ROOM (2026-10-05): once a session that held other players' cats ends, the run keeps only this peer's own. catsync_shutdown arms it; the tick runs from MapScreen::update (so on the map, between
+// nodes: at once when the player is on the map, and not until they are back on it when they were in a battle), takes the other players' session cats out of the run's lists, retires their copies in the
+// registry and logs what it did. A new session cancels it. No "play alone" click is involved.
+void catsync_leave_tick();
 // After a settlement: the other players' leftover copies (flagged out on adventure, not in the run's lists) are retired so the save does not keep them. Returns how many.
-unsigned catsync_retire_peer_copies(const char* why);
+unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions = 0xFFFFFFFFu);   // only_positions: bit p = position p (a player that dropped out)
 
 // The House is about to write its state (T_HouseSave; `house` = the writer's first argument). Every House cat entity whose id is a clone's that the merge swapped into its original
 // gets the ORIGINAL's id, so `house_state` names the cats that came home -- see swap_identity.

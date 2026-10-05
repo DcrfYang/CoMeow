@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
     F(RnglMsg, "rngl", dec_rngl);
     F(DeepMsg, "deep", dec_deep);
     F(ChatMsg, "chat", dec_chat);
+    F(SettingMsg, "setting", dec_setting);
     F(PropsMsg, "props", dec_props);
 #undef F
     (void)drop;

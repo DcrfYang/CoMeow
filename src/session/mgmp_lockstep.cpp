@@ -2543,6 +2543,12 @@ void audit_send() {
     const bool ok = net_send_audit(m);
     log_line("AUDIT", "PREBATTLE AUDIT: %u player cat(s) of battle %016llx described to the other player(s)%s", (unsigned)m.n, (unsigned long long)m.battle_id, ok ? "" : " -- NOT SENT");
     for (uint32_t i = 0; i < m.n; ++i) log_line("AUDIT", "  cat %016llx fp %016llx: %s", (unsigned long long)m.cat[i].id, (unsigned long long)m.cat[i].fp, m.cat[i].text);
+    // the body parts and mutations of each player cat as it stands at the first turn (see catsync_log_cat_parts): the one place both ends' logs can be set side by side
+    for (uint32_t i = 0; i < g.cat_count; ++i) {
+        if (!g.human_cat[i] || !g.cats[i]) continue;
+        const void* data = nullptr;
+        if (mem_read((const uint8_t*)g.cats[i] + kChar_CatData, &data, sizeof(data)) && data) catsync_log_cat_parts(data, "battle start");
+    }
     audit_compare();
 }
 
@@ -3358,6 +3364,10 @@ void lockstep_pump() {
                 chat_on_message(m.from, m.chat);
                 break;
 
+            case MSG_SETTING:
+                settings_on_message(m.from, m.setting);
+                break;
+
             case MSG_DEEP:
                 deep_on_peer(m.from, m.deep);
                 break;
@@ -3886,8 +3896,10 @@ void lockstep_on_applied(const void* action, const void* actor) {
 //                     peers then drive it locally, which is the old behaviour --
 //                     it is a gap, and a gap that says so is worth more than one
 //                     inferred from a divergence three turns later.
-void adopt_new_cats() {
-    if (!g.snapped || !g.snapped_list || g.halted) return;
+// `even_if_halted`: the halt's own auto-finish. A halted battle stops adopting (nothing is hashed any more), and that is what left an enemy standing after the auto-finish (2026-10-05): the sweep strikes
+// down what is on the roster, every kill can SPAWN more (death rattles: a champion, a spider), and the children of a halted battle were never put on the roster, so no sweep ever saw them.
+void adopt_new_cats(bool even_if_halted = false) {
+    if (!g.snapped || !g.snapped_list || (g.halted && !even_if_halted)) return;
 
     uint32_t    live_n = 0;
     const void* data   = nullptr;
@@ -4474,7 +4486,8 @@ static void halt_finish_pump() {
         log_line_lvl(LogLevel::Warn, "HALT", "the halt of battle %016llx is LIFTED: the next node can be entered and the next battle is synchronised again; the shared stream was put back to the value both peers derive from the battle", (unsigned long long)g.battles.current);
         return;
     }
-    adopt_new_cats();
+    const uint32_t roster_before = g.cat_count;
+    adopt_new_cats(true);                  // the children of the kills of the last sweep, halted or not
     uint32_t hit = 0, alive = 0;
     for (uint32_t i = 0; i < g.cat_count; ++i) {
         const void* chr = g.cats[i];
@@ -4487,7 +4500,7 @@ static void halt_finish_pump() {
         if (mem_write((uint8_t*)chr + kChar_HP, &zero, 4)) ++hit;
     }
     ++s_sweeps; s_hit_total += hit;
-    if (s_sweeps <= 30 || hit) log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH sweep %u: %u enem%s alive, hp 0 written to %u (the game's own death handling takes them)", s_sweeps, alive, alive == 1 ? "y" : "ies", hit);
+    if (s_sweeps <= 30 || hit) log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH sweep %u: %u enem%s alive, hp 0 written to %u (the game's own death handling takes them); %u unit(s) adopted since the last sweep, roster %u", s_sweeps, alive, alive == 1 ? "y" : "ies", hit, g.cat_count - roster_before, g.cat_count);
 }
 
 static void debug_hits_pump() {
@@ -5445,6 +5458,88 @@ void lockstep_reseed_action(const void* actor) {
         ++g_rs_action_logged;
         log_line("RESEED", "turn %u action %u of actor %u: the stream was %016llx, now %016llx", (unsigned)g.turn, (unsigned)n, idx == 0xFFFFu ? 0xFFFFu : (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
     }
+}
+
+namespace {
+struct TraceRow { int32_t hp = 0, shield = 0, tx = 0, ty = 0; uint8_t dead = 0; bool ok = false; };
+TraceRow g_tr[kMaxCats + 16];
+uint32_t g_tr_n = 0;
+uint64_t g_tr_battle = 0;
+bool     g_tr_have = false;
+char     g_tr_what[420] = {};
+uint32_t g_tr_logged = 0;
+
+void trace_take() {
+    g_tr_n = g.cat_count < kMaxCats ? g.cat_count : kMaxCats;
+    for (uint32_t i = 0; i < g_tr_n; ++i) {
+        CatState st;
+        const bool ok = g.cats[i] && read_cat_state(g.cats[i], st, false);
+        g_tr[i] = TraceRow{ ok ? st.hp : 0, ok ? st.shield : 0, ok ? st.tx : 0, ok ? st.ty : 0, ok ? st.dead : (uint8_t)0, ok };
+    }
+}
+} // namespace
+
+void lockstep_action_trace_flush(const char* why) {
+    if (!g_tr_have) return;
+    g_tr_have = false;
+    if (g.battles.current != g_tr_battle) return;
+    char buf[900]; int w = 0; unsigned changed = 0;
+    const uint32_t n = g.cat_count < kMaxCats ? g.cat_count : kMaxCats;
+    for (uint32_t i = 0; i < n && w >= 0 && (size_t)w < sizeof(buf) - 120; ++i) {
+        CatState st;
+        const bool ok = g.cats[i] && read_cat_state(g.cats[i], st, false);
+        if (!ok) continue;
+        if (i >= g_tr_n) {                       // a unit that appeared during the action
+            w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, " NEW u%u hp %d sh %d tile (%d,%d)%s;", i, st.hp, st.shield, st.tx, st.ty, g.human_cat[i] ? " [human]" : "");
+            ++changed; continue;
+        }
+        const TraceRow& b = g_tr[i];
+        if (!b.ok) continue;
+        if (b.hp == st.hp && b.shield == st.shield && b.tx == st.tx && b.ty == st.ty && b.dead == st.dead) continue;
+        ++changed;
+        w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, " u%u", i);
+        if (b.hp != st.hp)         w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, " hp %d>%d", b.hp, st.hp);
+        if (b.shield != st.shield) w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, " sh %d>%d", b.shield, st.shield);
+        if (b.dead != st.dead)     w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, " dead %u>%u", (unsigned)b.dead, (unsigned)st.dead);
+        if (b.tx != st.tx || b.ty != st.ty) w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, " tile (%d,%d)>(%d,%d)", b.tx, b.ty, st.tx, st.ty);
+        w += _snprintf_s(buf + w, sizeof(buf) - w, _TRUNCATE, ";");
+    }
+    if (g_tr_logged >= 700) return;                       // one battle's worth; a longer fight says so once
+    ++g_tr_logged;
+    log_line("ACTRACE", "%s => (%s) %u unit(s) changed:%s%s", g_tr_what, why ? why : "?", changed, changed ? buf : " none", g_tr_logged == 700 ? "  -- the rest of this battle's actions are not traced" : "");
+}
+
+void lockstep_action_trace(const void* actor, const void* turn_action) {
+    if (!g.active || !g.snapped || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2 || !turn_action) return;
+    if (g.battles.current != g_tr_battle) { g_tr_battle = g.battles.current; g_tr_have = false; g_tr_logged = 0; }
+    lockstep_action_trace_flush("effects of the previous action");
+    TurnAction a{};
+    if (!mem_read(turn_action, &a, sizeof(a))) return;
+    char gon[48] = "-";
+    if (a.type == TA_Ability && a.ability) ability_gon_name(a.ability, gon, sizeof(gon));
+    uint32_t idx = 0xFFFFu;
+    for (uint32_t i = 0; i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
+    // the game's live character list, to give each unit on the target tile its position in it
+    uint32_t live_n = 0; const uint8_t* ldata = nullptr;
+    const void* live[kMaxCats] = {};
+    if (g.snapped_list && mem_read((const uint8_t*)g.snapped_list + kList_Count, &live_n, sizeof(live_n)) && live_n && live_n <= kMaxCats &&
+        mem_read((const uint8_t*)g.snapped_list + kList_Data, &ldata, sizeof(ldata)) && ldata)
+        for (uint32_t j = 0; j < live_n; ++j) mem_read(ldata + j * sizeof(void*), &live[j], sizeof(void*));
+    char tile[300]; int w = 0; unsigned units = 0;
+    tile[0] = 0;
+    const uint32_t n = g.cat_count < kMaxCats ? g.cat_count : kMaxCats;
+    for (uint32_t i = 0; i < n && (size_t)w < sizeof(tile) - 60; ++i) {
+        CatState st;
+        if (!g.cats[i] || !read_cat_state(g.cats[i], st, false) || st.dead || st.tx != a.target_x || st.ty != a.target_y) continue;
+        int pos = -1;
+        for (uint32_t j = 0; j < live_n; ++j) if (live[j] == g.cats[i]) { pos = (int)j; break; }
+        w += _snprintf_s(tile + w, sizeof(tile) - w, _TRUNCATE, " [u%u live#%d hp %d sh %d%s]", i, pos, st.hp, st.shield, g.human_cat[i] ? " human" : "");
+        ++units;
+    }
+    _snprintf_s(g_tr_what, sizeof(g_tr_what), _TRUNCATE, "turn %u action %u actor u%u %s '%s' target (%d,%d) dir (%d,%d), %u unit(s) on the target tile:%s", (unsigned)g.turn, (unsigned)g_rs_action,
+                idx == 0xFFFFu ? 0xFFFFu : (unsigned)idx, a.type == TA_Ability ? "ability" : a.type == TA_EndTurn ? "endturn" : "type?", gon, a.target_x, a.target_y, a.dir_x, a.dir_y, units, units ? tile : " none");
+    trace_take();
+    g_tr_have = true;
 }
 
 uint64_t lockstep_battle_id()  { return g.active ? g.battles.current : kNoBattle; }
