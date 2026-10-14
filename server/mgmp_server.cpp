@@ -570,6 +570,7 @@ json room_summary(const Room& r) {
     o["cap"]     = kRoomCap;
     o["host"]    = r.count ? g_clients[r.members[0]].name : "";
     o["pw"]      = r.has_pw;
+    o["locked"]  = r.locked;     // its players have started: listed, but nobody may join (2026-10-06; it used to be left out of the list)
     return o;
 }
 
@@ -612,11 +613,11 @@ void make_token(char* out, size_t cap) {
 
 json rooms_array() {
     json a = json::array();
-    // A locked room is invisible: its players have started, and nobody else may walk in. Open rooms come first and
-    // password rooms after them (each group in creation order).
-    for (int pass = 0; pass < 2; ++pass)
+    // Open rooms first, password rooms after them, and LOCKED rooms last (each group in creation order). A locked room's players have started and nobody else
+    // may walk in -- the join is refused -- but it is listed, marked "locked", so a player can see the room exists (2026-10-06; it used to be left out).
+    for (int pass = 0; pass < 3; ++pass)
         for (int i = 0; i < kMaxRooms; ++i)
-            if (g_rooms[i].used && !g_rooms[i].locked && g_rooms[i].has_pw == (pass == 1)) a.push_back(room_summary(g_rooms[i]));
+            if (g_rooms[i].used && (pass == 2 ? g_rooms[i].locked : (!g_rooms[i].locked && g_rooms[i].has_pw == (pass == 1)))) a.push_back(room_summary(g_rooms[i]));
     return a;
 }
 

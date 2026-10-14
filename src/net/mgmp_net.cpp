@@ -64,6 +64,8 @@ struct State {
     // Membership, host-side. Rebroadcast to everyone whenever it changes.
     PeersMsg roster;
     bool     roster_valid = false;
+    uint8_t  seat_ids[kMaxPeers] = {};   // net_set_seat_order: the players' order, host first
+    uint8_t  seat_count = 0;
 
     char     error[256] = {};
     NetStats stats;
@@ -219,7 +221,9 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_PROPS:     return dec_props(r, m.props);
         case MSG_RNGL:      return dec_rngl(r, m.rngl);
         case MSG_CHAT:      return dec_chat(r, m.chat);
+        case MSG_DRAW:      return dec_draw(r, m.draw);
         case MSG_SETTING:   return dec_setting(r, m.setting);
+        case MSG_EQUIP:     return dec_equip(r, m.equip);
         case MSG_DEEP:      return dec_deep(r, m.deep);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
@@ -291,6 +295,11 @@ bool relayed(uint8_t type) {
         case MSG_DEEP:
         // CHAT: every peer authors its own lines, and the others (in a room of three or four, the other clients too) all show them
         case MSG_CHAT:
+        // DRAW: every peer draws its own lines, and every other screen shows them
+        case MSG_DRAW:
+        // EQUIP: authored by the cat's OWNER, which may be a client -- in a room of three or four the other clients equip the same item or their copy
+        // of the cat waits for it forever (2026-10-12 review: it reached the host only, and the next turn hash halted)
+        case MSG_EQUIP:
         // NODEHASH is symmetric -- every peer authors its own -- so with more
         // than two players a client's has to reach the other clients, exactly
         // like the per-turn HASH above it.
@@ -896,17 +905,45 @@ uint8_t net_peer_count() { return g.roster_valid ? g.roster.count : 0; }
 // session that loses peer 1 keeps ids {0,2,3} while the positions stay {0,1,2}.
 // The control split is computed from position precisely so that the departure
 // of one player does not silently hand another player somebody else's cats.
-uint8_t net_peer_pos() {
+// The members in seat order: the seated ones that are still here, in the seat order, then the rest as the roster has them (ascending ids).
+static uint8_t ordered_members(uint8_t* out) {
     if (!g.roster_valid) return 0;
-    for (uint8_t i = 0; i < g.roster.count; ++i)
-        if (g.roster.ids[i] == g.self) return i;
+    const uint8_t n = g.roster.count < kMaxPeers ? g.roster.count : (uint8_t)kMaxPeers;
+    bool taken[kMaxPeers] = {};
+    uint8_t k = 0;
+    for (uint8_t s = 0; s < g.seat_count; ++s)
+        for (uint8_t i = 0; i < n; ++i)
+            if (!taken[i] && g.roster.ids[i] == g.seat_ids[s]) { out[k++] = g.roster.ids[i]; taken[i] = true; }
+    for (uint8_t i = 0; i < n; ++i) if (!taken[i]) out[k++] = g.roster.ids[i];
+    return k;
+}
+
+uint8_t net_peer_pos() {
+    uint8_t ids[kMaxPeers] = {};
+    const uint8_t n = ordered_members(ids);
+    for (uint8_t i = 0; i < n; ++i)
+        if (ids[i] == g.self) return i;
     return 0;
 }
 
 bool net_peer_ids(uint8_t* out, uint8_t cap) {
     if (!g.roster_valid || !out) return false;
-    for (uint8_t i = 0; i < g.roster.count && i < cap; ++i) out[i] = g.roster.ids[i];
+    uint8_t ids[kMaxPeers] = {};
+    const uint8_t n = ordered_members(ids);
+    for (uint8_t i = 0; i < n && i < cap; ++i) out[i] = ids[i];
     return true;
+}
+
+void net_set_seat_order(const uint8_t* ids, uint8_t n) {
+    if (!ids || n > kMaxPeers || (n && ids[0] != kHostPeer)) return;
+    uint8_t was[kMaxPeers] = {}; const uint8_t had = g.seat_count;
+    memcpy(was, g.seat_ids, had);
+    memcpy(g.seat_ids, ids, n); g.seat_count = n;
+    if (had != n || memcmp(was, ids, n) != 0) {
+        char text[64] = {}; size_t at = 0;
+        for (uint8_t i = 0; i < n && at + 6 < sizeof(text); ++i) at += _snprintf_s(text + at, sizeof(text) - at, _TRUNCATE, "%s%u", i ? "," : "", (unsigned)ids[i]);
+        log_line("NET", "seat order set: positions are peers [%s] (host first, then by player id), position here %u", text, (unsigned)net_peer_pos());
+    }
 }
 
 void net_shutdown() {
@@ -969,6 +1006,7 @@ void net_shutdown() {
     g.role = NetRole::None;
     g.self = kNoPeer;
     g.roster_valid = false;
+    g.seat_count = 0;
     set_state(NetState::Idle);
 }
 
@@ -1098,6 +1136,16 @@ bool net_host_roll(uint64_t battle, uint32_t seq, uint8_t site, RollMsg& out) {
         if (g_roll_ring[k].battle == battle && g_roll_ring[k].seq == seq && g_roll_ring[k].site == site) { out = g_roll_ring[k]; ok = true; }
     LeaveCriticalSection(&g.cs);
     return ok;
+}
+void net_clear_battle_caches() {
+    if (!g.cs_ready) return;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kBoardRing; ++k) g_board_ring[k] = BoardAssembled{};
+    g_board_next = 0;
+    for (uint32_t k = 0; k < kRollRing; ++k) g_roll_ring[k] = RollMsg{};
+    g_roll_next = 0;
+    g_level_box = LevelBox{};
+    LeaveCriticalSection(&g.cs);
 }
 bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
     if (!g.cs_ready || !battle) return false;
@@ -1311,7 +1359,9 @@ bool net_send_statedump(const StateDumpMsg& m) {
 
 bool net_send_uqd(const UqdMsg& m) { uint8_t p[128]; const uint32_t n = enc_uqd(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_setting(const SettingMsg& m) { uint8_t p[16]; const uint32_t n = enc_setting(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_equip(const EquipMsg& m) { uint8_t p[160]; const uint32_t n = enc_equip(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_chat(const ChatMsg& m) { uint8_t p[320]; const uint32_t n = enc_chat(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_draw(const DrawMsg& m) { uint8_t p[320]; const uint32_t n = enc_draw(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_rngl(const RnglMsg& m) { uint8_t p[512]; const uint32_t n = enc_rngl(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_deep(const DeepMsg& m) { uint8_t p[384]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_props(const PropsMsg& m) { uint8_t p[1024]; const uint32_t n = enc_props(p, sizeof(p), m); return n && net_send(p, n); }

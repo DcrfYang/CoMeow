@@ -118,6 +118,11 @@ bool net_send_savewait(const SaveWaitMsg& m) {
 }
 bool lockstep_halted(){return false;}
 void lockstep_share_log(const char*) {}
+std::string host_said[kMaxPeers];   // the notice name_other_order() gave each process ("who must host"), by process
+void room_say_recovery_host(const char* name) { host_said[current]=name?name:""; }
+uint8_t seats[kMaxPeers][kMaxPeers]{}; uint8_t seat_n[kMaxPeers]{};   // net_set_seat_order, by process
+void net_set_seat_order(const uint8_t* ids,uint8_t n) { memcpy(seats[current],ids,n); seat_n[current]=n; }
+bool room_peer_name(uint8_t id,char* out,size_t cap) { _snprintf_s(out,cap,_TRUNCATE,"peer%u",(unsigned)id); return true; }
 uint32_t lockstep_owner_note_export(LockstepOwnerNote* out, uint32_t max) {
     if (max < 2) return 0;
     out[0] = {0x70000001ull, 0}; out[1] = {0x71000001ull, 1};
@@ -527,6 +532,44 @@ int main() {
     reset(L"wrong fingerprint / slot never finds another pairing's saved run");start();boundary(14000);
     states[1].identity=999;restart();CHECK(states[0].failed && states[1].failed);
 
+    // SEATS (proto 86). Process i runs the game of player who[i] (players are identities 100.., each with its own save, folder and slot).
+    {
+        auto session=[](const unsigned* who){
+            packets.clear(); map_packets.clear(); live=participants;
+            State old[3]={states[0],states[1],states[2]}; State by_player[3];
+            for(unsigned i=0;i<3;++i) by_player[old[i].identity-100]=old[i];
+            for(unsigned i=0;i<3;++i) {
+                const State& o=by_player[who[i]];
+                states[i]=State{}; states[i].on=true; states[i].host=i==0;
+                states[i].identity=o.identity; states[i].root=o.root; states[i].path=o.path;
+            }
+            for(auto& s:host_said) s.clear();
+            for(unsigned i=participants;i-->0;) at(i,[&]{ CHECK(!checkpoint_select((uint8_t)(g.identity-100+1),g.path.c_str())); });
+            drain();
+        };
+        // 2026-10-07 20:47, room YP6S: the two clients came back the other way round. Their seats follow their ids, not their connection: the run is recovered.
+        reset(L"clients rejoined in the other order: same seats, the run is recovered",3);start();boundary(15000);
+        const unsigned swapped[3]={0,2,1};
+        session(swapped);
+        CHECK(states[0].released && states[1].released && states[2].released && states[0].seq==1);
+        for(unsigned i=0;i<3;++i) {
+            CHECK(host_said[i].empty());
+            // every process puts the player with id 101 (now session 2) at seat 1, and 102 (session 1) at seat 2
+            CHECK(seat_n[i]==3 && seats[i][0]==0 && seats[i][1]==2 && seats[i][2]==1);
+            CHECK(states[i].pos==states[i].identity-100);
+        }
+        // The host is seat 0 of the run and stays so: another player hosting finds nothing, and everybody is told who must host (player 100, now session 1).
+        reset(L"another player hosts the run: refused, and the run's host is named",3);start();boundary(16000);
+        const unsigned rehost[3]={1,0,2};
+        session(rehost);
+        CHECK(states[0].failed);
+        for(unsigned i=0;i<3;++i) CHECK(host_said[i]=="peer1");
+        const unsigned same[3]={0,1,2};
+        session(same);
+        for(unsigned i=0;i<3;++i) CHECK(host_said[i].empty());
+        CHECK(states[0].released && states[1].released && states[2].released && states[0].seq==1);
+    }
+
     reset(L"SQLite WAL snapshot includes committed changes and restore refuses sidecars");
     at(0,[]{
         HMODULE mod=LoadLibraryW(L"winsqlite3.dll");CHECK(mod);
@@ -540,6 +583,29 @@ int main() {
         Bytes snapshot;CHECK(checkpoint_io::snapshot(g.path,snapshot));
         auto standalone=g.root+L"\\snapshot.sav";CHECK(checkpoint_io::atomic_write(standalone,snapshot));
         bool running=false;CHECK(checkpoint_io::in_run(standalone,running) && running);
+        // A save whose header and schema are intact but a table page is not: a NEW backup refuses it (verified), loading an OLD
+        // backup still hands it over (loadable). Page 1 is sqlite_master, so page 2 is a table's root; byte 0 of a b-tree page is its
+        // type (2/5/10/13), and 0 is none of them. Flipping byte 0 of the FILE (0.1.2's test) broke the header, which the header check
+        // alone already refused, so it never reached the integrity check.
+        {
+            CHECK(snapshot.size()>=100);
+            uint32_t page=(uint32_t(snapshot[16])<<8)|snapshot[17]; if(page==1) page=65536;
+            CHECK(snapshot.size()>=2*(size_t)page);
+            auto damaged=g.root+L"\\damaged.sav"; Bytes bad=snapshot; bad[page]=0;
+            CHECK(checkpoint_io::atomic_write(damaged,bad)); Bytes got;
+            CHECK(!checkpoint_io::verified(damaged,got) && got.empty());
+            CHECK(checkpoint_io::loadable(damaged,got) && got==bad);
+            CHECK(checkpoint_io::verified(standalone,got) && got==snapshot);
+        }
+        // A save over the wire's 4 MiB bound is still a save on this machine (YUEMO's slot 1, 2026-10-04/07).
+        {
+            auto bigpath=g.root+L"\\big.sav"; std::string big8(bigpath.begin(),bigpath.end()); void* bdb=nullptr;
+            CHECK(open(big8.c_str(),&bdb,6,nullptr)==0);
+            CHECK(exec(bdb,"CREATE TABLE t(b);INSERT INTO t VALUES(zeroblob(6291456));",nullptr,nullptr,nullptr)==0);
+            CHECK(close(bdb)==0);
+            Bytes copy;CHECK(checkpoint_io::snapshot(bigpath,copy) && copy.size()>kMaxSaveBytes);
+            Bytes got;CHECK(checkpoint_io::verified(bigpath,got) && got.size()==copy.size());   // the backup API's copy differs from its source in the header counters
+        }
         CHECK(!checkpoint_io::restore(g.path,snapshot)); // never write under an open WAL DB
         CHECK(close(db)==0);FreeLibrary(mod);
         CHECK(checkpoint_io::restore(g.path,snapshot));

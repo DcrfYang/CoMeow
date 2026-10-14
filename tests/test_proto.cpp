@@ -469,18 +469,20 @@ int main() {
                 u.index = (uint8_t)(14 + i); u.ident = 0xA0000000u + i; u.hp = 20 - (int)i; u.shield = (int)i; u.maxhp = 25; u.flags = (uint8_t)(i & 3);
                 u.tx = (int)i - 2; u.ty = 8 - (int)i; u.fx = -1; u.fy = (int)(i & 1);
                 u.key_a = 12 + (int)i; u.key_b = 0xFF000001 + (int)i * 977; u.speed = 5 + (int)(i & 3); u.init_base = -3 + (int)i;   // proto 69/70: the turn-order keys
+                u.faction = 2 + (int)i; u.carried = i == 3 ? 4 : -1; u.mana = 17 + (int)i; // proto 83/84: faction, captured-follower slot, mana
                 if ((i & 1) == 0) strcpy(u.def, "Leaper");               // proto 75: the definition name (empty for the odd ones)
             }
             strcpy(m.units[7].def, "Leaper_With_A_Rather_Long_Name_XYZ"); m.units[7].flags |= kBoardChampion;   // 34 characters: fits (limit 39)
             m.units[7].tx = -5000; m.units[7].ty = -5000;
             uint8_t bytes[1024]{};
             const uint32_t n = enc_board(bytes, sizeof(bytes), m);
-            check(n == 1 + 8 + 4 + 4 + 4 + 4 + 1 + 32 + 8 * (50 + 1) + 4 * 6 + 34, "board chunk wire size");
-            check(n <= 1024 && kBoardChunk * (50 + 1 + (kBoardDefLen - 1)) + 58 <= 1024, "a full board chunk of the longest names fits the send buffer");
+            check(n == 1 + 8 + 4 + 4 + 4 + 4 + 1 + 32 + 8 * (62 + 1) + 4 * 6 + 34, "board chunk wire size");
+            check(n <= 1024 && kBoardChunk * (62 + 1 + (kBoardDefLen - 1)) + 58 <= 1024, "a full board chunk of the longest names fits the send buffer");
             Reader r(bytes, n); r.u8v(); BoardMsg copy{};
             check(dec_board(r, copy) && copy.battle == m.battle && copy.turn == 7 && copy.cats == 36 && copy.total == 25 && copy.first == 16 && copy.count == 8 &&
                   copy.rng[3] == m.rng[3] && copy.units[0].index == 14 && copy.units[7].tx == -5000 && copy.units[3].hp == 17 && copy.units[5].ident == 0xA0000005u &&
                   copy.units[2].fx == -1 && copy.units[1].flags == 1 && copy.units[4].key_a == 16 && copy.units[4].key_b == (int32_t)(0xFF000001u + 4 * 977) && copy.units[6].speed == 7 && copy.units[5].init_base == 2 &&
+                  copy.units[3].faction == 5 && copy.units[3].carried == 4 && copy.units[3].mana == 20 &&
                   strcmp(copy.units[0].def, "Leaper") == 0 && copy.units[1].def[0] == 0 && strcmp(copy.units[7].def, "Leaper_With_A_Rather_Long_Name_XYZ") == 0 && (copy.units[7].flags & kBoardChampion), "board round-trip (with definition names)");
             {   // the longest name fits and the cursor stays in step
                 BoardMsg longm = m; memset(longm.units[0].def, 'a', kBoardDefLen - 1);
@@ -1024,6 +1026,41 @@ int main() {
             for (uint32_t cut = 1; cut < cn; ++cut) { Reader c2(cb, cut); c2.u8v(); ChatMsg x{}; if (dec_chat(c2, x)) { ctr = false; break; } }
             check(ctr, "no truncated chat line decodes");
 
+            // proto 87: the drawing board
+            DrawMsg dw{}; dw.kind = kDrawPoints; dw.layer = kDrawLayerBattle; dw.stroke = 0x01020304u; dw.scope = 0x1122334455667788ull; dw.count = kDrawChunk;
+            for (uint32_t i = 0; i < kDrawChunk; ++i) { dw.pts[i].x = (uint16_t)(i * 1000); dw.pts[i].y = (uint16_t)(65535 - i * 7); }
+            uint8_t wb[320];
+            uint32_t wn = enc_draw(wb, sizeof(wb), dw);
+            check(wn > 0 && wn <= 320, "a full chunk of drawing points fits the send buffer");
+            { Reader r(wb, wn); check(r.u8v() == MSG_DRAW, "type DRAW"); DrawMsg o{};
+              bool same = dec_draw(r, o) && o.kind == kDrawPoints && o.layer == kDrawLayerBattle && o.stroke == dw.stroke && o.scope == dw.scope && o.count == kDrawChunk;
+              for (uint32_t i = 0; same && i < kDrawChunk; ++i) same = o.pts[i].x == dw.pts[i].x && o.pts[i].y == dw.pts[i].y;
+              check(same, "drawing points round-trip"); }
+            bool wtr = true;
+            for (uint32_t cut = 1; cut < wn; ++cut) { Reader r(wb, cut); r.u8v(); DrawMsg x{}; if (dec_draw(r, x)) { wtr = false; break; } }
+            check(wtr, "no truncated drawing message decodes");
+            DrawMsg we{}; we.kind = kDrawErase; we.layer = kDrawLayerMap; we.stroke = 77;
+            wn = enc_draw(wb, sizeof(wb), we);
+            { Reader r(wb, wn); r.u8v(); DrawMsg o{}; check(wn > 0 && dec_draw(r, o) && o.kind == kDrawErase && o.stroke == 77 && o.count == 0, "an erase round-trips"); }
+            DrawMsg wc{}; wc.kind = kDrawClear; wc.layer = kDrawLayerMap;
+            wn = enc_draw(wb, sizeof(wb), wc);
+            { Reader r(wb, wn); r.u8v(); DrawMsg o{}; check(wn > 0 && dec_draw(r, o) && o.kind == kDrawClear && o.layer == kDrawLayerMap, "a clear round-trips"); }
+            DrawMsg wbad = dw; wbad.count = 0; check(enc_draw(wb, sizeof(wb), wbad) == 0, "an empty piece of a stroke is not sent");
+            wbad = dw; wbad.layer = 2; check(enc_draw(wb, sizeof(wb), wbad) == 0, "an unknown layer is not sent");
+            wbad = dw; wbad.kind = 4; check(enc_draw(wb, sizeof(wb), wbad) == 0, "an unknown drawing kind is not sent");
+            // proto 88: the eraser's circle
+            DrawMsg wa{}; wa.kind = kDrawEraseAt; wa.layer = kDrawLayerBattle; wa.scope = 0xB2; wa.count = 1; wa.pts[0] = { 12345, 54321 }; wa.radius = 320;
+            wn = enc_draw(wb, sizeof(wb), wa);
+            { Reader r(wb, wn); r.u8v(); DrawMsg o{};
+              check(wn > 0 && dec_draw(r, o) && o.kind == kDrawEraseAt && o.count == 1 && o.pts[0].x == 12345 && o.pts[0].y == 54321 && o.radius == 320 && o.scope == 0xB2,
+                    "an eraser circle round-trips"); }
+            wtr = true;
+            for (uint32_t cut = 1; cut < wn; ++cut) { Reader r(wb, cut); r.u8v(); DrawMsg x{}; if (dec_draw(r, x)) { wtr = false; break; } }
+            check(wtr, "no truncated eraser circle decodes");
+            wbad = wa; wbad.radius = 0; check(enc_draw(wb, sizeof(wb), wbad) == 0, "an eraser circle of no size is not sent");
+            { uint8_t forged[] = { MSG_DRAW, kDrawPoints, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (uint8_t)(kDrawChunk + 1) };
+              Reader r(forged, sizeof(forged)); r.u8v(); DrawMsg x{}; check(!dec_draw(r, x), "a piece claiming more points than a chunk holds is refused"); }
+
             // proto 82: the host's combat speed
             SettingMsg sm{}; sm.id = kSettingCombatSpeed; sm.value = 1.5f;
             uint8_t sb[16];
@@ -1037,6 +1074,33 @@ int main() {
             bool str = true;
             for (uint32_t cut = 1; cut < sn; ++cut) { Reader c3(sb, cut); c3.u8v(); SettingMsg x{}; if (dec_setting(c3, x)) { str = false; break; } }
             check(str, "no truncated setting decodes");
+
+            // proto 85: the consumable a backpack auto-equipped on its owner's peer
+            // proto 89: and the owner's item state (durability, aux, str_aux)
+            EquipMsg em{}; em.battle = 0x7B90E718075CCFEDull; em.cat = 20; strcpy_s(em.item, "Mushrooms");
+            em.has_state = 1; em.durability = 3; em.aux = 2; strcpy_s(em.str_aux, "Fireball");
+            uint8_t eb[160];                                   // net_send_equip's buffer
+            uint32_t en = enc_equip(eb, sizeof(eb), em);
+            check(en > 0 && en <= 160, "an auto-equip encodes");
+            Reader er(eb, en); check(er.u8v() == MSG_EQUIP, "type EQUIP");
+            EquipMsg eo{}; check(dec_equip(er, eo) && eo.battle == em.battle && eo.cat == 20 && strcmp(eo.item, "Mushrooms") == 0, "an auto-equip round-trips");
+            check(eo.has_state == 1 && eo.durability == 3 && eo.aux == 2 && strcmp(eo.str_aux, "Fireball") == 0, "the owner's item state round-trips");
+            EquipMsg el{}; memset(el.item, 'x', sizeof(el.item) - 1); memset(el.str_aux, 'y', sizeof(el.str_aux) - 1); el.has_state = 1;
+            check(enc_equip(eb, sizeof(eb), el) > 0, "the longest item name and str_aux fit the send buffer");
+            {   // a has_state byte other than 0/1 is malformed
+                uint32_t n2 = enc_equip(eb, sizeof(eb), em);
+                const uint32_t at = 1 + 8 + 1 + 1 + (uint32_t)strlen(em.item);
+                eb[at] = 7; Reader bad(eb, n2); bad.u8v(); EquipMsg x{};
+                check(!dec_equip(bad, x), "a has_state other than 0/1 is refused");
+            }
+            EquipMsg ez{}; ez.cat = 3;
+            en = enc_equip(eb, sizeof(eb), ez);
+            Reader ezr(eb, en); ezr.u8v(); EquipMsg ezo{}; ezo.item[0] = 'q';
+            check(dec_equip(ezr, ezo) && ezo.item[0] == 0, "an empty auto-equip (nothing equipped) round-trips");
+            en = enc_equip(eb, sizeof(eb), em);
+            bool etr = true;
+            for (uint32_t cut = 1; cut < en; ++cut) { Reader c4(eb, cut); c4.u8v(); EquipMsg x{}; if (dec_equip(c4, x)) { etr = false; break; } }
+            check(etr, "no truncated auto-equip decodes");
         }
 
         PropsMsg p{}; p.epoch = 77; p.total = 250; p.first = 100; p.count = kPropsChunk;

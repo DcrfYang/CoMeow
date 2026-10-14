@@ -5,6 +5,7 @@
 #include "mgmp_savefile.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_catsync.h"     // the clone -> original record rides in the journal
+#include "mgmp_room.h"        // the notice naming the join order the records were made under
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
@@ -70,7 +71,10 @@ uint64_t compatibility_build=0, compatibility_gpak=0;
 // Protocol 41 adds selection epochs. Save/journal layout and certificate inputs
 // remain generation 39 so existing certified runs can still be resumed. Bump
 // this separately when a save/recovery semantic change makes them incompatible.
-constexpr uint32_t kCheckpointCompatibility = 39;
+// 40 (2026-10-10, proto 86): positions are SEATS (host first, then by player id), no longer the connection order. A run recorded under 39 named its
+// players by the order they connected in -- its session cats, owner notes and journal file name -- so it is not offered for recovery any more; the
+// backup page's lenient read still shows its saves.
+constexpr uint32_t kCheckpointCompatibility = 40;
 // kDiskVersion 2 appends an owner-note section after the database (see
 // encode_entry). Version 1 files stay readable -- a missing section is simply
 // an empty table. The compatibility generation is NOT bumped: certificates
@@ -109,10 +113,14 @@ int position(uint8_t peer) {
     for(unsigned i=0;i<g.config.count;++i) if(g.config.peers[i]==peer) return int(i);
     return -1;
 }
-bool membership() {
+bool membership() {   // the same members as the configuration, in any order (the order is the configuration's: net_set_seat_order)
     uint8_t ids[kMaxPeers]{};
-    return net_active() && net_peer_count()==g.config.count && net_peer_ids(ids,kMaxPeers) &&
-        !memcmp(ids,g.config.peers,g.config.count);
+    if(!net_active() || net_peer_count()!=g.config.count || !net_peer_ids(ids,kMaxPeers)) return false;
+    for(unsigned i=0;i<g.config.count;++i) {
+        bool here=false; for(unsigned j=0;j<g.config.count;++j) if(ids[j]==g.config.peers[i]) here=true;
+        if(!here) return false;
+    }
+    return true;
 }
 bool same_config(const CheckpointMsg& m) {
     if(m.count!=g.config.count) return false;
@@ -155,7 +163,7 @@ std::vector<unsigned> queue_indices() {
 bool erase_index(unsigned k) { auto path=qfile(k); return DeleteFileW(path.c_str()) || GetLastError()==ERROR_FILE_NOT_FOUND; }
 Bytes encode_entry(const Entry& e) {
     uint8_t meta[512]; uint32_t n=enc_checkpoint(meta,sizeof(meta),e.certificate,kDiskCandidates,false);
-    if(!n || e.database.size()>kMaxSaveBytes) return {};
+    if(!n || e.database.size()>checkpoint_io::kMaxLocalSaveBytes) return {};   // a journal entry is a file of this machine, not a frame
     Bytes out(36+n+e.database.size()+4+(size_t)e.owner_count*9+4+(size_t)e.origin_count*16+4+8); Writer w(out.data(),(uint32_t)out.size());
     w.u32v(kDiskMagic); w.u32v(kDiskVersionFlags); w.u32v(kCheckpointCompatibility);
     w.u64v(compatibility_build); w.u64v(compatibility_gpak); w.u32v(n);
@@ -188,7 +196,7 @@ bool parse_entry(const Bytes& bytes,Entry& out,bool confirmed,bool lenient) {
     Reader meta(r.buf+r.pos,n); if(meta.u8v()!=MSG_CHECKPOINT) return false;
     CheckpointMsg m{}; if(!dec_checkpoint(meta,m,kDiskCandidates,false) || (!lenient && !same_config(m))) return false;
     r.pos+=n; uint32_t size=r.u32v();
-    if(!r.ok || size>kMaxSaveBytes) return false;
+    if(!r.ok || size>checkpoint_io::kMaxLocalSaveBytes) return false;
     uint32_t tail=r.len-r.pos;   // database + (version 2 only) the owner section
     if(version==kDiskVersion) { if(size!=tail) return false; }
     else if(tail<4 || size>tail-4) return false;
@@ -461,20 +469,81 @@ void resolve_paths() {
     CreateDirectoryW(g.root.c_str(),nullptr);
     g.key=make_key(m,prim);
 }
+// THE RUN'S HOST IS PART OF THE RUN (2026-10-10). A position is a seat: the host's is 0, the others' follow by player id (configure_host), so the clients
+// may connect in any order -- room YP6S of 2026-10-07 20:47, whose two clients came back the other way round and could read nothing, now finds its run.
+// The host's id is seat 0 of every certificate and of the journal's name (make_key), and it does not move: a session cat's id carries its owner's seat
+// (0x70.. is the host's cats), and so do the owner notes. The next session of the run must therefore be hosted by the same player. When another player
+// hosts, this player's key holds nothing; the records are LOOKED FOR under the other orders of the same players and slots, and the player is told who
+// has to open the room. Only for a save on the map (the one that needs recovering). Returns whether such an order was found.
+// Whether the journal under g.key holds a file THIS build wrote (its compatibility, build and data identity): a version-39 leftover, made when positions
+// were the connection order, names no host worth sending anybody to.
+bool key_holds_current_records() {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h=FindFirstFileW((g.root+L"\\"+g.key+L".*").c_str(),&fd);
+    if(h==INVALID_HANDLE_VALUE) return false;
+    bool found=false;
+    do {
+        Bytes bytes; if(!checkpoint_io::read(g.root+L"\\"+fd.cFileName,bytes) || bytes.size()<44) continue;
+        uint64_t hash=0; memcpy(&hash,bytes.data()+bytes.size()-8,8);
+        if(hash!=savefile_hash(bytes.data(),(uint32_t)bytes.size()-8)) continue;
+        Reader r(bytes.data(),(uint32_t)bytes.size()-8);
+        const uint32_t magic=r.u32v(); r.u32v(); const uint32_t compat=r.u32v(); const uint64_t build=r.u64v(); const uint64_t gpak=r.u64v();
+        found=r.ok && magic==kDiskMagic && compat==kCheckpointCompatibility && build==compatibility_build && gpak==compatibility_gpak;
+    } while(!found && FindNextFileW(h,&fd));
+    FindClose(h);
+    return found;
+}
+bool name_other_order() {
+    const CheckpointMsg& m=g.config;
+    if(g.mode!=1 || m.count<2 || m.count>kMaxPeers || g.root.empty() || has_record_files()) return false;
+    const std::wstring own=g.key;
+    uint8_t perm[kMaxPeers]{}; for(unsigned i=0;i<m.count;++i) perm[i]=(uint8_t)i;
+    bool found=false;
+    while(!found && std::next_permutation(perm,perm+m.count)) {   // every order but the current one
+        if(perm[0]==0) continue;   // the same host: the seats are its, whatever order the others connected in
+        CheckpointMsg pm=m;
+        for(unsigned i=0;i<m.count;++i) pm.slots[i]=m.slots[perm[i]];
+        for(unsigned mask=0;mask<(1u<<m.count) && !found;++mask) {   // either id of each player, as resolve_paths
+            uint64_t ids[kMaxPeers]{}; bool ok=true;
+            for(unsigned i=0;i<m.count;++i) {
+                const unsigned at=perm[i]; const bool alt=((mask>>i)&1)!=0;
+                if(alt && (!m.identities2[at] || m.identities2[at]==m.identities[at])) ok=false;
+                ids[i]=alt?m.identities2[at]:m.identities[at];
+            }
+            if(!ok) continue;
+            g.key=make_key(pm,ids); found=key_holds_current_records();
+        }
+    }
+    g.key=own;
+    if(!found) return false;
+    std::string names, ids;
+    for(unsigned i=0;i<m.count;++i) {
+        char name[64]; room_peer_name(m.peers[perm[i]],name,sizeof(name));
+        char one[96]; _snprintf_s(one,_TRUNCATE,"%sP%u %s",i?" -> ":"",i+1,name); names+=one;
+        char id[24]; _snprintf_s(id,_TRUNCATE,"%s%u",i?",":"",(unsigned)m.peers[perm[i]]); ids+=id;
+    }
+    char host[64]; room_peer_name(m.peers[perm[0]],host,sizeof(host));
+    log_line("CHECKPOINT","!! nothing under this host, but this run's records are on disk with %s as the host: seats %s (session ids now %s) -- told the player that %s has to open the room",
+                 host,names.c_str(),ids.c_str(),host);
+    room_say_recovery_host(host);
+    return true;
+}
 bool configure(const CheckpointMsg& m) {
     if(g.configured) return same_config(m) && m.identity==g.config.identity;
     if(!g.selected || m.count<2 || m.count>kMaxPeers || m.peers[0]!=kHostPeer) return false;
     g.pos=255;
     for(unsigned i=0;i<m.count;++i) {
         if(!m.identities[i] || m.slots[i]>31) return false;
-        for(unsigned j=0;j<i;++j) if(m.identities[i]==m.identities[j] || m.peers[i]<=m.peers[j]) return false;
+        for(unsigned j=0;j<i;++j) if(m.identities[i]==m.identities[j] || m.peers[i]==m.peers[j]) return false;   // seat order, not ascending ids (proto 86)
         if(m.peers[i]==net_self()) g.pos=(uint8_t)i;
     }
     if(g.pos>=m.count || (m.identities[g.pos]!=g.identity && !(g.identity2 && m.identities[g.pos]==g.identity2)) || m.slots[g.pos]!=g.slot ||
        !m.identity || m.hashes[g.pos]!=g.selectionNonce || m.mode!=(g.inSession?1:0)) return false;
     g.config=m; g.configured=true;
+    net_set_seat_order(m.peers,m.count);   // every position from here on is this order's (session cat ids, owner notes, this journal)
     resolve_paths();
     if(!membership()) return false;
+    name_other_order();
     send_offer(); return !g.failed;
 }
 void configure_host() {
@@ -493,6 +562,14 @@ void configure_host() {
         m.peers[i]=ids[i]; m.slots[i]=g.selections[ids[i]].slot;
         m.identities[i]=g.selections[ids[i]].identity; m.identities2[i]=g.selections[ids[i]].identity2;
         m.hashes[i]=g.selections[ids[i]].token; // selection nonce, not a DB hash yet
+    }
+    // THE SEATS (proto 86): the host first, the others by their persistent id (the Steam id where there is one), so the same players get the same positions
+    // whichever of them connected first -- and with them the same session cat ids, owner notes and journal name (net_set_seat_order). Selection sort: four at most.
+    for(unsigned i=1;i<n;++i) for(unsigned j=i+1;j<n;++j) {
+        const bool later=m.identities[j]<m.identities[i] || (m.identities[j]==m.identities[i] && m.identities2[j]<m.identities2[i]);
+        if(!later) continue;
+        std::swap(m.peers[i],m.peers[j]); std::swap(m.slots[i],m.slots[j]);
+        std::swap(m.identities[i],m.identities[j]); std::swap(m.identities2[i],m.identities2[j]); std::swap(m.hashes[i],m.hashes[j]);
     }
     if(!net_send_checkpoint(m) || !configure(m)) fail("recovery refused: invalid participants or slot configuration");
 }

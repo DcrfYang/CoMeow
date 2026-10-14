@@ -63,6 +63,12 @@ const char* page_name(PageState p);
 // name starts with a prefix this module cares about.
 void page_on_button(void* button);
 
+// THE DRAWING BOARD'S SCREEN TEST (mgmp_draw). Whether a button whose name starts with `prefix` has ticked in the last moment
+// (Map_ / MapNode_: the map; Event_, Shop_, InventoryButton_, EquippedButton_, Button_PauseMenu_: a screen over it; Combat_: a
+// battle), and whether one ever has in this process (so a name the game turns out not to use does not hide the map for good).
+bool page_button_live(const char* prefix);
+bool page_button_ever(const char* prefix);
+
 // Called once per Ready tick, after the button detour has run for the frame.
 void page_tick();
 void page_reset();

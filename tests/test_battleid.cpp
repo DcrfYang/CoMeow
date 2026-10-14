@@ -42,6 +42,17 @@ int main() {
         check(t.rel(0xCCCC) == BattleRel::Unknown,  "still-unseen stays Unknown -- HOLD");
     }
 
+    printf("-- a save was loaded: the battle is forgotten, not retired, and the same node can be entered again --\n");
+    {
+        BattleTracker<16> t;
+        t.enter(0xAAAA);
+        t.forget_current();
+        check(t.current == kNoBattle, "no battle after the load");
+        check(t.rel(0xAAAA) == BattleRel::Unknown, "its id is HELD, not dropped, until this peer enters the node (the other player may be ahead)");
+        t.enter(0xAAAA);
+        check(t.rel(0xAAAA) == BattleRel::Ours, "entered again: ours");
+    }
+
     printf("-- re-entering the same id is not a transition --\n");
     {
         // The roster snapshot can be re-taken inside one battle (a summon

@@ -143,6 +143,12 @@ static char g_snap_why[240] = "";
 const char* snapshot_why() { return g_snap_why; }
 static void snap_why(const char* fmt, int a = 0, int b = 0) { _snprintf_s(g_snap_why, sizeof(g_snap_why), _TRUNCATE, fmt, a, b); }
 
+// The size of a file for a failure line, 0 when it cannot be had.
+static uint64_t file_bytes(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if(!GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&a)) return 0;
+    return (uint64_t(a.nFileSizeHigh)<<32)|a.nFileSizeLow;
+}
 // THE ONLINE BACKUP: the exact copy, and the first choice. Fills `out`; on failure the reason is in snap_why.
 static bool backup_copy(const std::wstring& source, const std::wstring& tmp, Bytes& out) {
     DeleteFileW(tmp.c_str());
@@ -167,7 +173,7 @@ static bool backup_copy(const std::wstring& source, const std::wstring& tmp, Byt
     if(ok) { ok=healthy(dst); if(!ok) snap_why("the copy failed its integrity check"); }
     if(dst) sql.close(dst);
     if(src) sql.close(src);
-    if(ok) { ok=read(tmp,out,kMaxSaveBytes); if(!ok) snap_why("the copy could not be read back"); }
+    if(ok) { ok=read(tmp,out,kMaxLocalSaveBytes); if(!ok) snap_why("the copy could not be read back (%d MiB; the bound is %d MiB)",(int)(file_bytes(tmp)>>20),(int)(kMaxLocalSaveBytes>>20)); }
     DeleteFileW(tmp.c_str());
     return ok;
 }
@@ -178,9 +184,9 @@ static bool backup_copy(const std::wstring& source, const std::wstring& tmp, Byt
 // which a file the game holds open for writing refuses -- the host of a four-player room could neither back up nor read, and held every player at the first node.
 static bool raw_copy(const std::wstring& source, const std::wstring& tmp, Bytes& out, char* why, size_t cap) {
     Bytes a, b;
-    if(!read(source,a,kMaxSaveBytes)) { _snprintf_s(why,cap,_TRUNCATE,"the file could not be read (error %lu, %s)",GetLastError(), a.empty() ? "empty or too large or locked" : "?"); return false; }
+    if(!read(source,a,kMaxLocalSaveBytes)) { const DWORD e=GetLastError(); _snprintf_s(why,cap,_TRUNCATE,"the file could not be read (error %lu, %llu bytes on disk)",e,(unsigned long long)file_bytes(source)); return false; }
     Sleep(60);
-    if(!read(source,b,kMaxSaveBytes) || a!=b) { _snprintf_s(why,cap,_TRUNCATE,"the file changed while it was read (the game is writing it)"); return false; }
+    if(!read(source,b,kMaxLocalSaveBytes) || a!=b) { _snprintf_s(why,cap,_TRUNCATE,"the file changed while it was read (the game is writing it)"); return false; }
     HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(h==INVALID_HANDLE_VALUE) { _snprintf_s(why,cap,_TRUNCATE,"the temporary file could not be created (error %lu)",GetLastError()); return false; }
     DWORD put=0; bool w=WriteFile(h,a.data(),(DWORD)a.size(),&put,nullptr) && put==a.size();
@@ -197,15 +203,18 @@ static bool raw_copy(const std::wstring& source, const std::wstring& tmp, Bytes&
     return ok;
 }
 
-bool loadable(const std::wstring& source, Bytes& out) {
+static bool open_and_check(const std::wstring& source, Bytes& out, bool integrity) {
     out.clear();
-    if(!sql.load() || !read(source,out,kMaxSaveBytes) || out.size()<512 || memcmp(out.data(),"SQLite format 3",15)!=0) { out.clear(); return false; }
+    if(!sql.load() || !read(source,out,kMaxLocalSaveBytes) || out.size()<512 || memcmp(out.data(),"SQLite format 3",15)!=0) { out.clear(); return false; }
     void* db=nullptr;
-    bool ok=sql.open(utf8(source).c_str(),&db,1,nullptr)==0 && sql.exec(db,"SELECT count(*) FROM sqlite_master",nullptr,nullptr,nullptr)==0;
+    bool ok=sql.open(utf8(source).c_str(),&db,1,nullptr)==0 && (!integrity || healthy(db)) &&
+            sql.exec(db,"SELECT count(*) FROM sqlite_master",nullptr,nullptr,nullptr)==0;
     if(db) sql.close(db);
     if(!ok) out.clear();
     return ok;
 }
+bool loadable(const std::wstring& source, Bytes& out) { return open_and_check(source,out,false); }
+bool verified(const std::wstring& source, Bytes& out) { return open_and_check(source,out,true); }
 
 bool snapshot(const std::wstring& source, Bytes& out) {
     out.clear(); snap_why("");
@@ -369,7 +378,7 @@ bool restore(const std::wstring& target,const Bytes& bytes,bool require_run) {
     HANDLE lease=CreateFileW(target.c_str(),GENERIC_READ,FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
     if(lease==INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER n{}; DWORD got=0; Bytes before;
-    bool ok=GetFileSizeEx(lease,&n) && n.QuadPart>0 && n.QuadPart<=kMaxSaveBytes;
+    bool ok=GetFileSizeEx(lease,&n) && n.QuadPart>0 && n.QuadPart<=kMaxLocalSaveBytes;
     if(ok) {
         before.resize((size_t)n.QuadPart);
         ok=ReadFile(lease,before.data(),(DWORD)before.size(),&got,nullptr) && got==before.size();

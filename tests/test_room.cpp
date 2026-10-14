@@ -308,7 +308,7 @@ int main() {
     room_say_chapter_wait();                   { const std::string t = toast_text(); CHECK(t.find("ready") != std::string::npos); }
     CHECK(i18n_set_lang_code("zh"));
     room_say_chapter_wait();                   { const std::string t = toast_text(); CHECK(t.find("准备") != std::string::npos); }
-    room_say_story_only_host();                { const std::string t = toast_text(); CHECK(t.find("仅host可选主线任务道具") != std::string::npos); }
+    room_say_story_only_host();                { const std::string t = toast_text(); CHECK(t.find("仅房主可选主线任务道具") != std::string::npos); }
 
     printf("-- start over --\n");
     fresh(); room_abort_selection();

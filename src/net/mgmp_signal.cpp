@@ -602,6 +602,7 @@ void store_rooms(const json& arr) {
             out.players = (uint16_t)jint(r, "players");
             out.cap     = (uint16_t)jint(r, "cap");
             { auto pw = r.find("pw"); out.pw = pw != r.end() && pw->is_boolean() && pw->get<bool>(); }
+            { auto lk = r.find("locked"); out.locked = lk != r.end() && lk->is_boolean() && lk->get<bool>(); }
         }
     }
     g.rooms_valid = true;

@@ -106,6 +106,10 @@ constexpr uint64_t kEventOwnWaitMs = 1000;
 // applied by the normal path below. The cost is a visible screen for as long as the owner takes
 // to click. That is the trade this project wants: a wait, never two different cats.
 constexpr bool     kParallelLevelUp  = false;
+// NO LEVEL-UP IS HELD ANY MORE (2026-10-06, at the user's request): every level-up screen is answered by the player in front of it, on every peer -- the shop's upgrade screen was held for the
+// "verified owner" and stopped both players. Nothing is suppressed, nothing is injected; the cats themselves travel with catsync as before. The owner's own choice is still announced (the other
+// peer learns from it that the host's fight is over, see lockstep_note_host_fight_over).
+constexpr bool     kLevelUpLocalOnly = true;
 // Kept for the day a placeholder is wanted again, and kept at 0 so that if the flag above is ever
 // flipped back on, the behaviour is the one it was measured with rather than a new one.
 constexpr uint64_t kParallelGraceMs  = 0;
@@ -795,6 +799,12 @@ void receive_level_choice(uint8_t from, const ChoiceMsg& m) {
         log_line("CHOICE", "!! invalid upgrade from peer %u -- refused", (unsigned)from);
         return;
     }
+    if (kLevelUpLocalOnly) {
+        // not applied here (no level-up is held); what it still says is that the sender's fight is over
+        log_line("CHOICE", "<- peer %u levelled its cat %016llX ('%s') -- noted, not applied here", (unsigned)from, (unsigned long long)m.cat_id, m.name);
+        if (from == 0) lockstep_note_host_fight_over(m.node_seed);
+        return;
+    }
     if (was_skipped(m.node_seed) || (m.node_seed == g.here_seed && m.level_step < g.level_step)) {
         log_line("CHOICE", "ignored stale upgrade from peer %u: node=%016llX step=%u",
                  (unsigned)from, (unsigned long long)m.node_seed, m.level_step);
@@ -832,6 +842,7 @@ void receive_level_choice(uint8_t from, const ChoiceMsg& m) {
     log_line("CHOICE", "<- peer %u chose level-up: cat=%016llX seed=%016llX node=%016llX step=%u option=%u/%u '%s'",
              (unsigned)from, (unsigned long long)m.cat_id, (unsigned long long)m.cat_seed,
              (unsigned long long)m.node_seed, m.level_step, m.index, m.count, held.message.name);
+    if (from == 0) lockstep_note_host_fight_over(m.node_seed);     // a level-up is the reward of a fight that is over: the host's is
 }
 
 // WorldEvent+19F9 is set by setupActionChoice (91A818) and cleared by
@@ -951,9 +962,10 @@ void choice_init() {
         return;
     }
     log_line("CHOICE", "armed -- STORY events (one with a quest/home option): host "
-                       "decides, this peer replicates; RANDOM \"?\" events: each peer "
-                       "picks its own and nothing crosses the wire; level-ups: the cat "
-                       "owner decides, other peers replicate");
+                       "decides, this peer replicates; RANDOM \"?\" events: %s; level-ups: the cat "
+                       "owner decides, other peers replicate",
+             tune::kPerPlayerNodes ? "each peer picks its own and nothing crosses the wire"
+                                   : "SHARED (kPerPlayerNodes off): the same event on every peer, its draws reset per keyword");
 }
 
 // Defined further down, next to the trampoline it drives (see kPerPeerLevelTarget).
@@ -1291,6 +1303,30 @@ void choice_on_button(void* button) {
 bool choice_on_level_select(void* screen, void* opt) {
     if (!g.on || g.injecting) return true;
     Guard guard;
+    if (kLevelUpLocalOnly) {
+        // announced when it is this peer's own cat (a level-up of another kind, a shop's, goes through unannounced); never held
+        uint8_t committed = 0;
+        if (screen && mem_read((const uint8_t*)screen + kLvl_Committed, &committed, 1) && committed) return false;   // the game's own: one press per screen
+        g.level_screen = screen;
+        LevelSubject subject;
+        uint8_t owner = kNoPeer;
+        if (g.here_seed && screen && read_level_subject(screen, subject) && lockstep_cat_owner(subject.id, subject.seed, owner) && owner == net_self()) {
+            uint8_t* begin = nullptr; uint32_t count = 0, want_type = 0; char want_name[48] = {};
+            if (read_options(screen, kLvl_OptBegin, kLvl_OptEnd, begin, count) && opt && read_level_option((const uint8_t*)opt, want_type, want_name)) {
+                ChoiceMsg m{};
+                m.kind = kChoiceLevelUp; m.count = count; m.aux = want_type; m.node_seed = g.here_seed;
+                m.cat_id = subject.id; m.cat_seed = subject.seed; m.level_step = g.level_step;
+                memcpy(m.name, want_name, sizeof(m.name));
+                for (uint32_t i = 0; i < count; ++i) {
+                    uint32_t type = 0; char name[48] = {};
+                    if (read_level_option(begin + (uintptr_t)i * kOptStride, type, name) && type == want_type && strcmp(name, want_name) == 0) { m.index = i; break; }
+                }
+                if (net_send_choice(m)) { ++g.sent; ++g.level_step; }
+            }
+        }
+        catsync_publish("a level-up choice landed on this peer's own cat", false);
+        return true;
+    }
     uint8_t committed = 0;
     if (!screen || !opt || !mem_read((const uint8_t*)screen + kLvl_Committed, &committed, 1)) {
         log_line("CHOICE", "!! suppressed upgrade: screen/commit flag unreadable");
@@ -1567,9 +1603,8 @@ static void probe_level_stats(void* level_screen, uint32_t step) {
 // One of MY cats, out of the run's own id list, by session position. Null when ownership
 // cannot be read at all -- in which case nothing is changed.
 //
-// ROTATION, because this module cannot yet read a cat's level or XP (see kCatData_*: only
-// the seed, the id and the stats block are known), so successive re-points walk through
-// this peer's cats instead of always feeding it the first one.
+// THE LOWEST LEVEL FIRST, as the game's own pick does (2026-10-11, see the note in the body); the rotation that used to be the
+// whole rule -- written when this module could not read a cat's level -- now only breaks ties.
 //
 // ★ AND THE ROTATION USED TO STEP ON EVERY CALL, WHICH WAS A BUG THAT SHOWED UP ON SCREEN
 // (2026-09-23, measured, and it is the run whose two sides looked like different cats).
@@ -1665,6 +1700,41 @@ void* my_level_cat() {
             if (cat && !dup) found[nfound++] = cat;
         }
     }
+    // THE GAME'S OWN RULE, NOT A ROTATION (2026-10-11, the user: "the host's cats level evenly, a client's look random"). The game picks the cat
+    // to level in 0x1403B7720: 0x1403B7530 takes the LOWEST level (CatData+0xC30) among the cats that may level (0x1400D22F0; the others count as
+    // 999999) and PickRandom chooses among the cats at that level. The host's draw lands on its own cats and keeps that rule; a re-pointed draw
+    // (the game drew another player's cat -- every level-up of a client, in the logs) used to walk this peer's cats round-robin, whatever their
+    // levels: 71000003 went 4 -> 5 while 71000004 sat at 3. Now the re-point takes the lowest level among this peer's cats too, and only a tie is
+    // broken by the rotation (this peer's own, so no shared draw is spent: the stream stays the same on every peer).
+    if (nfound) {
+        using fn_can_level = bool (__fastcall*)(void* cat);
+        const fn_can_level can_level = (fn_can_level)addr_of_call(C_CatCanLevel);
+        uint32_t lvl[8] = {};
+        uint32_t lowest = ~0u;
+        for (uint32_t k = 0; k < nfound; ++k) {
+            bool ok = true;
+            if (can_level) { __try { ok = can_level(found[k]); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = true; } }
+            uint32_t v = 0;
+            mem_read((const uint8_t*)found[k] + 0xC30, &v, sizeof(v));
+            lvl[k] = ok ? v : 999999u;
+            if (lvl[k] < lowest) lowest = lvl[k];
+        }
+        void* tied[8] = {};
+        uint32_t ntied = 0;
+        for (uint32_t k = 0; k < nfound; ++k) if (lvl[k] == lowest) tied[ntied++] = found[k];
+        s_pick_cat = tied[s_next_pick++ % ntied];
+        char line[200] = {};
+        int off = 0;
+        for (uint32_t k = 0; k < nfound && off < (int)sizeof(line) - 32; ++k) {
+            uint64_t id = 0;
+            mem_read((const uint8_t*)found[k] + kCatData_SaveId, &id, sizeof(id));
+            if (lvl[k] == 999999u) off += _snprintf_s(line + off, sizeof(line) - off, _TRUNCATE, " %llX=cannot-level", (unsigned long long)(id & 0xFFFFFFFFull));
+            else off += _snprintf_s(line + off, sizeof(line) - off, _TRUNCATE, " %llX=lv%u%s", (unsigned long long)(id & 0xFFFFFFFFull), lvl[k], found[k] == s_pick_cat ? "*" : "");
+        }
+        log_line("CHOICE", "re-pointed level-up: this peer's cats%s -- the lowest level (%u) is taken, as the game's own pick does (%u tied)%s",
+                 line, lowest, ntied, can_level ? "" : " [the can-level check did not resolve: every cat counted]");
+        return s_pick_cat;
+    }
     if (!nfound) {
         // SAID OUT LOUD, because a silent null is what made the last round unreadable: the
         // caller changes nothing, and without this line the only visible symptom is that
@@ -1680,8 +1750,7 @@ void* my_level_cat() {
         }
         return nullptr;
     }
-    s_pick_cat = found[s_next_pick++ % nfound];
-    return s_pick_cat;
+    return nullptr;
 }
 
 // A NEW LEVEL-UP GETS A NEW PICK (2026-09-23).
@@ -2340,6 +2409,7 @@ constexpr bool kOpenerSubst = true;
 // panel/options. Redirect the argument, never deserialize onto the drawn cat
 // and never retarget the screen after that increment.
 static void* __fastcall h_lvl_opener(void* screen, void* cat, void* host) {
+    if (g.on) unlocksrc_context("level-up screen");   // UNLOCKSRC: the option pool's unlock checks are counted as the level-up screen's
     if (g.on) unlocks_level_screen_opens();       // before the constructor builds the option pool
     if (g.on && kPerPeerLevelTarget && cat) {
         uint64_t drawn = 0;
@@ -2490,6 +2560,7 @@ void choice_on_level_update(void* level_screen) {
     if (!g.on || !level_screen) return;
     Guard guard;
     g.level_screen = level_screen;
+    unlocksrc_context("level-up screen");
     // 385A90 is a UI resource helper, not a CatData level-up entry; do not hook it.
     install_level_screen_hooks();
 
@@ -2515,6 +2586,14 @@ void choice_on_level_update(void* level_screen) {
     uint8_t owner = kNoPeer;
     if (read_level_subject(level_screen, subject))
         lockstep_cat_owner(subject.id, subject.seed, owner);
+    if (kLevelUpLocalOnly) {
+        // nothing is applied from the other peer, nothing is pressed for it, no "waiting for the owner" note: the player in front of the screen chooses
+        if (g.owner_logged_screen != level_screen) {
+            g.owner_logged_screen = level_screen; g.owner_logged_peer = owner;
+            log_line("CHOICE", "level-up screen: cat=%016llX owner=%u self=%u -- chosen here (no level-up is held)", (unsigned long long)subject.id, (unsigned)owner, (unsigned)net_self());
+        }
+        return;
+    }
     if (g.owner_logged_screen != level_screen || g.owner_logged_peer != owner) {
         g.owner_logged_screen = level_screen;
         g.owner_logged_peer = owner;

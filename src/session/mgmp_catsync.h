@@ -177,6 +177,14 @@ void catsync_log_cat_parts(const void* cat, const char* what);
 // Real cats whose ids fall among the ids reserved for clones (older builds left such cats in saves) are moved to ordinary ids, and the run's party list is re-pointed. Returns how many were moved.
 // Cheap when there is nothing to do; called from the collar/gear pages and before the party exchange.
 unsigned catsync_relocate_squatters(const char* why);
+// WHETHER THIS ID IS A SESSION CLONE'S (2026-10-05): the ids reserved for clones are 0x70000000 + (the player's position << 24) + a slot 1..4. A cat the GAME made while its id counter sat inside that range
+// (the counter follows the highest id in the save, and a save that held a retired clone started it there) has an id in the range too -- a newborn kitten got 0x71000013 -- but it is no clone: the slot is
+// above 4. The kitten rule answered "never a kitten" for everything in the range, so a newborn in the warehouse was an adult until the room was left.
+inline bool catsync_is_clone_id(uint64_t id) {
+    if (id < 0x70000000ull || id >= 0x80000000ull) return false;
+    const uint64_t slot = id & 0xFFFFFFull;
+    return slot >= 1 && slot <= 4;
+}
 // Whether this cat id is in the run's party list (the cats chosen at the House's departure box). False when the list cannot be read.
 bool catsync_in_run_party(uint64_t id);
 // Whether the run's lists hold clones this peer knows (an owner or origin note names them): the run is a shared one, whatever the network says.
@@ -200,6 +208,9 @@ unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions = 0
 // The House is about to write its state (T_HouseSave; `house` = the writer's first argument). Every House cat entity whose id is a clone's that the merge swapped into its original
 // gets the ORIGINAL's id, so `house_state` names the cats that came home -- see swap_identity.
 void catsync_house_save(void* house);
+// The cat census (see mgmp_catsync.cpp): taken when the House's box sets off (`box` = the ids in it), checked after a shared run is settled.
+void catsync_census_take(const uint64_t* box, uint32_t nbox);
+void catsync_census_check(const char* stage);
 
 // THE SAVE THE NATIVE SETTLEMENT WRITES IS NOT THE ONE THAT COUNTS (2026-10-03). MewDirector::SaveGame is the settlement's own last step, and it runs BEFORE the clone merge: the file on disk then
 // holds the settled CLONES under their session ids, the originals still "on adventure", and a house_state naming the clones. A player who reloads before anything saves again got the

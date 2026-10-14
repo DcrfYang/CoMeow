@@ -29,6 +29,7 @@ bool setup_ready = true, resume_owners = false;
 bool notes_ready = false, split_flipped = false;
 uint8_t peer_position = 0, peer_count = 2;
 bool net_active_flag = true;                         // the session exists (false: left / never joined)
+int census_notices = 0; unsigned census_lost = 0, census_dup = 0, reserved_notices = 0; char census_lost_names[300] = {}, census_dup_names[300] = {};   // the room notices catsync raised
 uint8_t member_ids[4] = {0, 1, 2, 3};                // net_peer_ids: who is in the session (peer ids), as many as peer_count says
 int drop_calls = 0; uint32_t drop_mask = 0;          // roster_drop_positions, as the membership watch calls it
 int prune_calls = 0, prune_keep = -1;                // roster_leave_prune, as the catsync alone-check calls it
@@ -116,9 +117,24 @@ void* __fastcall register_cat(void* table, void* result, const uint64_t* id) {
     put(result, 8, uint8_t(inserted.second));
     return result;
 }
+// The game's family table (registry+0x38): a flat hash map id -> {parent a, parent b, kinship}: control bytes at +0, 32-byte slots at +8, capacity at
+// +0x18. Modelled with every slot full, so the mod's walk reads exactly these entries.
+std::map<uint64_t, std::pair<uint64_t, uint64_t>> pedigree;
+std::vector<int8_t> ped_ctrl;
+std::vector<uint64_t> ped_slots;
+void sync_pedigree() {
+    ped_ctrl.assign(pedigree.size() + 16, int8_t(-1));
+    ped_slots.assign(pedigree.size() * 4 + 4, 0);
+    size_t i = 0;
+    for (auto& kv : pedigree) { ped_ctrl[i] = 0; ped_slots[i * 4] = kv.first; ped_slots[i * 4 + 1] = kv.second.first; ped_slots[i * 4 + 2] = kv.second.second; ++i; }
+    const void* c = ped_ctrl.data(); const void* s = ped_slots.data(); const uint64_t cap = pedigree.size();
+    std::memcpy(registry + 0x38, &c, 8); std::memcpy(registry + 0x40, &s, 8); std::memcpy(registry + 0x50, &cap, 8);
+}
 void __fastcall parents(void* table, uint64_t id, uint64_t a, uint64_t b) {
     CHECK(table == registry + 0x38);
-    CHECK(entries.count(id) == 1 && a == UINT64_MAX && b == UINT64_MAX);
+    CHECK(entries.count(id) == 1);
+    pedigree[id] = { a, b };
+    sync_pedigree();
 }
 void __fastcall append(void* p, const uint64_t* id) {
     auto* v = (IdVector*)p;
@@ -192,6 +208,7 @@ void initialize() {
         void* cat = allocate(0xC58); put(cat, kCatData_SaveId, id); put(cat, 0, id * 10);
         entries[id].cat = cat;
     }
+    pedigree.clear(); sync_pedigree();
     catsync_set_base(0); catsync_forget(); catsync_init();
 }
 void imports_and_membership() {
@@ -806,6 +823,139 @@ void real_cats_on_reserved_ids_are_moved() {
     entries.clear(); peer_position = 0; catsync_forget();
 }
 
+// The House object the House-save hook is handed: ((house+0x18)->+8)->+0x20 -> +0x4480 = a vector {count at +0xC, entity pointers at +0x10}; id at +0x80.
+struct FakeHouse {
+    uint8_t house[0x20]{}, a[0x10]{}, b[0x28]{}, c[0x4488]{}, vec[0x18]{};
+    std::vector<std::vector<uint8_t>> ents;
+    std::vector<uint8_t*> ptrs;
+    explicit FakeHouse(std::initializer_list<uint64_t> ids) {
+        for (uint64_t id : ids) { ents.emplace_back(0x88, 0); std::memcpy(ents.back().data() + 0x80, &id, 8); }
+        for (auto& e : ents) ptrs.push_back(e.data());
+        void* p = a; std::memcpy(house + 0x18, &p, 8); p = b; std::memcpy(a + 8, &p, 8); p = c; std::memcpy(b + 0x20, &p, 8); p = vec; std::memcpy(c + 0x4480, &p, 8);
+        const uint32_t n = (uint32_t)ptrs.size(); std::memcpy(vec + 0xC, &n, 4); p = ptrs.data(); std::memcpy(vec + 0x10, &p, 8);
+    }
+    uint64_t id(size_t i) const { uint64_t v; std::memcpy(&v, ents[i].data() + 0x80, 8); return v; }
+};
+
+// THE HOST'S SAVE OF 2026-10-11 (LANYI, 20:16), rebuilt: no cat has an ordinary id (an older build dragged the counter to 710000d6), four REAL cats sit on
+// the reserved ids 70000001..4, and the family table still names long-dead ancestors 1..3. That save lost the four cats to the setup and came home with a
+// duplicate. Now: the squatters move to ids the save never used (not to 1), keep their family, the run's clones on the same reserved ids come home, the
+// House save gives every entity its own cat, and the census finds everything -- and finds it when a cat IS lost.
+void host_save_with_squatters_and_a_session_range_counter() {
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : party) entries.erase(id);
+    static uint64_t box[2] = {0x710000cbull, 0x710000c5ull};
+    auto make = [](uint64_t id, uint64_t seed, uint64_t flags, int32_t stat) {
+        void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, 0, seed); put(c, kCatData_Flags, flags); put(c, 0x70C, stat); entries[id].cat = c; return c;
+    };
+    void* susu = make(box[0], 0x3e92abba3ffabe87ull, kHome, 11);
+    void* chirya = make(box[1], 0x72b8877f10ae3c44ull, kHome, 12);
+    void* sq[4];
+    for (unsigned i = 0; i < 4; ++i) sq[i] = make(0x70000001ull + i, 0x5000 + i, kHome, 40 + (int32_t)i);
+    pedigree.clear();
+    pedigree[1] = {UINT64_MAX, UINT64_MAX}; pedigree[2] = {UINT64_MAX, UINT64_MAX}; pedigree[3] = {1, 2};
+    pedigree[0x70000002ull] = {1, 2}; pedigree[box[1]] = {0x70000002ull, 3}; pedigree[box[0]] = {UINT64_MAX, UINT64_MAX};
+    sync_pedigree();
+    counter = 0x710000d6ull;
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_CatIdData, (const uint64_t*)box);
+    put(director, kDir_MirrorCount, uint32_t(2)); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)box);
+    sync_list();
+
+    catsync_census_take(box, 2);                                                         // the departure: six cats alive at home
+    put(susu, kCatData_Flags, uint64_t(kAway)); put(chirya, kCatData_Flags, uint64_t(kAway));   // the game flags the box's cats
+
+    // 1. the squatters move, to 4..7: above every id the save knows (the ancestors 1..3 are only in the family table)
+    CHECK(catsync_relocate_squatters("t") == 4);
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint64_t nid = 4 + i;
+        CHECK(entries.count(nid) == 1 && entries[nid].cat == sq[i]);
+        CHECK(get<uint64_t>(sq[i], kCatData_SaveId) == nid && get<int32_t>(sq[i], 0x70C) == 40 + (int32_t)i && flags_of(nid) == kHome);
+        CHECK(flags_of(0x70000001ull + i) == 0 && entries[0x70000001ull + i].cat != sq[i]);
+    }
+    CHECK(!entries.count(1) && !entries.count(2) && !entries.count(3));
+    CHECK(pedigree[5].first == 1 && pedigree[5].second == 2);                          // the moved cat kept its parents
+    CHECK(pedigree[box[1]].first == 5 && pedigree[box[1]].second == 3);                // its child names the new id
+    CHECK(counter == 7);                                                                // the game's next cat gets 8: never used, ordinary
+
+    // 2. the run: the clones go on 70000001/2 (retired copies there now), the moved cats are not touched
+    SetupMsg m{}; CHECK(catsync_prepare_party_setup(m, 0)); free_msg_cats(m);
+    CHECK(reserved_notices == 0);
+    for (unsigned i = 0; i < 4; ++i) CHECK(entries[4 + i].cat == sq[i] && get<int32_t>(sq[i], 0x70C) == 40 + (int32_t)i);
+    CHECK(get<uint64_t>(entries[0x70000001ull].cat, 0) == 0x3e92abba3ffabe87ull && get<uint64_t>(entries[0x70000002ull].cat, 0) == 0x72b8877f10ae3c44ull);
+
+    // 3. home: both clones merge into their originals
+    settle_clone(0x70000001ull, 71); settle_clone(0x70000002ull, 72);
+    CHECK(catsync_merge_session_cats("t") == 2);
+    CHECK(get<int32_t>(entries[box[0]].cat, 0x70C) == 71 && get<int32_t>(entries[box[1]].cat, 0x70C) == 72);
+    CHECK(flags_of(box[0]) == kHome && flags_of(box[1]) == kHome);
+
+    // 4. the House save: the squatters' entities (from the save, still 70000001..4) come first, the clones' (added at the settlement) after
+    FakeHouse h({0x70000001ull, 0x70000002ull, 0x70000003ull, 0x70000004ull, 0x70000001ull, 0x70000002ull});
+    catsync_house_save(h.house);
+    CHECK(h.id(0) == 4 && h.id(1) == 5 && h.id(2) == 6 && h.id(3) == 7);               // each moved cat keeps its place
+    CHECK(h.id(4) == box[0] && h.id(5) == box[1]);                                     // each returned cat is its original -- once
+    FakeHouse later({0x70000001ull});                                                  // every note was used once: nothing pairs with a later entity
+    catsync_house_save(later.house);
+    CHECK(later.id(0) == 0x70000001ull);
+
+    // 5. the census: everything accounted for, no notice
+    census_notices = 0;
+    catsync_census_check("t");
+    CHECK(census_notices == 0);
+    // ... and a lost cat IS reported
+    catsync_census_take(box, 2);
+    entries.erase(6); sync_list();
+    catsync_census_check("t");
+    CHECK(census_notices == 1 && census_lost == 1 && census_dup == 0);
+    printf("census notice names: lost [%s] dup [%s]\n", census_lost_names, census_dup_names);
+    CHECK(census_lost_names[0] && strcmp(census_lost_names, "-") != 0 && strcmp(census_dup_names, "-") == 0);   // the notice names the lost cat
+    // ... and a duplicate
+    catsync_census_take(box, 2);
+    make(0x900, get<uint64_t>(entries[4].cat, 0), kHome, 1); sync_list();
+    catsync_census_check("t");
+    CHECK(census_notices == 2 && census_lost == 0 && census_dup == 1);
+    printf("census notice names: lost [%s] dup [%s]\n", census_lost_names, census_dup_names);
+    CHECK(strcmp(census_lost_names, "-") == 0 && census_dup_names[0] && strcmp(census_dup_names, "-") != 0);    // ... and the duplicated one
+    // ... and two House entities saved with one id
+    catsync_census_take(box, 2);
+    FakeHouse twice({0x710000cbull, 0x710000cbull});
+    catsync_house_save(twice.house);
+    catsync_census_check("t");
+    CHECK(census_notices == 3 && census_dup >= 1);
+    printf("census notice names: lost [%s] dup [%s]\n", census_lost_names, census_dup_names);
+    CHECK(census_dup_names[0] && strcmp(census_dup_names, "-") != 0);                                               // ... and the cat two House entities carry
+
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
+    put(director, kDir_MirrorCount, uint32_t(0)); put(director, kDir_MirrorData, (const uint64_t*)nullptr);
+    catsync_origin_clear();
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
+// A REAL CAT THAT CANNOT BE MOVED IS NEVER OVERWRITTEN: the family table is unreadable (no id may be invented), so the squatter stays, the setup stops,
+// the player is told, and the cat is exactly as it was.
+void a_real_cat_that_cannot_move_is_not_overwritten() {
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : party) entries.erase(id);
+    static uint64_t box[1] = {0x710000cbull};
+    void* own = allocate(0xC58); put(own, kCatData_SaveId, box[0]); put(own, 0, uint64_t(0xabc)); put(own, kCatData_Flags, uint64_t(kAway)); entries[box[0]].cat = own;
+    void* sq = allocate(0xC58); put(sq, kCatData_SaveId, uint64_t(0x70000001ull)); put(sq, 0, uint64_t(0xdef)); put(sq, kCatData_Flags, uint64_t(kHome)); put(sq, 0x70C, int32_t(99));
+    entries[0x70000001ull].cat = sq;
+    counter = 0x710000d6ull;
+    const void* bad = nullptr; const uint64_t cap = 8; std::memcpy(registry + 0x38, &bad, 8); std::memcpy(registry + 0x50, &cap, 8);   // the family table cannot be read
+    put(director, kDir_CatIdCount, uint32_t(1)); put(director, kDir_CatIdData, (const uint64_t*)box);
+    sync_list();
+    reserved_notices = 0;
+    SetupMsg m{}; CHECK(!catsync_prepare_party_setup(m, 0)); free_msg_cats(m);
+    CHECK(reserved_notices == 1);
+    CHECK(entries[0x70000001ull].cat == sq && get<int32_t>(sq, 0x70C) == 99 && get<uint64_t>(sq, 0) == 0xdef && flags_of(0x70000001ull) == kHome);
+    CHECK(counter == 0x710000d6ull);
+    pedigree.clear(); sync_pedigree();
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
 void recorded_origin_beats_the_seed_search() {
     // 2026-10-02: setup records which original each clone came from; the merge trusts the record first and keeps the seed search as the fallback.
     auto fresh = [] {
@@ -1138,6 +1288,8 @@ bool lockstep_cat_is_mine(uint64_t id, bool& mine) {
 }
 // The settlement's ownership source: the session note table, filled by the
 // roster install / journal import WITHOUT any battle.
+void room_say_cat_census(unsigned lost, const char* lost_names, unsigned dup, const char* dup_names) { ++census_notices; census_lost = lost; census_dup = dup; strncpy_s(census_lost_names, lost_names ? lost_names : "", _TRUNCATE); strncpy_s(census_dup_names, dup_names ? dup_names : "", _TRUNCATE); }
+void room_say_reserved_real() { ++reserved_notices; }
 bool lockstep_owner_pos(uint64_t id, uint8_t& owner_pos) {
     if (!notes_ready && !resume_owners) return false;
     const int p=session_cat_owner(id);if(p>=0){owner_pos=(uint8_t)p;return true;}
@@ -1197,11 +1349,14 @@ uintptr_t addr_of_data(DataSym d) {
 }
 }
 int main() {
+    // a clone's id is 0x70000000 + (position << 24) + a slot 1..4; a cat the game made into the reserved range (a newborn kitten, 0x71000013) is no clone and keeps the game's kitten answer
+    CHECK(catsync_is_clone_id(0x70000001ull) && catsync_is_clone_id(0x70000004ull) && catsync_is_clone_id(0x71000002ull) && catsync_is_clone_id(0x73000004ull));
+    CHECK(!catsync_is_clone_id(0x71000013ull) && !catsync_is_clone_id(0x70000000ull) && !catsync_is_clone_id(0x70000005ull) && !catsync_is_clone_id(0x6FFFFFFFull) && !catsync_is_clone_id(0x80000001ull) && !catsync_is_clone_id(0x309ull));
     wide_names(); initialize(); imports_and_membership(); entry_replacement(); rejected_inputs();
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
     in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals(); alone_check_finds_this_players_position(); a_player_who_drops_out_loses_their_cats_for_everyone_else();
-    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
+    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);
     std::free(ids->data);

@@ -159,6 +159,12 @@ void lockstep_action_trace(const void* actor, const void* turn_action);
 void lockstep_action_trace_flush(const char* why);
 
 void lockstep_reseed(const void* actor, int arg);
+// SOLO only (no session snapshot): the live character list at the first turns of a battle, one line per unit with what the game's own win test
+// reads (faction, dead, kill_required) -- a single-player battle logged nothing about its units (2026-10-11: "every enemy vanished on entry").
+void lockstep_solo_battle_probe(const void* actor);
+// h_UpdateDecision, after the original: when `out` (the TurnAction it returns) holds a decision (type > 1, the test TurnControl makes), the shared
+// stream is set from (battle, turn, the brain's unit, the number the coming action will get). Passive slot 52 runs between this and the apply.
+void lockstep_reseed_decision(const void* brain, const void* out);
 
 // The armed click's landing point: apply AND broadcast, so both peers write the
 // same hp change. Local-only was the first version and it left the other peer
@@ -214,6 +220,19 @@ void lockstep_disarm_enemy_hit();
 // Which battle this peer is in: the node seed both peers read out of
 // MapNode+0x118. kNoBattle when not in one. See mgmp_battleid.h.
 uint64_t lockstep_battle_id();
+// The turn number of the battle in progress (0 outside one).
+uint32_t lockstep_turn();
+// CLIENT: the host's fight of battle `node` is over (its level-up choice for that node arrived). If this peer's fight is still up a few seconds later, the enemies still standing here are struck down
+// the way a halted battle is finished, so this peer leaves the fight too (2026-10-06: the last shot ended the host's battle, the client stayed in it).
+void lockstep_note_host_fight_over(uint64_t node);
+// THE BACKPACK'S AUTO-EQUIP (proto 85). The game's AutoEquipConsumables picks a consumable at random from THIS PLAYER'S inventory and equips it on the cat whose slot was used up. In a battle in a room it runs
+// on the cat's owner's peer only (from the owner's inventory, the shared stream fenced around it) and the owner says what it equipped; every other peer equips that item, by name, and touches neither its
+// own inventory nor the shared stream. `native` is the game's function.
+void lockstep_autoequip(void* passive, void (__fastcall* native)(void*));
+void lockstep_autoequip_on_message(uint8_t from, const EquipMsg& m);
+// Every non-player unit still standing, with its faction fields (Character+0x350/+0x354/+0x358, which FactionConversion writes), its familiar slot (+0xC4) and +0xCF4 -- logged on every peer when
+// its fight is over, and on a client that finishes its fight after the host's: the two lists show which unit one peer's game still counted as an enemy.
+void lockstep_log_standing(const char* why);
 // A chance roll whose odds are not the same on every peer (the coin a kill drops): `local` is what this peer's own roll gave. The host's answer is sent to the clients; a
 // client waits briefly for it and returns it instead (its own on a timeout). Outside a room / a battle it returns `local`. site: kRollSite* (mgmp_proto.h).
 bool lockstep_roll_resolve(uint8_t site, double chance, double luck, bool local);
@@ -341,6 +360,9 @@ bool lockstep_in_battle();
 // The CURRENT battle (the one lockstep_enter_battle last named) has been built and its roster snapshotted: unlike lockstep_in_battle() this is false
 // again the moment the next battle is entered, until that one is built.
 bool lockstep_battle_ready();
+// A save was loaded (MewDirector::init): every battle there was is over, and the next node entered may carry the SAME battle id (a handshake save restored from before that node). Forgets the battle, its hash
+// tables, the peer's control split, pending actions and the host's boards/rolls/level, so the next battle starts from nothing instead of inheriting the old one's numbers.
+void lockstep_on_save_loaded();
 
 // --- AND THE ONE SIGNAL THAT SURVIVES A HALT: THE BATTLE IS OVER (2026-09-23) ---------
 //

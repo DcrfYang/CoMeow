@@ -31,6 +31,7 @@ struct LanRoom {
     std::string id, name, host;
     int         players = 0, cap = 4;
     bool        pw = false;
+    bool        locked = false;   // its players have started: listed, cannot be joined
 };
 
 enum class LanSearch { Idle, Searching, Done };

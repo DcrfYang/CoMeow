@@ -55,6 +55,7 @@
 #include "mgmp_savefile.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_setup.h"
+#include "mgmp_storage_diag.h"
 #include "mgmp_unlocks.h"
 #include "mgmp_leave.h"
 #include "mgmp_page.h"
@@ -67,6 +68,8 @@
 #include "mgmp_menu.h"
 #include "mgmp_roster.h"       // the run editor; config debug.roster_shrink
 #include "mgmp_rng.h"
+#include "mgmp_rngfix.h"
+#include "mgmp_rngframe.h"
 #include "mgmp_rtti.h"
 #include "mgmp_turnaction.h"
 
@@ -338,6 +341,7 @@ void __fastcall h_BeginTurn(void* self, int arg) {
     lockstep_action_trace_flush("before the next turn begins");
     lockstep_reseed(self, arg);
     o_BeginTurn(self, arg);
+    lockstep_solo_battle_probe(self);   // single player only: what the battle's units are (see the note there)
 }
 
 void __fastcall h_EndTurn(void* self) {
@@ -725,7 +729,7 @@ bool __fastcall h_ScumWarn(void* pause, void* on_quit) {
 bool __fastcall h_IsKitten(void* cat) {
     if (net_active() && net_peer_count() >= 2) {
         uint64_t id = 0;
-        if (cat && mem_read((const uint8_t*)cat + kCatData_SaveId, &id, sizeof(id)) && id >= 0x70000000ull && id < 0x80000000ull) return false;
+        if (cat && mem_read((const uint8_t*)cat + kCatData_SaveId, &id, sizeof(id)) && catsync_is_clone_id(id)) return false;     // a clone's slot only: a cat born into the reserved range keeps the game's answer
         const PageState pg = page_self();
         if (pg == PageState::InGame) return false;
         // A CAT IN THE PARTY is no kitten on the preparation pages either (2026-10-03): the House's box had to accept it to put it there, and a copy the older builds made of a clone (or any cat whose
@@ -803,6 +807,7 @@ bool __fastcall h_TryDepart(void* box) {
     }
     if (!room_depart_allowed(n)) { log_line("DEPART", "refused by the room (party size rule)"); return true; }
     catsync_log_snapshot("departure (the box is accepted)");
+    catsync_census_take(ids, n);
     catsync_log_audit("departure (the box is accepted)");
     // A client may not bring a main-story item (the host alone carries those): the click gate stops equipping one,
     // this stops departing with a cat that already wears one. Only while the client is still preparing.
@@ -1017,6 +1022,7 @@ static void run_settled(const char* how, bool was_shared) {
         catsync_log_audit("after the merge");
         // the settlement saved BEFORE the merge: write the merged state to disk too, so a reload finds it (and the other players' leftover copies, now retired, are not kept out on adventure)
         if (merged || retired) catsync_save_game(how);
+        catsync_census_check(how);   // after the merge and the save (the House save checks its entities): every cat the box left with is accounted for
     }
     leave_on_settlement();
     checkpoint_clear(true);
@@ -1125,36 +1131,41 @@ void __fastcall h_EquipDone(void* self) {
 // While a chapter map is generated its mapflag_* nodes answer with the flags EVERY player has (mgmp_unlocks). The getter destroys its key,
 // so the original is always run -- for an overridden key only to let it do that -- and an inactive override costs one load and a branch.
 int64_t __fastcall h_PropGetInt(void* props, void* key, int64_t fallback) {
+    char name[96] = {};
+    const bool have_name = key && mem_read_std_string(key, name, sizeof(name));
     if (unlocks_override_active()) {
-        char name[96];
-        if (mem_read_std_string(key, name, sizeof(name))) {
+        if (have_name) {
             const int64_t local = o_PropGetInt(props, key, fallback);   // the getter destroys its key, so it always runs; its answer is the "this save says"
             int64_t value = 0;
-            const int64_t answer = unlocks_override_lookup(name, local, value) ? value : local;
+            const int64_t answer = unlocks_override_lookup(name, local, fallback, value) ? value : local;
+            storage_diag_property_get(name, local, answer, answer != local);
             if (lockstep_in_battle()) unlockq_prop(name, local, answer);
             return answer;
         }
     } else if (lockstep_in_battle()) {
         // a battle in a session, no override running (the host, or a client outside its window): the read is only RECORDED, so both peers' logs list what the battle asked of the save
-        char name[96];
-        if (mem_read_std_string(key, name, sizeof(name))) {
+        if (have_name) {
             const int64_t local = o_PropGetInt(props, key, fallback);
+            storage_diag_property_get(name, local, local, false);
             unlockq_prop(name, local, local);
             return local;
         }
     }
-    return o_PropGetInt(props, key, fallback);
+    const int64_t value = o_PropGetInt(props, key, fallback);
+    if (have_name) storage_diag_property_get(name, value, value, false);
+    return value;
 }
 
 // While a client builds a battle the host's unlock answers replace its own (mgmp_unlocks). The check destroys its name argument, so the original always
 // runs -- its answer is the "this save says" half of the debug line.
 bool unlock_detour(UnlockList list, fn_unlock_chk original, void* save, void* name) {
     if (!unlocks_window_active()) {
-        if (!lockstep_in_battle()) return original(save, name);
+        if (!lockstep_in_battle() && !unlocksrc_wanted()) return original(save, name);   // alone: untouched
         char text[96];                                  // a battle on the host (or a client outside its window): recorded, answered as the save does
         if (!mem_read_std_string(name, text, sizeof(text))) return original(save, name);
         const bool local = original(save, name);
-        unlockq_query(list, text, local, local);
+        if (lockstep_in_battle()) unlockq_query(list, text, local, local);
+        unlocksrc_note(list, text, local, local, false);   // UNLOCKSRC: this save answered (level-up screens, rewards, shops, events outside the window ...)
         return local;
     }
     char text[96];
@@ -1177,7 +1188,13 @@ bool __fastcall h_IsLevel  (void* save, void* name) { return unlock_detour(Unloc
 bool __fastcall h_IsBoss(void* closure, void* gon) {
     const bool local = o_IsBoss(closure, gon);
     if (!unlocks_window_active()) {
-        if (lockstep_in_battle()) { char t[96]; if (mem_read_std_string((const uint8_t*)gon + 0x88, t, sizeof(t))) unlockq_query(UnlockList::Boss, t, local, local); }
+        if (lockstep_in_battle() || unlocksrc_wanted()) {
+            char t[96];
+            if (mem_read_std_string((const uint8_t*)gon + 0x88, t, sizeof(t))) {
+                if (lockstep_in_battle()) unlockq_query(UnlockList::Boss, t, local, local);
+                unlocksrc_note(UnlockList::Boss, t, local, local, false);
+            }
+        }
         return local;
     }
     char text[96];
@@ -1234,9 +1251,14 @@ typedef void* (__fastcall* fn_pick_random)(void* vec, void* stream);
 fn_pick_random o_PickRandom = nullptr;
 void* __fastcall h_PickRandom(void* vec, void* stream) {
     static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
-    if ((uintptr_t)_ReturnAddress() == base + kRet_EventSubject) {
+    const uintptr_t ret = (uintptr_t)_ReturnAddress();
+    if (ret == base + kRet_EventSubject) {
         void* r = nullptr;
         if (unlocks_event_subject(vec, stream, (void*)o_PickRandom, &r)) return r;
+    }
+    if (ret == base + kRet_BountyOthers || ret == base + kRet_BountyFaction1) {     // the bounty hunter's target: the same unit on every peer
+        void* r = nullptr;
+        if (unlocks_bounty_target(vec, (void*)o_PickRandom, ret == base + kRet_BountyFaction1, &r)) return r;
     }
     return o_PickRandom(vec, stream);
 }
@@ -1247,6 +1269,9 @@ fn_prop_set_int o_PropSetInt = nullptr;
 // In a STORY event this peer only replays (the host decided it), the counters the result changes are not written to this peer's save: the reads inside the event still follow the new value (unlocks_property_set),
 // which is what the host's own reads see. The callee destroys its name string; not calling it just leaves that string to be freed with the caller's frame.
 void __fastcall h_PropSetInt(void* name, int value) {
+    char key[96] = {};
+    if (name && mem_read_std_string(name, key, sizeof(key)))
+        storage_diag_property_set(key, value);
     unlocks_property_set(name, value);
     if (choice_story_event_block_active()) { choice_story_event_blocked("a save property counter (increment/decrement_legacy_counter)"); return; }
     o_PropSetInt(name, value);
@@ -1284,17 +1309,54 @@ void __fastcall h_ResCompleteItemQuest(void* a, void* b, void* c, void* d) {
 typedef void (__fastcall* fn_res_ResGiveItem)(void*, void*, void*, void*);
 fn_res_ResGiveItem o_ResGiveItem = nullptr;
 void __fastcall h_ResGiveItem(void* a, void* b, void* c, void* d) {
+    if (unlocksrc_wanted()) {   // UNLOCKSRC: which item an event gives this player, read before the giver runs (it may consume the name)
+        unlocksrc_context("event item reward");
+        char item[64] = {};
+        if (b && mem_read_std_string(b, item, sizeof(item)) && item[0]) log_line("UNLOCKSRC", "an event gives an item: '%s'%s", item, choice_story_event_block_active() ? " (a story event: not kept on this peer)" : "");
+    }
     if (choice_story_event_block_active()) { choice_story_event_blocked("the item a story event gives (it is not put in this peer's inventory or on a cat here)"); return; }
     o_ResGiveItem(a, b, c, d);
 }
 // THE COMBAT SPEED (proto 82): the turn layer reads the "combat_speed" setting through Settings::get_float every frame; in a room a client's read is answered with the host's value (mgmp_unlocks:
 // settings_override), and the host's own read publishes its value when it changed. Every other key goes straight through. The key is a std::string*; the default is in xmm2 (the third argument).
 typedef float (__fastcall* fn_setting_get_float)(void*, void*, float, float);
+// A RANDOM CAT NAME DOES NOT TOUCH THE SHARED STREAM (2026-10-06, battle bdd220b7, a halt at turn 13). The name generator draws from the shared stream and skips the names this player's save
+// already uses, so it draws a different number of times on each peer. A cat-kind enemy made mid-battle (a WaterKitten) drew its name inside its load, and everything the load drew after it -- the
+// initiative variation (+0x5DC) and the turn-order tie-break (+0x958) -- came out different: base 3 here, -1 on the host. The host's board puts the keys right at the next boundary, but the unit had
+// already been put into the turn order with this peer's keys, and at turn 13 the two peers gave the turn to two different units. In a room the name is drawn from a stream of its own and the shared
+// stream is put back exactly as it was, so what follows the name is drawn alike on every peer.
+typedef void* (__fastcall* fn_cat_name_pick)(void* self, void* out, uint64_t gender, uint64_t a, uint64_t b);
+fn_cat_name_pick o_CatNamePick = nullptr;
+void* __fastcall h_CatNamePick(void* self, void* out, uint64_t gender, uint64_t a, uint64_t b) {
+    uint64_t* s = multiplayer_live() ? rng_global_stream() : nullptr;
+    uint64_t saved[4] = {};
+    const bool fence = s && mem_read(s, saved, sizeof(saved));
+    if (fence) {
+        uint64_t x = saved[0] ^ (saved[2] * 0x9E3779B97F4A7C15ull) ^ 0x6D676D706E616D65ull, own[4];
+        for (int i = 0; i < 4; ++i) { x += 0x9E3779B97F4A7C15ull; uint64_t z = x; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; own[i] = z ^ (z >> 31); }
+        if (!(own[0] | own[1] | own[2] | own[3])) own[0] = 1;
+        mem_write(s, own, sizeof(own));
+    }
+    void* r = o_CatNamePick(self, out, gender, a, b);
+    if (fence) {
+        mem_write(s, saved, sizeof(saved));
+        static unsigned said = 0;
+        if (said < 8) { ++said; log_line("RNGTRACE", "a random cat name was drawn from its own stream; the shared stream is back at %016llx", (unsigned long long)saved[0]); }
+    }
+    return r;
+}
+// THE BACKPACK'S AUTO-EQUIP (proto 85): sub_1408C3960, AutoEquipConsumables' update -- see lockstep_autoequip.
+typedef void (__fastcall* fn_auto_equip)(void*);
+fn_auto_equip o_AutoEquip = nullptr;
+void __fastcall h_AutoEquip(void* self) { lockstep_autoequip(self, o_AutoEquip); }
 fn_setting_get_float o_SettingGetFloat = nullptr;
 float __fastcall h_SettingGetFloat(void* self, void* key, float def, float x3) {
-    const float own = o_SettingGetFloat(self, key, def, x3);
+    // THE KEY IS READ BEFORE THE CALL (2026-10-06): it is passed BY VALUE -- the caller builds a temporary std::string and get_float moves it out (sub_140052460) and destroys it -- so read
+    // afterwards it was always empty, the name never matched, and the combat speed was never sent nor taken (not one SETTING line in any log since proto 82).
     char name[24] = {};
-    if (!key || !mem_read_std_string((const uint8_t*)key, name, sizeof(name)) || name[0] != 'c') return own;
+    const bool named = key && mem_read_std_string((const uint8_t*)key, name, sizeof(name)) && name[0] == 'c';
+    const float own = o_SettingGetFloat(self, key, def, x3);
+    if (!named) return own;
     float use = own;
     return settings_override(name, own, use) ? use : own;
 }
@@ -1321,6 +1383,55 @@ void* __fastcall h_EvItemPick(void* a, void* b, void* c, double luck) {
 }
 fn_ev_handler o_EvStatCheck = nullptr;
 uint64_t __fastcall h_EvStatCheck(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvStatCheck(a, b, c); }
+
+// RNG research 2026-10-11 (mgmp_rngfix.h): the event keywords that drew from the shared stream without a reset. (context, node) in rcx/rdx;
+// a and b are passed on untouched, c and d are whatever the caller left in r8/r9.
+typedef uint64_t (__fastcall* fn_ev_kw)(void*, void*, void*, void*);
+#define MGMP_EV_KEYWORD(Name, Rid, Keyword) \
+    fn_ev_kw o_##Name = nullptr; \
+    uint64_t __fastcall h_##Name(void* a, void* b, void* c, void* d) { rngfix_event_keyword(Rid, Keyword); return o_##Name(a, b, c, d); }
+MGMP_EV_KEYWORD(EvSelfDamage,    "R430", "self_damage")
+MGMP_EV_KEYWORD(EvPartyDamage,   "R431", "party_damage")
+MGMP_EV_KEYWORD(EvUpgAbility,    "R434", "upgrade_ability")
+MGMP_EV_KEYWORD(EvUpgPassive,    "R435", "upgrade_passive")
+MGMP_EV_KEYWORD(EvScrambleAbil,  "R436", "scramble_abilities")
+MGMP_EV_KEYWORD(EvScramblePass,  "R437", "scramble_passives")
+MGMP_EV_KEYWORD(EvScrambleAtk,   "R438", "scramble_basic_attack")
+MGMP_EV_KEYWORD(EvSkipFight,     "R439", "party_skip_next_fight_chance")
+MGMP_EV_KEYWORD(EvSpawnNext,     "R440", "spawn_unit_next_fight")
+#undef MGMP_EV_KEYWORD
+
+// R369: DelayedTrigger's target tile. Only the per-frame call (DelayedTrigger late_update, slot 11) is fenced; OnTurnBegin's is the real one.
+static const uintptr_t kRa_DelayedTargetFrame = 0x80CF20;
+fn_rngfix_2 o_DelayedTarget = nullptr;
+void* __fastcall h_DelayedTarget(void* self, void* out) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    if ((uintptr_t)_ReturnAddress() - base != kRa_DelayedTargetFrame) return o_DelayedTarget(self, out);
+    return rngfix_delayed_target(self, out, o_DelayedTarget);
+}
+// R102: the random-element helper, fenced for Character late_update's AI intent display only (54 other callers pass straight through).
+static const uintptr_t kRa_IntentPick = 0x108D3C;
+fn_rngfix_3 o_PickIndex = nullptr;
+void* __fastcall h_PickIndex(void* out, void* vec, void* stream) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    if ((uintptr_t)_ReturnAddress() - base != kRa_IntentPick) return o_PickIndex(out, vec, stream);
+    return rngfix_pick_index(out, vec, stream, o_PickIndex);
+}
+// ModelingClayPassive's after-cast (0x140906F50, reached from vtable slot 57 once the used ability is the clay's): see rngfix_clay. Only `this`
+// is read; the other three argument registers are passed on as they came.
+fn_rngfix_4 o_ClayChange = nullptr;
+void* __fastcall h_ClayChange(void* self, void* a, void* b, void* c) { return rngfix_clay(self, a, b, c, o_ClayChange); }
+// R027: the battle build's read of the run backpack (mode 0). 15 callers; only the build's (return 0x35B704) is touched, after the original.
+typedef void* (__fastcall* fn_item_collect)(void*, void*, uint64_t, void*, uint64_t);
+static const uintptr_t kRa_BuildBackpack = 0x35B704;
+fn_item_collect o_ItemCollect = nullptr;
+void* __fastcall h_ItemCollect(void* inv, void* out, uint64_t mode, void* r9, uint64_t a5) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uintptr_t ra = (uintptr_t)_ReturnAddress() - base;
+    void* r = o_ItemCollect(inv, out, mode, r9, a5);
+    if (ra == kRa_BuildBackpack && r == out) rngfix_battle_backpack(out);   // the build merges the vector it returns, which is `out`
+    return r;
+}
 fn_stage o_BuildStatics = nullptr;
 void* __fastcall h_BuildStatics(void* self) { void* r = o_BuildStatics(self); unlocks_build_stage_end("statics"); return r; }
 fn_stage o_BuildTerrain = nullptr;
@@ -1331,8 +1442,19 @@ fn_stage o_BuildParty = nullptr;
 void* __fastcall h_BuildParty(void* self) { void* r = o_BuildParty(self); unlocks_build_stage_end("party"); return r; }
 fn_stage o_BuildAllies = nullptr;
 void* __fastcall h_BuildAllies(void* self) { void* r = o_BuildAllies(self); unlocks_build_stage_end("allies"); return r; }
-fn_stage o_BuildExtra = nullptr;
-void* __fastcall h_BuildExtra(void* self) { void* r = o_BuildExtra(self); unlocks_build_stage_end("extra"); return r; }
+// THE EXTRA STAGE TAKES THE WAVE AS ITS SECOND ARGUMENT (2026-10-11, measured: a single-player battle with no enemies at all). 0x14035E5E0 begins
+// `mov r12d, edx` and spawns only the level objects whose wave byte (+6) equals it; both callers pass it (the build: `inc edx; mov [rdi+0x194], edx`,
+// Level's per-frame update the same). This hook used to be declared with `self` alone and worked by luck -- it called the original first, so rdx
+// was still the caller's. From 0.1.16 on, the solo and mid-battle path ran other code first, rdx was whatever that left, no object matched,
+// and the battle was built without its enemies (the game then counts it as won). The wave is passed on explicitly now.
+typedef void* (__fastcall* fn_extra_stage)(void* self, int32_t wave);
+fn_extra_stage o_BuildExtra = nullptr;
+void* __fastcall h_BuildExtra(void* self, int32_t wave) {
+    if (!unlocks_in_build()) return rngfix_wave(self, wave, o_BuildExtra);   // R270: Level's per-frame update spawning the level's next wave (and every solo build)
+    void* r = o_BuildExtra(self, wave);
+    unlocks_build_stage_end("extra");
+    return r;
+}
 fn_stage o_BuildEnemies = nullptr;
 void* __fastcall h_BuildEnemies(void* self) { void* r = o_BuildEnemies(self); unlocks_build_stage_end("enemies"); return r; }
 // The battle build (0x35AAF0): in a room every peer starts it from the same shared stream (mgmp_unlocks).
@@ -1431,6 +1553,11 @@ void* __fastcall h_UpdateDecision(void* self, void* out) {
     // NOT own this cat the original drew nothing anyway, because GetChoice was
     // overwritten with "nothing decided" and the type-2 guard never passed.
     aim_on_update_decision(self);
+
+    // The decision-time window (R373/R386/R388, P0): when this call produced a decision, TurnControl next dispatches passive slot 52
+    // (OnAnyCharacterMakesDecision: ProtectTargetedAllies, BackflipWhenTargeted ...) on the shared stream -- BEFORE ApplyTurnAction's reseed,
+    // and after the owner's own aim preview has drawn from it. Reseed here, last, from what every peer knows.
+    lockstep_reseed_decision(self, out);
     return ret;
 }
 
@@ -1482,6 +1609,8 @@ void* __fastcall h_MewDirInit(void* self, void* name) {
     void* r = nullptr;
     if (const void* sub = savefile_redirect_load()) r = o_MewDirInit(self, (void*)sub);
     else                                              r = o_MewDirInit(self, name);
+    lockstep_on_save_loaded();                                      // every battle there was is over (the same node may be entered again after a restore)
+    storage_diag_save_loaded();
     catsync_log_audit("a save is loaded (MewDirector::init)");     // who the run's lists hold right after a load, in a room or alone
     return r;
 }
@@ -1625,6 +1754,21 @@ const Binding kBindings[] = {
     { T_ResCompleteItemQuest, (void*)&h_ResCompleteItemQuest, (void**)&o_ResCompleteItemQuest },
     { T_ResGiveItem, (void*)&h_ResGiveItem, (void**)&o_ResGiveItem },
     { T_SettingGetFloat, (void*)&h_SettingGetFloat, (void**)&o_SettingGetFloat },
+    { T_CatNamePick, (void*)&h_CatNamePick, (void**)&o_CatNamePick },
+    { T_AutoEquip, (void*)&h_AutoEquip, (void**)&o_AutoEquip },
+    { T_EvSelfDamage,   (void*)&h_EvSelfDamage,   (void**)&o_EvSelfDamage },
+    { T_EvPartyDamage,  (void*)&h_EvPartyDamage,  (void**)&o_EvPartyDamage },
+    { T_EvUpgAbility,   (void*)&h_EvUpgAbility,   (void**)&o_EvUpgAbility },
+    { T_EvUpgPassive,   (void*)&h_EvUpgPassive,   (void**)&o_EvUpgPassive },
+    { T_EvScrambleAbil, (void*)&h_EvScrambleAbil, (void**)&o_EvScrambleAbil },
+    { T_EvScramblePass, (void*)&h_EvScramblePass, (void**)&o_EvScramblePass },
+    { T_EvScrambleAtk,  (void*)&h_EvScrambleAtk,  (void**)&o_EvScrambleAtk },
+    { T_EvSkipFight,    (void*)&h_EvSkipFight,    (void**)&o_EvSkipFight },
+    { T_EvSpawnNext,    (void*)&h_EvSpawnNext,    (void**)&o_EvSpawnNext },
+    { T_DelayedTarget,  (void*)&h_DelayedTarget,  (void**)&o_DelayedTarget },
+    { T_ItemCollect,    (void*)&h_ItemCollect,    (void**)&o_ItemCollect },
+    { T_PickIndex,      (void*)&h_PickIndex,      (void**)&o_PickIndex },
+    { T_ClayChange,     (void*)&h_ClayChange,     (void**)&o_ClayChange },
     { T_ResDejaVu, (void*)&h_ResDejaVu, (void**)&o_ResDejaVu },
     { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
     { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },
@@ -1791,6 +1935,10 @@ int hooks_install() {
     int installed = 0;
     for (const Binding& b : kBindings)
         if (install_one(b, /*announce_off=*/true)) ++installed;
+
+    // The per-event stream fence over the frame-driven passive handlers (mgmp_rngframe). Not in the table above: these come from a generated
+    // list of plain RVAs, each checked against the bytes it was generated from. Inert outside a room's battle.
+    installed += rngframe_install(g_base);
 
     // After every hook is known, not before: a feature that is only safe while
     // another hook runs has to be told, and aim_set_base ran above -- before

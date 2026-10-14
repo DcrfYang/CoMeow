@@ -44,6 +44,10 @@ uint64_t* rng_global_stream();
 // that needs the module base.
 void rng_set_base(uintptr_t base);
 
+// mgmp_rngframe's fences (game thread): the draws made between enter and leave come from a stream of the event's own, so the ledger leaves them out.
+void rng_fence_enter();
+void rng_fence_leave();
+
 // Detours. Installed by hooks_install() alongside the phase-1 hooks; the
 // originals live here so the detours can tail-call them.
 void* rng_detour_randint();

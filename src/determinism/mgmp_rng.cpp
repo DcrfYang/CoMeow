@@ -3,6 +3,7 @@
 #include "mgmp_tuning.h"
 #include "mgmp_record.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_log.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -35,6 +36,7 @@ uint32_t g_led_nl = 0, g_led_digl = 2166136261u;
 bool     g_led_apply = false;
 uint32_t g_led_key[kLedgerSites] = {}, g_led_cnt[kLedgerSites] = {};
 uint32_t g_led_last = 0;               // index of the site hit last: draws come in runs from one site
+uint32_t g_fence_depth = 0;            // > 0 while a per-event fence (mgmp_rngframe) runs: its draws come from a stream of their own and are not the shared stream's
 
 // Return address -> RVA. Absolute addresses would differ between runs under
 // ASLR and make every record differ; the RVA is stable for a pinned build.
@@ -67,7 +69,7 @@ inline void note(uint8_t fn, void* ret, uint64_t s0, uint64_t result, bool globa
     InterlockedIncrement64(&g_total);
     if (global) {
         InterlockedIncrement64(&g_global);
-        if (g_led_on && GetCurrentThreadId() == g_led_tid) ledger_add(fn, site_rva(ret));
+        if (g_led_on && !g_fence_depth && GetCurrentThreadId() == g_led_tid) ledger_add(fn, site_rva(ret));
     }
 
     if (!record_active()) return;
@@ -139,10 +141,52 @@ __m128 __fastcall h_rand2(double m, uint64_t* state) {
 // recorded (result = 1, s0 unchanged) because "a proc that was guaranteed"
 // still has to match between peers -- a peer that thought it was 0.9 would take
 // a draw here and desync the stream position, not just the outcome.
+// ROLLS THAT RACE AN ANIMATION GET A STREAM OF THEIR OWN (2026-10-06). A reaction (the Spider Queen's ButtWeb, an ImmediateAbilityReaction) fires a projectile while the attack that provoked it is still
+// hitting, and where its draws land among the attack's draws depends on each peer's frame timing: the same 51 draws, in another order (RNG ledger, battle 4b3989b8, turn 5). The queen's
+// SpawnThingOnDamage roll (50%, the attacker's luck) then came out differently -- a spider more on the client, a halt at the next boundary. Such a roll is taken from a stream seeded by the battle,
+// the turn and how many rolls of that site this turn has made, so its result no longer depends on what was drawn before it. The shared stream is not touched by it (on every peer alike).
+// TODO(RNG-FRAME): this is ONE site of a whole class (RNG research 2026-10-11, 总结.md 2.1: 26 items -- reaction closures R195/R197/R198, on-hit
+// passives, R261 projectiles, R266/R269 knockback, R268 dice). The general fix gives each frame-driven sequence its own stream; see mgmp_rngfix.h.
+// Until then a listed site here only fixes that site's own roll, and the ledger lines name the research item of a differing site.
+namespace {
+struct IsolatedSite { uint32_t rva; uint32_t salt; const char* what; };
+constexpr IsolatedSite kIsolated[] = {
+    { 0x7CC49B, 0x5350574E, "SpawnThingOnDamage" },       // the passive's chance roll (sub_1407CC040, its damage-taken handler; vtable slot +0x218)
+};
+const IsolatedSite* isolated_site(uint32_t rva) {
+    for (const auto& s : kIsolated) if (s.rva == rva) return &s;
+    return nullptr;
+}
+uint64_t iso_mix(uint64_t& x) {
+    uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+}
+
 bool __fastcall h_rollchance(double p, double scale, uint64_t* state) {
     void*    ret = _ReturnAddress();
     bool     glb = (state == rng_global_stream());
     uint64_t s0  = state ? state[0] : 0;
+    if (glb && lockstep_active()) {
+        if (const IsolatedSite* iso = isolated_site(site_rva(ret))) {
+            const uint64_t battle = lockstep_battle_id();
+            const uint32_t turn = lockstep_turn();
+            if (battle) {
+                static uint64_t s_battle = 0;
+                static uint32_t s_turn = ~0u, s_n[sizeof(kIsolated) / sizeof(kIsolated[0])] = {};
+                if (battle != s_battle || turn != s_turn) { s_battle = battle; s_turn = turn; memset(s_n, 0, sizeof(s_n)); }
+                const uint32_t n = ++s_n[iso - kIsolated];
+                uint64_t x = battle ^ ((uint64_t)iso->salt << 32) ^ ((uint64_t)turn * 0x100000001B3ull) ^ ((uint64_t)n * 0xD6E8FEB86659FD93ull);
+                uint64_t own[4];
+                for (int i = 0; i < 4; ++i) own[i] = iso_mix(x);
+                const bool r = o_rollchance(p, scale, own);
+                log_line("RNG", "isolated roll %s #%u of turn %u: chance %.3f luck %.3f -> %s (its own stream; the shared one is untouched)", iso->what, n, turn, p, scale, r ? "yes" : "no");
+                return r;
+            }
+        }
+    }
     bool     r   = o_rollchance(p, scale, state);
     note(RNG_ROLL, ret, s0, (uint64_t)r, glb, state);
     // The coin a melee kill drops (the effect at 0x2C3060): this roll's odds come from data that is not the same on every peer, so the HOST's answer is the one everybody uses.
@@ -167,6 +211,9 @@ void rng_counters(uint64_t* total, uint64_t* global) {
 }
 
 void rng_set_base(uintptr_t base) { g_base = base; }
+
+void rng_fence_enter() { ++g_fence_depth; }
+void rng_fence_leave() { if (g_fence_depth) --g_fence_depth; }
 
 void rng_ledger_arm(bool on) {
     InterlockedExchange(&g_led_on, 0);

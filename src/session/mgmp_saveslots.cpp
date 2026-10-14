@@ -328,11 +328,38 @@ bool capture_current(const std::wstring& game, Bytes out[kGameSlots], bool have[
             got = checkpoint_io::snapshot(f, out[s]);
         }
         if (got) { have[s] = true; continue; }
-        // The database would not open cleanly (corrupt, or locked exclusively).
-        // Still worth having: a byte copy of a damaged save beats no copy when
-        // this is the undo point for a load.
-        log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls could not be copied cleanly (%s) -- taking its bytes as they are", kGameFile[s], checkpoint_io::snapshot_why());
-        if (checkpoint_io::read(f, out[s], 64u << 20)) { have[s] = true; continue; }
+        // The live file itself, but only when it passes the same integrity check: a NEW backup is kept only when it is sound (until 0.1.1 the
+        // bytes were taken as they were). The failure seen in the field was not a damaged save but one over the old 4 MiB bound -- YUEMO,
+        // 2026-10-07: "the copy could not be read back" after a clean backup -- which kMaxLocalSaveBytes now covers.
+        log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls could not be copied cleanly (%s) -- validating the live file before accepting it", kGameFile[s], checkpoint_io::snapshot_why());
+        if (checkpoint_io::verified(f, out[s])) {
+            have[s] = true;
+            log_line_lvl(LogLevel::Warn, "SAVESLOTS", "the live %ls is a readable SQLite save; keeping it as the last-resort backup", kGameFile[s]);
+            continue;
+        }
+        // A DATABASE THAT FAILS SQLITE'S CHECK IS STILL TAKEN, AS IT IS (2026-10-12 review). Refusing it refused EVERY backup -- a load's undo point, the
+        // auto-save queue, a restore from a handshake save -- for the sake of one slot, maybe one the player does not even use; and leaving the slot out
+        // is no way round it, since a backup without a slot DELETES that slot when it is loaded (install_from). The restore side already hands over a
+        // save that only opens and answers (loadable(): the game loads such saves); the copy is now kept on the same terms -- read twice, 150 ms apart,
+        // and kept only when both reads are the same bytes, so a file the game is writing is not caught half-written.
+        {
+            Bytes again;
+            bool stable = false;
+            for (int attempt = 0; attempt < 3 && !stable; ++attempt) {
+                if (attempt) Sleep(150);
+                if (!checkpoint_io::loadable(f, out[s])) break;
+                Sleep(150);
+                stable = checkpoint_io::read(f, again, checkpoint_io::kMaxLocalSaveBytes) && again == out[s];
+            }
+            if (stable) {
+                have[s] = true;
+                log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls fails sqlite's integrity check but opens and answers as a database (the game loads such saves) -- kept as it is, %llu bytes",
+                             kGameFile[s], (unsigned long long)out[s].size());
+                continue;
+            }
+            out[s].clear();
+        }
+        log_line_lvl(LogLevel::Error, "SAVESLOTS", "!! %ls snapshot failed and the live file is not a readable SQLite save (or kept changing while read) -- refusing to create or replace this backup", kGameFile[s]);
         say(tr(Tx::SS_READ_FAIL), kGameFile[s]);
         return false;
     }
@@ -406,7 +433,8 @@ bool install_from(const std::wstring& game, const std::wstring& dir, const SaveB
         if (!exists(f)) { say(tr(Tx::SS_MISSING), kGameFile[s]); return false; }
         if (!checkpoint_io::snapshot(f, bytes[s])) {
             // The backup may be a byte copy of a save that fails sqlite's integrity check and that the game loads all the same (a save copied while the game was writing it, or one from a sqlite the check
-            // is stricter than). It is the player's own save: hand it over when it is a database at all, and say so in the log; refuse only what is not one.
+            // is stricter than). It is the player's own save: hand it over when it is a database at all, and say so in the log; refuse only what is not one. (0.1.2 checked integrity in loadable()
+            // and so refused these too; restored 2026-10-10.)
             const std::string why = checkpoint_io::snapshot_why();
             if (checkpoint_io::loadable(f, bytes[s])) {
                 log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls in the backup fails the integrity check (%s) but is a readable database -- loading it as it is", kGameFile[s], why.c_str());

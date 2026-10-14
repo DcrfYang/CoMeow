@@ -1,4 +1,6 @@
 #include "mgmp_catsync.h"
+#include "mgmp_equipment_guard.h"   // the equipment slot layout (normalize_equipment)
+#include "mgmp_room.h"              // room_say_cat_census
 
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
@@ -567,6 +569,30 @@ static unsigned restore_part_types(void* cat) {
     return fixed;
 }
 
+// A HALF-EMPTY EQUIPMENT SLOT (2026-10-11, WeaponMaster+ gave the host's fighter a Geode and the client's copy a Revolver). The game's equipment
+// serializer (0x14022D2A0) writes a slot as present when its id (+0) is not -1 AND its name (std::string at +8) is not empty -- and when it READS an
+// image whose slot is absent it skips the slot, leaving the object as it was. The owner had moved its Pipe out of the weapon slot; on the client
+// the slot ended with id -1 but the name 'Pipe' still in it: the serializer calls that empty (so the readback matched the owner's image byte for
+// byte), but code that looks at the name sees a weapon -- and EquipRandomTemporaryItemFromPool took another branch at the battle build. After an
+// image is applied, a slot whose id says "empty" gets an empty name too, released the game's way (_Tidy_deallocate).
+static void normalize_equipment(void* cat, uint64_t id) {
+    using fn_str_tidy = void (__fastcall*)(void*);
+    const fn_str_tidy tidy = (fn_str_tidy)addr_of_call(C_GameStrDtor);
+    if (!cat || !tidy) return;
+    for (unsigned k = 0; k < kEquip_Slots; ++k) {
+        uint8_t* slot = (uint8_t*)cat + kCat_Equipment + k * kEquip_Stride;
+        int64_t item_id = 0;
+        uint64_t len = 0;
+        if (!mem_read(slot, &item_id, sizeof(item_id)) || item_id != -1) continue;
+        if (!mem_read(slot + kEquip_Name + 0x10, &len, sizeof(len)) || !len || len > 256) continue;
+        char name[64] = "?";
+        mem_read_std_string(slot + kEquip_Name, name, sizeof(name));
+        __try { tidy(slot + kEquip_Name); } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        log_line("CATSYNC", "cat %016llx: equipment slot %u had no item (id -1) but still carried the name '%s' -- cleared, as the owner's image has it",
+                 (unsigned long long)id, k, name);
+    }
+}
+
 bool catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len) {
     if (!cat || !image || !len || len > kMaxCatBytes) return false;
 
@@ -1092,17 +1118,23 @@ void adopted_clear(uint64_t id) {
         if (g_adopted[i] == id) { g_adopted[i] = g_adopted[--g_adopted_n]; return; }
 }
 
+struct SwapNote { uint64_t clone = 0, original = 0; };
 struct Origin { uint64_t id = 0; void* cat = nullptr; bool legacy = false; unsigned ordinary_away = 0, ordinary_home = 0, legacy_away = 0; void* home_cat = nullptr; };
 
 // Clone id -> the original it was swapped into (swap_identity), kept so the House's entities -- which carry their OWN id, written to house_state -- can be put right.
-struct SwapNote { uint64_t clone = 0, original = 0; };
+// AN ORDERED LIST, EACH NOTE USED ONCE (2026-10-11 review). The notes used to be one per clone id, a later one overwriting the earlier: a reserved id
+// can be swapped TWICE in one session -- the squatter on 70000002 moved away (note 70000002 -> its new id), then this run's clone on 70000002 merged
+// into its original (note 70000002 -> the original) -- and if no House save came between the two, both House entities still said 70000002 and BOTH
+// were written as the original: one cat twice, the moved cat gone from house_state. Now the k-th entity carrying a clone id (in House order: the
+// older entity first) takes the k-th note for that id (in the order the swaps happened), and a note that has been written is removed.
 SwapNote g_swaps[32];
 uint32_t g_swaps_n = 0;
 void swap_note(uint64_t clone, uint64_t original) {
-    for (uint32_t i = 0; i < g_swaps_n; ++i) if (g_swaps[i].clone == clone) { g_swaps[i].original = original; return; }
+    for (uint32_t i = 0; i < g_swaps_n; ++i) if (g_swaps[i].clone == clone && g_swaps[i].original == original) return;
     if (g_swaps_n < 32) g_swaps[g_swaps_n++] = { clone, original };
     else { memmove(g_swaps, g_swaps + 1, sizeof(g_swaps) - sizeof(SwapNote)); g_swaps[31] = { clone, original }; }
 }
+void swap_note_consume(uint32_t i) { if (i < g_swaps_n) { memmove(g_swaps + i, g_swaps + i + 1, (g_swaps_n - i - 1) * sizeof(SwapNote)); g_swaps[--g_swaps_n] = {}; } }
 
 // The registry's list node of an id ({next, prev, key, CatData*}); null when the id is not there.
 uint8_t* registry_node(const void* registry, uint64_t id) {
@@ -1168,6 +1200,58 @@ bool find_origin_by_seed(const void* registry, uint64_t seed, const uint64_t* bu
     out = o_leg; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; out.home_cat = hc; return true;
 }
 
+// THE FAMILY TABLE (registry+0x38; 2026-10-11 review). The game keeps a flat hash map id -> {parent a, parent b, kinship} next to the cat registry
+// (control bytes at +0, 32-byte slots {id, a, b, double} at +8, capacity at +0x18 -- read off 0x140183E70, which 0x140772AC0 (C_CatParents)
+// calls), and computes kinship against every id in it. It knows ids the live registry no longer holds (a long-dead ancestor) and ids that are only
+// some cat's parent. An id handed to a new cat must be in neither: a reused ancestor id would make the new cat that ancestor in every family tree.
+template <class F> bool pedigree_walk(const void* registry, F&& visit) {
+    const uint8_t* t = (const uint8_t*)registry + 0x38;
+    const uint8_t* ctrl = nullptr; const uint8_t* slots = nullptr; uint64_t cap = 0;
+    if (!mem_read(t, &ctrl, sizeof(ctrl)) || !mem_read(t + 8, &slots, sizeof(slots)) || !mem_read(t + 0x18, &cap, sizeof(cap))) return false;
+    if (!cap) return true;                                            // an empty table
+    if (!ctrl || !slots || cap > (1ull << 22)) return false;
+    int8_t chunk[4096];
+    for (uint64_t base = 0; base < cap; base += sizeof(chunk)) {
+        const uint64_t n = cap - base < sizeof(chunk) ? cap - base : sizeof(chunk);
+        if (!mem_read(ctrl + base, chunk, (size_t)n)) return false;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (chunk[i] < 0) continue;                                // empty / deleted / the sentinel
+            uint64_t s[3] = {};
+            if (!mem_read(slots + (base + i) * 32, s, sizeof(s))) return false;
+            visit(s[0], s[1], s[2]);
+        }
+    }
+    return true;
+}
+
+// The highest ORDINARY id the save knows anywhere -- a registered cat, a family-table entry, or a parent named in one. False when either table
+// cannot be read: then nobody may invent an id.
+bool ordinary_ceiling(const void* registry, uint64_t& top) {
+    top = 0;
+    auto take = [&](uint64_t v) { if (v && v != UINT64_MAX && !is_session_range(v) && v < 0x70000000ull && v > top) top = v; };
+    if (!registry_walk(registry, [&](uint64_t key, void*) { take(key); })) return false;
+    return pedigree_walk(registry, [&](uint64_t id, uint64_t a, uint64_t b) { take(id); take(a); take(b); });
+}
+
+// A cat that moves from `from` to `to` (the squatter move) keeps its family: its own parents go with it, and every cat that names `from` as a
+// parent names `to` instead -- through the game's own registration (C_CatParents), which also recomputes the kinship.
+void pedigree_move(const void* registry, uint64_t from, uint64_t to) {
+    if (!g.register_parents) return;
+    uint64_t pa = UINT64_MAX, pb = UINT64_MAX;
+    struct Child { uint64_t id, a, b; } kids[64]; uint32_t nk = 0;
+    if (!pedigree_walk(registry, [&](uint64_t id, uint64_t a, uint64_t b) {
+            if (id == from) { pa = a; pb = b; }
+            else if ((a == from || b == from) && nk < 64) kids[nk++] = { id, a == from ? to : a, b == from ? to : b };
+        })) return;
+    __try {
+        void* table = (uint8_t*)registry + 0x38;
+        if (pa != UINT64_MAX || pb != UINT64_MAX) g.register_parents(table, to, pa, pb);
+        for (uint32_t i = 0; i < nk; ++i) g.register_parents(table, kids[i].id, kids[i].a, kids[i].b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    log_line("CATSYNC", "family: %016llx moved to %016llx with its parents (%llx, %llx); %u child(ren) now name the new id",
+             (unsigned long long)from, (unsigned long long)to, (unsigned long long)pa, (unsigned long long)pb, nk);
+}
+
 // The highest id among ORDINARY cats (0 when the walk fails).
 uint64_t max_ordinary_id(const void* registry) {
     uint64_t best = 0;
@@ -1182,8 +1266,10 @@ uint64_t max_ordinary_id(const void* registry) {
 // build already pushed up back to just above the highest ordinary cat.
 void repair_id_counter(const void* registry) {
     if (!g.id_counter || *g.id_counter < 0x70000000ull) return;
-    const uint64_t top = max_ordinary_id(registry);
-    if (!top || top >= 0x70000000ull) return;
+    // 2026-10-11 review: the ceiling over the family table too -- the registry alone may not hold a dead ancestor, and the counter put back below its
+    // id would have the game hand that id to the next kitten.
+    uint64_t top = 0;
+    if (!ordinary_ceiling(registry, top) || !top) return;
     log_line("CATSYNC", "the cat id counter was %llx (inside the session range) -- put back to %llx",
              (unsigned long long)*g.id_counter, (unsigned long long)top);
     *g.id_counter = top;
@@ -1193,10 +1279,29 @@ void repair_id_counter(const void* registry) {
 // progress it carries survives the next run's re-use of the clone slot.
 // CatData's age fields: the birth day (int32) and the day override (int64, -1 = none). is_kitten is "the save's day - birth day <= 1" (T_IsKitten), and a cat made by construct_cat is born TODAY
 // unless the image carries its birth: `birth_from`, the cat the image was taken from, hands both over so an adopted copy is not a kitten (every stat -2) for its first two days (2026-10-03).
+// THE COUNTER CAN SIT INSIDE THE SESSION RANGE FOR GOOD (2026-10-11, the host lost four House cats). Saves made by older builds gave EVERY cat an id
+// in 0x71000000+ (the counter was dragged there), so there is no ordinary cat for repair_id_counter to pull the counter back to, counter + 1 is a
+// session id, and every move of a real cat off a reserved id failed with "new id 0" -- after which the setup overwrote those four cats with the run's
+// clones. The id now falls back to the first free one above the highest ordinary cat (from 1 when there is none), checked against the registry; the
+// game's counter is left where it is, so the cats it makes later get ids far above these.
 bool adopt_as_new_cat(const void* registry, const uint8_t* image, uint32_t size, uint64_t& new_id, const void* birth_from = nullptr) {
     if (!g.id_counter || !image || !size) return false;
-    const uint64_t id = *g.id_counter + 1;
-    if (!id || is_session_range(id)) return false;
+    auto taken = [&](uint64_t k) { void* c = nullptr; return !safe_by_id((void*)registry, k, &c) || c != nullptr; };   // an unreadable answer counts as taken
+    uint64_t id = *g.id_counter + 1;
+    if (!id || is_session_range(id) || taken(id)) {
+        // never an id the save has used: above every ordinary id in the registry AND the family table (see ordinary_ceiling)
+        uint64_t top = 0;
+        if (!ordinary_ceiling(registry, top)) {
+            log_line_lvl(LogLevel::Error, "CATSYNC", "!! adopt: the cat id counter (%llx) cannot give an ordinary id and the family table could not be read -- no id is invented",
+                         (unsigned long long)*g.id_counter);
+            return false;
+        }
+        id = top + 1;
+        while (id < 0x70000000ull && taken(id)) ++id;
+        if (id >= 0x70000000ull) return false;
+        log_line("CATSYNC", "adopt: the cat id counter (%llx) cannot give an ordinary id -- the first free one, %llx, is used",
+                 (unsigned long long)*g.id_counter, (unsigned long long)id);
+    }
     void* cat = construct_cat();
     if (!cat || !catsync_deserialize_into(cat, image, size)) return false;
     if (birth_from) {
@@ -1298,8 +1403,139 @@ bool catsync_save_game(const char* why) {
     return ok;
 }
 
+// THE CAT CENSUS (2026-10-11). Every cat problem so far had the same shape -- a path wrote over a cat object it believed was disposable, and nothing
+// checked afterwards that the player still had every cat: four of the host's House cats were overwritten by a run's clones and the House came back
+// with a duplicate. The census is taken when the House's box sets off (every alive cat: seed, id, flags, name, whether it is in the box) and checked
+// after the run is settled: a cat alive at departure that is neither alive nor recorded dead afterwards is LOST; a seed alive more often afterwards
+// than at departure is a DUPLICATE. Either one is an error line, a notice that tells the player to restore the pre-run handshake save, and stays
+// in the log the player uploads. Nothing is changed by it.
+namespace {
+struct CensusCat { uint64_t seed = 0, id = 0, flags = 0; bool party = false; char name[24] = {}; };
+CensusCat g_census[512];
+uint32_t g_census_n = 0;
+bool g_census_on = false;
+unsigned g_census_house_dup = 0;
+uint64_t g_census_house_ids[8] = {};   // the ids two House entities were written with (the notice names those cats)
+uint32_t g_census_house_ids_n = 0;
+bool census_alive(uint64_t flags) { return (flags & 0x1) != 0; }
+bool census_dead(const void* cat, uint64_t flags) { return (flags & 0x30) != 0 || cat_data_perished(cat); }
+}
+static void census_report_house_duplicates(unsigned dup, const uint64_t* ids, uint32_t n) {
+    g_census_house_dup = dup;
+    g_census_house_ids_n = n < 8 ? n : 8;
+    for (uint32_t i = 0; i < g_census_house_ids_n; ++i) g_census_house_ids[i] = ids[i];
+}
+
+void catsync_census_take(const uint64_t* box, uint32_t nbox) {
+    ensure_state();
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    g_census_n = 0; g_census_on = false; g_census_house_dup = 0; g_census_house_ids_n = 0;
+    // (Pending swap notes are NOT dropped here: this runs before the game's own departure save, and a squatter moved on the collar page of a departure the
+    // player then cancelled still needs its note for the House save that follows. Every note is consumed when its entity is written.)
+    if (g_swaps_n) log_line("CATSYNC", "departure: %u swap note(s) still pending for the House save", g_swaps_n);
+    if (!g.director_slot || !mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return;
+    registry_walk(registry, [&](uint64_t key, void* cat) {
+        if (g_census_n >= 512) return;
+        uint64_t flags = 0, seed = 0;
+        if (!mem_read((uint8_t*)cat + kCatData_Flags, &flags, sizeof(flags)) || !census_alive(flags) || !mem_read(cat, &seed, sizeof(seed))) return;
+        CensusCat& c = g_census[g_census_n++];
+        c = CensusCat{}; c.seed = seed; c.id = key; c.flags = flags;
+        for (uint32_t i = 0; i < nbox; ++i) if (box[i] == key) c.party = true;
+        uint8_t* image = nullptr;
+        const uint32_t size = serialize_cat(cat, &image);
+        CatBrief b;
+        if (size && image && catblob_parse(image, size, b)) strncpy_s(c.name, sizeof(c.name), b.name, _TRUNCATE);
+        free(image);
+    });
+    g_census_on = true;
+    // the family table as the id allocation sees it -- a line per departure that shows the layout read off the game is right on this build
+    uint32_t ped_n = 0; uint64_t top = 0;
+    const bool ped_ok = pedigree_walk(registry, [&](uint64_t, uint64_t, uint64_t) { ++ped_n; });
+    const bool top_ok = ordinary_ceiling(registry, top);
+    log_line("CENSUS", "taken at departure: %u alive cat(s), %u of them in the box | family table %s: %u entr(ies), highest ordinary id the save knows %llx, the game's id counter %llx",
+             g_census_n, nbox, ped_ok ? "readable" : "NOT READABLE (no new id would be invented)", ped_n, top_ok ? (unsigned long long)top : 0ull,
+             g.id_counter ? (unsigned long long)*g.id_counter : 0ull);
+}
+
+void catsync_census_check(const char* stage) {
+    ensure_state();
+    if (!g_census_on) return;
+    g_census_on = false;
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!g.director_slot || !mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return;
+    struct After { uint64_t seed; uint32_t alive, dead; };
+    static After after[1024];
+    uint32_t na = 0;
+    registry_walk(registry, [&](uint64_t, void* cat) {
+        uint64_t flags = 0, seed = 0;
+        if (!mem_read((uint8_t*)cat + kCatData_Flags, &flags, sizeof(flags)) || !mem_read(cat, &seed, sizeof(seed))) return;
+        const bool alive = census_alive(flags) && !census_dead(cat, flags), dead = census_dead(cat, flags);
+        if (!alive && !dead) return;
+        uint32_t k = 0;
+        while (k < na && after[k].seed != seed) ++k;
+        if (k == na) { if (na >= 1024) return; after[na++] = { seed, 0, 0 }; }
+        if (alive) ++after[k].alive; else ++after[k].dead;
+    });
+    unsigned lost = 0, dup = 0;
+    char lost_line[400] = {}, dup_line[400] = {}; int lw = 0, dw = 0;
+    for (uint32_t i = 0; i < g_census_n; ++i) {
+        const CensusCat& c = g_census[i];
+        uint32_t before_n = 0, first = i;
+        for (uint32_t j = 0; j < g_census_n; ++j) if (g_census[j].seed == c.seed) { ++before_n; if (j < first) first = j; }
+        if (first != i) continue;                                   // one verdict per seed
+        const After* a = nullptr;
+        for (uint32_t k = 0; k < na; ++k) if (after[k].seed == c.seed) a = &after[k];
+        if (!a || (!a->alive && !a->dead)) {
+            ++lost;
+            if (lw >= 0 && (size_t)lw < sizeof(lost_line) - 60) lw += _snprintf_s(lost_line + lw, sizeof(lost_line) - lw, _TRUNCATE, " '%s'(id %llx seed %08llx%s)", c.name, (unsigned long long)c.id, (unsigned long long)(c.seed & 0xFFFFFFFFull), c.party ? ", in the box" : "");
+        } else if (a->alive > before_n) {
+            ++dup;
+            if (dw >= 0 && (size_t)dw < sizeof(dup_line) - 60) dw += _snprintf_s(dup_line + dw, sizeof(dup_line) - dw, _TRUNCATE, " '%s'(seed %08llx: %u alive, %u before)", c.name, (unsigned long long)(c.seed & 0xFFFFFFFFull), a->alive, before_n);
+        }
+    }
+    dup += g_census_house_dup;
+    if (!lost && !dup) {
+        log_line("CENSUS", "%s: every one of the %u cat(s) alive at departure is accounted for, none duplicated", stage ? stage : "?", g_census_n);
+        return;
+    }
+    log_line_lvl(LogLevel::Error, "CENSUS", "!! %s: %u cat(s) LOST:%s | %u DUPLICATED:%s%s -- the pre-run handshake save holds the state before departure",
+                 stage ? stage : "?", lost, lost ? lost_line : " -", dup, dup ? dup_line : " -", g_census_house_dup ? " (+ House entities saved twice)" : "");
+    // THE NOTICE NAMES THE CATS (2026-10-12, at the user's request: "Cisol" and "Grimmsley" were duplicated and the notice only said "2"), so the player can find
+    // them in the House. A House entity written twice is named by the cat registered under its id.
+    char lost_names[300] = {}, dup_names[300] = {};
+    auto add_name = [](char (&out)[300], const char* name) {
+        const char* n = name && name[0] ? name : "?";
+        if (strstr(out, n)) return;                                   // once each
+        const size_t at = strlen(out);
+        _snprintf_s(out + at, sizeof(out) - at, _TRUNCATE, "%s%s", at ? ", " : "", n);
+    };
+    for (uint32_t i = 0; i < g_census_n; ++i) {
+        const CensusCat& c = g_census[i];
+        uint32_t before_n = 0;
+        for (uint32_t j = 0; j < g_census_n; ++j) if (g_census[j].seed == c.seed) ++before_n;
+        const After* a = nullptr;
+        for (uint32_t k = 0; k < na; ++k) if (after[k].seed == c.seed) a = &after[k];
+        if (!a || (!a->alive && !a->dead)) add_name(lost_names, c.name);
+        else if (a->alive > before_n) add_name(dup_names, c.name);
+    }
+    for (uint32_t i = 0; i < g_census_house_ids_n; ++i) {
+        char name[24] = {};
+        void* cat = nullptr;
+        if (safe_by_id((void*)registry, g_census_house_ids[i], &cat) && cat) {
+            uint8_t* image = nullptr;
+            const uint32_t size = serialize_cat(cat, &image);
+            CatBrief b;
+            if (size && image && catblob_parse(image, size, b)) strncpy_s(name, sizeof(name), b.name, _TRUNCATE);
+            free(image);
+        }
+        if (!name[0]) _snprintf_s(name, sizeof(name), _TRUNCATE, "#%llx", (unsigned long long)g_census_house_ids[i]);
+        add_name(dup_names, name);
+    }
+    room_say_cat_census(lost, lost_names[0] ? lost_names : "-", dup, dup_names[0] ? dup_names : "-");
+}
+
 void catsync_house_save(void* house) {
-    if (!g_swaps_n || !house) return;
+    if (!house) return;
     // The writer (sub_1401E6810) reads the entity list from ((house+0x18)->+8)->+0x20 -> +0x4480: a vector {.. count at +0xC, element pointers at +0x10}; each entity's id is at +0x80.
     const uint8_t* a = nullptr; const uint8_t* b = nullptr; const uint8_t* c = nullptr; const uint8_t* vec = nullptr;
     if (!mem_read((const uint8_t*)house + 0x18, &a, sizeof(a)) || !a || !mem_read(a + 8, &b, sizeof(b)) || !b ||
@@ -1307,19 +1543,37 @@ void catsync_house_save(void* house) {
     uint32_t count = 0; const uint8_t* const* data = nullptr;
     if (!mem_read(vec + 0xC, &count, sizeof(count)) || !count || count > 4096 || !mem_read(vec + 0x10, &data, sizeof(data)) || !data) return;
     unsigned fixed = 0;
-    for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i < count && g_swaps_n; ++i) {
         const uint8_t* ent = nullptr; uint64_t id = 0;
         if (!mem_read(data + i, &ent, sizeof(ent)) || !ent || !mem_read(ent + 0x80, &id, sizeof(id)) || !is_session_range(id)) continue;
         for (uint32_t k = 0; k < g_swaps_n; ++k) {
-            if (g_swaps[k].clone != id) continue;
-            if (mem_write((uint8_t*)ent + 0x80, &g_swaps[k].original, sizeof(uint64_t))) {
+            if (g_swaps[k].clone != id) continue;                   // the FIRST pending note for this id: the oldest swap goes with the oldest entity
+            const uint64_t to = g_swaps[k].original;
+            if (mem_write((uint8_t*)ent + 0x80, &to, sizeof(uint64_t))) {
                 ++fixed;
-                log_line("CATSYNC", "house save: the House's cat entity %016llx is written as %016llx (the cat it was swapped into)", (unsigned long long)id, (unsigned long long)g_swaps[k].original);
+                swap_note_consume(k);
+                log_line("CATSYNC", "house save: the House's cat entity %016llx is written as %016llx (the cat it was swapped into)", (unsigned long long)id, (unsigned long long)to);
             }
             break;
         }
     }
     (void)fixed;
+    // TWO ENTITIES, ONE CAT (2026-10-11: the host's House saved 70000002 -> 710000cb twice, and came back with two identical Susus). Checked on every House save,
+    // after the ids are put right: two entities written with the same id are two copies of one cat on the next load.
+    uint64_t seen[512], twice_ids[8] = {}; uint32_t ns = 0, dup = 0, ntwice = 0;
+    char line[300] = {}; int w = 0;
+    for (uint32_t i = 0; i < count && ns < 512; ++i) {
+        const uint8_t* ent = nullptr; uint64_t id = 0;
+        if (!mem_read(data + i, &ent, sizeof(ent)) || !ent || !mem_read(ent + 0x80, &id, sizeof(id)) || !id) continue;
+        bool twice = false;
+        for (uint32_t k = 0; k < ns && !twice; ++k) twice = seen[k] == id;
+        if (twice) { if (ntwice < 8) twice_ids[ntwice++] = id; ++dup; if (w >= 0 && (size_t)w < sizeof(line) - 24) w += _snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, " %llx", (unsigned long long)id); }
+        else seen[ns++] = id;
+    }
+    if (dup) {
+        log_line_lvl(LogLevel::Error, "CATSYNC", "!! house save: %u House cat entit(ies) carry an id another entity already has --%s -- the next load shows those cats twice", dup, line);
+        census_report_house_duplicates(dup, twice_ids, ntwice);
+    }
 }
 
 unsigned catsync_merge_session_cats(const char* why) {
@@ -1611,6 +1865,7 @@ unsigned catsync_relocate_squatters(const char* why) {
                 continue;
             }
             swap_note(id, target);
+            pedigree_move(registry, id, target);                                           // its parents go with it, its children follow it
             const uint64_t retired = 0;
             mem_write((uint8_t*)adopted + kCatData_Flags, &retired, sizeof(retired));     // `adopted` is now the object registered under the reserved id
             if (moved < 16) { from_id[moved] = id; to_id[moved] = target; }
@@ -1872,6 +2127,18 @@ bool catsync_prepare_party_setup(SetupMsg& out, uint8_t owner_pos) {
         // already performs for a re-delivered identity -- instead of retrying
         // "already owned by another cat" forever while the client's export
         // never leaves and the host's chapter click stays held.
+        // A REAL CAT IS NEVER OVERWRITTEN HERE (2026-10-11). The replacement below is for a stale clone of this session (the merge retires those: flags 0).
+        // A cat that is alive and at home on a reserved id is a real cat an older build left there, which catsync_relocate_squatters (above) moves away;
+        // when that move failed, the old code overwrote it with the new selection and the player lost the cat. Now the setup refuses instead.
+        uint64_t existing_flags = 0;
+        if (existing && original.cats[i].id != id && mem_read((uint8_t*)existing + kCatData_Flags, &existing_flags, sizeof(existing_flags)) &&
+            (existing_flags & 0x1) && !(existing_flags & kCatFlag_OnAdventure)) {
+            log_line_lvl(LogLevel::Error, "SETUP", "!! reserved session cat id %016llx holds a REAL cat at home (flags %llx) that could not be moved away -- not overwritten; the setup stops here",
+                         (unsigned long long)id, (unsigned long long)existing_flags);
+            room_say_reserved_real();
+            for (uint8_t j = 0; j < original.count; ++j) free(original.cats[j].data);
+            return false;
+        }
         if (existing && original.cats[i].id != id) {
             if (!reset_cat(existing) ||
                 !catsync_deserialize_into(existing, original.cats[i].data,
@@ -2380,7 +2647,29 @@ static void drop_apply() {
     catsync_log_audit("a player left the room, on the map");
 }
 
+// THE GAME'S ID COUNTER, KEPT OUT OF THE CLONE RANGE (2026-10-05). It was put back only when a run was merged or a clone adopted, and the game made a cat in between -- the day turning at the departure box
+// brought a kitten whose id was 0x71000013 (counter 0x71000012 after a settlement that did not move it). Here it is looked at about once a second, wherever this peer is, and moved back to the highest
+// ordinary id the moment it is inside the range. Cheap when it is not: one read.
+static void counter_tick() {
+    static ULONGLONG s_next = 0, s_logged = 0;
+    const ULONGLONG t = GetTickCount64();
+    if (t < s_next) return;
+    s_next = t + 1000;
+    ensure_state();
+    if (!g.on || !g.id_counter || !g.director_slot || *g.id_counter < 0x70000000ull) return;
+    const uint8_t* dir = nullptr;
+    const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return;
+    const uint64_t before = *g.id_counter;
+    repair_id_counter(registry);
+    if (*g.id_counter == before && t - s_logged > 30000) {
+        s_logged = t;
+        log_line_lvl(LogLevel::Warn, "CATSYNC", "!! the cat id counter is %llx (inside the clone range) and could not be put back: no ordinary cat id was found in the registry", (unsigned long long)before);
+    }
+}
+
 void catsync_leave_tick() {
+    counter_tick();
     if (!net_active()) { s_seen_n = 0; s_dropped_any = false; s_drop_mask = 0; }     // no session: the next one starts with a clean membership
     if (net_active() && net_peer_count() >= 2) { members_watch(); drop_apply(); return; }
     if (!s_leave_pending) { if (net_peer_count() < 2) alone_check(); return; }
@@ -2672,10 +2961,14 @@ bool catsync_apply_snapshot(const CatDataMsg& m, const char* when, bool allow_cr
     // is live then, and a mid-run update keeps its object as it is.
     const bool rebuild = !created && when && strcmp(when, "all-player setup exchange") == 0 &&
                          m.id >= 0x70000000ull && m.id < 0x80000000ull;
+    // (2026-10-11 review: no "real cat" guard here. An image only ever arrives for the SENDER's id range, so the object it lands on is that player's copy --
+    // a copy the game had brought back to life would have been refused and the next setup exchange could not start. This player's own cats in that range
+    // are moved away before the setup by catsync_relocate_squatters, which no longer fails.)
     if (rebuild) {
         if (!reset_cat(cat) || !mem_write((uint8_t*)cat + kCatData_SaveId, &m.id, sizeof(m.id))) return false;
     }
     bool ok = catsync_deserialize_into(cat, m.data, m.size);
+    if (ok) normalize_equipment(cat, m.id);
     uint64_t actual_hash = 0;
     if (ok) {
         uint8_t* actual = nullptr;

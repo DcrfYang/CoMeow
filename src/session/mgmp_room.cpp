@@ -615,6 +615,36 @@ void room_sync_trouble(const char* what) {
     push_notice(tr(Tx::R_SYNC_TROUBLE));
 }
 
+void room_say_recovery_host(const char* name) {
+    char text[sizeof(g.notice[0])];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_RECOVERY_HOST), name ? name : "?", name ? name : "?");
+    push_notice(text);
+}
+
+void room_say_reserved_real() {
+    static ULONGLONG last = 0;                       // the setup retries every tick: once a minute is enough
+    const ULONGLONG now = GetTickCount64();
+    if (last && now - last < 60000) return;
+    last = now;
+    push_notice(tr(Tx::R_RESERVED_REAL));
+}
+
+void room_say_cat_census(unsigned lost, const char* lost_names, unsigned duplicated, const char* dup_names) {
+    char text[sizeof(g.notice[0])];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_CAT_CENSUS), lost, lost_names ? lost_names : "-", duplicated, dup_names ? dup_names : "-");
+    push_notice(text);
+}
+
+bool room_peer_name(uint8_t id, char* out, size_t cap) {
+    if (!out || !cap) return false;
+    const char* name = nullptr;
+    if (id == net_self()) name = signal_name();
+    else if (id < kMaxPeers && g.have_name[id]) name = g.name[id];
+    if (!name || !name[0]) { strncpy_s(out, cap, "P?", _TRUNCATE); return false; }
+    strncpy_s(out, cap, name, _TRUNCATE);
+    return true;
+}
+
 bool room_notice(char* out, size_t cap) {
     if (!g.notices) return false;
     strncpy_s(out, cap, g.notice[0], _TRUNCATE);

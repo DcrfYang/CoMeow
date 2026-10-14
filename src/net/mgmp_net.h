@@ -78,7 +78,9 @@ struct NetMsg {
     PropsMsg     props;       // a chunk of the host's save-property table (proto 79): flat
     RnglMsg      rngl;        // one action's ledger of draws on the shared stream (proto 80): flat
     ChatMsg      chat;        // a line of text one player typed (proto 81): flat
+    DrawMsg      draw;        // a piece of a player's drawing over the map or the battle (proto 87): flat
     SettingMsg   setting;     // the host's combat speed (proto 82): flat
+    EquipMsg     equip;       // the consumable a backpack auto-equipped on its owner's peer (proto 85): flat
     DeepMsg      deep;        // one turn's per-unit digest of derived values (proto 80): flat
     NodeHashMsg  nodehash;
     CatDigestMsg catdigest;  // per-cat hash digest, see MSG_CATDIGEST
@@ -150,13 +152,20 @@ uint8_t net_self();
 // Members of the session, host included. 0 before the first PEERS.
 uint8_t net_peer_count();
 
-// This peer's INDEX in the sorted membership list. Differs from its id once
+// This peer's INDEX in the membership list. Differs from its id once
 // anyone has disconnected, and it is the index -- never the id -- that the
 // control split is computed from.
 uint8_t net_peer_pos();
 
-// Copy the sorted member ids out. False before the first PEERS.
+// Copy the member ids out, in that same order. False before the first PEERS.
 bool net_peer_ids(uint8_t* out, uint8_t cap);
+
+// THE SEAT ORDER (proto 86, 2026-10-10). The membership list is ordered by the players, not by when they connected: the host first, then the
+// others in the order the save selection put them (mgmp_checkpoint's configure_host: by each player's persistent id, the Steam id where there is
+// one). A position is what a session cat's id, a cat's owner note and the recovery journal's name are made of, so with the connection order a
+// room whose two clients came back the other way round held the run and could not read it. Members the order does not name (someone who
+// connected after it was set) follow it in connection order. `ids` must start with the host. Cleared with the session.
+void net_set_seat_order(const uint8_t* ids, uint8_t n);
 
 bool net_send_hello(const Hello& h);
 bool net_send_welcome(const Welcome& w);
@@ -242,6 +251,9 @@ bool net_send_board_to(uint8_t peer, const BoardMsg& m);
 // come through the frame queue): true once every chunk is in.
 // The host's board for one TURN boundary of a battle (the last few are kept): true once every chunk of it is in.
 bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out);
+// Forgets what the host sent for battles that are over -- the boards, the rolls and the level box. Called when a save is loaded: a node entered again keeps its battle id, and a stale board of turn 0 would
+// otherwise be applied before the host's new one arrives.
+void net_clear_battle_caches();
 // The host's weather names that came with that level (same mailbox): true when the level message for `node_id` has arrived.
 bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n);
 
@@ -255,7 +267,9 @@ bool net_send_uqd(const UqdMsg& m);
 bool net_send_props(const PropsMsg& m);
 bool net_send_rngl(const RnglMsg& m);
 bool net_send_chat(const ChatMsg& m);
+bool net_send_draw(const DrawMsg& m);
 bool net_send_setting(const SettingMsg& m);
+bool net_send_equip(const EquipMsg& m);
 bool net_send_deep(const DeepMsg& m);
 bool net_send_halt(const HaltMsg& h);
 bool net_send_refuse(const char* reason);

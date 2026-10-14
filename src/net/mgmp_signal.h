@@ -59,6 +59,7 @@ struct SignalRoom {
     uint16_t players  = 0;
     uint16_t cap      = 0;
     bool     pw       = false;   // the room has a password (the list shows a padlock)
+    bool     locked   = false;   // its players have started: listed, cannot be joined
 };
 
 // One member of the room this peer is in.

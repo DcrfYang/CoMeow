@@ -17,6 +17,7 @@
 #include "mgmp_follow.h"
 #include "mgmp_unlocks.h"
 #include "mgmp_chat.h"
+#include "mgmp_draw.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_page.h"
@@ -682,6 +683,10 @@ void session_update() {
 
             case MSG_CHAT:
                 chat_on_message(m.from, m.chat);
+                break;
+
+            case MSG_DRAW:
+                draw_on_message(m.from, m.draw);
                 break;
 
             case MSG_SETTING:

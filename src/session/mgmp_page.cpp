@@ -11,6 +11,7 @@
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
 #include "mgmp_setup.h"
+#include "mgmp_storage_diag.h"
 
 namespace mgmp {
 namespace {
@@ -32,6 +33,10 @@ constexpr ULONGLONG kHeartbeatMs = 2000;
 struct Seen { char name[40]; ULONGLONG ms; };
 Seen      g_seen[96];
 int       g_seen_n = 0;
+// Every button name seen while a run is up, once each, for the log: what the drawing board's screen test (page_button_live) is built
+// on is the game's button names, and the first test after a change has to be able to say which ones a screen really has.
+char      g_logged[160][40];
+int       g_logged_n = 0;
 
 PageState g_self     = PageState::Unknown;
 PageState g_last_sent = PageState::Unknown;
@@ -137,16 +142,33 @@ void page_on_button(void* button) {
     char name[64];
     if (!mem_read_std_string((const uint8_t*)button + kBtn_Name, name, sizeof(name))) return;
     if (!name[0]) return;
+    if (g_self == PageState::InGame && g_logged_n < 160) {
+        bool seen = false;
+        for (int i = 0; i < g_logged_n && !seen; ++i) seen = strcmp(g_logged[i], name) == 0;
+        if (!seen) { strncpy_s(g_logged[g_logged_n++], name, _TRUNCATE); log_line("PAGE", "in a run, button '%s' is up", name); }
+    }
     // Only the names this module can ask about are kept: the detour runs for every
-    // button in the game, and the table is bounded.
+    // button in the game, and the table is bounded. The second line is the drawing board's: the map's own buttons, and the
+    // screens that cover it (an event, a shop, the pause menu) or replace it (a battle).
     if (!starts(name, "InventoryButton_") && !starts(name, "EquippedButton_") &&
-        !starts(name, "CatSelector_") && !starts(name, "Button_LowerDifficulty"))
+        !starts(name, "CatSelector_") && !starts(name, "Button_LowerDifficulty") &&
+        !starts(name, "Map_") && !starts(name, "MapNode_") && !starts(name, "Event_") && !starts(name, "Shop_") &&
+        !starts(name, "Combat_") && !starts(name, "Button_PauseMenu_"))
         return;
     note(name, GetTickCount64());
 }
 
+bool page_button_live(const char* prefix) { return prefix && live_prefix(prefix); }
+
+bool page_button_ever(const char* prefix) {
+    if (!prefix) return false;
+    for (int i = 0; i < g_seen_n; ++i) if (starts(g_seen[i].name, prefix)) return true;
+    return false;
+}
+
 void page_reset() {
     g_seen_n = 0;
+    g_logged_n = 0;
     g_self = PageState::Unknown;
     g_last_sent = PageState::Unknown;
     g_last_send = 0;
@@ -189,6 +211,7 @@ void page_tick() {
         if (now != PageState::Unknown)
             log_line("PAGE", "this peer is on '%s'", page_name(now));
         g_self = now;
+        storage_diag_page((uint8_t)now);
     }
 
     if (!session_live()) return;

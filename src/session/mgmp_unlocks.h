@@ -35,7 +35,7 @@ void unlocks_override_clear();
 bool unlocks_override_active();
 // The property-getter detour's question, for `key` whose own answer was `local`: true with the value to return when the key is one an override answers --
 // a mapflag_* while a chapter map is generated, or one of the properties the random events read while a client follows the host through an event.
-bool unlocks_override_lookup(const char* key, int64_t local, int64_t& value);
+bool unlocks_override_lookup(const char* key, int64_t local, int64_t fallback, int64_t& value);   // fallback: the getter's own default (a key the host's save has no row for)
 
 // ---- THE HOST'S UNLOCK LISTS DECIDE HOW A BATTLE IS BUILT --------------------------------------------------------------------------------------
 //
@@ -71,6 +71,10 @@ void unlocks_level_screen_opens();
 // room that has been told one); the HOST'S call also publishes its value when it changed. False for any other key.
 bool settings_override(const char* key, float own, float& out);
 void settings_on_message(uint8_t from, const SettingMsg& m);
+// The combat speed this game runs a room's battles at, for the panel: the host's own setting as its game last read it, or on a client the
+// host's value it was told. False while it is not known yet (the game reads it only in a battle). settings_room_left forgets the host's.
+bool settings_room_speed(float& out);
+void settings_room_left();
 // THE UNLOCK-QUERY RECORD (both peers, every battle): see mgmp_unlocks.cpp. `local` is what this save says, `answer` what the game was told.
 void unlockq_query(UnlockList list, const char* name, bool local, bool answer);
 void unlockq_prop(const char* key, int64_t local, int64_t answer);
@@ -85,6 +89,13 @@ void unlocks_tick();
 // The detours' answer for a check made inside the window: `local` is what this save said. Returns the HOST's answer for a name on a blacklist, and `local`
 // for everything else (and when no snapshot has arrived). Every answer that differs from this save's is logged.
 bool unlocks_window_answer(UnlockList list, const char* name, bool local);
+// WHOSE UNLOCK LIST ANSWERED (UNLOCKSRC lines, read-only; see mgmp_unlocks.cpp). In a room every check and class-list request is counted per screen and logged when the screen changes.
+// unlocksrc_context names the screen for the next 1.5 s (the level-up screen marks itself every frame); unlocksrc_tick flushes a segment after a quiet second.
+void unlocksrc_note(UnlockList list, const char* name, bool local, bool answer, bool from_host);
+void unlocksrc_classes(bool from_host);
+void unlocksrc_context(const char* what);
+bool unlocksrc_wanted();
+void unlocksrc_tick();
 
 // The battle's party sort (sub_140364760), called by its hook before (sorted = false) and after the game sorts: both peers log the order and
 // every party cat's stats with the inputs they come from; then every peer puts the party into one canonical order -- speed, highest first,
@@ -114,10 +125,16 @@ void unlocks_build_enemies_begin();
 // An event outcome is about to draw from a `random_pool` (T_RandomPool): in a room the shared stream is set from the node's seed and the number of draws made on this
 // node, so both peers pick -- and roll the entry's own numbers -- from the same state.
 void unlocks_event_roll();
+// True between the battle build's start and its end (the window unlocks_build_stage_end works in); false for a mid-battle spawner.
+bool unlocks_in_build();
 // The call that picks an event's SUBJECT cat (`cat_choice random` ...): `vec` = the candidate vector (count at +4, element pointers at +8), `pick` = the game's own "random element"
 // helper. In a room the candidates are sorted by cat id and the helper's draw indexes THAT list, so every peer names the same cat whatever order its own lists are in. False (the
 // caller then runs the original) outside a room or when the vector does not read as cats.
 bool unlocks_event_subject(void* vec, void* stream, void* pick, void** out);
+// The bounty hunter's target (kRet_BountyOthers / kRet_BountyFaction1): the candidates (Character*) are sorted by their tile -- the same on every peer, unlike their addresses -- and one is drawn
+// from a stream of its own, seeded from the battle id, so neither the order of the board's list nor what the hunter's load drew before it can change the pick. The shared stream is not touched.
+// False (the game picks as it would) outside a room or when a candidate cannot be read.
+bool unlocks_bounty_target(void* vec, void* pick, bool faction1, void** out);
 // The game is writing an int save property (T_PropSetInt; `name` = the std::string it passes, `value` = what it stores). Inside an event window the value becomes what the property reads as.
 void unlocks_property_set(const void* name, int value);
 

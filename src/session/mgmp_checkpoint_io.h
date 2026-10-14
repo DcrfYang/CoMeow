@@ -4,7 +4,13 @@
 #include <vector>
 namespace mgmp { namespace checkpoint_io {
 using Bytes = std::vector<uint8_t>;
-bool read(const std::wstring& path, Bytes& out, uint32_t limit = 5u << 20);
+// THE SIZE OF A SAVE ON THIS MACHINE (2026-10-10): snapshots, journal entries, backups, restores. Not the wire's kMaxSaveBytes (4 MiB, a bound on what a peer may make
+// us allocate): a long-played campaign save passes 4 MiB -- YUEMO's steamcampaign01.sav did, and with the wire bound here every snapshot of it failed ("the copy could
+// not be read back" right after a backup that passed its integrity check), the room was held at the first node on 2026-10-04, and the player moved to an older save.
+// No save travels whole with kLocalSetup, so the local bound only has to stop a runaway file.
+constexpr uint32_t kMaxLocalSaveBytes = 64u << 20;
+// The default fits a journal entry: a whole save plus its certificate and notes.
+bool read(const std::wstring& path, Bytes& out, uint32_t limit = kMaxLocalSaveBytes + (1u << 20));
 bool atomic_write(const std::wstring& path, const Bytes& bytes);
 bool snapshot(const std::wstring& source, Bytes& out);
 // What the last snapshot() did when it failed, or how it succeeded if it had to take the file as it is (empty after a plain backup). For a caller's log line.
@@ -12,6 +18,9 @@ const char* snapshot_why();
 // Whether a file is a SQLite database the game can be given: it has the SQLite header and opens and answers a query -- WITHOUT sqlite's full integrity check, which snapshot() applies and which a save the game
 // itself loads happily can still fail. Fills `out` with the bytes. For restoring a backup, where refusing a save the game would have opened is worse than handing it over.
 bool loadable(const std::wstring& source, Bytes& out);
+// loadable() AND sqlite's quick_check. For MAKING a backup when snapshot() failed: a new backup is only worth keeping when it is sound, while an
+// old one is still handed over by loadable() (2026-10-10: 0.1.2 put the check into loadable() itself, which also refused existing backups).
+bool verified(const std::wstring& source, Bytes& out);
 bool in_run(const std::wstring& source, bool& running);
 // True when this save's adventure has already ENTERED the map: files.trollengine_state's event count is
 // nonzero, OR properties.adventure_started is 1 (the count stays 0 until the first node resolves, so on

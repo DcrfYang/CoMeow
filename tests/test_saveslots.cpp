@@ -242,6 +242,29 @@ int main() {
         }
     }
 
+    printf("-- a slot that fails sqlite's integrity check but opens is kept as it is (2026-10-12 review) --\n");
+    {
+        const std::wstring f = g_root + L"\\" + kGameFile[2];
+        Bytes good; CHECK(checkpoint_io::read(f, good, 64u << 20));
+        CHECK(good.size() >= 100);
+        uint32_t page = (uint32_t(good[16]) << 8) | good[17]; if (page == 1) page = 65536;
+        CHECK(good.size() >= 2 * (size_t)page);
+        Bytes bad = good; bad[page] = 0;                                  // page 2 (a table's root) is no b-tree page any more; the header and page 1 are intact
+        CHECK(checkpoint_io::atomic_write(f, bad));
+        Bytes probe; CHECK(!checkpoint_io::verified(f, probe) && checkpoint_io::loadable(f, probe));
+        CHECK(saveslots_save(4, "damaged third slot"));                  // used to refuse the whole backup
+        saveslots_refresh();
+        CHECK(saveslots_get(4).used && saveslots_get(4).slot[2].present);
+        const std::wstring kept = g_root + L"\\mgmp_saveslots\\slot_05\\" + kGameFile[2];
+        Bytes got; CHECK(checkpoint_io::read(kept, got, 64u << 20) && got == bad);
+        CHECK(saveslots_auto_push());                                     // and the auto-save queue goes on
+        printf("-- a slot that is no database at all still refuses the backup --\n");
+        put(f, "this is not a database");
+        CHECK(!saveslots_save(5, "junk third slot"));
+        saveslots_refresh(); CHECK(!saveslots_get(5).used);
+        CHECK(checkpoint_io::atomic_write(f, good));
+    }
+
     printf("saveslots: %u checks passed\n", checks);
     return 0;
 }

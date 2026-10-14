@@ -51,6 +51,8 @@ add_library(mgmp SHARED
     src/determinism/mgmp_ability.cpp
     src/determinism/mgmp_record.cpp
     src/determinism/mgmp_rng.cpp
+    src/determinism/mgmp_rngfix.cpp
+    src/determinism/mgmp_rngframe.cpp
     src/determinism/mgmp_replay.cpp
     src/net/mgmp_net.cpp
     src/net/mgmp_signal.cpp
@@ -74,6 +76,8 @@ add_library(mgmp SHARED
     src/session/mgmp_setup.cpp
     src/session/mgmp_unlocks.cpp
     src/session/mgmp_diag.cpp
+    src/session/mgmp_storage_diag.cpp
+    src/session/mgmp_draw.cpp
     src/session/mgmp_chat.cpp
     src/session/mgmp_leave.cpp
     src/session/mgmp_listprobe.cpp

@@ -24,12 +24,14 @@
 #include "mgmp_unlocks.h"
 #include "mgmp_diag.h"
 #include "mgmp_chat.h"
+#include "mgmp_draw.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_setup.h"
 #include "mgmp_leave.h"
 #include "mgmp_session.h"
+#include "mgmp_balance.h"   // balance_is_enemy_faction: the finish after the host's strikes only enemies
 #include "mgmp_ability.h"
 #include "mgmp_turnaction.h"
 #include "mgmp_config.h"
@@ -141,7 +143,57 @@ constexpr uintptr_t kChar_HP       = 0x4B0;
 constexpr uintptr_t kChar_Shield   = 0x4B4;
 constexpr uintptr_t kChar_MaxHP    = 0x4BC;
 constexpr uintptr_t kChar_Dead     = 0x4C2;
+constexpr uintptr_t kChar_KillReq  = 0x365;   // bool: the GON's `kill_required` (copied from +0x366 at load) -- the units the win test (0x140361020) and the next-wave test count
 constexpr uintptr_t kTObj_Tile     = 0x48;
+constexpr uintptr_t kChar_Faction  = 0x350;   // int32 x3 (+0x350/+0x354/+0x358): FactionConversion writes all three
+constexpr uintptr_t kChar_Mana     = 0xD18;   // int32: the unit's mana (sub_140114370, ManaGain, adds to it); an ability's cost is checked against it
+constexpr uintptr_t kChar_Carried  = 0xC4;    // int32: the slot in the director's queue of captured followers, -1 = none (CaptureFamiliar sets it)
+// The game's CaptureFamiliar on one unit (SEH: a function of its own, no C++ objects to unwind).
+static bool board_call_capture(uintptr_t fn, void* chr) {
+    __try { ((void(__fastcall*)(void*))fn)(chr); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// The game's own equip of a named item on a cat (SEH: a function of its own, no C++ objects). 1 = equipped, 0 = the game declined (the slot is not free), -1 = faulted.
+// THE OWNER'S ITEM STATE (proto 89, 2026-10-12 review). Item::make runs the item's init (0x1402E01D0), which reads `durability` into +0x48 (a ranged one
+// is DRAWN, 0x14094F270 on the shared stream: ViperBottle, Mushrooms), `aux` into +0x4C and `str_aux` into the std::string at +0x28 (its random_* forms
+// draw too). The copy made here is overwritten with the owner's values -- the item its owner equipped from the inventory, perhaps already used -- in the
+// slot that changed (`before`: the slots' ids before the equip), BEFORE items_changed recomputes the cat's abilities from them. The caller fences the
+// shared stream around this call.
+struct AeState { bool on = false; int32_t durability = -1, aux = 0; const char* str_aux = ""; };
+static int autoequip_call(void* chr, void* cd, const char* name, const uint64_t (&before)[5], const AeState& st, int& slot_out) {
+    slot_out = -1;
+    const uintptr_t mk = addr_of_call(C_ItemMake), eq = addr_of_call(C_EquipIfFree), changed = addr_of_call(C_CharItemsChanged);
+    const uintptr_t sctor = addr_of_call(C_StrFromCStr), sdtor = addr_of_call(C_GameStrDtor);
+    if (!mk || !eq || !changed || !sctor || !sdtor) return -2;
+    __try {
+        alignas(16) uint8_t str[32];
+        alignas(16) uint8_t item[0x60];
+        memset(str, 0, sizeof(str)); memset(item, 0, sizeof(item));
+        ((void* (__fastcall*)(void*, const char*))sctor)(str, name);
+        ((void* (__fastcall*)(void*, void*, void*))mk)(nullptr, item, str);       // takes the name by value: the callee frees it
+        const bool ok = ((bool (__fastcall*)(void*, void*, int))eq)(cd, item, 0);
+        ((void (__fastcall*)(void*))sdtor)(item + 0x08);                           // the item's two strings (the slot holds its own copy)
+        ((void (__fastcall*)(void*))sdtor)(item + 0x28);
+        if (ok) {
+            for (int k = 0; k < 5 && slot_out < 0; ++k)
+                if (*(const uint64_t*)((const uint8_t*)cd + kCatData_Items + k * 0x60) != before[k]) slot_out = k;
+            if (slot_out >= 0 && st.on) {
+                uint8_t* s = (uint8_t*)cd + kCatData_Items + slot_out * 0x60;
+                *(int32_t*)(s + 0x48) = st.durability;
+                *(int32_t*)(s + 0x4C) = st.aux;
+                uint8_t* sa = s + 0x28;                                                // std::string {buf/ptr, size, cap}
+                const uint64_t size = *(const uint64_t*)(sa + 0x10), cap = *(const uint64_t*)(sa + 0x18);
+                const char* have = cap > 15 ? *(const char* const*)sa : (const char*)sa;
+                const size_t want = strlen(st.str_aux);
+                if (size != want || memcmp(have, st.str_aux, want) != 0) {
+                    ((void (__fastcall*)(void*))sdtor)(sa);                            // released the game's way, then built again in place
+                    ((void* (__fastcall*)(void*, const char*))sctor)(sa, st.str_aux);
+                }
+            }
+            ((void (__fastcall*)(void*))changed)(chr);
+        }
+        return ok ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 constexpr uintptr_t kTObj_Owner    = 0x98;
 
 // glaiel::Character::get_affecting_elements(Character*, ElementList* out).
@@ -345,6 +397,8 @@ struct State {
     // This battle was halted (it stays true after the halt is lifted at the fight's end, for the summary), and the battle whose halt was already lifted (a late HALT message of it is stale).
     bool     halted_in_battle = false;
     uint64_t halt_cleared_for = 0;
+    uint64_t host_over_battle = 0;   // CLIENT: the battle the host's fight is known to be over in (lockstep_note_host_fight_over), and since when
+    ULONGLONG host_over_at = 0;
     LockstepStats stats;
 
     // --- the per-turn state trace (net_state_trace) ---
@@ -3364,8 +3418,16 @@ void lockstep_pump() {
                 chat_on_message(m.from, m.chat);
                 break;
 
+            case MSG_DRAW:
+                draw_on_message(m.from, m.draw);
+                break;
+
             case MSG_SETTING:
                 settings_on_message(m.from, m.setting);
+                break;
+
+            case MSG_EQUIP:
+                lockstep_autoequip_on_message(m.from, m.equip);
                 break;
 
             case MSG_DEEP:
@@ -3759,8 +3821,22 @@ bool lockstep_fill_choice(void* brain, void* out) {
 // did. Everything below -- the slot resolution, the GON cross-check, the halt
 // on a mismatch -- has to be identical for both, because a replayed decision is
 // exactly as authoritative as a live one.
+static ActionMsg   g_remote_wait{};           // the last remote decision handed to the brain, until the game applies it
+static bool        g_remote_wait_on = false;
+static const void* g_remote_wait_actor = nullptr;
 static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     const uint8_t cat = msg.actor;
+    if (g_remote_wait_on && g_remote_wait_actor == actor) {
+        // THE LAST ONE NEVER REACHED THE GAME'S QUEUE (2026-10-06): the brain was asked again before the previous remote decision was applied -- the game here refused it (a cost it cannot pay, a
+        // target its rules reject) and the owner's turn goes on without it on this peer. Said with what decides such a refusal, so the log names the difference.
+        int32_t mn = 0, hp = 0, tile[2] = {}, face[2] = {};
+        mem_read((const uint8_t*)actor + kChar_Mana, &mn, 4); mem_read((const uint8_t*)actor + kChar_HP, &hp, 4); mem_read((const uint8_t*)actor + kChar_Facing, face, 8);
+        const void* tobj = nullptr;
+        if (mem_read((const uint8_t*)actor + kChar_TObj, &tobj, sizeof(tobj)) && tobj) mem_read((const uint8_t*)tobj + kTObj_Tile, tile, 8);
+        log_line_lvl(LogLevel::Error, "LOCKSTEP", "!! the game here REFUSED the owner's action: cat %u '%s' slot %u:%u target (%d,%d) -- this peer: mana %d hp %d tile (%d,%d) facing (%d,%d). The owner played it; this peer's battle goes on without it",
+                     (unsigned)g_remote_wait.actor, g_remote_wait.gon[0] ? g_remote_wait.gon : "-", g_remote_wait.slot_kind, g_remote_wait.slot_index, g_remote_wait.tx, g_remote_wait.ty, mn, hp, tile[0], tile[1], face[0], face[1]);
+        g_remote_wait_on = false;
+    }
 
     TurnAction a{};
     memset(&a, 0, sizeof(a));
@@ -3822,6 +3898,7 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
 
     mem_write(out, &a, sizeof(a));
     ++g.stats.applied;
+    g_remote_wait = msg; g_remote_wait_on = true; g_remote_wait_actor = actor;   // lockstep_on_applied clears it; asked again first = the game here refused it
     log_line("LOCKSTEP", "<- cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
              (unsigned)cat, msg.type == TA_EndTurn ? "endturn" : "ability",
              msg.slot_kind, msg.slot_index, msg.tx, msg.ty,
@@ -3830,8 +3907,150 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
 
 void lockstep_reseed_action(const void* actor);     // below, with lockstep_reseed
 
+// ============================================================================================================================================
+// THE BACKPACK'S AUTO-EQUIP (proto 85, 2026-10-06, battle 7b90e718: the chapter's last boss halted at turn 2 -- "cat 20 slot 4:5 holds 'cm_LckBuff', peer sent 'cm_SpdBuff'").
+// The host's thief ate its Clover; its Backpack (passive AutoEquipConsumables, sub_1408C3960) then put a consumable from the PLAYER'S INVENTORY into the free trinket slot, picked with a draw from the shared
+// stream. Each peer has its own inventory: the host's held an Upper, the client's another Clover -- the two cats left with different abilities. Owner-authoritative now, like the cat's actions.
+// ============================================================================================================================================
+namespace {
+constexpr uintptr_t kAE_Pending = 0xC8;    // byte: the passive has something to do (cleared by the game's function)
+constexpr uintptr_t kAE_Char    = 0x38;    // Character*
+struct AeHeld { bool on = false; EquipMsg msg; };          // the owner's message, item state and all (proto 89)
+struct AeWait { bool on = false; uint64_t battle = 0; uint8_t cat = 0; void* passive = nullptr; void* chr = nullptr; };
+AeHeld g_ae_held[16];
+AeWait g_ae_wait[8];
+
+bool ae_slot_name(const uint8_t* cd, unsigned k, char (&out)[48], uint64_t& id) {
+    out[0] = 0; id = 0;
+    const uint8_t* slot = cd + kCatData_Items + k * 0x60;
+    if (!mem_read(slot, &id, 8)) return false;
+    return mem_read_std_string(slot + 8, out, sizeof(out));
+}
+void ae_apply(void* passive, void* chr, uint8_t cat, const EquipMsg& m) {
+    const uint8_t zero = 0;
+    mem_write((uint8_t*)passive + kAE_Pending, &zero, 1);                   // what the game's function does first
+    char item[48] = {};
+    memcpy(item, m.item, sizeof(item)); item[sizeof(item) - 1] = 0;
+    char str_aux[48] = {};
+    memcpy(str_aux, m.str_aux, sizeof(str_aux)); str_aux[sizeof(str_aux) - 1] = 0;
+    if (!item[0]) { log_line("EQUIP", "cat %u: the owner's backpack equipped nothing -- nothing equipped here either", (unsigned)cat); return; }
+    void* cd = nullptr;
+    if (!mem_read((const uint8_t*)chr + kChar_CatData, &cd, sizeof(cd)) || !cd) { log_line_lvl(LogLevel::Error, "EQUIP", "!! cat %u: no cat data -- '%s' NOT equipped", (unsigned)cat, item); return; }
+    uint64_t before[5] = {};
+    char name[48] = {};
+    for (unsigned k = 0; k < 5; ++k) ae_slot_name((const uint8_t*)cd, k, name, before[k]);
+    AeState st;
+    st.on = m.has_state != 0; st.durability = m.durability; st.aux = m.aux; st.str_aux = str_aux;
+    // THE SHARED STREAM IS FENCED (2026-10-12 review): the item's init draws a ranged durability / a random str_aux from it, here alone and at the moment
+    // the owner's message landed (often mid-action) -- the owner's own equip is fenced the same way. The values drawn are overwritten with the owner's.
+    uint64_t* s = rng_global_stream();
+    uint64_t saved[4] = {};
+    const bool fence = s && mem_read(s, saved, sizeof(saved));
+    int slot = -1;
+    const int r = autoequip_call(chr, cd, item, before, st, slot);
+    if (fence) mem_write(s, saved, sizeof(saved));
+    if (r == 1) log_line("EQUIP", "cat %u: the owner's backpack equipped '%s' -- the same item equipped here in slot %d%s (durability %d aux %d str_aux '%s'; this player's inventory untouched)",
+                         (unsigned)cat, item, slot, st.on ? " with the owner's item state" : " (!! the owner could not read its item's state: the copy keeps its own)", m.durability, m.aux, str_aux);
+    else log_line_lvl(LogLevel::Error, "EQUIP", "!! cat %u: the owner's backpack equipped '%s' and it could NOT be equipped here (%s)", (unsigned)cat, item,
+                      r == 0 ? "the game declined: the slot is not free" : r == -1 ? "the game's equip FAULTED" : "the game's functions are not resolved");
+    if (r == 1 && st.on && slot < 0) log_line_lvl(LogLevel::Error, "EQUIP", "!! cat %u: '%s' was equipped but no slot changed id -- the owner's item state was NOT written", (unsigned)cat, item);
+}
+bool ae_take(uint64_t battle, uint8_t cat, EquipMsg& out) {
+    for (auto& h : g_ae_held) {
+        if (!h.on || h.msg.battle != battle || h.msg.cat != cat) continue;
+        out = h.msg;
+        h.on = false;
+        return true;
+    }
+    return false;
+}
+} // namespace
+
+void lockstep_autoequip(void* passive, void (__fastcall* native)(void*)) {
+    uint8_t pending = 0;
+    void* chr = nullptr;
+    if (!passive || !mem_read((const uint8_t*)passive + kAE_Pending, &pending, 1) || !pending ||
+        !mem_read((const uint8_t*)passive + kAE_Char, &chr, sizeof(chr)) || !chr || !g.active || !net_active() || net_peer_count() < 2) { native(passive); return; }
+    const uint8_t cat = cat_index_of(chr);
+    if (cat == kNoCat) { native(passive); return; }
+    const uint64_t battle = lockstep_battle_id();
+    Guard guard;
+    if (g.local_cat[cat]) {
+        // THE OWNER: the game's own pick, from this player's inventory -- with the shared stream put back afterwards, since no other peer draws here.
+        const uint8_t* cd = nullptr;
+        mem_read((const uint8_t*)chr + kChar_CatData, &cd, sizeof(cd));
+        uint64_t before[5] = {};
+        char name[48] = {};
+        if (cd) for (unsigned k = 0; k < 5; ++k) ae_slot_name(cd, k, name, before[k]);
+        uint64_t* s = rng_global_stream();
+        uint64_t saved[4] = {};
+        const bool fence = s && mem_read(s, saved, sizeof(saved));
+        native(passive);
+        if (fence) mem_write(s, saved, sizeof(saved));
+        EquipMsg m;
+        m.battle = battle; m.cat = cat;
+        if (cd) for (unsigned k = 0; k < 5; ++k) {
+            uint64_t id = 0;
+            if (ae_slot_name(cd, k, name, id) && id != before[k] && name[0]) {
+                memcpy(m.item, name, sizeof(m.item));
+                // the item's state goes with it (proto 89): the other peers write it over the copy they make by name
+                const uint8_t* slot = cd + kCatData_Items + k * 0x60;
+                m.has_state = mem_read(slot + 0x48, &m.durability, 4) && mem_read(slot + 0x4C, &m.aux, 4) &&
+                              mem_read_std_string(slot + 0x28, m.str_aux, sizeof(m.str_aux)) ? 1 : 0;
+                break;
+            }
+        }
+        const bool sent = net_send_equip(m);
+        log_line("EQUIP", "cat %u (this player's): the backpack equipped %s%s%s from this player's inventory (durability %d aux %d str_aux '%s'%s) -- %s (the shared stream put back)", (unsigned)cat,
+                 m.item[0] ? "'" : "", m.item[0] ? m.item : "nothing", m.item[0] ? "'" : "", m.durability, m.aux, m.str_aux, m.item[0] && !m.has_state ? ", !! unreadable" : "",
+                 sent ? "told the other players" : "!! NOT SENT");
+        return;
+    }
+    // ANOTHER PLAYER'S CAT: what its owner equipped, never this player's inventory. Not here yet: the pending flag stays and the message equips it when it lands.
+    EquipMsg held;
+    if (ae_take(battle, cat, held)) { ae_apply(passive, chr, cat, held); return; }
+    for (auto& w : g_ae_wait) if (w.on && w.battle == battle && w.cat == cat) { w.passive = passive; w.chr = chr; return; }
+    for (auto& w : g_ae_wait) {
+        if (w.on && w.battle == battle) continue;
+        w.on = true; w.battle = battle; w.cat = cat; w.passive = passive; w.chr = chr;
+        log_line("EQUIP", "cat %u (peer's): its backpack has a free slot to fill -- waiting for what its owner equipped (this player's inventory is not used)", (unsigned)cat);
+        return;
+    }
+}
+
+void lockstep_autoequip_on_message(uint8_t from, const EquipMsg& m) {
+    (void)from;
+    Guard guard;
+    const uint64_t battle = lockstep_battle_id();
+    if (m.battle != battle || m.cat >= kMaxCats || g.local_cat[m.cat]) {
+        log_line("EQUIP", "an auto-equip of cat %u for battle %016llx dropped (this battle %016llx%s)", (unsigned)m.cat, (unsigned long long)m.battle, (unsigned long long)battle,
+                 m.cat < kMaxCats && g.local_cat[m.cat] ? ", and the cat is this player's" : "");
+        return;
+    }
+    char item[48] = {};
+    memcpy(item, m.item, sizeof(item)); item[sizeof(item) - 1] = 0;
+    for (auto& w : g_ae_wait) {
+        if (!w.on || w.battle != battle || w.cat != m.cat) continue;
+        w.on = false;
+        uint8_t pending = 0;
+        void* chr = nullptr;
+        if (mem_read((const uint8_t*)w.passive + kAE_Pending, &pending, 1) && pending && mem_read((const uint8_t*)w.passive + kAE_Char, &chr, sizeof(chr)) && chr == w.chr) {
+            ae_apply(w.passive, w.chr, m.cat, m);
+            return;
+        }
+    }
+    for (auto& h : g_ae_held) {
+        if (h.on && h.msg.battle == battle) continue;
+        h.on = true; h.msg = m;
+        log_line("EQUIP", "cat %u: its owner's backpack equipped '%s' -- held until this peer's backpack asks", (unsigned)m.cat, item[0] ? item : "nothing");
+        return;
+    }
+    log_line_lvl(LogLevel::Error, "EQUIP", "!! cat %u: no room to hold the owner's auto-equip '%s'", (unsigned)m.cat, item);
+}
+
 void lockstep_on_applied(const void* action, const void* actor) {
     if (!g.active || !action) return;
+    g_remote_wait_on = false;
 
     TurnAction a{};
     if (!mem_read(action, &a, sizeof(a))) return;
@@ -4057,6 +4276,51 @@ uint32_t build_live_roster(const void* list, const void* out[], bool human[], ui
     return n;
 }
 
+// THE SOLO BATTLE PROBE (2026-10-11). A single-player run with the mod loaded reported a battle whose enemies were all gone on entry and that
+// ended at once in a level-up -- and its log held nothing about the battle's units, because every roster line here belongs to a session. This
+// reads the live character list (the same one debug-hit-all reads without a session) at the first two turns of each battle and names, per unit,
+// what the game's win test (0x140361020) looks at: kill_required (+0x365), the dead flag (+0x4C2) and the faction. The count at the end is the
+// one that decides: 0 kill_required enemies standing is a fight the game counts as won.
+void lockstep_solo_battle_probe(const void* actor) {
+    if (g.active && g.snapped) return;                         // a session has its own roster lines
+    static const void* s_tc = nullptr;
+    static uint32_t s_done = 0;
+    if (g.tc != s_tc) { s_tc = g.tc; s_done = 0; }
+    if (!g.tc || s_done >= 2) return;
+    ++s_done;
+    const void* roster[kMaxCats] = {};
+    bool human[kMaxCats] = {};
+    const uint32_t n = build_live_roster(resolve_char_list(g.tc), roster, human, kMaxCats);
+    log_line("SOLO", "battle probe (turn of %p, #%u): the live character list holds %u unit(s)", actor, s_done, n);
+    uint32_t enemies = 0, standing = 0, required = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* c = (const uint8_t*)roster[i];
+        int32_t fac = -1, hp = 0, maxhp = 0, shield = 0;
+        uint8_t dead = 0, kreq = 0;
+        mem_read(c + kChar_Faction, &fac, 4);
+        mem_read(c + kChar_HP, &hp, 4);
+        mem_read(c + kChar_MaxHP, &maxhp, 4);
+        mem_read(c + kChar_Shield, &shield, 4);
+        mem_read(c + kChar_Dead, &dead, 1);
+        mem_read(c + kChar_KillReq, &kreq, 1);
+        char type[64] = "?";
+        mem_read_std_string(c + 0x248, type, sizeof(type));
+        int32_t tile[2] = { -1, -1 };
+        const void* to = nullptr;
+        if (mem_read(c + kChar_TObj, &to, sizeof(to)) && to) mem_read((const uint8_t*)to + kTObj_Tile, tile, sizeof(tile));
+        char cls[96] = "?";
+        const void* brain = nullptr;
+        if (mem_read(c + kChar_Brain, &brain, sizeof(brain)) && brain) rtti_class_name(brain, cls, sizeof(cls));
+        const bool enemy = balance_is_enemy_faction(fac);
+        if (enemy) ++enemies;
+        if (enemy && kreq) { ++required; if (!dead) ++standing; }
+        log_line("SOLO", "  unit %2u %-30s faction %d%s hp %d/%d shield %d tile (%d,%d) dead %u kill_required %u brain=%s%s", i, type, fac, enemy ? "(enemy)" : "",
+                 hp, maxhp, shield, tile[0], tile[1], (unsigned)dead, (unsigned)kreq, cls, human[i] ? " [player]" : "");
+    }
+    log_line("SOLO", "battle probe: %u enemy-faction unit(s), %u of them kill_required, %u of those standing%s", enemies, required, standing,
+             standing ? "" : " -- NONE: the game counts this fight as won (or spawns the level's next wave)");
+}
+
 // ONE HP WRITE, TWO CALLERS (2026-09-22).
 //
 // This was the middle of lockstep_graze_enemy_on_tile, and extracting it is what makes the
@@ -4101,13 +4365,28 @@ bool debug_apply_hit(const void* chr, int32_t amount, int32_t tx, int32_t ty) {
     int32_t hp = 0, maxhp = 0;
     if (!mem_read((const uint8_t*)chr + kChar_HP, &hp, 4)) return false;
     if (!mem_read((const uint8_t*)chr + kChar_MaxHP, &maxhp, 4)) return false;
-    const int32_t after = (hp > amount) ? hp - amount : 0;
+
+    // THE SHIELD FIRST (2026-10-11: the bone worms and skeleshamblers, hp 0/0 and living on their shield, stood through every sweep). The
+    // game's per-frame death test (Character late_update, 0x1401084C1) kills a unit when hp <= 0 AND either +0x4B4 (shield) and +0x4B8 are
+    // both <= 0 or the flag +0x4CE is clear -- these units carry that flag, so hp 0 alone never killed them. The damage now goes where a
+    // hit's would: the shield, then +0x4B8, then hp. The same numbers on every peer (the broadcast hit runs this same function).
+    int32_t shield = 0, extra = 0;
+    mem_read((const uint8_t*)chr + kChar_Shield, &shield, 4);
+    mem_read((const uint8_t*)chr + kChar_Shield + 4, &extra, 4);
+    int32_t left = amount;
+    auto spend = [&](int32_t v) { if (v <= 0 || left <= 0) return v; const int32_t take = v < left ? v : left; left -= take; return v - take; };
+    const int32_t shield_after = spend(shield);
+    const int32_t extra_after = spend(extra);
+    const int32_t after = (hp > left) ? hp - left : (hp > 0 ? 0 : hp);
+    if (shield_after != shield && !mem_write((uint8_t*)chr + kChar_Shield, &shield_after, 4)) return false;
+    if (extra_after != extra && !mem_write((uint8_t*)chr + kChar_Shield + 4, &extra_after, 4)) return false;
     if (!mem_write((uint8_t*)chr + kChar_HP, &after, 4)) return false;
 
     log_line_lvl(LogLevel::Warn, "LOCKSTEP",
-                 "!! DEBUG HIT on request: enemy at tile (%d,%d), hp %d/%d -> %d. This EDITS"
+                 "!! DEBUG HIT on request: enemy at tile (%d,%d), hp %d/%d -> %d, shield %d -> %d%s. This EDITS"
                  " the battle; session callers broadcast the same hit to the peer. The game's own"
-                 " death handling is what kills it.", tx, ty, hp, maxhp, after);
+                 " death handling is what kills it.", tx, ty, hp, maxhp, after, shield, shield_after,
+                 extra != extra_after ? " (and +0x4B8 too)" : "");
     return true;
 }
 
@@ -4326,7 +4605,7 @@ int lockstep_debug_hit_all(int32_t amount) {
     // different fix. Measured that day: 34 live entries, 0 hits, and nothing in the log to
     // say whether the player test, the familiar test, the dead flag or the link check had
     // done it. These counters answer it in one run.
-    uint32_t n_human = 0, n_familiar = 0, n_dead = 0, n_unlinked = 0, n_notile = 0;
+    uint32_t n_human = 0, n_familiar = 0, n_dead = 0, n_unlinked = 0, n_notile = 0, n_optional = 0;
 
     for (uint32_t i = 0; i < n; ++i) {
         const void* chr = roster[i];
@@ -4336,6 +4615,11 @@ int lockstep_debug_hit_all(int32_t amount) {
         if (!mem_read((const uint8_t*)chr + kChar_Dead, &dead, 1) || dead)
             { ++n_dead; continue; }
         if (cat_is_familiar(chr)) { ++n_familiar; continue; }  // nor the run's familiars
+        // ONLY WHAT THE GAME REQUIRES TO BE KILLED (2026-10-11). The sweep used to hit every non-player unit: walls and rocks (STATIC OBJECT) and pickups
+        // took the 999 and stood on at hp 0 -- hit again by every later sweep -- because nothing kills them. The win test and the next-wave test count
+        // the kill_required units only, so those are what "kill all" means.
+        uint8_t kill_req = 0;
+        if (mem_read((const uint8_t*)chr + kChar_KillReq, &kill_req, 1) && !kill_req) { ++n_optional; continue; }
 
         // The tile, believed only when the TacticsObject points back at this
         // Character -- the same rule every other reader here applies, and for the
@@ -4364,14 +4648,15 @@ int lockstep_debug_hit_all(int32_t amount) {
                  "!! DEBUG HIT ALL: %d damage to every enemy on the field -- %d cat(s) hit"
                  " across %u roster entr(ies), each one broadcast so both peers write the"
                  " same numbers. %s Skipped: %u player cat(s), %u familiar(s), %u dead,"
-                 " %u unlinked (no TacticsObject, or it does not point back), %u whose"
-                 " tile would not read.",
+                 " %u not kill_required (walls, props, pickups), %u unlinked (no TacticsObject,"
+                 " or it does not point back), %u whose tile would not read. A level with a"
+                 " second wave spawns it the moment the last of these dies.",
                  amount, hits, n,
                  live ? "The roster was the LIVE character list, not a snapshot: a"
                         " single-player run has no snapshot to sweep."
                       : "Mid-battle arrivals were adopted first, which is what makes a"
                         " deathrattle's children hittable at all.",
-                 n_human, n_familiar, n_dead, n_unlinked, n_notile);
+                 n_human, n_familiar, n_dead, n_optional, n_unlinked, n_notile);
     return hits;
 }
 
@@ -4457,19 +4742,68 @@ void lockstep_on_debug_hit(uint8_t from, const DebugHitMsg& m) {
 // A HALTED BATTLE IS FINISHED BY STRIKING DOWN THE ENEMIES (see tune::kHaltAutoFinish). Each peer does it for itself: nothing is broadcast (the session is halted, and the two battles no longer agree anyway);
 // what both must reach is the same END -- the fight won -- and the game's own victory flow takes it from there. Every kHaltFinishEveryMs: adopt what appeared since (a deathrattle's children), then write
 // hp 0 to every enemy-side unit still alive (players' cats, their familiars and summons are never touched). Stops when the battle's character list is gone, which is the game leaving the fight.
+// THE HOST'S FIGHT IS OVER AND THIS ONE IS NOT (2026-10-06, battle a607be50): the client's own last shot killed the last enemy on the host, whose fight ended at once (its level-up came); the client
+// stayed in the battle, every turn hash having agreed. The same finish as a halted battle's ends it here once the host's has been over for kHostOverGraceMs (a projectile may still be in flight), and
+// the log names every unit still standing -- the evidence of what this peer's game still waited for.
+constexpr ULONGLONG kHostOverGraceMs = 8000;
+void lockstep_note_host_fight_over(uint64_t node) {
+    Guard guard;
+    if (!g.active || net_role() == NetRole::Host || !node || node != g.battles.current || g.host_over_battle == node) return;
+    g.host_over_battle = node; g.host_over_at = GetTickCount64();
+    log_line("LOCKSTEP", "the host's fight of battle %016llx is over (its level-up arrived)%s", (unsigned long long)node,
+             lockstep_fight_up() ? " -- this peer's is still up: it is finished here if it has not ended in a few seconds" : "");
+}
+void lockstep_log_standing(const char* why) {
+    if (!g.active || !g.snapped) return;
+    if (!lockstep_fight_up()) { log_line("LOCKSTEP", "standing units (%s): the battle's character list is already gone -- not read", why); return; }   // its units may be freed
+    unsigned n = 0;
+    for (uint32_t i = 0; i < g.cat_count; ++i) {
+        const void* chr = g.cats[i];
+        if (!chr || g.human_cat[i]) continue;
+        uint8_t dead = 0; int32_t hp = 0;
+        if (!mem_read((const uint8_t*)chr + kChar_Dead, &dead, 1) || dead || !mem_read((const uint8_t*)chr + kChar_HP, &hp, 4) || hp <= 0) continue;
+        int32_t fac[3] = {}, fam = 0, cf4 = 0;
+        mem_read((const uint8_t*)chr + 0x350, fac, sizeof(fac));
+        mem_read((const uint8_t*)chr + 0xC4, &fam, 4);
+        mem_read((const uint8_t*)chr + 0xCF4, &cf4, 4);
+        if (fac[0] == 0 && fac[1] == 0 && fac[2] == 0) continue;          // scenery (faction 0): not worth a line
+        CatState st{};
+        read_cat_state(chr, st, false);
+        char kind[64] = {};
+        unit_definition_name(chr, kind, sizeof(kind));
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "   standing (%s): unit %u '%s' hp %d tile (%d,%d) faction %d/%d/%d familiar-slot %d cf4 %d%s", why, i, kind, hp, st.tx, st.ty,
+                     fac[0], fac[1], fac[2], fam, cf4, debug_is_enemy(chr) ? " (counted as an enemy by the mod)" : "");
+        ++n;
+    }
+    log_line("LOCKSTEP", "%u non-player unit(s) with a faction still standing in battle %016llx (%s)", n, (unsigned long long)g.battles.current, why);
+}
+static bool host_over_due() {
+    return g.host_over_battle && g.host_over_battle == g.battles.current && GetTickCount64() - g.host_over_at >= kHostOverGraceMs;
+}
+
 static void halt_finish_pump() {
-    if (!tune::kHaltAutoFinish || !g.halted || !g.snapped || g.battles.current == kNoBattle) return;
+    const bool host_over = !g.halted && host_over_due();
+    if (!tune::kHaltAutoFinish || !(g.halted || host_over) || !g.snapped || g.battles.current == kNoBattle) return;
     static uint64_t s_battle = 0;
     static ULONGLONG s_next = 0;
     static uint32_t s_sweeps = 0, s_hit_total = 0;
     static bool s_done = false;
     const ULONGLONG now = GetTickCount64();
-    if (s_battle != g.battles.current) { s_battle = g.battles.current; s_next = now + tune::kHaltFinishEveryMs; s_sweeps = s_hit_total = 0; s_done = false; log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH armed for battle %016llx: every %u ms every enemy still standing is struck down, until the battle is won", (unsigned long long)s_battle, (unsigned)tune::kHaltFinishEveryMs); }
+    if (s_battle != g.battles.current) {
+        s_battle = g.battles.current; s_next = now + (host_over ? 0 : tune::kHaltFinishEveryMs); s_sweeps = s_hit_total = 0; s_done = false;
+        if (host_over && !lockstep_fight_up()) { s_done = true; return; }      // it ended here too, in time: nothing to finish
+        if (host_over && lockstep_fight_up()) {
+            log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! the host's fight of battle %016llx has been over for %llu ms and this peer's is still up -- finishing it here (every enemy still standing is struck down)",
+                         (unsigned long long)s_battle, (unsigned long long)(now - g.host_over_at));
+            lockstep_log_standing("this peer's fight is still up after the host's ended");     // what this peer's game still had standing
+        } else log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH armed for battle %016llx: every %u ms every enemy still standing is struck down, until the battle is won", (unsigned long long)s_battle, (unsigned)tune::kHaltFinishEveryMs);
+    }
     if (s_done || now < s_next) return;
     s_next = now + tune::kHaltFinishEveryMs;
     if (!lockstep_fight_up()) {
         s_done = true;
-        log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH over: the battle's character list is gone -- the fight has ended (%u sweep(s), %u unit(s) struck down)", s_sweeps, s_hit_total);
+        log_line_lvl(LogLevel::Warn, "HALT", "%s over: the battle's character list is gone -- the fight has ended (%u sweep(s), %u unit(s) struck down)", g.halted ? "HALT AUTO-FINISH" : "FINISH AFTER THE HOST'S", s_sweeps, s_hit_total);
+        if (!g.halted) return;
         // THE HALT ENDS WITH THE FIGHT (2026-10-04). The halt was about this battle; left on, it blocked the next node (the checkpoint refuses to enter while the lockstep is halted, and a halted session never
         // snapshots the next battle). Lifted here, on each peer when its own fight is over. The shared stream is put where both peers derive it from the battle's identity: the two had drifted apart, which is what
         // halted the battle, and the node-entry hash compares the stream.
@@ -4492,6 +4826,13 @@ static void halt_finish_pump() {
     for (uint32_t i = 0; i < g.cat_count; ++i) {
         const void* chr = g.cats[i];
         if (!chr || g.human_cat[i] || !debug_is_enemy(chr)) continue;
+        if (host_over) {
+            // FINISHING AFTER THE HOST'S FIGHT strikes only what is an enemy: a captured follower or a unit of the players' side goes on to the next fight with the party on the host, and struck
+            // down here it would be missing from this peer's next battle (2026-10-06: three followers on the host, none on the client, the next battle halted at once).
+            int32_t fac = 0, car = -1;
+            mem_read((const uint8_t*)chr + kChar_Faction, &fac, 4); mem_read((const uint8_t*)chr + kChar_Carried, &car, 4);
+            if (car >= 0 || !balance_is_enemy_faction(fac)) continue;
+        }
         uint8_t dead = 0;
         int32_t hp = 0;
         if (!mem_read((const uint8_t*)chr + kChar_Dead, &dead, 1) || dead || !mem_read((const uint8_t*)chr + kChar_HP, &hp, 4) || hp <= 0) continue;
@@ -4793,6 +5134,8 @@ void board_publish() {
             }
             if (!g.human_cat[i]) unit_definition_name(g.cats[i], u.def, kBoardDefLen);   // proto 75: what a peer holding another kind here replaces its unit with
             u.tx = st.tx; u.ty = st.ty; u.fx = st.fx; u.fy = st.fy;
+            mem_read((const uint8_t*)g.cats[i] + kChar_Faction, &u.faction, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Carried, &u.carried, 4);   // proto 83
+            mem_read((const uint8_t*)g.cats[i] + kChar_Mana, &u.mana, 4);                                                                         // proto 84
             mem_read((const uint8_t*)g.cats[i] + kChar_InitA, &u.key_a, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitB, &u.key_b, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Speed, &u.speed, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitBase, &u.init_base, 4);
         }
         first += m.count;
@@ -4909,6 +5252,28 @@ void board_apply(const BoardAssembled& b, bool quiet) {
     if (b.cats != g.cat_count) {
         log_line_lvl(LogLevel::Error, "BOARD", "!! the host's roster has %u unit(s), this one %u -- the boards cannot be matched; only the stream is taken over", b.cats, g.cat_count);
     } else {
+        // TWO UNITS THAT SWAPPED PLACES IN THE ROSTER (2026-10-05, battle 90d49b27, turn 22): a killing blow dropped a coin on the tile where a spider was revived, and the two peers made the two units in the
+        // opposite order -- index 39 was the coin here and the spider there, index 40 the other way round. The kind repair below TRANSFORMED both, which leaves each object in the other one's place in the
+        // game's turn queue: the coin (NoBrain) then took the spider's turn here (turn 23: actor 40 'endturn' against the host's actor 39 'SpiderSuicideMelee'), and the hash halted the battle two turns later.
+        // When two indices hold exactly each other's kind, on one tile on the host's board, the roster entries are SWAPPED instead -- the objects stay where the game put them, only the numbering follows the host's.
+        {
+            const BoardUnit* hu[kMaxCats] = {};
+            for (uint32_t k = 0; k < b.total; ++k) if (b.unit[k].index < kMaxCats) hu[b.unit[k].index] = &b.unit[k];
+            for (uint32_t i = 0; i < g.cat_count && i < kMaxCats; ++i) {
+                const BoardUnit* a = hu[i];
+                if (!a || (a->flags & (kBoardHuman | kBoardGone | kBoardRemoved | kBoardDead)) || g.human_cat[i] || !g.cats[i] || !here_present(i)) continue;
+                for (uint32_t j = i + 1; j < g.cat_count && j < kMaxCats; ++j) {
+                    const BoardUnit* c = hu[j];
+                    if (!c || (c->flags & (kBoardHuman | kBoardGone | kBoardRemoved | kBoardDead)) || g.human_cat[j] || !g.cats[j] || !here_present(j)) continue;
+                    if (a->ident == c->ident || a->tx != c->tx || a->ty != c->ty) continue;
+                    if (board_ident(g.cats[i]) != c->ident || board_ident(g.cats[j]) != a->ident) continue;
+                    std::swap(g.cats[i], g.cats[j]); std::swap(g.cat_key[i], g.cat_key[j]); std::swap(g.cat_key_ok[i], g.cat_key_ok[j]);
+                    std::swap(g.fresh_left[i], g.fresh_left[j]); std::swap(g.summon[i], g.summon[j]); std::swap(still_a[i], still_a[j]);
+                    say("units %u and %u stood in each other's place here (a %08x and a %08x) -- the roster entries were swapped to the host's numbering, nothing was transformed", i, j, a->ident, c->ident);
+                    break;
+                }
+            }
+        }
         struct Want { uint32_t i; int32_t x, y; };
         Want want[kMaxCats]; uint32_t nwant = 0;
         for (uint32_t k = 0; k < b.total; ++k) {
@@ -5053,12 +5418,65 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                         if (!have) for (auto& w : g.sw) if (w.left <= 0) { w.cat = i; w.left = 4; break; }
                     }
                 }
+                {   // THE MANA (proto 84, 2026-10-06, battle 7802bb10): a result of the battle like the hit points, and what an ability's cost is checked against -- the host's Shadow2 was refused on
+                    // the client (nothing queued, the next action ran instead) and the thief's turn split the peers. Written for every player's cat, before the layer-1 switch.
+                    int32_t mn = 0;
+                    if (mem_read((const uint8_t*)g.cats[i] + kChar_Mana, &mn, 4) && mn != u.mana) {
+                        mem_write((uint8_t*)g.cats[i] + kChar_Mana, &u.mana, 4);
+                        say("unit %u (a player's cat): mana %d -> host's %d", i, mn, u.mana);
+                    }
+                }
                 if (!tune::kBoardRepairPlayerCats) continue;
                 // LAYER 1 (2026-10-04, b521766e: a player's summon took 10 damage and a push on the host and none here, the board left it, turn 6 halted): below, the hit points, shield, tile and
                 // facing are overwritten like any unit's -- they are results of the battle, not inputs -- and the max hit points are not (see the write below).
             }
             CatState st{};
             if (!read_cat_state(g.cats[i], st, false)) { ++bad; say("unit %u is unreadable here", i); continue; }
+            if (!host_human && !st.dead && !host_dead) {
+                int32_t mn = 0;
+                if (mem_read((const uint8_t*)g.cats[i] + kChar_Mana, &mn, 4) && mn != u.mana) {      // proto 84: an enemy's mana decides what its brain may cast
+                    mem_write((uint8_t*)g.cats[i] + kChar_Mana, &u.mana, 4);
+                    say("unit %u: mana %d -> host's %d", i, mn, u.mana);
+                }
+            }
+            if (!host_human && !st.dead && !host_dead) {
+                // A CAPTURE AND A CONVERSION THAT WENT THROUGH ON THE HOST ONLY (proto 83, 2026-10-06, battle a607be50): the host's persuasion device took a Pooter -- CaptureFamiliar put it into the
+                // director's queue of followers and FactionConversion made it an ally -- and on the client it stayed an enemy: the host won the fight with it standing, the client never did, and the
+                // next battle the host brought three followers and the client none. Neither is in the turn hash; the host's board puts both right here, through the game's own capture.
+                uint8_t* c = (uint8_t*)g.cats[i];
+                int32_t fac = 0, car = -1;
+                mem_read(c + kChar_Faction, &fac, 4); mem_read(c + kChar_Carried, &car, 4);
+                // A SUMMON MUST NEVER ENTER THE PERSISTENT FOLLOWER QUEUE (2026-10-07).
+                //
+                // `Character+0xC4` is copied by some of the game's servant/transform
+                // paths.  It is therefore not, by itself, proof that a mid-battle
+                // unit is a real persuasion capture.  Calling CaptureFamiliar here
+                // is a persistent write to MewDirector; on a client it turned a
+                // temporary ally produced by a summon skill into a follower in the
+                // next battle.  Adopted summons are marked in `g.summon`, and a
+                // player-brain unit is temporary by definition for this path.  The
+                // host's faction/carried values are still synchronized below, so the
+                // summon remains an ally for this fight without being saved as one.
+                const bool temporary = (i < kMaxCats && g.summon[i]) || host_human || g.human_cat[i];
+                if (u.carried >= 0 && car < 0 && !temporary) {
+                    const uintptr_t cap = addr_of_call(C_CaptureFamiliar);
+                    const bool ok = cap && board_call_capture(cap, c);
+                    mem_read(c + kChar_Carried, &car, 4);
+                    log_line_lvl(LogLevel::Warn, "BOARD", "!! unit %u was captured as a follower on the host (slot %d) and not here -- %s (slot here now %d)", i, u.carried,
+                                 !cap ? "the game's capture is not resolved" : ok ? "captured with the game's own CaptureFamiliar" : "the game's capture FAULTED", car);
+                } else if (u.carried >= 0 && car < 0 && temporary) {
+                    log_line_lvl(LogLevel::Warn, "BOARD", "!! unit %u carries host follower slot %d but is a temporary summon -- faction will sync, persistent CaptureFamiliar is skipped", i, u.carried);
+                } else if (u.carried < 0 && car >= 0) {
+                    log_line_lvl(LogLevel::Warn, "BOARD", "!! unit %u is a captured follower here (slot %d) and not on the host -- left as it is", i, car);
+                }
+                if (fac != u.faction) {
+                    int32_t three[3] = { u.faction, u.faction, u.faction };
+                    const uint8_t zero = 0;
+                    mem_write(c + kChar_Faction, three, sizeof(three));
+                    mem_write(c + kChar_Faction + 0x10, &zero, 1);           // +0x360, cleared by FactionConversion too
+                    log_line_lvl(LogLevel::Warn, "BOARD", "!! unit %u was of faction %d here and %d on the host -- the host's written (as FactionConversion does)", i, fac, u.faction);
+                }
+            }
             if (!host_human && !st.dead && host_dead && b.turn > 0 && unit_remove_game_way(const_cast<void*>(g.cats[i]))) {
                 // DEAD ON THE HOST, ALIVE HERE (2026-10-03, host's 'remove (game way)'): the host's unit is dead and off the board in the very boundary this board comes from, so this one is put through the
                 // same sequence now -- a lethal hit is only finished a beat later (it stood on its tile, not dead, elements still read, at the hash: a halt). Before any write: Die wants the unit as it is.
@@ -5091,11 +5509,49 @@ void board_apply(const BoardAssembled& b, bool quiet) {
             else if (!changed) ++same;
         }
         // The moves, in passes: a unit goes only where no other unit stands NOW.
+        // UNITS THAT WANT EACH OTHER'S TILES (2026-10-06): two corpses laid on two tiles in the opposite order, nine spiders hatched one index apart -- every unit of such a ring waits for a tile
+        // another member holds, and no pass moves anyone. A ring is broken by parking one member on a free tile; the passes then close it (at most a few parkings per board).
+        for (int round = 0; round < 4 && nwant; ++round) {
+        if (round > 0) {
+            bool parked = false;
+            for (uint32_t w = 0; w < nwant && !parked; ++w) {
+                // the unit standing on this one's target is itself waiting to move: a ring (or a chain into one)
+                bool ring = false;
+                for (uint32_t v = 0; v < nwant && !ring; ++v) {
+                    if (v == w) continue;
+                    CatState o{};
+                    if (here_present(want[v].i) && read_cat_state(g.cats[want[v].i], o, false) && o.linked && o.tx == want[w].x && o.ty == want[w].y) ring = true;
+                }
+                if (!ring || unit_is_pickup(g.cats[want[w].i])) continue;
+                CatState me{};
+                int32_t bw = 0, bh = 0;
+                if (!read_cat_state(g.cats[want[w].i], me, false) || !unit_board_size(g.cats[want[w].i], bw, bh)) continue;
+                int32_t px = -1, py = -1, best = 0x7FFFFFFF;
+                for (int32_t yy = 0; yy < bh; ++yy)
+                    for (int32_t xx = 0; xx < bw; ++xx) {
+                        if (tile_taken(xx, yy)) continue;
+                        bool wanted = false;
+                        for (uint32_t v = 0; v < nwant && !wanted; ++v) if (want[v].x == xx && want[v].y == yy) wanted = true;
+                        if (wanted) continue;
+                        const int32_t d = (xx - me.tx) * (xx - me.tx) + (yy - me.ty) * (yy - me.ty);
+                        if (d < best) { best = d; px = xx; py = yy; }
+                    }
+                if (px < 0) break;
+                if (board_move_unit(g.cats[want[w].i], px, py)) {
+                    parked = true;
+                    say("unit %u parked on the free tile (%d,%d) to open a ring of units that want each other's tiles", want[w].i, px, py);
+                }
+            }
+            if (!parked) break;
+        }
         for (int pass = 0; pass < 8 && nwant; ++pass) {
             uint32_t left = 0, did = 0;
             for (uint32_t w = 0; w < nwant; ++w) {
                 bool taken = false;
-                for (uint32_t j = 0; j < g.cat_count && !taken; ++j) {
+                // A PICKUP IS NEVER BLOCKED BY A UNIT (2026-10-05, battle 7ad94376: a killing blow dropped a coin on the tile where the spiders hatched; the host's coin stood on (3,6) with two spiders, this peer's
+                // game put it on the free tile (4,5), and the move to (3,6) was refused as "another unit holds it" -- the one hashed difference, turn 14, then a halt). A coin shares its tile with a unit.
+                const bool mover_pickup = g.cats[want[w].i] && unit_is_pickup(g.cats[want[w].i]);
+                for (uint32_t j = 0; j < g.cat_count && !taken && !mover_pickup; ++j) {
                     if (j == want[w].i) continue;
                     CatState o{};
                     if (here_present(j) && read_cat_state(g.cats[j], o, false) && o.linked && o.tx == want[w].x && o.ty == want[w].y && !unit_is_pickup(g.cats[j])) taken = true;     // a pickup shares its tile with a unit
@@ -5110,6 +5566,7 @@ void board_apply(const BoardAssembled& b, bool quiet) {
             }
             nwant = left;
             if (!did) break;
+        }
         }
         for (uint32_t w = 0; w < nwant; ++w) { ++stuck; say("unit %u wants (%d,%d), which another unit holds -- left where it is", want[w].i, want[w].x, want[w].y); }
     }
@@ -5460,6 +5917,42 @@ void lockstep_reseed_action(const void* actor) {
     }
 }
 
+// THE DECISION-TIME WINDOW (RNG research 2026-10-11, R373/R386/R388 -- P0). TurnControl, once UpdateDecision returns a decision, first
+// dispatches passive slot 52 (OnAnyCharacterMakesDecision) to every unit and only then queues and applies the action -- the reseed above runs
+// at the apply. On the acting cat's owner the game's own aim preview has been drawing from the shared stream until that frame (R050), so
+// ProtectTargetedAllies' pick of who to protect and the Backflip lambdas' landing tiles came out of a different stream on each peer: the
+// mother cat swapped in front of a different kitten, Dybbuk backflipped to a different tile. The non-owner gets the same decision injected
+// through GetChoice inside the same call, so both peers pass here once per decision; the AI's decisions are made on both.
+// Seeded with the number the coming action will get (g_rs_action + 1) and a different constant, so it never repeats the apply's seed.
+void lockstep_reseed_decision(const void* brain, const void* out) {
+    if (!tune::kReseedPerTurn || !g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
+    if (!brain || !out) return;
+    uint32_t type = 0;
+    if (!mem_read(out, &type, sizeof(type)) || type <= 1) return;
+    uint64_t* s = rng_global_stream();
+    if (!s) return;
+    const void* actor = nullptr;
+    mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor));
+    uint32_t idx = 0xFFFFu;
+    for (uint32_t i = 0; actor && i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
+    if (g.battles.current != g_rs_battle) { g_rs_battle = g.battles.current; g_rs_turn = ~0u; g_rs_logged = 0; g_rs_action_logged = 0; }
+    uint64_t x = g.battles.current ^ 0x4445434953494F4Eull ^ ((uint64_t)g.turn * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^
+                 ((uint64_t)(g_rs_action + 1) * 0x165667B19E3779F9ull) ^ ((uint64_t)g_rs_repeat * 0xD6E8FEB86659FD93ull) ^ ((uint64_t)type << 56);
+    uint64_t st[4];
+    for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
+    uint64_t before = 0;
+    mem_read(s, &before, sizeof(before));
+    if (!mem_write(s, st, sizeof(st))) return;
+    static uint64_t logged_battle = 0;
+    static uint32_t logged = 0;
+    if (logged_battle != g.battles.current) { logged_battle = g.battles.current; logged = 0; }
+    if (logged < 200) {
+        ++logged;
+        log_line("RESEED", "turn %u decision (type %u) for action %u of actor %u: the stream was %016llx, now %016llx (before slot 52, OnAnyCharacterMakesDecision)",
+                 (unsigned)g.turn, (unsigned)type, (unsigned)(g_rs_action + 1), (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
+    }
+}
+
 namespace {
 struct TraceRow { int32_t hp = 0, shield = 0, tx = 0, ty = 0; uint8_t dead = 0; bool ok = false; };
 TraceRow g_tr[kMaxCats + 16];
@@ -5543,6 +6036,7 @@ void lockstep_action_trace(const void* actor, const void* turn_action) {
 }
 
 uint64_t lockstep_battle_id()  { return g.active ? g.battles.current : kNoBattle; }
+uint32_t lockstep_turn()       { return g.active ? g.turn : 0; }
 bool     lockstep_local_actor(){ return g.active && g.snapped && g.local_actor; }
 
 void lockstep_reset_cat_owners() {
@@ -5754,6 +6248,28 @@ void lockstep_enter_battle(uint64_t seed0) {
 
     log_line("LOCKSTEP", "battle id now %016llx%s", (unsigned long long)seed0,
              left == kNoBattle ? " (first this session)" : "");
+}
+
+// A SAVE WAS LOADED (2026-10-05). The battle id is the node's seed, and a handshake save restored from before a node brings the SAME node back: the id was already current, so entering it was "not a
+// transition", the TurnControl's character list is the same object, and the first turn boundary did not see a new battle. The old battle's turn-0 hash, the host's turn-0 board, its rolls, the peer's
+// control split (which opened the join barrier at once) and a halt that was lifted all stayed -- the client halted at turn 0 against the host's real hash of the new battle, and its auto-finish never ran.
+void lockstep_on_save_loaded() {
+    Guard guard;
+    if (!g.active) return;
+    const bool had = g.battles.current != kNoBattle || g.snapped;
+    g.battles.forget_current();
+    g.snapshot_battle = kNoBattle;                      // the next turn boundary reads this as a new battle and resets everything per battle
+    g.my_hash.clear();
+    for (uint32_t p = 0; p < kMaxPeers; ++p) { g.peer_hash[p].clear(); g.have_peer_control[p] = false; }
+    g.control_checked = false; g.barrier_said_open = false; g.barrier_waits = 0;
+    g.pend_head = 0; g.pend_count = 0;
+    g.have_audit_peer = false;
+    g.halt_cleared_for = 0;
+    g.board_battle = 0; g.board_turn = ~0u; g.board_sent_for = 0; g.board_sent_n = 0;
+    g.sent_log_n = 0; g.sent_log_full = false;
+    g.armed_hit = 0; g.dbg_n = 0; g.dbg_waiting = false;
+    net_clear_battle_caches();                          // the host's boards, rolls and level of the battle that was
+    if (had) log_line("LOCKSTEP", "a save was loaded: the battle that was is over -- its hashes, boards, rolls and control split are dropped, so the next node (the same one again after a restore) starts a new battle");
 }
 
 // A peer connected or reconnected. Hand it everything this peer has already

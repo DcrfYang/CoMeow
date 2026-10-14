@@ -1,4 +1,4 @@
-// mgmp_chat.h -- the room's text chat (proto 81). Enter opens the input (and the whole history), Enter again sends what was typed and every screen shows the history for ten seconds, then fades it.
+// mgmp_chat.h -- the room's text chat (proto 81). Enter opens the input (and the whole history), Enter again sends what was typed and every screen shows the history for five seconds, then fades it.
 //
 // This module is the data and the wire: the history, the lines that arrive, the input-open state and the Enter key's decision. The drawing lives in mgmp_menu (draw_chat); the key is read in the overlay's
 // window procedure (mgmp_ui). Nothing here touches the game or the simulation: a line of chat is text that is shown, never an action.
@@ -10,7 +10,7 @@
 namespace mgmp {
 
 constexpr int kChatHistory = 200;
-constexpr unsigned kChatShowMs = 10000;     // how long the history stays up after a line is sent or arrives
+constexpr unsigned kChatShowMs = 5000;      // how long the history stays up after a line is sent or arrives (2026-10-06: was 10 s)
 constexpr unsigned kChatFadeMs = 1200;      // and the fade after that
 
 struct ChatLine {

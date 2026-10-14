@@ -131,6 +131,28 @@ enum Target : int {
     T_ResGiveItem,        // the event results' common item giver (0x140920600: result context, item name, equip flag, flag): get_item, get_item_from_pool, get_and_equip_item(_from_pool), get_parasite_from_pool -- inventory insert, the equip on the subject cat, the message
     T_ResDejaVu,             // the event result `increment_deja_vu` (0x140937930: context, node): the deja-vu legacy counter
     T_SettingGetFloat,    // Settings::get_float (0x1409D3B40: settings, std::string* key, default in xmm2) -> float in xmm0: the turn layer reads "combat_speed" through it every frame
+    T_CatNamePick,        // the random cat name (0x1407AD2F0: name generator, std::string* out, gender, bool, bool) -> out: draws from the shared stream, a different number of times on each peer (it avoids the names this save already uses)
+    T_AutoEquip,          // AutoEquipConsumables' update (0x1408C3960: the passive) -- the Backpack: a consumable from THIS PLAYER'S inventory, picked with a draw from the shared stream, into the cat's free slot
+    // RNG research 2026-10-11 (调研任务列表/结果/总结.md). Event keywords the WorldEvent interpreter (0x1409173A0) calls that draw from the shared stream and were missing from the reset list:
+    // each now resets it first (unlocks_event_roll), like the T_Ev* above. Args (context, node) in rcx/rdx, called only from the interpreter.
+    T_EvSelfDamage,       // R430 `self_damage` / `damage` (0x1409230F0): random damage in a range
+    T_EvPartyDamage,      // R431 `party_damage` (0x1409236F0): random damage per party cat (it also fires each peer's own on-hit passives)
+    T_EvUpgAbility,       // R434 `upgrade_ability` (0x140925110)
+    T_EvUpgPassive,       // R435 `upgrade_passive` (0x140925860)
+    T_EvScrambleAbil,     // R436 `scramble_abilities` (0x140925EE0)
+    T_EvScramblePass,     // R437 `scramble_passives` (0x140926A80)
+    T_EvScrambleAtk,      // R438 `scramble_basic_attack` (0x140927220) -- its candidates also come from this peer's unlocked classes (TODO(RNG-R438))
+    T_EvSkipFight,        // R439 `party_skip_next_fight_chance` (0x1409286F0): rand2 per party cat decides who sits out the next fight
+    T_EvSpawnNext,        // R440 `spawn_unit_next_fight` (0x140928B40): writes the SHARED next-fight spawn queue MewDirector+0x610
+    T_DelayedTarget,      // R369 DelayedTrigger's target tile (0x14080CFC0, this, out): an off-board relative target is re-picked with an INLINE xoshiro on the shared stream -- the per-frame
+                          // late_update call (return 0x14080CF20) is fenced (mgmp_rngfix), the OnTurnBegin one (0x14080D3D2) is left alone
+    T_ItemCollect,        // R027 ItemMgr collect (0x1402E1660: inventory, out, mode, ...): hooked ONLY for the battle build's read of the run backpack (return 0x14035B704), whose items' global_passives
+                          // would apply to the whole battle on one peer only (mgmp_rngfix)
+    T_PickIndex,          // R102 a random-element helper (0x14004A110: out, vector, stream in r8; 55 callers): hooked ONLY for Character late_update's call (return 0x140108D3C, the AI intent display,
+                          // every frame) -- fenced (mgmp_rngfix). A twin template instance shares its first 157 bytes, hence the long pattern
+    T_ClayChange,         // ModelingClayPassive's after-cast (vtable 0x14102A8F0 slot 57 -> 0x140906F50, this only): the clay turns into a random weapon of the
+                          // combat_reward_hard pool -- drawn inline from the shared stream at the moment the throw lands. Halted a room 2026-10-11 (host MeatCleaver,
+                          // client BentSpoon); now drawn from a stream of (battle, cat, n-th change) (mgmp_rngfix)
     T_COUNT
 };
 
@@ -661,6 +683,21 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x00920600, "RESGIVEITEM", "event result item giver (get_item & co: Inventory::insert_item + equip)" },
     { 0x00937930, "RESDEJAVU", "event result increment_deja_vu" },
     { 0x009D3B40, "SETTINGGETFLOAT", "Settings::get_float (the combat speed is read through it)" },
+    { 0x007AD2F0, "CATNAMEPICK", "the random cat name (draws from the shared stream)" },
+    { 0x008C3960, "AUTOEQUIP", "the Backpack's AutoEquipConsumables (picks from the player's own inventory)" },
+    { 0x009230F0, "EVSELFDAMAGE", "event: self_damage (R430)" },
+    { 0x009236F0, "EVPARTYDAMAGE", "event: party_damage (R431)" },
+    { 0x00925110, "EVUPGABILITY", "event: upgrade_ability (R434)" },
+    { 0x00925860, "EVUPGPASSIVE", "event: upgrade_passive (R435)" },
+    { 0x00925EE0, "EVSCRAMBLEABIL", "event: scramble_abilities (R436)" },
+    { 0x00926A80, "EVSCRAMBLEPASS", "event: scramble_passives (R437)" },
+    { 0x00927220, "EVSCRAMBLEATK", "event: scramble_basic_attack (R438)" },
+    { 0x009286F0, "EVSKIPFIGHT", "event: party_skip_next_fight_chance (R439)" },
+    { 0x00928B40, "EVSPAWNNEXT", "event: spawn_unit_next_fight (R440)" },
+    { 0x0080CFC0, "DELAYEDTARGET", "DelayedTrigger: target tile (R369, per-frame call fenced)" },
+    { 0x002E1660, "ITEMCOLLECT", "ItemMgr collect (R027, the battle build's backpack read)" },
+    { 0x0004A110, "PICKINDEX", "random element helper (R102, Character late_update's call fenced)" },
+    { 0x00906F50, "CLAYCHANGE", "ModelingClayPassive after-cast: the clay becomes a random weapon" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -769,6 +806,12 @@ enum Call : int {
     C_CharTurnControl,       // TurnControl*(Character*) -- sub_140049750, through the world's type table 0x855
     C_CharDie,               // void(Character*, bool, const CustomVectorInterface<Character*>*, bool) -- sub_140115070: the death events (drops, deathrattles) run from here
     C_CorpsePop,             // void(Character*, bool) -- sub_140115E10
+    C_CaptureFamiliar,       // void(Character*) -- sub_14011AB00, the CaptureFamiliar effect: a non-cat goes into the director's queue of followers (+0x628), Character+0xC4 = its slot
+    C_ItemMake,              // Item*(unused, Item* out 0x60 bytes, std::string name BY VALUE) -- sub_1402E1320: a new item of that gon name (id from the global counter), as the event item giver makes one
+    C_EquipIfFree,           // bool(CatData*, Item*, int) -- sub_1400CA5C0: equips the item when the slot of its kind is empty (what AutoEquipConsumables calls)
+    C_CharItemsChanged,      // void(Character*) -- sub_1400FE980: what AutoEquipConsumables calls on the cat after the equip (its abilities follow its items)
+    C_StrFromCStr,           // std::string*(std::string* out, const char*) -- sub_140052AF0
+    C_CatCanLevel,           // bool(CatData*) -- sub_1400D22F0: may this cat be offered a level-up (the level-up pick 0x1403B7530 counts the others as level 999999)
     C_COUNT
 };
 
@@ -1043,6 +1086,12 @@ static const CallDesc kCalls[C_COUNT] = {
     { 0x00049750, "Character -> TurnControl" },
     { 0x00115070, "Character::Die" },
     { 0x00115E10, "Character::OnCorpsePop" },
+    { 0x0011AB00, "Character::CaptureFamiliar" },
+    { 0x002E1320, "Item::make(name)" },
+    { 0x000CA5C0, "CatData::equip_if_slot_free" },
+    { 0x000FE980, "Character::items_changed" },
+    { 0x00052AF0, "std::string(const char*)" },
+    { 0x000D22F0, "CatData::can_level_up" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -1176,6 +1225,12 @@ constexpr uintptr_t kCatData_Killed  = 0x7AC;   // u8
 constexpr uint64_t  kCatFlag_Perished = 0x40000;
 // The instruction after the call that picks a WorldEvent's subject cat (sub_140913A90, `call sub_1400AB770` at 0x1409150F3): T_PickRandom only acts when it returns here.
 constexpr uintptr_t kRet_EventSubject = 0x009150F8;
+// THE BOUNTY HUNTER'S TARGET (weather BountyHunting -> EventBountyHunter, passive EventBounterHunterPassive). Its vtable slot +0x108 (sub_1407E99F0) walks the board's units, sorts them into two
+// lists -- faction 1 and every other faction -- and puts EventBounty 5 on one picked with T_PickRandom from the shared stream: the second list first (the call returns to kRet_BountyOthers), the
+// first if that one was empty (kRet_BountyFaction1). It runs while the hunter is being loaded at the battle's start, and that load draws a different number of times on each peer (2026-10-06:
+// the stream after loading 'EventBountyHunter' was 2fab5848.. on the host and a53f8590.. on the client), so the bounty landed on two different units.
+constexpr uintptr_t kRet_BountyOthers   = 0x007E9C25;
+constexpr uintptr_t kRet_BountyFaction1 = 0x007E9C5B;
 constexpr uintptr_t kCatData_BirthDay    = 0xC38;  // int32: the day the cat was born (T_IsKitten: the save's day - this <= 1 means kitten)
 constexpr uintptr_t kCatData_DayOverride = 0xC40;  // int64: replaces the save's day in that test when not -1
 constexpr uint64_t  kCatFlag_OnAdventure = 0x80000; // set by set_party_and_go (0x3B1504) on the cats that leave; 0xD2D40 clears it

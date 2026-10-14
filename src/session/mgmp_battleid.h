@@ -73,6 +73,11 @@ struct BattleTracker {
         current = kNoBattle;
     }
 
+    // A SAVE WAS LOADED: whatever battle this peer was in is over, and the next node entered may be the SAME node again (2026-10-05: the host restored a handshake save from before a node and walked into it
+    // a second time -- the node seed, and so the battle id, is the same). The battle is forgotten WITHOUT being retired: retired ids are dropped on arrival, and the other player's messages for the
+    // new battle can reach this peer before it has entered the node -- those must be HELD (Unknown), as for any battle not reached yet.
+    void forget_current() { current = kNoBattle; }
+
     BattleRel rel(uint64_t id) const {
         if (id != kNoBattle && id == current) return BattleRel::Ours;
         for (uint32_t i = 0; i < count; ++i)

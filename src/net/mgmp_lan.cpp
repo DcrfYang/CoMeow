@@ -130,6 +130,7 @@ void search_thread() {
                     lr.players = r.value("players", 0);
                     lr.cap     = r.value("cap", 4);
                     lr.pw      = r.value("pw", false);
+                    lr.locked  = r.value("locked", false);
                     if (lr.id.empty()) continue;
                     bool dup = false;
                     // the same room answered from two addresses of one machine (a virtual adapter besides the real one): keep the first

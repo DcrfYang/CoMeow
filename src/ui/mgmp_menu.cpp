@@ -7,6 +7,7 @@
 #include <objbase.h>
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "ole32.lib")
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -29,6 +30,8 @@
 #include "mgmp_saveslots.h"
 #include "mgmp_roomhist.h"
 #include "mgmp_chat.h"
+#include "mgmp_draw.h"
+#include "mgmp_unlocks.h"     // settings_room_speed: the combat speed line
 #include "mgmp_page.h"
 #include "mgmp_abandon.h"
 #include "mgmp_room.h"
@@ -240,6 +243,9 @@ struct Menu {
     // The dialog that asks before a backup is loaded, overwritten or deleted (None = closed). idx 0.. = the twenty, 100.. = the auto saves.
     Confirm dlg = Confirm::None;
     int     dlg_idx = -1;
+    // Overwrite asks for the backup's name in the dialog itself (2026-10-10), starting from the name it has; the page's name box is for an empty position.
+    char    dlg_name[kSaveNameMax] = {};
+    bool    dlg_focus = false;
     SaveSlotInfo current[kGameSlots];
     double  refreshed_at = 0;
     // The page that restores a slot from a handshake save (inside the backup window); sync_slot/sync_idx = the entry the confirm dialog is about (-1 = closed).
@@ -896,7 +902,7 @@ void draw_lan_tab(ImDrawList* dl, const View& v, ImVec2 a, float W, float H) {
             const bool full = r.players >= r.cap;
             char bid[48]; _snprintf_s(bid, sizeof(bid), _TRUNCATE, "lanjoin_%s_%s", r.addr.c_str(), r.id.c_str());
             if (paper_button(bid, ImVec2(X(730), rp.y + 5 * k), ImVec2(X(W - 70), rp.y + rowh - 5 * k),
-                             full ? tr(Tx::FULL) : tr(Tx::JOIN), 24 * k, !full && free, Tone::Good)) {
+                             r.locked ? tr(Tx::ROOM_LOCKED_BTN) : full ? tr(Tx::FULL) : tr(Tx::JOIN), 24 * k, !r.locked && !full && free, Tone::Good)) {
                 strncpy_s(g.lan_t_addr, sizeof(g.lan_t_addr), r.addr.c_str(), _TRUNCATE);
                 strncpy_s(g.lan_t_id, sizeof(g.lan_t_id), r.id.c_str(), _TRUNCATE);
                 g.lan_t_port = r.port;
@@ -948,6 +954,7 @@ void draw_create_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H,
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, tr(Tx::TR_DIRECT), port);
         if (paper_button("tr_direct", ImVec2(X(190), Y(y)), ImVec2(X(400), Y(y + 52)), lbl, 22 * k, direct_ok && !busy, eff == 1 ? Tone::Good : Tone::Normal)) g.transport = 1;
         if (paper_button("tr_steam", ImVec2(X(410), Y(y)), ImVec2(X(620), Y(y + 52)), tr(Tx::TR_STEAM), 22 * k, steam_ok && !busy, eff == 2 ? Tone::Good : Tone::Normal)) g.transport = 2;
+        text_c(dl, X(515), Y(y + 56), 18 * k, kGreen, tr(Tx::TR_RECOMMENDED));   // the small "recommended" under the Steam button (user request 2026-10-11)
         if (relay_known) _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s %u/%u", tr(Tx::TR_RELAY), (unsigned)relay_used, (unsigned)relay_max);
         else             _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s", tr(Tx::TR_RELAY));
         if (paper_button("tr_relay", ImVec2(X(630), Y(y)), ImVec2(X(W - 50), Y(y + 52)), lbl, 22 * k, relay_ok && !busy && !g.relay_warn, eff == 3 ? Tone::Good : Tone::Normal)) {
@@ -972,10 +979,10 @@ void draw_create_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H,
         }
         if (!relay_known) { const size_t n = strlen(hint); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", tr(Tx::TR_RELAY_NA)); }
         else if (!relay_ok) { const size_t n = strlen(hint); char full[200]; _snprintf_s(full, sizeof(full), _TRUNCATE, tr(Tx::TR_RELAY_FULL), (unsigned)relay_used, (unsigned)relay_max); _snprintf_s(hint + n, sizeof(hint) - n, _TRUNCATE, " %s", full); }
-        wrap_text(dl, X(50), Y(y + 70), (W - 100 - 180) * k, 22 * k, 26 * k, col, hint);
-        if (paper_button("tr_recheck", ImVec2(X(W - 190), Y(y + 66)), ImVec2(X(W - 50), Y(y + 116)), tr(Tx::TR_RECHECK), 22 * k, ds != DirectCheck::Checking && !busy)) signal_request_direct_check();
+        wrap_text(dl, X(50), Y(y + 88), (W - 100 - 180) * k, 22 * k, 26 * k, col, hint);
+        if (paper_button("tr_recheck", ImVec2(X(W - 190), Y(y + 84)), ImVec2(X(W - 50), Y(y + 134)), tr(Tx::TR_RECHECK), 22 * k, ds != DirectCheck::Checking && !busy)) signal_request_direct_check();
         chosen = eff == 1 ? RoomTransport::Direct : eff == 2 ? RoomTransport::Steam : eff == 3 ? RoomTransport::Relay : RoomTransport::Any;
-        y += 160;
+        y += 178;
     }
 
     // the name, and an optional password (empty = an open room)
@@ -1103,10 +1110,12 @@ void draw_multi_window(const View& v) {
     // THE ROOMS JOINED WITHIN A DAY, AND THE ROOMS OF THEIR HOSTS, come first (and are highlighted); inside each group the open rooms are before the locked ones.
     uint32_t order[32]; bool recent[32] = {}; uint32_t n = 0;
     for (uint32_t i = 0; i < total && i < 32; ++i) recent[i] = roomhist_recent(g.rooms[i].id, g.rooms[i].host);
+    // a room whose players have started (locked) comes after every room that can be joined
+    for (int lk = 0; lk < 2; ++lk)
     for (int grp = 0; grp < 2; ++grp)
         for (int pass = 0; pass < 2; ++pass)
             for (uint32_t i = 0; i < total && i < 32; ++i)
-                if (recent[i] == (grp == 0) && g.rooms[i].pw == (pass == 1) &&
+                if (g.rooms[i].locked == (lk == 1) && recent[i] == (grp == 0) && g.rooms[i].pw == (pass == 1) &&
                     (contains_ci(g.rooms[i].name, g.search) || contains_ci(g.rooms[i].host, g.search) || contains_ci(g.rooms[i].id, g.search)))
                     order[n++] = i;
     if (n == 0) {
@@ -1135,7 +1144,7 @@ void draw_multi_window(const View& v) {
             text_at(cdl, ImVec2(X(640), rp.y + 12 * k), 26 * k, kInkSoft, cnt);
             const bool full = r.players >= r.cap;
             if (paper_button(r.id, ImVec2(X(730), rp.y + 6 * k), ImVec2(X(W - 70), rp.y + rowh - 6 * k),
-                             full ? tr(Tx::FULL) : tr(Tx::JOIN), 26 * k, !full && !busy && !g.pw_ask, Tone::Good)) {
+                             r.locked ? tr(Tx::ROOM_LOCKED_BTN) : full ? tr(Tx::FULL) : tr(Tx::JOIN), 26 * k, !r.locked && !full && !busy && !g.pw_ask, Tone::Good)) {
                 strncpy_s(g.room_name, sizeof(g.room_name), r.name[0] ? r.name : r.id, _TRUNCATE);
                 roomhist_set_pending(r.id, r.host);        // noted once the lobby has really put this peer in it
                 if (r.pw) {
@@ -1425,6 +1434,18 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
                           : (host ? tr(Tx::UNLOCKED_HOST) : tr(Tx::UNLOCKED_CLIENT)));
     y += 34 * k;
 
+    // The combat speed every player's battles run at (the host's, proto 82; user request 2026-10-11).
+    {
+        float sp = 0.0f;
+        char val[48];
+        // the game's speeds are 1, 2, 3 and 4 (the setting holds 1.0 .. 4.0): shown as the step, the way the game names it
+        if (settings_room_speed(sp)) _snprintf_s(val, sizeof(val), _TRUNCATE, sp == (float)(int)sp ? "%.0f" : "%g", (double)sp);
+        else                         strncpy_s(val, sizeof(val), tr(Tx::SPEED_UNKNOWN), _TRUNCATE);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::SPEED_LINE), val);
+        text_at(dl, ImVec2(o.x, y), 22 * k, kInkSoft, line);
+        y += 34 * k;
+    }
+
     // (The notice that the host's game port is closed to the outside, with the router-forwarding advice, is gone for good (2026-10-04): it misled -- the server relay and Steam carry a room without the port.)
 
     // Session line.
@@ -1666,7 +1687,13 @@ bool confirm_armed(Confirm kind, int idx) {
     return g.confirm == kind && g.confirm_idx == idx && now() < g.confirm_until;
 }
 void arm(Confirm kind, int idx) { g.confirm = kind; g.confirm_idx = idx; g.confirm_until = now() + 3.0; }
-void ask(Confirm kind, int idx) { g.dlg = kind; g.dlg_idx = idx; }   // open the confirm dialog (draw_backup_confirm)
+void ask(Confirm kind, int idx) {   // open the confirm dialog (draw_backup_confirm)
+    g.dlg = kind; g.dlg_idx = idx;
+    if (kind == Confirm::Overwrite && idx >= 0 && idx < kSaveBackupCount) {
+        strncpy_s(g.dlg_name, sizeof(g.dlg_name), saveslots_get(idx).name, _TRUNCATE);
+        g.dlg_focus = true;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RESTORE FROM A HANDSHAKE SAVE (2026-10-05): a page of its own inside the backup window. The three game slots side by side, each with every handshake save made for it (newest first); "Restore" asks, then
@@ -1986,7 +2013,8 @@ void draw_backup_confirm(const View& v) {
     if (!b || !b->used || g.win != Win::Backup || (in_room() && g.dlg != Confirm::Delete)) { g.dlg = Confirm::None; return; }
 
     const float k = v.k;
-    const float W = 900, H = 500;
+    const bool ow = g.dlg == Confirm::Overwrite;
+    const float W = 900, H = ow ? 600 : 500;   // overwrite: room for the name box
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
     const ImVec2 sz(W * k, H * k);
     if (!modal_begin("##mgmp_backup_ask")) return;
@@ -2006,13 +2034,22 @@ void draw_backup_confirm(const View& v) {
     const float ey = wrap_text(dl, X(60), Y(140), (W - 120) * k, 30 * k, 42 * k, kInk, line);
     // what the backup holds, so the right one is certain
     char sl[256]; fmt_slots(*b, sl, sizeof(sl));
-    wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, sl);
+    const float sy = wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, sl);
+
+    // Overwrite: the name the backup will carry, starting from the one it has (Enter confirms, like the button).
+    bool enter = false;
+    if (ow) {
+        text_at(dl, ImVec2(X(60), sy + 30 * k), 26 * k, kInk, tr(Tx::BACKUP_NAME));
+        if (g.dlg_focus) { ImGui::SetKeyboardFocusHere(); g.dlg_focus = false; }
+        enter = paper_input("##ow_name", ImVec2(X(190), sy + 18 * k), ImVec2(X(W - 60), sy + 74 * k), g.dlg_name, sizeof(g.dlg_name),
+                            tr(Tx::BACKUP_NAME_HINT), 26 * k, ImGuiInputTextFlags_EnterReturnsTrue);
+    }
 
     const float by0 = H - 120, by1 = H - 44;
     bool done = false;
-    if (paper_button("bk_yes", ImVec2(X(60), Y(by0)), ImVec2(X(W / 2 - 14), Y(by1)), act, 34 * k, true, load ? Tone::Good : Tone::Danger)) {
+    if (paper_button("bk_yes", ImVec2(X(60), Y(by0)), ImVec2(X(W / 2 - 14), Y(by1)), act, 34 * k, true, load ? Tone::Good : Tone::Danger) || enter) {
         if (g.dlg == Confirm::Load)           { if (is_auto) saveslots_auto_load(pos); else saveslots_load(pos); }
-        else if (g.dlg == Confirm::Overwrite) saveslots_save(pos, g.save_name);
+        else if (g.dlg == Confirm::Overwrite) saveslots_save(pos, g.dlg_name);
         else if (g.dlg == Confirm::Delete)    saveslots_delete(pos);
         log_line("MENU", "backup %s%d: %s confirmed", is_auto ? "A" : "", pos + 1, load ? "load" : del ? "delete" : "overwrite");
         done = true;
@@ -2093,6 +2130,214 @@ void chat_rows(float fs, float maxw, int first, std::vector<ChatRow>& rows) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE DRAWING BOARD (mgmp_draw, proto 87): the pen, the eraser and the bin in the bottom-right corner while the map or a battle is
+// showing; the lines of every player in their P colour. The lines are drawn on the background list -- over the game, under every one
+// of the mod's own windows -- and while the pen or the eraser is in hand a window as large as the game's picture, kept BEHIND the
+// mod's other windows, takes the mouse so the clicks that draw never reach the game (the window procedure swallows what ImGui wants).
+// ---------------------------------------------------------------------------
+ImU32 board_color(uint8_t owner) {
+    static const ImU32 kPlayer[4] = { IM_COL32(205, 58, 52, 255), IM_COL32(58, 108, 205, 255), IM_COL32(214, 168, 24, 255), IM_COL32(56, 150, 68, 255) };
+    const int row = room_row_of_peer(owner);
+    return row >= 0 ? kPlayer[row & 3] : kInk;
+}
+
+ImU32 board_mix(ImU32 a, ImU32 b, float t) {
+    auto ch = [&](int s) { return (int)(((a >> s) & 0xFF) * (1 - t) + ((b >> s) & 0xFF) * t); };
+    return IM_COL32(ch(IM_COL32_R_SHIFT), ch(IM_COL32_G_SHIFT), ch(IM_COL32_B_SHIFT), 255);
+}
+
+// A quill lying from the top right to the bottom left (user's reference, 2026-10-11): the vane, in the player's drawing colour (`tip`),
+// with a few notches and a pale shaft, and a dark steel nib.
+void icon_pen(ImDrawList* dl, ImVec2 c, float s, ImU32 tip) {
+    auto P = [&](float x, float y) { return ImVec2(c.x + x * s, c.y + y * s); };
+    const float nx0 = -0.40f, ny0 = 0.40f;          // the nib's point
+    const float DX = 0.7071f, DY = -0.7071f;        // along the quill, toward its top
+    const float NX = 0.7071f, NY = 0.7071f;         // across it, toward the lower right
+    const float A0 = 0.20f, A1 = 1.10f;             // the vane, along the axis (the nib is 0..A0)
+    auto axis = [&](float a, float off) {           // a point at `a` along the (slightly bent) axis, `off` across it
+        float t = (a - A0) / (A1 - A0);
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const float bend = 0.035f * sinf(3.14159265f * t);
+        return P(nx0 + DX * a + NX * (bend + off), ny0 + DY * a + NY * (bend + off));
+    };
+    struct Notch { float t, depth, len; };
+    static const Notch kNotch[2][2] = { { { 0.34f, 0.05f, 0.10f }, { 0.56f, 0.05f, 0.10f } },      // upper-left side
+                                        { { 0.44f, 0.04f, 0.09f }, { 0.68f, 0.035f, 0.09f } } };   // lower-right side
+    auto width = [&](float t, int side) {           // side 0: upper left (the wide side), 1: lower right
+        const float wmax = side == 0 ? 0.185f : 0.12f;
+        float w = wmax * powf(sinf(3.14159265f * fminf(1.0f, powf(t, 0.75f))), 0.8f);
+        if (t < 0.1f && w < 0.018f) w = 0.018f;
+        for (const Notch& n : kNotch[side])
+            if (t >= n.t - n.len && t < n.t) w -= n.depth * (t - (n.t - n.len)) / n.len;
+        return w > 0 ? w : 0.0f;
+    };
+    // the samples along the vane: an even run plus both sides of every notch's step
+    float ts[64];
+    int nt = 0;
+    for (int i = 0; i <= 40; ++i) ts[nt++] = i / 40.0f;
+    for (const auto& side : kNotch) for (const Notch& n : side) { ts[nt++] = n.t - 0.002f; ts[nt++] = n.t; }
+    std::sort(ts, ts + nt);
+    ImVec2 outline[128];
+    int no = 0;
+    for (int i = 0; i < nt; ++i) { const float a = A0 + ts[i] * (A1 - A0); outline[no++] = axis(a, -width(ts[i], 0)); }
+    for (int i = nt - 1; i >= 0; --i) { const float a = A0 + ts[i] * (A1 - A0); outline[no++] = axis(a, width(ts[i], 1)); }
+    dl->AddConcavePolyFilled(outline, no, tip);
+    dl->AddPolyline(outline, no, kInk, 0.03f * s, ImDrawFlags_Closed);
+    // the shaft
+    ImVec2 shaft[22];
+    shaft[0] = axis(A0 - 0.02f, 0);
+    for (int i = 0; i <= 20; ++i) shaft[i + 1] = axis(A0 + (A1 - A0) * 0.86f * i / 20.0f, 0);
+    dl->AddPolyline(shaft, 22, IM_COL32(252, 244, 222, 255), 0.028f * s);
+    // the nib: the point, the shoulders, the base under the vane; its slit and hole
+    auto nib = [&](float a, float w) { return P(nx0 + DX * a + NX * w, ny0 + DY * a + NY * w); };
+    const ImVec2 nb[5] = { nib(0, 0), nib(0.12f, 0.06f), nib(A0 + 0.02f, 0.035f), nib(A0 + 0.02f, -0.035f), nib(0.12f, -0.06f) };
+    dl->AddConvexPolyFilled(nb, 5, IM_COL32(36, 46, 84, 255));
+    dl->AddPolyline(nb, 5, kInk, 0.025f * s, ImDrawFlags_Closed);
+    dl->AddLine(nib(0.02f, 0), nib(0.10f, 0), IM_COL32(200, 205, 225, 255), 0.014f * s);
+    dl->AddCircleFilled(nib(0.115f, 0), 0.016f * s, IM_COL32(200, 205, 225, 255));
+}
+
+// An eraser on the slant, in two colours.
+void icon_eraser(ImDrawList* dl, ImVec2 c, float s) {
+    const ImVec2 u(0.7071f * s, -0.7071f * s), w(0.7071f * s, 0.7071f * s);
+    auto Q = [&](float a, float b) { return ImVec2(c.x + u.x * a + w.x * b, c.y + u.y * a + w.y * b); };
+    const float L = 0.36f, W = 0.17f, split = 0.06f;
+    dl->AddQuadFilled(Q(-L, -W), Q(split, -W), Q(split, W), Q(-L, W), kPink);
+    dl->AddQuadFilled(Q(split, -W), Q(L, -W), Q(L, W), Q(split, W), IM_COL32(120, 160, 205, 255));
+    dl->AddQuad(Q(-L, -W), Q(L, -W), Q(L, W), Q(-L, W), kInk, 0.035f * s);
+    dl->AddLine(Q(split, -W), Q(split, W), kInk, 0.025f * s);
+}
+
+// A bin: the lid and its handle, the body with three ribs.
+void icon_bin(ImDrawList* dl, ImVec2 c, float s) {
+    auto P = [&](float x, float y) { return ImVec2(c.x + x * s, c.y + y * s); };
+    dl->AddQuadFilled(P(-0.27f, -0.17f), P(0.27f, -0.17f), P(0.21f, 0.37f), P(-0.21f, 0.37f), IM_COL32(150, 156, 160, 255));
+    dl->AddQuad(P(-0.27f, -0.17f), P(0.27f, -0.17f), P(0.21f, 0.37f), P(-0.21f, 0.37f), kInk, 0.035f * s);
+    for (float x : { -0.1f, 0.0f, 0.1f }) dl->AddLine(P(x * 1.1f, -0.08f), P(x, 0.29f), kInk, 0.025f * s);
+    dl->AddRectFilled(P(-0.34f, -0.29f), P(0.34f, -0.2f), IM_COL32(170, 176, 180, 255), 0.02f * s);
+    dl->AddRect(P(-0.34f, -0.29f), P(0.34f, -0.2f), kInk, 0.02f * s, 0, 0.035f * s);
+    dl->AddRect(P(-0.1f, -0.38f), P(0.1f, -0.29f), kInk, 0.02f * s, 0, 0.035f * s);
+}
+
+// One of the three tool buttons. `kind` 0 pen, 1 eraser, 2 bin.
+bool board_button(const char* id, ImVec2 a, ImVec2 b, int kind, bool active, ImU32 mine, const char* tip, float k) {
+    ImGui::SetCursorScreenPos(a);
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##t", ImVec2(b.x - a.x, b.y - a.y));
+    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    ImGui::PopID();
+    if (hov) g.hovering_button = true;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 fill = active ? board_mix(kPaperHi, mine, 0.42f) : held ? kPaperLo : hov ? kPaperHi : kPaper;
+    const float lift = hov && !held ? 2.0f : 0.0f;
+    const ImVec2 pa(a.x, a.y - lift), pb(b.x, b.y - lift);
+    dl->AddRectFilled(ImVec2(pa.x + 3, pa.y + 4), ImVec2(pb.x + 3, pb.y + 4), IM_COL32(0, 0, 0, 60), 2.0f);
+    rough_rect(dl, pa, pb, fill, kInk, active ? 3.2f : 2.2f, ImHashStr(id), 1.2f);
+    const ImVec2 c((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
+    const float s = (b.x - a.x) * 0.92f;
+    if (kind == 0) icon_pen(dl, c, s, mine);
+    else if (kind == 1) icon_eraser(dl, c, s);
+    else icon_bin(dl, c, s);
+    if (hov && tip) {   // the name of the tool to the left of the column, on a slip of paper
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        const float fs = 22 * k;
+        const ImVec2 ts = text_size(fs, tip);
+        const float cy = (a.y + b.y) * 0.5f;
+        const ImVec2 ta(a.x - ts.x - 26 * k, cy - ts.y * 0.5f - 7 * k), tb(a.x - 12 * k, cy + ts.y * 0.5f + 7 * k);
+        rough_rect(fg, ta, tb, kPaperHi, kInk, 1.8f, ImHashStr(tip), 1.0f);
+        text_at(fg, ImVec2(ta.x + 7 * k, ta.y + 7 * k), fs, kInk, tip);
+    }
+    return clicked;
+}
+
+void draw_board(const View& v) {
+    draw_tick();
+    uint64_t scope = 0;
+    const int layer = draw_visible_layer(&scope);
+    if (layer < 0) return;
+    const float k = v.k;
+    const ImVec2 o = v.org;
+    const ImU32 mine = board_color(net_self());
+
+    // the lines
+    {
+        ImDrawList* bg = ImGui::GetBackgroundDrawList();
+        const float th = 5.0f * k;
+        std::vector<ImVec2> pts;
+        for (int i = 0; i < draw_stroke_count(); ++i) {
+            const DrawStroke& s = draw_stroke(i);
+            if ((int)s.layer != layer || (layer == kDrawLayerBattle && s.scope != scope) || s.pts.empty()) continue;
+            const ImU32 col = board_color(s.owner);
+            // one polyline per run: the eraser cuts a stroke into pieces (DrawStroke::cut)
+            for (size_t r0 = 0; r0 < s.pts.size();) {
+                size_t r1 = r0 + 1;
+                while (r1 < s.pts.size() && !(r1 < s.cut.size() && s.cut[r1])) ++r1;
+                pts.resize(r1 - r0);
+                for (size_t j = r0; j < r1; ++j) pts[j - r0] = ImVec2(o.x + s.pts[j].x / 65535.0f * v.w, o.y + s.pts[j].y / 65535.0f * v.h);
+                r0 = r1;
+                if (pts.size() == 1) { bg->AddCircleFilled(pts[0], th * 0.6f, col, 12); continue; }
+                bg->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(0, 0, 0, 55), ImDrawFlags_None, th + 2.5f * k);
+                bg->AddPolyline(pts.data(), (int)pts.size(), col, ImDrawFlags_None, th);
+                if (pts.size() < 600) { for (const ImVec2& p : pts) bg->AddCircleFilled(p, th * 0.5f, col, 8); }   // round joins
+                else { bg->AddCircleFilled(pts.front(), th * 0.5f, col, 8); bg->AddCircleFilled(pts.back(), th * 0.5f, col, 8); }
+            }
+        }
+    }
+
+    // the canvas: the mouse belongs to the board while a tool is in hand (right click puts it down)
+    const DrawTool tool = draw_tool();
+    if (tool != DrawTool::None) {
+        if (overlay_window_begin("##mgmp_board_canvas", o, ImVec2(v.w, v.h), false)) {
+            ImGui::SetCursorScreenPos(o);
+            ImGui::InvisibleButton("##canvas", ImVec2(v.w, v.h), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+            const ImVec2 m = ImGui::GetIO().MousePos;
+            const float fx = (m.x - o.x) / v.w, fy = (m.y - o.y) / v.h;
+            const bool hovered = ImGui::IsItemHovered();
+            ImDrawList* fg = ImGui::GetForegroundDrawList();
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                draw_set_tool(DrawTool::None);
+            } else if (tool == DrawTool::Pen) {
+                static ImVec2 last;
+                if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) { draw_pen_down(fx, fy); last = m; }
+                else if (ImGui::IsItemActive() && draw_pen_active()) {
+                    const float dx = m.x - last.x, dy = m.y - last.y;
+                    if (dx * dx + dy * dy >= 2.5f * 2.5f * k * k) { draw_pen_move(fx, fy); last = m; }
+                }
+                if (ImGui::IsItemDeactivated() || (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && draw_pen_active())) draw_pen_up();
+                if (hovered) fg->AddCircleFilled(m, 4.0f * k, mine, 12);
+            } else if (tool == DrawTool::Eraser) {
+                const float r = 20.0f;   // stage pixels
+                if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) draw_erase_at(fx, fy, r);
+                if (hovered) {
+                    fg->AddCircle(m, r * k, IM_COL32(255, 255, 255, 220), 24, 3.0f * k);
+                    fg->AddCircle(m, r * k, kInk, 24, 1.5f * k);
+                }
+            }
+        }
+        ImGui::End();
+    }
+
+    // the three tools, a column on the right edge of the game's picture above the battle's "end turn" button (2026-10-11: a row in
+    // the bottom-right corner covered it), stage x 1858..1914, y 707..891 -- clear of the map's furniture too
+    const float bs = 56 * k, gap = 8 * k;
+    const ImVec2 a0(o.x + (kStageW - 6 - 56) * k, o.y + 707 * k);
+    const ImVec2 b1(a0.x + bs, a0.y + 3 * bs + 2 * gap);
+    if (overlay_window_begin("##mgmp_board_tools", ImVec2(a0.x - 8 * k, a0.y - 8 * k), ImVec2(b1.x - a0.x + 14 * k, b1.y - a0.y + 16 * k))) {
+        const DrawTool t = draw_tool();
+        ImVec2 p = a0;
+        if (board_button("bd_pen", p, ImVec2(p.x + bs, p.y + bs), 0, t == DrawTool::Pen, mine, tr(Tx::DRAW_PEN), k))
+            draw_set_tool(t == DrawTool::Pen ? DrawTool::None : DrawTool::Pen);
+        p.y += bs + gap;
+        if (board_button("bd_eraser", p, ImVec2(p.x + bs, p.y + bs), 1, t == DrawTool::Eraser, mine, tr(Tx::DRAW_ERASER), k))
+            draw_set_tool(t == DrawTool::Eraser ? DrawTool::None : DrawTool::Eraser);
+        p.y += bs + gap;
+        if (board_button("bd_bin", p, ImVec2(p.x + bs, p.y + bs), 2, false, mine, tr(Tx::DRAW_CLEAR), k))
+            draw_clear_own();
+    }
+    ImGui::End();
+}
+
 void draw_chat(const View& v) {
     const float k = v.k;
     bool open = chat_input_open();
@@ -2146,7 +2391,8 @@ void draw_chat(const View& v) {
     }
     was_open = false;
 
-    // Not typing: the history for ten seconds after the last line, then a fade.
+    // Not typing: the history for five seconds after the last line, then a fade. NO BACKGROUND (2026-10-06): the lines stand on the game itself; a soft light halo behind each letter keeps them
+    // readable on a dark scene.
     const uint64_t until = chat_show_until();
     if (!until || !chat_available()) return;
     const uint64_t t = GetTickCount64();
@@ -2161,10 +2407,18 @@ void draw_chat(const View& v) {
     const size_t first = rows.size() > maxrows ? rows.size() - maxrows : 0;
     const float h = lh * (float)(rows.size() - first) + 24 * k;
     const ImVec2 pa(v.org.x + 28 * k, v.org.y + v.h - 150 * k - h), pb(pa.x + cw + 40 * k, pa.y + h);
-    rough_rect(dl, pa, pb, mul_alpha(IM_COL32(217, 217, 210, 225), a), mul_alpha(kInk, a), 2.6f, 9, 1.4f);
+    (void)pb;
     ImFont* f = g.font ? g.font : ImGui::GetFont();
-    for (size_t i = first; i < rows.size(); ++i)
-        dl->AddText(f, fs, ImVec2(pa.x + 20 * k, pa.y + 12 * k + lh * (float)(i - first)), mul_alpha(rows[i].col, a), rows[i].text.c_str());
+    const ImU32 halo = mul_alpha(IM_COL32(240, 238, 228, 200), a);
+    const float o = 1.5f * k;
+    for (size_t i = first; i < rows.size(); ++i) {
+        const ImVec2 at(pa.x + 20 * k, pa.y + 12 * k + lh * (float)(i - first));
+        const char* s = rows[i].text.c_str();
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                if (dx || dy) dl->AddText(f, fs, ImVec2(at.x + dx * o, at.y + dy * o), halo, s);
+        dl->AddText(f, fs, at, mul_alpha(rows[i].col, a), s);
+    }
 }
 
 void draw_toast(const View& v) {
@@ -2964,6 +3218,7 @@ void menu_draw() {
     // The first-run notice, once the title screen is up.
     if (title && g.title_a > 0.001f && config().beta_notice && !g.beta_closed) draw_beta_notice(v);
 
+    draw_board(v);      // first: its canvas sits behind every other window of the mod
     draw_mp_tag(v);
     draw_save_sync(v);
     draw_abandon(v);
@@ -2985,7 +3240,7 @@ void menu_draw() {
         // needs from them. Bounded, in case the menu is still fading in.
         g.auto_play_until = GetTickCount64() + 10000;
     }
-    if (!room_now && prev_room) { g.room_name[0] = 0; say(tr(Tx::LEFT_ROOM)); chat_reset(); }
+    if (!room_now && prev_room) { g.room_name[0] = 0; say(tr(Tx::LEFT_ROOM)); chat_reset(); draw_reset(); settings_room_left(); }
     prev_room = room_now;
 
     // The dial to the host gave up on every address. A player who never got through is told why and walked out of the room

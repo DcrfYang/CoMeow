@@ -12,6 +12,7 @@
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
 #include "mgmp_rng.h"
+#include "mgmp_rngfix.h"
 #include "mgmp_tuning.h"
 
 namespace mgmp {
@@ -54,7 +55,10 @@ size_t site_diff(const RnglMsg& a0, const RnglMsg& b0, bool loose, char* out, si
         ++total;
         if (shown >= 8 || w + 100 >= cap) return;
         ++shown;
-        const int n = _snprintf_s(out + w, cap - w, _TRUNCATE, "%s[%s site rva 0x%07X: here %lld, there %lld%s]", w ? " " : "", fn_name(key), key & 0x07FFFFFFu, here, there, unsure ? " (listing cut)" : "");
+        // a site the RNG research of 2026-10-11 flagged carries its item: look it up in 调研任务列表/结果/批次NN.md (mgmp_rngfix.h lists what is still open)
+        const char* tag = rngfix_site_tag(key & 0x07FFFFFFu);
+        const int n = _snprintf_s(out + w, cap - w, _TRUNCATE, "%s[%s site rva 0x%07X%s%s: here %lld, there %lld%s]", w ? " " : "", fn_name(key), key & 0x07FFFFFFu,
+                                  tag ? " = research " : "", tag ? tag : "", here, there, unsure ? " (listing cut)" : "");
         if (n > 0) w += (size_t)n;
     };
     while (i < a.sites || j < b.sites) {
@@ -113,7 +117,14 @@ void rngl_flush(uint32_t turn, uint32_t action) {
             static bool logged_here = false;
             char text[1400];
             const size_t n = diag_environment_text(text, sizeof(text));
-            if (!logged_here) { logged_here = true; log_line("ENV", "%s", text); }
+            if (!logged_here) {
+                logged_here = true;
+                log_line("ENV", "%s", text);
+                // So a desync log says up front which known causes are still open (mgmp_rngfix.h; grep the source for TODO(RNG-).
+                log_line("RNGFIX", "RNG research 2026-10-11 -- fixed: event keywords R430-R440 reset, decision-time reseed (R373/R386/R388), per-frame fences R369/R102, "
+                                   "R027 backpack global passives ignored in a room. OPEN: TODO(RNG-FRAME) frame-driven sequences inside one action (R195 reaction closures, "
+                                   "R001 per-hit procs, R261, R266/R269, R268 dice), TODO(RNG-R013), TODO(RNG-R438); R270 mid-battle waves fenced 2026-10-11; measured only: R102");
+            }
             if (n) {
                 PeerLogMsg m{};
                 m.battle_id = battle; m.turn = turn;

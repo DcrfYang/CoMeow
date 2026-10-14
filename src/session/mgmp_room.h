@@ -93,6 +93,13 @@ void room_say_no_chapter_wait();
 // A sync that waits for another player's data ran out of time: the player is told (a notice with an OK) that the client's connection to the
 // host may have a problem and the games cannot be kept in sync. `what` names the data, for the log. Silent outside a session.
 void room_sync_trouble(const char* what);
+// This run's sync saves are on disk, made while ANOTHER of these players was the host (mgmp_checkpoint: the seats put the host first, so
+// that is the only order that differs): a notice naming the player who has to open the room. The lobby name of session id `id`: false
+// (and "P?" filled) when unknown.
+void room_say_recovery_host(const char* name);
+void room_say_cat_census(unsigned lost, const char* lost_names, unsigned duplicated, const char* dup_names);   // the names: "Cisol, Grimmsley" (or "-")
+void room_say_reserved_real();   // the setup paused rather than overwrite a real cat on a reserved id (catsync)   // the cat census found missing / duplicated cats after a run (catsync)
+bool room_peer_name(uint8_t id, char* out, size_t cap);
 
 // --- solo house boss ---------------------------------------------------------------------------------
 bool room_solo_active();        // this player is away fighting a house boss on its own

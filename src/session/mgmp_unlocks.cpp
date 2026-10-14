@@ -24,6 +24,8 @@
 #include "mgmp_room.h"
 #include "mgmp_tuning.h"
 #include "mgmp_event_keys.h"
+#include "mgmp_spawntest.h"
+#include "mgmp_page.h"         // page_self / page_button_live: the screen an unlock check is asked on (UNLOCKSRC)
 
 namespace mgmp {
 namespace {
@@ -113,7 +115,7 @@ uint32_t unlocks_mapflags() {
 }
 
 bool event_window_on();
-bool event_property_answer(const char* key, int64_t local, int64_t& value);
+bool event_property_answer(const char* key, int64_t local, int64_t fallback, int64_t& value);
 
 void unlocks_override_set(uint32_t flags) {
     g_override = flags; g_override_on = true; g_override_at = GetTickCount64();
@@ -128,12 +130,12 @@ bool unlocks_override_active() {
     if (g_override_on && GetTickCount64() - g_override_at > kOverrideMaxMs) g_override_on = false;
     return g_override_on || event_window_on();
 }
-bool unlocks_override_lookup(const char* key, int64_t local, int64_t& value) {
+bool unlocks_override_lookup(const char* key, int64_t local, int64_t fallback, int64_t& value) {
     if (g_override_on && strncmp(key, "mapflag_", 8) == 0) {
         for (int i = 0; i < kFlagCount; ++i)
             if (strcmp(key + 8, kFlagNames[i]) == 0) { value = (g_override >> i) & 1u; return true; }
     }
-    return event_property_answer(key, local, value);
+    return event_property_answer(key, local, fallback, value);
 }
 
 // ============================================================================================================================================
@@ -603,6 +605,7 @@ uint64_t splitmix64(uint64_t& x) {
 // on every test the same way -- so the board (statics, the party's shuffle, pickups, spiderlings) was placed from two different streams. Every
 // peer now starts the build from a stream derived from the battle id (the node seed both share).
 namespace { bool g_in_build = false; uint32_t g_load_no = 0; }
+bool unlocks_in_build() { return g_in_build; }
 
 // ---- the director's per-run queues the battle build consumes (see the protocol: PendingEnemy) ----------------------------------------------------------
 //
@@ -885,6 +888,55 @@ bool unlocks_event_subject(void* vec, void* stream, void* pick, void** out) {
     return true;
 }
 
+bool unlocks_bounty_target(void* vec, void* pick, bool faction1, void** out) {
+    if (!net_active() || net_peer_count() < 2 || !vec || !pick || !out) return false;
+    const uint64_t battle = lockstep_battle_id();
+    uint32_t n = 0;
+    void** data = nullptr;
+    if (!battle || !mem_read((uint8_t*)vec + 4, &n, sizeof(n)) || !n || n > 64 || !mem_read((uint8_t*)vec + 8, &data, sizeof(data)) || !data) return false;
+    void* units[64] = {};
+    if (!mem_read(data, units, n * sizeof(void*))) return false;
+    struct Key { int32_t y, x; char def[48]; };
+    Key key[64] = {};
+    uint32_t order[64] = {};
+    for (uint32_t i = 0; i < n; ++i) {
+        const void* tobj = nullptr;
+        int32_t tile[2] = {};
+        if (!units[i] || !mem_read((const uint8_t*)units[i] + 0x60, &tobj, sizeof(tobj)) || !tobj || !mem_read((const uint8_t*)tobj + 0x48, tile, sizeof(tile))) return false;
+        key[i].x = tile[0]; key[i].y = tile[1];
+        unit_definition_name(units[i], key[i].def, sizeof(key[i].def));
+        order[i] = i;
+    }
+    std::sort(order, order + n, [&](uint32_t a, uint32_t b) {
+        if (key[a].y != key[b].y) return key[a].y < key[b].y;
+        if (key[a].x != key[b].x) return key[a].x < key[b].x;
+        return strcmp(key[a].def, key[b].def) < 0;
+    });
+    // a stream of its own, from the battle: the game's helper draws over a stand-in vector of the indices 0..n-1, as for the event's subject cat
+    uint64_t x = battle ^ 0x626F756E74790000ull ^ (faction1 ? 0x31ull : 0x32ull);
+    uint64_t st[4];
+    for (int i = 0; i < 4; ++i) st[i] = splitmix64(x);
+    void* idx[64] = {};
+    for (uint32_t i = 0; i < n; ++i) idx[i] = (void*)(uintptr_t)i;
+    uint8_t fake[24] = {};
+    void* fp = idx;
+    memcpy(fake + 4, &n, sizeof(n));
+    memcpy(fake + 8, &fp, sizeof(fp));
+    const uintptr_t k = (uintptr_t)((void*(__fastcall*)(void*, void*))pick)(fake, st);
+    if (k >= n) return false;
+    *out = units[order[k]];
+    char line[600] = {};
+    int off = 0;
+    for (uint32_t i = 0; i < n && off < (int)sizeof(line) - 80; ++i) {
+        const Key& c = key[order[i]];
+        off += _snprintf_s(line + off, sizeof(line) - off, _TRUNCATE, " %s(%d,%d)", c.def[0] ? c.def : "?", c.x, c.y);
+    }
+    const Key& w = key[order[k]];
+    log_line("SPAWN", "the bounty hunter's target (%s): %u candidate(s) sorted by tile [%s ] -- draw %u -> %s at (%d,%d) (battle %016llx; the same on every peer)",
+             faction1 ? "faction-1 units, the other list was empty" : "units of the other factions", n, line, (unsigned)k, w.def[0] ? w.def : "?", w.x, w.y, (unsigned long long)battle);
+    return true;
+}
+
 void unlocks_build_enemies_begin() {
     if (!g_in_build || !net_active() || net_peer_count() < 2) return;
     const bool client = net_role() == NetRole::Client;
@@ -968,7 +1020,13 @@ void unlocks_build_enemies_begin() {
     }
 }
 
+// THE BATTLE'S START, AFTER THE BUILD AND BEFORE THE FIRST TURN (2026-10-06): the passives that act "on battle start" load units in this window -- a necromancer's CorpseConnoisseur lays 2-4
+// chapter corpses (SpawnOnBattleStart chapter_corpse_medium), a familiar comes in. The build's fence is over and the fight's is not up yet (lockstep_fight_up is false until the first turn
+// boundary), so such a load drew its random cat name from the shared stream unfenced: the first corpse (a Catcaller) drew a different number of times on each peer, and the next corpse came out
+// another kind (LilRat on the host, Pooter on the client) on swapped tiles -- turn 0 differed, turn 1 halted (battle 9a3ab41b). The mid-battle fence now covers this window too.
+namespace { bool g_after_build = false; uint64_t g_after_build_battle = 0; }
 void unlocks_battle_build_done() {
+    if (g_in_build) { g_after_build = true; g_after_build_battle = lockstep_battle_id(); }
     if (g_in_build) unlocks_build_stage_end("end of the build");
     pending_unhide();
     g_in_build = false;
@@ -1011,7 +1069,8 @@ namespace { bool g_mid_in = false; uint32_t g_mid_no = 0; uint64_t g_mid_seed = 
 void unlocks_midbattle_load(const char* what) {
     if (g_mid_depth++ > 0) return;                                  // a load inside a load: the outer one's fence covers it
     g_mid_in = false;
-    if (g_in_build || !net_active() || net_peer_count() < 2 || !lockstep_fight_up()) return;
+    if (lockstep_fight_up() || lockstep_battle_id() != g_after_build_battle) g_after_build = false;   // the first turn boundary has been (from here on it is the fight's own fence), or this battle is over
+    if (g_in_build || !net_active() || net_peer_count() < 2 || !(lockstep_fight_up() || g_after_build)) return;
     uint64_t* s = rng_global_stream();
     if (!s) return;
     uint64_t cur[4] = {};
@@ -1076,7 +1135,7 @@ void unlocks_battle_build() {
         log_line_lvl(LogLevel::Error, "SPAWN", "!! battle build: the shared stream could not be set");
         return;
     }
-    g_in_build = true; g_load_no = 0; g_stage_no = 0;
+    g_in_build = true; g_load_no = 0; g_stage_no = 0; g_after_build = false;
     unlocks_build_enemies_begin();   // the director's queues and active modifiers: logged on both peers, aligned with the host's on a client (the weather's props are read from the first stage on)
     {   // the 20% bird of the build (0x35B54A): chance 0.2 only when MewDirector+0x70C == 0 and +0x6DC != 0 -- both are per-save, so say what this peer has
         const uintptr_t at = addr_of_data(D_MewDirectorPtr);
@@ -1375,6 +1434,7 @@ void unlocks_window_close(const char* why) {
 }
 
 void unlocks_tick() {
+    unlocksrc_tick();
     if (!win.on || win.left_map || !lockstep_battle_ready()) return;
     win.left_map = true;
     log_line("UNLOCK", "the battle is built (%u ability, %u passive, %u item, %u level group, %u boss check(s) so far) -- the window stays open until the map is ready again",
@@ -1409,7 +1469,7 @@ void note_uncovered(const char* key, int64_t local) {
 }
 
 // The property getter's answer for one of the properties the events read: the HOST's value, with every difference from this save's own on the record.
-bool event_property_answer(const char* key, int64_t local, int64_t& value) {
+bool event_property_answer(const char* key, int64_t local, int64_t fallback, int64_t& value) {
     if (!event_window_on()) return false;
     for (int i = 0; i < event_keys::kCount; ++i) {
         if (strcmp(event_keys::kKeys[i], key) != 0) continue;
@@ -1438,13 +1498,21 @@ bool event_property_answer(const char* key, int64_t local, int64_t& value) {
         value = win.prop_virt[i];
         return true;
     }
-    // A property that is not one of the 55 but IS in the host's whole table (proto 79): the host's value, followed through the event's own writes like the others. Not the map flags (they have their
-    // own rule at map generation), the run's own markers, and the level-up counters (the level-up that follows a fight draws from THIS save's own numbers).
-    if (hprops.have && hprops.got == hprops.total && strncmp(key, "mapflag_", 8) != 0 && strncmp(key, "SeenLevelup", 11) != 0 && strcmp(key, "on_adventure") != 0 &&
+    // A property that is not one of the 55 but IS in the host's whole table (proto 79): the host's value, followed through the event's own writes like the others. Not the run's own markers, and not
+    // the level-up counters (the level-up that follows a fight draws from THIS save's own numbers).
+    // THE MAP FLAGS TOO (2026-10-14, room UDU5, node 18 of the core map): a map's `flags {}` block changes what a node IS -- core.gon's quest_event is Quest_CoreObelisk, and Quest_DimensionXPortal
+    // with mapflag_DimensionXUnlocked -- and the game resolves it from the save's mapflag_* as the event is set up (the reads come in every event and battle window). The client had the rift
+    // unlocked and the host had not: the host drew Quest_CoreObelisk, the client Quest_DimensionXPortal, and the client could not follow the host's choice. The map generation has its own rule
+    // (unlocks_override_set, checked first); inside a window a map flag answers what the HOST's save says. The host's table is the integer rows of its save file, and a flag the host never earned
+    // has no row: then the answer is the getter's own default, which is what the host's game reads too.
+    const bool mapflag = strncmp(key, "mapflag_", 8) == 0;
+    if (hprops.have && hprops.got == hprops.total && strncmp(key, "SeenLevelup", 11) != 0 && strcmp(key, "on_adventure") != 0 &&
         strcmp(key, "departed_first_real_adventure") != 0) {
         const uint32_t h = prop_key_hash(key);
         int32_t host = 0;
-        if (hprops.lookup(h, host)) {
+        bool known = hprops.lookup(h, host);
+        if (!known && mapflag) { host = fallback < -2000000000LL ? -2000000000 : fallback > 2000000000LL ? 2000000000 : (int32_t)fallback; known = true; }
+        if (known) {
             unsigned d = 0;
             for (; d < win.dyn_n; ++d) if (win.dyn_hash[d] == h) break;
             if (d == win.dyn_n) {
@@ -1452,7 +1520,8 @@ bool event_property_answer(const char* key, int64_t local, int64_t& value) {
                 win.dyn_hash[d] = h; win.dyn_last[d] = local; win.dyn_virt[d] = host; ++win.dyn_n; ++win.props;
                 if ((int64_t)host != local) {
                     ++win.dyn_differing; ++win.props_differing;
-                    if (win.logged < kMaxDifferenceLines) { ++win.logged; log_line("UNLOCK", "save property '%s' (the host's whole table): the host has %d, this save has %lld -- answered with the host's", key, (int)host, (long long)local); }
+                    if (mapflag) log_line("UNLOCK", "map flag '%s': the host's save says %d, this save %lld -- answered with the host's (what this node or battle is made of follows the host)", key, (int)host, (long long)local);
+                    else if (win.logged < kMaxDifferenceLines) { ++win.logged; log_line("UNLOCK", "save property '%s' (the host's whole table): the host has %d, this save has %lld -- answered with the host's", key, (int)host, (long long)local); }
                 }
             } else if (local != win.dyn_last[d]) {
                 win.dyn_last[d] = local;
@@ -1513,9 +1582,18 @@ float g_host_speed = 0.0f;           // client: what the host told us (0 = nothi
 float g_sent_speed = 0.0f;           // host: what was last sent
 uint8_t g_sent_peers = 0;            // host: how many players there were then (a player who joined must be told again)
 bool g_speed_said = false;
+float g_own_speed = 0.0f;            // what this game's own setting answered last (any peer; 0 = never read)
 }
+bool settings_room_speed(float& out) {
+    const float v = net_role() == NetRole::Host ? g_own_speed : g_host_speed;
+    if (v <= 0.0f) return false;
+    out = v;
+    return true;
+}
+void settings_room_left() { g_host_speed = 0.0f; g_speed_said = false; }
 bool settings_override(const char* key, float own, float& out) {
     if (!key || strcmp(key, "combat_speed") != 0) return false;
+    g_own_speed = own;
     if (!net_active() || net_peer_count() < 2) { g_host_speed = 0.0f; g_sent_speed = 0.0f; g_sent_peers = 0; g_speed_said = false; return false; }
     if (net_role() == NetRole::Host) {
         const uint8_t peers = net_peer_count();
@@ -1550,6 +1628,7 @@ void unlocks_level_screen_opens() {
     if (cls.released) return;
     cls.released = true;
     log_line("UNLOCK", "the unlock answers (abilities, passives, items, level groups, bosses, classes) are this save's own again: the fight is over (the level-up screen of its reward is being built; the level-up uses this save's unlocks)");
+    lockstep_log_standing("the fight is over here");
 }
 
 void unlocks_classes_after(void* out_vector, bool with_colorless) {
@@ -1564,6 +1643,7 @@ void unlocks_classes_after(void* out_vector, bool with_colorless) {
     unlocks_fight_released();                                  // the fight's end, seen from here (see above)
     // One line per distinct list per flag per battle, on BOTH peers: what this peer's save lists, what the game is given.
     auto say = [&](const char* what, const std::string& given) {
+        unlocksrc_classes(strncmp(what, "REPLACED", 8) == 0);   // counted on every request (the line below is once per distinct list)
         uint64_t h = 1469598103934665603ULL;
         for (const char* c = what; *c; ++c) { h ^= (uint8_t)*c; h *= 1099511628211ULL; }
         for (char c : given) { h ^= (uint8_t)c; h *= 1099511628211ULL; }
@@ -1731,7 +1811,124 @@ void unlockq_flush(uint32_t turn, uint32_t actions_done) {
     uq = UQ{}; uq.battle = b; uq.seen_n = seen_n; memcpy(uq.seen, seen, sizeof(seen)); uq.lines = lines; uq.seq = keep_seq;
 }
 
+// ============================================================================================================================================
+// WHOSE UNLOCK LIST ANSWERED (2026-10-14, the user: "is every player's level-up and item pick drawing from its OWN save's unlocks?"). Read-only. In a room, every unlock check (ability,
+// passive, item, level group, boss) and every class-list request is counted in a SEGMENT -- the screen it was asked on (battle, the level-up screen, the rewards after a fight, an event,
+// a shop, the map, the House ...) -- and split by who answered: THIS save, or the HOST's lists (a client inside its window). When the screen changes, or after a quiet second, the
+// segment is one line:
+//   UNLOCKSRC <screen> (node ...): N checks -- this save answered A (ability a/u passive ... where u = unlocked), the host's lists answered H (...) | this save vs the host's list: D differ [names]
+// The last part exists on a client only (the host's lists arrived): of the checks THIS save answered, how many the host's list would have answered otherwise -- so a log shows both WHICH
+// list a level-up or an item pick used and whether that made a difference. Nothing is changed by any of it.
+// ============================================================================================================================================
+namespace {
+constexpr int kSrcKinds = 6;     // the five UnlockList kinds + the class list
+const char* const kSrcNames[kSrcKinds] = { "ability", "passive", "item", "level group", "boss", "class list" };
+struct SrcSeg {
+    bool on = false;
+    char label[64] = {};
+    uint64_t node = 0;
+    ULONGLONG first = 0, last = 0;
+    unsigned own[kSrcKinds] = {}, own_yes[kSrcKinds] = {}, host[kSrcKinds] = {}, host_yes[kSrcKinds] = {};
+    unsigned compared = 0, differ = 0;
+    char differ_names[260] = {};
+};
+SrcSeg g_src;
+char g_src_ctx[48] = {};
+ULONGLONG g_src_ctx_until = 0;
+constexpr ULONGLONG kSrcQuietMs = 1000;
+
+bool src_wanted() { return net_active() && net_peer_count() >= 2; }
+
+void src_label(char* out, size_t cap) {
+    const ULONGLONG now = GetTickCount64();
+    const char* role = net_role() == NetRole::Host ? "host" : "client";
+    if (now < g_src_ctx_until && g_src_ctx[0])            _snprintf_s(out, cap, _TRUNCATE, "%s, %s", g_src_ctx, role);
+    else if (lockstep_fight_up())                         _snprintf_s(out, cap, _TRUNCATE, "battle, %s", role);
+    else if (win.on && win.event)                         _snprintf_s(out, cap, _TRUNCATE, "event, %s", role);
+    else if (win.on)                                      _snprintf_s(out, cap, _TRUNCATE, "after the fight (rewards), %s", role);
+    else if (page_button_live("Shop_"))                   _snprintf_s(out, cap, _TRUNCATE, "shop, %s", role);
+    else if (page_button_live("Event_"))                  _snprintf_s(out, cap, _TRUNCATE, "event screen, %s", role);
+    else                                                  _snprintf_s(out, cap, _TRUNCATE, "page '%s', %s", page_name(page_self()), role);
+}
+
+void src_flush(const char* why) {
+    SrcSeg& s = g_src;
+    if (!s.on) return;
+    s.on = false;
+    unsigned own = 0, host = 0;
+    for (int k = 0; k < kSrcKinds; ++k) { own += s.own[k]; host += s.host[k]; }
+    auto part = [&](const unsigned* n, const unsigned* yes, char* out, size_t cap) {
+        size_t w = 0; out[0] = 0;
+        for (int k = 0; k < kSrcKinds; ++k) {
+            if (!n[k]) continue;
+            const int r = k == 5 ? _snprintf_s(out + w, cap - w, _TRUNCATE, "%s%s %u", w ? ", " : "", kSrcNames[k], n[k])
+                                 : _snprintf_s(out + w, cap - w, _TRUNCATE, "%s%s %u/%u", w ? ", " : "", kSrcNames[k], yes[k], n[k]);
+            if (r <= 0) break;
+            w += (size_t)r;
+        }
+        if (!w) _snprintf_s(out, cap, _TRUNCATE, "none");
+    };
+    char a[200], b[200];
+    part(s.own, s.own_yes, a, sizeof(a));
+    part(s.host, s.host_yes, b, sizeof(b));
+    char cmp[340] = {};
+    if (s.compared) _snprintf_s(cmp, sizeof(cmp), _TRUNCATE, " | this save vs the host's list, on the %u blacklisted name(s) this save answered: %u differ%s%s", s.compared, s.differ,
+                                s.differ ? " --" : "", s.differ ? s.differ_names : "");
+    else if (net_role() == NetRole::Client) _snprintf_s(cmp, sizeof(cmp), _TRUNCATE, " | %s", host_lists.have ? "no blacklisted name was answered by this save" : "the host's lists have not arrived: nothing to compare");
+    log_line("UNLOCKSRC", "%s (node %016llx, %llu ms, %s): %u check(s) -- THIS save answered %u [%s], the HOST's lists answered %u [%s]%s",
+             s.label, (unsigned long long)s.node, (unsigned long long)(s.last - s.first), why, own + host, own, a, host, b, cmp);
+}
+
+void src_count(int kind, bool local, bool answer, bool from_host, const char* name, UnlockList list) {
+    if (!src_wanted()) return;
+    char label[64];
+    src_label(label, sizeof(label));
+    const uint64_t node = lockstep_battle_id();
+    if (g_src.on && (strcmp(label, g_src.label) != 0 || node != g_src.node)) src_flush("the screen changed");
+    SrcSeg& s = g_src;
+    const ULONGLONG now = GetTickCount64();
+    if (!s.on) { s = SrcSeg{}; s.on = true; strncpy_s(s.label, sizeof(s.label), label, _TRUNCATE); s.node = node; s.first = now; }
+    s.last = now;
+    if (from_host) { ++s.host[kind]; if (answer) ++s.host_yes[kind]; }
+    else           { ++s.own[kind];  if (answer) ++s.own_yes[kind]; }
+    // a client's own answer next to what the host's list says for the same name
+    if (!from_host && kind < 5 && name && net_role() == NetRole::Client && host_lists.have) {
+        const int idx = find_name(list, name);
+        if (idx >= 0) {
+            ++s.compared;
+            if (bit_of(host_lists.msg, list, idx) != local) {
+                ++s.differ;
+                const size_t at = strlen(s.differ_names);
+                if (at < sizeof(s.differ_names) - 48)
+                    _snprintf_s(s.differ_names + at, sizeof(s.differ_names) - at, _TRUNCATE, " %s '%s' (here %s)", kSrcNames[kind], name, local ? "unlocked" : "locked");
+            }
+        }
+    }
+}
+} // namespace
+
+void unlocksrc_context(const char* what) {
+    if (!what) return;
+    strncpy_s(g_src_ctx, sizeof(g_src_ctx), what, _TRUNCATE);
+    g_src_ctx_until = GetTickCount64() + 1500;
+}
+void unlocksrc_note(UnlockList list, const char* name, bool local, bool answer, bool from_host) { src_count((int)list, local, answer, from_host, name, list); }
+void unlocksrc_classes(bool from_host) { src_count(5, true, true, from_host, nullptr, UnlockList::Ability); }
+bool unlocksrc_wanted() { return src_wanted(); }
+void unlocksrc_tick() {
+    if (g_src.on && GetTickCount64() - g_src.last > kSrcQuietMs) src_flush("a quiet second");
+}
+
+static bool unlocks_window_answer_impl(UnlockList list, const char* name, bool local);
 bool unlocks_window_answer(UnlockList list, const char* name, bool local) {
+    const bool host_answer = unlocks_window_answer_impl(list, name, local);
+    // who answered: the host's list only when the window really replaced the answer (a name on a blacklist, the host's lists in, the fight not over)
+    const bool from_host = !unlocks_fight_released() && host_lists.have && find_name(list, name) >= 0;
+    unlocksrc_note(list, name, local, host_answer, from_host);
+    return host_answer;
+}
+
+static bool unlocks_window_answer_impl(UnlockList list, const char* name, bool local) {
     const int li = (int)list;
     if (unlocks_fight_released()) { unlockq_query(list, name, local, local); return local; }     // the fight is over: this save answers for itself
     ++win.checks[li];
