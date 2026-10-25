@@ -104,6 +104,9 @@ bool lockstep_fill_choice(void* brain, void* out);
 // Called from the ApplyTurnAction hook, before the original runs. Clears the
 // outstanding-send guard and validates that what landed is what we expected.
 void lockstep_on_applied(const void* action, const void* actor);
+// h_QueueDecision, before the original: TurnControl is queueing `ta`. A decision a slot-52 passive cancelled (type 0: an enemy's Counterspell) is never applied,
+// so the outstanding guard the sent decision raised is dropped here and the next decision goes out (0.1.82).
+void lockstep_on_queued(const void* ta);
 // After Character::EndTurn: the owner's final facing of that cat (see apply_remote) is written again if the end of the turn changed it.
 void lockstep_after_endturn(void* self);
 
@@ -165,6 +168,9 @@ void lockstep_solo_battle_probe(const void* actor);
 // h_UpdateDecision, after the original: when `out` (the TurnAction it returns) holds a decision (type > 1, the test TurnControl makes), the shared
 // stream is set from (battle, turn, the brain's unit, the number the coming action will get). Passive slot 52 runs between this and the apply.
 void lockstep_reseed_decision(const void* brain, const void* out);
+// A RANDOM PICK BOTH PEERS MUST MAKE ALIKE, wherever the shared stream stands (0.1.74): sets the stream from (battle, turn, the acting unit, the current action's number, the n-th such pick of this
+// action, `salt`). The caller fences the stream around it (it is put back afterwards). False outside a room's snapshotted battle -- the stream is left alone then.
+bool lockstep_stream_for_pick(uint64_t salt, uint64_t* seed_out);
 
 // The armed click's landing point: apply AND broadcast, so both peers write the
 // same hp change. Local-only was the first version and it left the other peer
@@ -222,6 +228,10 @@ void lockstep_disarm_enemy_hit();
 uint64_t lockstep_battle_id();
 // The turn number of the battle in progress (0 outside one).
 uint32_t lockstep_turn();
+// The first word the shared stream was last reseeded with (lockstep_reseed / lockstep_reseed_action: each actor-turn and each action). Both peers
+// reseed at the same points with the same numbers, so it names "this action" the same way everywhere; 0 before the first reseed. mgmp_dmgfence keys
+// each damage instance with it.
+uint64_t lockstep_reseed_key();
 // CLIENT: the host's fight of battle `node` is over (its level-up choice for that node arrived). If this peer's fight is still up a few seconds later, the enemies still standing here are struck down
 // the way a halted battle is finished, so this peer leaves the fight too (2026-10-06: the last shot ended the host's battle, the client stayed in it).
 void lockstep_note_host_fight_over(uint64_t node);

@@ -165,6 +165,23 @@ struct Config {
     // ui.block_new_cats: the event effect "a new cat joins the run" does nothing. Off by default (the game as it is); set from the main menu's
     // mod settings. Part of the handshake's ruleset: both players must agree.
     bool     block_new_cats = false;
+    // ui.enemy_scale: the room's enemy health and armor multiplier, 2.0 .. 8.0 in steps of 0.5 (2026-10-19), kept here in HALVES (4 .. 16).
+    // Set from the mod settings' slider; in a room the HOST's counts (its HELLO carries it).
+    uint8_t  enemy_scale_half = 4;
+    // THE EXPERIMENTAL FEATURES (2026-10-18): each one switched on and off on its own in the mod settings, all off by default. In a room the HOST's settings
+    // count (its HELLO carries them). The old single ui.experimental is no longer read.
+    // 0.1.106 (2026-10-25): exp_treasure and exp_indep_events are well tested now -- ON by default (a file that says false keeps false), listed ahead of the
+    // experimental section without its warning. RULE: a feature that has been verified is listed first and loses the warning; the settings list runs from verified to
+    // experimental.
+    // ui.exp_treasure: a treasure node's chest holds one item per player, the same on every screen, each player takes one, first come first served (mgmp_treasure).
+    bool     exp_treasure = true;
+    // ui.exp_house_coop: when exactly one player has the house boss today, the others may help them fight it (mgmp_housecoop). Still experimental: off.
+    bool     exp_house_coop = false;
+    // ui.exp_indep_events: the random "?" events are each player's own -- own cats, own choice; the draw follows the host (mgmp_indepevt).
+    bool     exp_indep_events = true;
+    // ui.player_name (0.1.89): the name this player last connected with, from the multiplayer window -- the box starts with it next time
+    // (before signal.name, which a shipped config may set). "" = never saved.
+    char     ui_player_name[32] = {};
     // ui.auto_upload_crash_log: when the game crashes (the crash handler runs) or an earlier run ended without a clean exit (crash, freeze, killed), its log is sent to the configured
     // server by itself -- from the crash handler at once, and from the next start for what could not be sent then (mgmp_prevrun.h). False: nothing is sent unless the player presses "upload" in F2.
     bool     auto_upload_crash_log = true;
@@ -239,6 +256,17 @@ bool        config_set_debug_mode(bool on);
 bool        config_set_beta_notice(bool on);
 // ui.block_new_cats, in memory and in mgmp.json (the same careful rewrite as beta_notice). False when the file could not be written.
 bool        config_set_block_new_cats(bool on);
+// ui.exp_treasure / ui.exp_house_coop, the same way.
+bool        config_set_exp_treasure(bool on);
+bool        config_set_exp_house_coop(bool on);
+bool        config_set_exp_indep_events(bool on);
+// ui.player_name: remembered in mgmp.json when it changed (true = written). config_json_string: a JSON string literal, quotes included.
+bool        config_set_player_name(const char* name);
+std::string config_json_string(const char* s);
+// ui.enemy_scale in halves (4 = x2 .. 16 = x8; clamped). `persist` false changes only the live value (the slider while it is dragged).
+bool        config_set_enemy_scale_half(uint8_t half, bool persist);
+// The text rewrite of any ui.<key> with a literal JSON value (a number, true/false), as config_rewrite_ui_bool does it.
+std::string config_rewrite_ui_value(const std::string& text, const char* key, const char* value);
 // The text rewrite behind both: `text` with ui.<key> set to `on` (added when absent), or an empty string for a file that is not an object.
 std::string config_rewrite_ui_bool(const std::string& text, const char* key, bool on);
 // The text rewrite behind it, exposed for tests: returns `text` with ui.beta_notice set to `on`, or an empty string if

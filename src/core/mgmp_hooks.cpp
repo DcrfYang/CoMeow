@@ -56,6 +56,9 @@
 #include "mgmp_checkpoint.h"
 #include "mgmp_setup.h"
 #include "mgmp_storage_diag.h"
+#include "mgmp_areagate.h"
+#include "mgmp_indepevt.h"
+#include "mgmp_perf.h"
 #include "mgmp_unlocks.h"
 #include "mgmp_leave.h"
 #include "mgmp_page.h"
@@ -70,11 +73,18 @@
 #include "mgmp_rng.h"
 #include "mgmp_rngfix.h"
 #include "mgmp_rngframe.h"
+#include "mgmp_poolfence.h"
 #include "mgmp_rtti.h"
 #include "mgmp_turnaction.h"
+#include "mgmp_treasure.h"
+#include "mgmp_housecoop.h"
+#include "mgmp_mapvote.h"       // 0.1.95: every player picks the next map node first
 
 #include <windows.h>
 #include "MinHook.h"
+#include "mgmp_souljar.h"
+#include "mgmp_gains.h"        // 0.1.83: a cat's battle gains go to its owner
+#include "mgmp_dmgfence.h"     // 0.1.83: R001, every damage instance on a stream of its own
 
 #include <cstdio>
 #include <cstring>
@@ -564,6 +574,8 @@ void __fastcall h_QueueDecision(void* self, void* ta) {
         }
     }
 
+    if (lockstep_active()) lockstep_on_queued(ta);   // a decision the game cancelled (Counterspell) lets the next one go out (0.1.82)
+
     if (record_active()) {
         uint32_t type = 0;
         if (mem_read(ta, &type, sizeof(type)) && type > TA_None) {
@@ -684,6 +696,15 @@ void __fastcall h_TimeDelay(void* self) {
 static bool multiplayer_live() { return net_active() && net_peer_count() >= 2; }
 
 void __fastcall h_SaveScum(void* run, int mode) {
+    {   // 0.1.92 diagnostics (HOUSEBOSS): the save loader (sub_1403BBFF0) calls the penalty from two places in this build -- its branch for a save left
+        // in "houseboss_prepare" (a house boss that was quit, RA 0x3BD068) and its "savescumlocation" branch (RA 0x3BD2B6)
+        const uintptr_t ra = (uintptr_t)_ReturnAddress() - g_base;
+        const char* where = ra == 0x3BD068 ? "the loader's branch for a save left in houseboss_prepare (a house boss that was quit)"
+                          : ra == 0x3BD2B6 ? "the loader's savescumlocation branch" : "another caller";
+        log_line("HOUSEBOSS", "save-scum penalty called (mode %d) from rva 0x%zx, %s -- %s", mode, (size_t)ra, where,
+                 multiplayer_live() ? "in multiplayer: the mod SWALLOWS it (Steven's lines and what follows them do not run)" : "alone: the game's own runs");
+        housecoop_log_boss("at the save-scum penalty");
+    }
     if (!multiplayer_live()) { o_SaveScum(run, mode); return; }
     static LONG volatile swallowed = 0;
     LONG n = InterlockedIncrement(&swallowed);
@@ -758,7 +779,7 @@ void* __fastcall h_LoadChar(void* chr, void* name, uint8_t a, uint8_t b) {
     int32_t hp_before = 0;
     mem_read((const uint8_t*)chr + kChr_Hp, &hp_before, sizeof(hp_before));
     void* r = o_LoadChar(chr, name, a, b);
-    balance_scale_enemy(chr, hp_before);
+    balance_scale_enemy(chr, hp_before, session_enemy_scale_half());
     unlocks_build_load_done();   // ...and again when it is over: what the definition drew (a random cat's name) must not reach the next roll
     unlocks_midbattle_load_done();
     return r;
@@ -806,6 +827,7 @@ bool __fastcall h_TryDepart(void* box) {
         log_line("DEPART", "[%02d:%02d:%02d] the House's box sets off with %u cat(s):%s", st.wHour, st.wMinute, st.wSecond, n, list);
     }
     if (!room_depart_allowed(n)) { log_line("DEPART", "refused by the room (party size rule)"); return true; }
+    if (housecoop_refuse_depart(n)) { log_line("DEPART", "refused: the house boss co-op is being decided, or this helper has not had its inserted day yet"); return true; }
     catsync_log_snapshot("departure (the box is accepted)");
     catsync_census_take(ids, n);
     catsync_log_audit("departure (the box is accepted)");
@@ -823,6 +845,10 @@ bool __fastcall h_TryDepart(void* box) {
 // --- phase 5: following the host through the map ---------------------------
 
 void __fastcall h_EnterNode(void* self, void* node) {
+    // 0.1.53: the host about to lead the room into an area another player has not unlocked is asked first (mgmp_areagate) -- before the room is told
+    if (areagate_hold_node(self, node)) return;
+    // experimental (mgmp_indepevt): the host does not leave an event node while a client is still on its own event there
+    if (indepevt_hold_node()) return;
     log_stage_quiet("map: a node is being entered");
     lockstep_log_battle_summary("the next node is entered");
     // The client's own clicks are swallowed here; the host's are published.
@@ -830,19 +856,45 @@ void __fastcall h_EnterNode(void* self, void* node) {
     // o_EnterNode, the MinHook trampoline, which bypasses this detour outright.
     bool sent = false;
     if (!follow_on_enter_node(self, node, &sent)) return;
+    storage_diag_items("before a node is entered", false);
     o_EnterNode(self, node);
     follow_after_enter_node();
 }
 
+// THE MAP NODE'S CLICK (0.1.95, mgmp_mapvote). The std::function call every node's button runs: rcx = the closure, [rcx+8] = the MapNode. In a room it is a vote
+// (swallowed); the host's own pick is clicked for real, later, through mapvote_click_node (the closure is a copy of what the callback reads of it: only [rcx+8]).
+typedef void (__fastcall* fn_nodeclick)(void* closure);
+fn_nodeclick o_NodeClick = nullptr;
+static bool g_click_passthrough = false;
+void __fastcall h_NodeClick(void* closure) {
+    if (!g_click_passthrough && closure) {
+        void* node = nullptr;
+        if (mem_read((const uint8_t*)closure + 8, &node, sizeof(node)) && node && mapvote_on_click(node)) return;
+    }
+    o_NodeClick(closure);
+}
+static void mapvote_click_node(void* node) {
+    struct { void* vptr; void* node; uint64_t pad[8]; } fake = {};
+    fake.node = node;
+    g_click_passthrough = true;
+    __try { o_NodeClick(&fake); } __except (EXCEPTION_EXECUTE_HANDLER) { log_line_lvl(LogLevel::Error, "MAPVOTE", "!! the game's click on the node faulted"); }
+    g_click_passthrough = false;
+}
+
 void __fastcall h_MapUpdate(void* self) {
     o_MapUpdate(self);
+    mapvote_tick(self, mapvote_click_node);       // 0.1.95: the host enters its pick once every player has picked
+    menu_board_cursor_tick();     // 0.1.91: a drawing tool over the map hides the game's cursor (the tool is the pointer)
 
     // After the original, not before: the node the host chose should be entered
     // from a map screen that has already finished this frame's update, which is
     // as close as we can get to the native call site (a UI callback fired from
     // inside this same function).
     if (!o_EnterNode) return;
+    // the exit the host confirmed in the area question: entered the way its click would have been (h_EnterNode lets this one node through)
+    if (void* confirmed = areagate_take_confirmed_node(self)) { h_EnterNode(self, confirmed); return; }
     if (void* node = follow_map_update(self)) {
+        storage_diag_items("before a node is entered (following the host)", false);
         o_EnterNode(self, node);
         follow_after_enter_node();
         // READ-ONLY, and off by default: the window dump that finds the field marking "this
@@ -900,6 +952,7 @@ void __fastcall h_LevelSelect(void* self, void* option) {
 
 void __fastcall h_LevelUpdate(void* self) {
     o_LevelUpdate(self);
+    mapvote_note_screen_over();
     choice_on_level_update(self);
 }
 
@@ -927,6 +980,7 @@ void __fastcall h_CombatMenu(void* self) {
     combatlock_enter(self);
     o_CombatMenu(self);
     combatlock_leave();
+    menu_board_cursor_tick();     // 0.1.91: ... and over the battle
 }
 
 // The status half of the ability highlight. Swallowed while mgmp_aim is drawing
@@ -1015,7 +1069,7 @@ static void run_settled(const char* how, bool was_shared) {
     catsync_log_snapshot("after the native settlement, before the merge");
     catsync_log_audit("after the native settlement, before the merge");
     if (was_shared) {
-        const unsigned merged = catsync_merge_session_cats(how);
+        const unsigned merged = catsync_merge_session_cats(how, true);   // the game has just settled the party: a clone still out on adventure was not in it
         catsync_release_stuck_cats(how);
         const unsigned retired = catsync_retire_peer_copies(how);
         catsync_log_snapshot("after the merge");
@@ -1045,6 +1099,7 @@ static void run_settled(const char* how, bool was_shared) {
         if (tune::kLocalSetup)
             log_line("SETUP", "run settled in-session; chapter barrier re-armed for the next chapter");
     }
+    housecoop_after_settlement();   // a helper of a co-op house boss gets its own house boss values back
     log_stage("%s: finished -- per-run state reset, the next run starts clean", how);
 }
 
@@ -1055,6 +1110,10 @@ void __fastcall h_EndRunFinalize(void* self) {
     // "out on adventure" for good while the clones and the other player's copies became cats of the House.
     const bool shared = (tune::kLocalSetup && net_active() && setup_has_shared_roster()) || catsync_run_is_shared();
     log_stage("settlement: return home begins (shared run: %s, %u peer(s) connected, net %s)", shared ? "yes" : "no", (unsigned)net_peer_count(), net_active() ? "up" : "down");
+    // 0.1.55: the run is over -- the settlement and the House after it read this player's own save (the window used to stay open until a map was ready, i.e. all the way home)
+    unlocks_window_close("the run is over (return home)");
+    storage_diag_house("settlement begins");
+    housecoop_settlement_begin();
     if (shared) {
         if (!catsync_prepare_settlement(self)) {
             // With the other players present the refusal holds the door (a settlement that cannot tell the cats apart must not write a save). With nobody else there is nothing to protect them from,
@@ -1063,12 +1122,20 @@ void __fastcall h_EndRunFinalize(void* self) {
                 log_line_lvl(LogLevel::Error, "SETTLE", "!! return-home settlement held: local ownership filter failed or already committed (the reason is in the SETTLE line above)");
                 return;
             }
-            log_line_lvl(LogLevel::Warn, "SETTLE", "!! return-home settlement: the ownership filter could not be applied and no other player is connected -- ending the run unfiltered");
+            // 0.1.79: never unfiltered -- another player's copies in the run's lists would become cats of this House ("the other player's cat came home with me").
+            // The fallback takes only them out; the run then ends as the game ends it.
+            if (catsync_strip_peer_copies_for_settlement(self)) {
+                filtered = true;
+                log_line_lvl(LogLevel::Warn, "SETTLE", "!! return-home settlement: the ownership filter could not be applied and no other player is connected -- ending the run with the fallback filter");
+            } else {
+                log_line_lvl(LogLevel::Error, "SETTLE", "!! return-home settlement: neither filter could be applied and no other player is connected -- ending the run unfiltered");
+            }
         } else {
             filtered = true;
         }
     }
     o_EndRunFinalize(self);
+    storage_diag_house("settlement done");
     run_settled("settlement", filtered);
 }
 
@@ -1081,12 +1148,19 @@ void __fastcall h_EndRunDefeat(void* self) {
     bool filtered = false;
     const bool shared = (tune::kLocalSetup && net_active() && setup_has_shared_roster()) || catsync_run_is_shared();
     log_stage("defeat/abandon: the end of a lost run begins (shared run: %s, %u peer(s) connected)", shared ? "yes" : "no", (unsigned)net_peer_count());
+    unlocks_window_close("the run is over (lost or abandoned)");   // 0.1.55, as above
+    storage_diag_house("defeat/abandon begins");
+    housecoop_settlement_begin();
     if (shared) {
         filtered = catsync_prepare_settlement(self);
-        if (!filtered)
-            log_line_lvl(LogLevel::Warn, "SETTLE", "!! defeat/abandon: the ownership filter could not be applied -- ending the run unfiltered");
+        if (!filtered) {
+            filtered = catsync_strip_peer_copies_for_settlement(self);     // 0.1.79: the other players' copies out, whatever else failed
+            log_line_lvl(filtered ? LogLevel::Warn : LogLevel::Error, "SETTLE", "!! defeat/abandon: the ownership filter could not be applied -- ending the run %s",
+                         filtered ? "with the fallback filter (only the other players' cats taken out)" : "unfiltered");
+        }
     }
     o_EndRunDefeat(self);
+    storage_diag_house("defeat/abandon done");
     run_settled("defeat", filtered);
 }
 
@@ -1097,15 +1171,17 @@ void __fastcall h_EndRunDefeat(void* self) {
 // allowed to run; roster_normalize_shared() puts every cat back on its owner's
 // side afterwards (see mgmp_roster.cpp).
 
-// ui.block_new_cats: every "a new cat joins" event effect does nothing. It has to be the SAME on both peers -- one machine adding a
-// cat the other does not would split the rosters -- so the HOST's setting rules: a client takes it from the host's HELLO (session_block_new_cats).
+// "A new cat joins" (gain_cat_familiar). Every peer runs it (the client follows the host's choice); in a room the cat it makes is then moved to the
+// same shared id on every peer and noted as the host's (catsync_on_gained_cat). The old ui.block_new_cats switch is gone (2026-10-21).
 void* __fastcall h_GainCat(void* ctx, void* arg) {
-    if (session_block_new_cats()) {
-        static bool said = false;
-        if (!said) { said = true; log_line("EVENT", "ui.block_new_cats (the host's): the \"a new cat joins\" effect is skipped"); }
-        return nullptr;
+    const bool room = multiplayer_live();
+    const uint64_t before = room ? catsync_id_counter() : 0;
+    void* r = o_GainCat(ctx, arg);
+    if (room) {
+        catsync_on_gained_cat(before, "event: a new cat joins");
+        if (net_role() == NetRole::Host) catsync_publish("a new cat joined the run", true, true);
     }
-    return o_GainCat(ctx, arg);
+    return r;
 }
 
 // The gear screen's lock. A player with chapter 2 unlocked goes on to the chapter page (the setup barrier lives there); one WITHOUT it
@@ -1244,7 +1320,97 @@ uint64_t __fastcall h_EvMut(void* a, void* b, void* c) { unlocks_event_roll(); r
 // DarkDen differed between the peers (host: CharmedBear familiar, client: MaddenedBear spawn) and the boards halted on a friendly bear (2026-10-03).
 // The event's constructor: from here on its draws (difficulty, the subject cat) come from the node-seeded stream, the same on every peer.
 fn_ev_handler o_EvSetup = nullptr;
-uint64_t __fastcall h_EvSetup(void* a, void* b, void* c) { unlocks_event_roll(); return o_EvSetup(a, b, c); }
+uint64_t __fastcall h_EvSetup(void* a, void* b, void* c) {
+    unlocks_event_roll();
+    indepevt_ctor_begin(a, b);       // experimental: the pool draw inside decides whether this event is the player's own (mgmp_indepevt)
+    const uint64_t r = o_EvSetup(a, b, c);
+    indepevt_ctor_end(a);
+    return r;
+}
+// The event pool draw (sub_1403968E0, returns the out string). Two of its callers are looked at -- an event node's draw (EnterNode lambda_5)
+// and a constructor given "random": with the experimental own random events on, the drawn event decides whether the player's own cats take
+// it (mgmp_indepevt).
+// FIVE ARGUMENTS, NOT FOUR (0.1.60, both players crashed the moment the first own event came up): the function keeps a dword in its FIFTH
+// argument's stack slot (`mov dword ptr [rbp+0x180], ebx` at 0x14039716E, rbp+0x180 = its entry rsp+0x28). Declared with four, this detour
+// had no outgoing slot there -- the compiler kept its saved r14 at that address, the draw zeroed its low half, and the r14 handed back up the
+// stack (the scene list the main loop walks, app+0x180) became 0x0000xxxx00000000. The fifth is declared and passed on so the callee writes
+// into an argument slot of ours, never into a saved register.
+typedef void* (__fastcall* fn_ev_pick)(void* map, void* out, void* kind, void* node, uint64_t a5);
+fn_ev_pick o_EvPick = nullptr;
+void* __fastcall h_EvPick(void* map, void* out, void* kind, void* node, uint64_t a5) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uintptr_t ret = (uintptr_t)_ReturnAddress();
+    void* r = o_EvPick(map, out, kind, node, a5);
+    if (ret == base + kRet_EvPickNode) indepevt_after_pick(r, false);        // an event node's draw (the usual one)
+    else if (ret == base + kRet_EvPickCtor) indepevt_after_pick(r, true);    // a constructor given "random"
+    return r;
+}
+// THE NEXT EVENT'S QUEUE (0.1.61, Tragedy). `next_event_from_set` pushes an event, bound to the subject cat, onto MewDirector+0x698, and the
+// next pool draw takes it from there. In an own random event each player gets its own outcome, so one queue would grow and the other not, and
+// the next event node would draw two different events -- skipped on every peer inside an own event (the draw stays the same everywhere). The
+// target reads rcx and rdx and uses no stack-argument slot; four are declared and passed on anyway (see h_EvPick).
+typedef uint64_t (__fastcall* fn_ev_next_event)(void* world_event, void* node, void* c, void* d);
+fn_ev_next_event o_EvNextEvent = nullptr;
+uint64_t __fastcall h_EvNextEvent(void* world_event, void* node, void* c, void* d) {
+    if (indepevt_suppress(world_event, "next_event_from_set (an event queued for the next draw)")) return 0;
+    return o_EvNextEvent(world_event, node, c, d);
+}
+// THE COIN COST OF ANOTHER PLAYER'S CAT (0.1.69, room D547). A few spells cost COINS (BuyCatnip, VetVisit, HireHitman, SubwayRide, GymMembership, Donate, CoinToss).
+// For a player's cat the game checks and takes them from THIS game's inventory (Ability slot 2, 0x140031CA3: `mov rax,[global inventory]; mov ecx,[rax+0x148]`; slot 3
+// pays through 0x140114E30) -- but coins are each player's own. When another player's cat cast BuyCatnip, its owner (14 coins) cast it, the host (0 coins) refused it:
+// slot 3 returned before paying and before the after-cast passives, the quest antenna's AlliesScrambleSpellAfterCast did not run, the spell slot stayed 'BuyCatnip' on
+// the host and became 'FindARock2' on the owner, and the next cast halted the battle. A host WITH coins would instead have paid another player's spell out of its own purse.
+// Now, in a room, for a cat ANOTHER player owns: the check sees enough coins (the owner already checked its own), and whatever the payment took is put back.
+namespace {
+int32_t* local_coins() {
+    static int32_t* volatile* global = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        uint8_t* f = (uint8_t*)addr_of(T_AbilityCanCast);
+        uint8_t b[7] = {};
+        if (f && mem_read(f + 0x4A3, b, sizeof(b)) && b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x05) {
+            int32_t d = 0; memcpy(&d, b + 3, 4);
+            global = (int32_t* volatile*)(f + 0x4AA + d);
+            log_line("COINS", "the inventory the coin cost is checked against: global at %p", (void*)global);
+        } else log_line_lvl(LogLevel::Warn, "COINS", "!! the coin check of Ability slot 2 is not where it was expected -- another player's cat pays its coins from this inventory as before");
+    }
+    uint8_t* inv = nullptr;
+    if (!global || !mem_read((const void*)global, &inv, sizeof(inv)) || !inv) return nullptr;
+    return (int32_t*)(inv + 0x148);
+}
+struct CoinShield {
+    int32_t* at = nullptr;
+    int32_t saved = 0;
+    CoinShield(void* ability, const char* what) {
+        if (!ability || !net_active() || net_peer_count() < 2 || !lockstep_in_battle()) return;
+        int32_t cost = 0; void* chr = nullptr;
+        if (!mem_read((const uint8_t*)ability + 0x58, &cost, sizeof(cost)) || cost <= 0 || cost > 100000) return;
+        if (!mem_read((const uint8_t*)ability + 0x10, &chr, sizeof(chr)) || !chr || !lockstep_peer_owns_character(chr)) return;
+        int32_t* p = local_coins();
+        if (!p || !mem_read(p, &saved, sizeof(saved))) return;
+        at = p;
+        if (saved < cost) mem_write(at, &cost, sizeof(cost));
+        static ULONGLONG said = 0;
+        if (GetTickCount64() - said > 2000) {
+            said = GetTickCount64();
+            log_line("COINS", "%s: another player's cat's spell costs %d coin(s) -- its owner's purse decides (this player holds %d, left untouched)", what, cost, saved);
+        }
+    }
+    ~CoinShield() { if (at) mem_write(at, &saved, sizeof(saved)); }
+};
+} // namespace
+typedef uint64_t (__fastcall* fn_ability_slot)(void* ability, void* b, void* c, void* d);
+fn_ability_slot o_AbilityCanCast = nullptr;
+uint64_t __fastcall h_AbilityCanCast(void* ability, void* b, void* c, void* d) {
+    CoinShield shield(ability, "can it be cast");
+    return o_AbilityCanCast(ability, b, c, d);
+}
+fn_ability_slot o_AbilityPay = nullptr;
+uint64_t __fastcall h_AbilityPay(void* ability, void* b, void* c, void* d) {
+    CoinShield shield(ability, "paid and cast");
+    return o_AbilityPay(ability, b, c, d);
+}
 // "A random element of this vector" (sub_1400AB770, 41 callers). Only the call that picks an event's SUBJECT cat is taken over (the instruction after that call is kRet_EventSubject): the
 // candidates are sorted by cat id and the draw indexes the sorted list, so both peers name the same cat even when their party lists are in another order (the client's own cats come first).
 typedef void* (__fastcall* fn_pick_random)(void* vec, void* stream);
@@ -1280,6 +1446,34 @@ void __fastcall h_PropSetInt(void* name, int value) {
 // THE EVENT RESULTS THAT CHANGE THE SAVE (2026-10-04). A story event's choice is the host's; the client replays it with the game's own commit, and the game runs the option's result script on the client's own save too:
 // legacy tokens, quest progress, adventure unlocks. The client did not earn them (it carried no such item), so for the rest of such an event node each of these is skipped on the client. Everything that
 // acts on the run itself (cats, items, coins, fights) still runs. None of the five has a return value the dispatcher (0x1409173A0) looks at.
+// THE RESULTS ONLY SOME PEERS RUN DO NOT MOVE THE SHARED STREAM (2026-10-16, the quest review). A client skips the save-level results of a story event
+// (and, below, a quest completed in a shared battle), the host runs them -- and some of them draw from the shared stream: the House progression a
+// completed quest or an adventure unlock runs (get_random_furniture_piece, 0x1401CE1A5), an item's own init (a ranged durability), the butterfly
+// effect's frame. Drawn on one peer only, they would part the streams in the middle of an event or a battle. In a room the stream is put back after
+// each of them, on every peer alike, so whether a peer ran one makes no difference to what follows.
+struct RoomStreamFence {
+    uint64_t* s = nullptr;
+    uint64_t saved[4] = {};
+    bool on = false;
+    RoomStreamFence() { if (net_active() && net_peer_count() >= 2 && (s = rng_global_stream()) != nullptr && mem_read(s, saved, sizeof(saved))) on = true; }
+    ~RoomStreamFence() { if (on) mem_write(s, saved, sizeof(saved)); }
+};
+// THE QUEST ANTENNA'S SCRAMBLE (0.1.74, room QQA9). The TransmitterAntenna's passive (AlliesScrambleSpellAfterCast, slot 154) replaces an ally's spell after each cast
+// with a random one: the AnyUnlocked pool (the same list on both peers -- the unlock answers are the host's in a room) and ONE draw from the shared stream (0x140166C95).
+// The stream is reseeded at every action, but a multi-hit spell's per-hit procs draw frame by frame inside the action (RNG research R001, open), so where the stream stood
+// when the scramble ran was not the same on both peers: Baptism2 was cast, the owner's cat got 'Anoint', the host's 'RemoteDetonator', and the next cast halted the battle.
+// Now the pick's stream is derived from (battle, turn, action, n-th pick) on every peer, and the shared stream is put back afterwards, so the rest of the action is untouched.
+typedef uint64_t (__fastcall* fn_allies_scramble)(void* passive, void* b, void* c, void* d);
+fn_allies_scramble o_AlliesScramble = nullptr;
+uint64_t __fastcall h_AlliesScramble(void* passive, void* b, void* c, void* d) {
+    RoomStreamFence fence;
+    uint64_t seed = 0;
+    if (fence.on && lockstep_stream_for_pick(0x414E54454E4E41ull /* "ANTENNA" */, &seed)) {
+        static int said = 0;
+        if (said < 60) { ++said; log_line("SCRAMBLE", "the antenna's spell scramble: its pick drawn from a stream every peer derives alike (%016llx); the shared stream is put back after it", (unsigned long long)seed); }
+    }
+    return o_AlliesScramble(passive, b, c, d);
+}
 typedef void (__fastcall* fn_res_ResSetLegacyToken)(void*, void*, void*, void*);
 fn_res_ResSetLegacyToken o_ResSetLegacyToken = nullptr;
 void __fastcall h_ResSetLegacyToken(void* a, void* b, void* c, void* d) {
@@ -1296,13 +1490,139 @@ typedef void (__fastcall* fn_res_ResAdventureUnlock)(void*, void*, void*, void*)
 fn_res_ResAdventureUnlock o_ResAdventureUnlock = nullptr;
 void __fastcall h_ResAdventureUnlock(void* a, void* b, void* c, void* d) {
     if (choice_story_event_block_active()) { choice_story_event_blocked("trigger_adventure_unlock"); return; }
+    RoomStreamFence fence;   // the House progression it runs may draw (see RoomStreamFence)
     o_ResAdventureUnlock(a, b, c, d);
 }
+// A QUEST COMPLETED IN A SHARED BATTLE (2026-10-16). The CompleteItemQuest battle effect (0x1405CA6D0: ScaldingOrb's moon-boss one-shot, BlackShard
+// killing the coven, the Nuke) calls House::complete_item_quest directly, and the shared battle runs it on EVERY peer: the host's cat finished the
+// quest and the client's save was credited too -- its House progression ran (the obelisk map flags, NPC sequences, unlocks) for a quest it never
+// carried. The main quest is settled in the host's save (a client carries no quest item), so on a client the battle's call is skipped.
+static const uintptr_t kRa_BattleCompleteQuest = 0x5CA864;   // the instruction after `call 0x1401cf6f0` at 0x1405CA85F
 typedef void (__fastcall* fn_res_ResCompleteItemQuest)(void*, void*, void*, void*);
 fn_res_ResCompleteItemQuest o_ResCompleteItemQuest = nullptr;
 void __fastcall h_ResCompleteItemQuest(void* a, void* b, void* c, void* d) {
     if (choice_story_event_block_active()) { choice_story_event_blocked("complete_item_quest"); return; }
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    if ((uintptr_t)_ReturnAddress() - base == kRa_BattleCompleteQuest && net_active() && net_peer_count() >= 2 && net_role() == NetRole::Client) {
+        char quest[64] = "?";
+        if (b) mem_read_std_string(b, quest, sizeof(quest));
+        log_line_lvl(LogLevel::Warn, "CHOICE", "the quest '%s' was completed in the shared battle -- NOT in this client's save (the main quest is settled in the host's save; the House progression it would run is skipped here)", quest);
+        return;
+    }
+    RoomStreamFence fence;
     o_ResCompleteItemQuest(a, b, c, d);
+}
+// `trigger_butterfly_effect` (0x1401C1450): a time-travel frame for THIS save, picked with a draw from the shared stream. A save-level result like the
+// others above: skipped on a client replaying a story event (it used to run there), fenced in a room. It reads no argument; rcx is passed on as it came.
+typedef void (__fastcall* fn_butterfly)(void*);
+// THE HOUSE BOSS CO-OP (EXPERIMENTAL, mgmp_housecoop.h): a helper's inserted day skips the countdown, the overnight and the strays (and the
+// helped player's boss goes in where the overnight was); the house boss gear screen's done is held until every player is ready; a helper's
+// settlement does not run the story.
+typedef void (__fastcall* fn_one_ptr)(void*);
+fn_one_ptr o_HouseCountdown = nullptr;
+void __fastcall h_HouseCountdown(void* gpd) {
+    housecoop_log_boss("end of day: before the house boss countdown");      // 0.1.92 diagnostics (HOUSEBOSS)
+    if (housecoop_skip_countdown()) { log_line("HOUSEBOSS", "end of day: the house boss countdown is SKIPPED (the co-op's inserted day)"); return; }
+    o_HouseCountdown(gpd);
+    housecoop_log_boss("end of day: after the house boss countdown");
+}
+typedef void* (__fastcall* fn_overnight)(void* house, void* out_vec);
+fn_overnight o_HouseOvernight = nullptr;
+void* __fastcall h_HouseOvernight(void* house, void* out_vec) { if (housecoop_overnight(out_vec)) return out_vec; return o_HouseOvernight(house, out_vec); }
+fn_one_ptr o_HouseStrays = nullptr;
+void __fastcall h_HouseStrays(void* house) { if (housecoop_skip_strays()) return; o_HouseStrays(house); }
+fn_one_ptr o_HouseFight = nullptr;
+static void house_fight_original(void* data) { o_HouseFight(data); }
+void __fastcall h_HouseFight(void* data) {
+    {   // 0.1.92 diagnostics (HOUSEBOSS): the game starts a house boss fight
+        char name[64] = {};
+        if (data) mem_read_std_string((const uint8_t*)data + 8, name, sizeof(name));
+        log_line("HOUSEBOSS", "the game starts the house boss fight '%s' (%u player(s) in the session)", name[0] ? name : "?", (unsigned)net_peer_count());
+        housecoop_log_boss("at the house boss fight's start");
+    }
+    if (housecoop_on_fight_start(data, house_fight_original)) { log_line("HOUSEBOSS", "   the fight's start is HELD by the house boss co-op (it starts when every player is ready)"); return; }
+    o_HouseFight(data);
+}
+fn_one_ptr o_BeatHouseBoss = nullptr;
+void __fastcall h_BeatHouseBoss(void* gpd) {
+    housecoop_log_boss("BeatHouseBoss (a house boss won): before");          // 0.1.92 diagnostics (HOUSEBOSS)
+    if (housecoop_skip_beat_boss()) return;
+    o_BeatHouseBoss(gpd);
+    housecoop_log_boss("BeatHouseBoss: after (the next house boss is scheduled here)");
+}
+
+// THE SCRAMBLED STATUS, logged on every peer (see T_ScrambleRoll). One line per roll, per stack taken off, and per CHANGE of what the cat's
+// spells become -- the two peers' logs side by side say where a client's cat got its own abilities back.
+static void scramble_describe(const void* status, char* out, size_t cap) {
+    out[0] = 0;
+    const uint8_t* chr = nullptr; const uint8_t* cd = nullptr;
+    int32_t stacks = -1; uint64_t id = 0; uint8_t cat = 0;
+    char type[48] = "?";
+    mem_read((const uint8_t*)status + 0x38, &chr, sizeof(chr));
+    mem_read((const uint8_t*)status + 0x5C, &stacks, sizeof(stacks));
+    if (chr) { mem_read_std_string(chr + 0x248, type, sizeof(type)); mem_read(chr + 0x88, &cd, sizeof(cd)); mem_read(chr + 0x489, &cat, 1); }
+    if (cd) mem_read(cd + kCatData_SaveId, &id, sizeof(id));
+    int w = _snprintf_s(out, cap, _TRUNCATE, "unit '%s' (cat %llx, player %u) stacks %d, kept [", type, (unsigned long long)id, (unsigned)cat, stacks);
+    const uint8_t* b = nullptr; const uint8_t* e = nullptr;
+    mem_read((const uint8_t*)status + 0xF0, &b, sizeof(b)); mem_read((const uint8_t*)status + 0xF8, &e, sizeof(e));
+    for (int i = 0; b && e > b && i < 8 && b + i * 0x20 < e && w > 0 && (size_t)w < cap - 40; ++i) {
+        char nm[40] = {};
+        mem_read_std_string(b + i * 0x20, nm, sizeof(nm));
+        w += _snprintf_s(out + w, cap - w, _TRUNCATE, "%s%s", i ? " " : "", nm);
+    }
+    if (w > 0 && (size_t)w < cap - 2) _snprintf_s(out + w, cap - w, _TRUNCATE, "]");
+}
+static void names_text(const void* vec, char* out, size_t cap) {
+    out[0] = 0; int w = 0;
+    const uint8_t* b = nullptr; const uint8_t* e = nullptr;
+    if (!vec || !mem_read(vec, &b, sizeof(b)) || !mem_read((const uint8_t*)vec + 8, &e, sizeof(e))) return;
+    for (int i = 0; b && e > b && i < 8 && b + i * 0x20 < e && w >= 0 && (size_t)w < cap - 40; ++i) {
+        char nm[40] = {};
+        mem_read_std_string(b + i * 0x20, nm, sizeof(nm));
+        w += _snprintf_s(out + w, cap - w, _TRUNCATE, "%s%s", i ? " " : "", nm);
+    }
+}
+fn_one_ptr o_ScrambleRoll = nullptr;
+void __fastcall h_ScrambleRoll(void* status) {
+    uint64_t s0 = 0;
+    if (const uint64_t* s = rng_global_stream()) mem_read(s, &s0, sizeof(s0));
+    o_ScrambleRoll(status);
+    char d[400]; scramble_describe(status, d, sizeof(d));
+    log_line("SCRAMBLE", "roll (stream %016llx): %s", (unsigned long long)s0, d);
+}
+fn_one_ptr o_ScrambleTick = nullptr;
+void __fastcall h_ScrambleTick(void* status) {
+    char d[400]; scramble_describe(status, d, sizeof(d));
+    log_line("SCRAMBLE", "a stack off -- before: %s", d);
+    o_ScrambleTick(status);   // may remove (and free) the status: nothing of it is read after
+}
+typedef void (__fastcall* fn_scr_names)(void* status, void* names);
+fn_scr_names o_ScrambleNames = nullptr;
+void __fastcall h_ScrambleNames(void* status, void* names) {
+    char before[300]; names_text(names, before, sizeof(before));
+    o_ScrambleNames(status, names);
+    char after[300]; names_text(names, after, sizeof(after));
+    static char last[700];
+    char line[700];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "%p [%s] -> [%s]", status, before, after);
+    if (strcmp(line, last) == 0) return;
+    strncpy_s(last, line, _TRUNCATE);
+    char d[400]; scramble_describe(status, d, sizeof(d));
+    log_line("SCRAMBLE", "spells [%s] -> [%s] (%s)", before, after, d);
+}
+
+// Shop::initShop's stock half (EXPERIMENTAL shared treasure chest, mgmp_treasure): held back while the player picks from the shared items.
+typedef void (__fastcall* fn_shop_stock)(void* shop);
+fn_shop_stock o_ShopStock = nullptr;
+void __fastcall h_ShopStock(void* shop) {
+    if (treasure_on_stock(shop, o_ShopStock)) return;
+    o_ShopStock(shop);
+}
+fn_butterfly o_ButterflyEffect = nullptr;
+void __fastcall h_ButterflyEffect(void* a) {
+    if (choice_story_event_block_active()) { choice_story_event_blocked("trigger_butterfly_effect"); return; }
+    RoomStreamFence fence;
+    o_ButterflyEffect(a);
 }
 // The item an event result gives (get_item, get_item_from_pool, get_and_equip_item, ...): the pool PICK before it has already drawn from the shared stream on both peers (mgmp_hooks h_EvItemPick), so skipping the give
 // here keeps the streams together. On the client of a story event the item would land in its own inventory (or on the host's cat's copy, which the host's push replaces anyway) and is a story item it did not earn.
@@ -1315,6 +1635,7 @@ void __fastcall h_ResGiveItem(void* a, void* b, void* c, void* d) {
         if (b && mem_read_std_string(b, item, sizeof(item)) && item[0]) log_line("UNLOCKSRC", "an event gives an item: '%s'%s", item, choice_story_event_block_active() ? " (a story event: not kept on this peer)" : "");
     }
     if (choice_story_event_block_active()) { choice_story_event_blocked("the item a story event gives (it is not put in this peer's inventory or on a cat here)"); return; }
+    RoomStreamFence fence;   // the item's own init may draw (a ranged durability): a client of a story event skips it (see RoomStreamFence)
     o_ResGiveItem(a, b, c, d);
 }
 // THE COMBAT SPEED (proto 82): the turn layer reads the "combat_speed" setting through Settings::get_float every frame; in a room a client's read is answered with the host's value (mgmp_unlocks:
@@ -1425,6 +1746,39 @@ void* __fastcall h_ClayChange(void* self, void* a, void* b, void* c) { return rn
 typedef void* (__fastcall* fn_item_collect)(void*, void*, uint64_t, void*, uint64_t);
 static const uintptr_t kRa_BuildBackpack = 0x35B704;
 fn_item_collect o_ItemCollect = nullptr;
+// Inventory::insert_item (0.1.52): only LOGGED -- what the item is, where it goes and which of the game's 36 callers put it there (mgmp_storage_diag).
+// The name is read BEFORE the call: the callee may move from the Equipment it is handed.
+typedef void* (__fastcall* fn_inv_insert)(void* inv, void* item, int32_t loc, int64_t arg);
+fn_inv_insert o_InvInsert = nullptr;
+__declspec(noinline) void* __fastcall h_InvInsert(void* inv, void* item, int32_t loc, int64_t arg) {
+    // 0.1.54: the soul jar a dying cat dropped goes to its owner's inventory only (the one caller, DropSoulJarOnDeath, does not use the result)
+    if (souljar_drop_skip(item, loc, (uintptr_t)_ReturnAddress())) return nullptr;
+    // 0.1.83: an item another player's cat produced in a battle goes to that player's inventory, not this one (none of these callers uses the result)
+    if (gains_insert_skip(item, loc, (uintptr_t)_ReturnAddress())) return nullptr;
+    void* frames[8] = {};
+    const USHORT nf = RtlCaptureStackBackTrace(1, 8, frames, nullptr);   // [0] = the game's call site (this detour is jumped to, not called)
+    ItemInsertNote note;
+    storage_diag_item_insert_before(note, inv, item, loc, arg, _ReturnAddress(), frames, nf);
+    void* r = o_InvInsert(inv, item, loc, arg);
+    storage_diag_item_insert_after(note);
+    return r;
+}
+// THE SOUL JAR (0.1.54, mgmp_souljar). 0x1400475C0 reads rcx only (the ability: its +0x708 chain, then +0x30 / +0x10) and tail-jumps to the item
+// finder; 0x1400D7220 reads rcx (registry) and rdx (id) only. Each detour acts on the summon's own call and passes every other caller straight on.
+typedef void* (__fastcall* fn_ability_item)(void* ability);
+fn_ability_item o_AbilityItem = nullptr;
+void* __fastcall h_AbilityItem(void* ability) {
+    void* r = o_AbilityItem(ability);
+    souljar_note_item(ability, r, (uintptr_t)_ReturnAddress());
+    return r;
+}
+typedef void* (__fastcall* fn_cat_by_id_t)(void* registry, uint64_t id);
+fn_cat_by_id_t o_CatById = nullptr;
+void* __fastcall h_CatById(void* registry, uint64_t id) {
+    void* out = nullptr;
+    if (souljar_cat_lookup(registry, id, (uintptr_t)_ReturnAddress(), o_CatById, out)) return out;
+    return o_CatById(registry, id);
+}
 void* __fastcall h_ItemCollect(void* inv, void* out, uint64_t mode, void* r9, uint64_t a5) {
     static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
     const uintptr_t ra = (uintptr_t)_ReturnAddress() - base;
@@ -1439,7 +1793,7 @@ void* __fastcall h_BuildTerrain(void* self) { void* r = o_BuildTerrain(self); un
 fn_stage o_BuildProps = nullptr;
 void* __fastcall h_BuildProps(void* self) { void* r = o_BuildProps(self); unlocks_build_stage_end("props"); return r; }
 fn_stage o_BuildParty = nullptr;
-void* __fastcall h_BuildParty(void* self) { void* r = o_BuildParty(self); unlocks_build_stage_end("party"); return r; }
+void* __fastcall h_BuildParty(void* self) { void* r = o_BuildParty(self); souljar_on_party_built(); unlocks_build_stage_end("party"); return r; }
 fn_stage o_BuildAllies = nullptr;
 void* __fastcall h_BuildAllies(void* self) { void* r = o_BuildAllies(self); unlocks_build_stage_end("allies"); return r; }
 // THE EXTRA STAGE TAKES THE WAVE AS ITS SECOND ARGUMENT (2026-10-11, measured: a single-player battle with no enemies at all). 0x14035E5E0 begins
@@ -1508,6 +1862,7 @@ void __fastcall h_ButtonUpdate(void* self) {
 
     // Optional independent cross-check of the upgrade screen's subject pointer.
     choice_on_button(self);
+    choice_grey_event_button(self);   // a client's option buttons of a host-decided event: grey, no click (before the update decides the look ...
 
     // And the one button question that is not instrumentation: is the CHAPTER
     // PAGE up. Its two difficulty buttons ticking is what the run's barrier will
@@ -1517,6 +1872,7 @@ void __fastcall h_ButtonUpdate(void* self) {
 
     o_ButtonUpdate(self);
     chapter_control(self);
+    choice_grey_event_button(self);   // ... and after it, so the next frame starts from the disabled state too)
 
     // AFTER the original, and this one has to be. Button::update recomputes the
     // button's state and pushes it into the SWF before it returns, and
@@ -1606,12 +1962,15 @@ void __fastcall h_SaveSelUpdate(void* self) {
 // reads and does not own -- so handing it a std::string of ours is exactly as
 // valid as the vector element the game would have passed.
 void* __fastcall h_MewDirInit(void* self, void* name) {
+    // 0.1.55: whatever node opened it, a load is not part of it -- the load reads the House (house_gold ...) through the property getter
+    unlocks_window_close("a save is being loaded");
     void* r = nullptr;
     if (const void* sub = savefile_redirect_load()) r = o_MewDirInit(self, (void*)sub);
     else                                              r = o_MewDirInit(self, name);
     lockstep_on_save_loaded();                                      // every battle there was is over (the same node may be entered again after a restore)
     storage_diag_save_loaded();
     catsync_log_audit("a save is loaded (MewDirector::init)");     // who the run's lists hold right after a load, in a room or alone
+    catsync_census_on_save_loaded();                                // a census taken before the load describes another registry (0.1.51)
     return r;
 }
 
@@ -1635,6 +1994,8 @@ void* __fastcall h_SFLoadBlob(void* self, void* key, void* bs) {
 }
 
 void __fastcall h_FrameBegin(void* self) {
+    long long perf_t_in = 0;
+    perf_frame_begin(&perf_t_in);    // the frame's length, for the PERF log (mgmp_perf)
     static LONG volatile frames = 0;
     LONG n = InterlockedIncrement(&frames);
     uint32_t every = tune::kFrameLogEvery;
@@ -1656,6 +2017,9 @@ void __fastcall h_FrameBegin(void* self) {
     checkpoint_tick();
     setup_tick();
     unlocks_tick();
+    choice_story_guard_tick();   // a client's House surviving kaiju, kept through the host's story event
+    treasure_tick();             // the experimental shared chest: the item granted to this player is taken
+    rngfix_simultaneous_aoe_tick();   // R013: in a room an AOE applies all its tiles' damage at once (the landing order no longer depends on frame timing)
 
 
     // Frame markers are what let Run D ask its question: with identical actions
@@ -1668,7 +2032,11 @@ void __fastcall h_FrameBegin(void* self) {
     // keep arriving while a brain is polled -- a peer's decision has to be able
     // to land in the middle of our wait for it, not only between turns.
     session_update();
+    areagate_tick();     // a client's map flags to the host when they change (mgmp_areagate)
+    indepevt_tick();     // experimental: a client tells the host it is done with its own random event (mgmp_indepevt)
+    perf_tick();         // the 2 s ping and the 10 s PERF line (mgmp_perf)
 
+    perf_frame_mod_done(perf_t_in);   // the mod's part of this frame ends here; the game's own frame follows
     o_FrameBegin(self);
 }
 
@@ -1769,6 +2137,25 @@ const Binding kBindings[] = {
     { T_ItemCollect,    (void*)&h_ItemCollect,    (void**)&o_ItemCollect },
     { T_PickIndex,      (void*)&h_PickIndex,      (void**)&o_PickIndex },
     { T_ClayChange,     (void*)&h_ClayChange,     (void**)&o_ClayChange },
+    { T_ButterflyEffect, (void*)&h_ButterflyEffect, (void**)&o_ButterflyEffect },
+    { T_ShopStock, (void*)&h_ShopStock, (void**)&o_ShopStock },
+    { T_HouseCountdown, (void*)&h_HouseCountdown, (void**)&o_HouseCountdown },
+    { T_HouseOvernight, (void*)&h_HouseOvernight, (void**)&o_HouseOvernight },
+    { T_HouseStrays,    (void*)&h_HouseStrays,    (void**)&o_HouseStrays },
+    { T_HouseFight,     (void*)&h_HouseFight,     (void**)&o_HouseFight },
+    { T_BeatHouseBoss,  (void*)&h_BeatHouseBoss,  (void**)&o_BeatHouseBoss },
+    { T_ScrambleRoll,   (void*)&h_ScrambleRoll,   (void**)&o_ScrambleRoll },
+    { T_ScrambleTick,   (void*)&h_ScrambleTick,   (void**)&o_ScrambleTick },
+    { T_ScrambleNames,  (void*)&h_ScrambleNames,  (void**)&o_ScrambleNames },
+    { T_InvInsert,      (void*)&h_InvInsert,      (void**)&o_InvInsert },
+    { T_CatById,        (void*)&h_CatById,        (void**)&o_CatById },
+    { T_AbilityItem,    (void*)&h_AbilityItem,    (void**)&o_AbilityItem },
+    { T_EvPick,         (void*)&h_EvPick,         (void**)&o_EvPick },
+    { T_EvNextEvent,    (void*)&h_EvNextEvent,    (void**)&o_EvNextEvent },
+    { T_AbilityCanCast, (void*)&h_AbilityCanCast, (void**)&o_AbilityCanCast },
+    { T_AbilityPay,     (void*)&h_AbilityPay,     (void**)&o_AbilityPay },
+    { T_AlliesScramble, (void*)&h_AlliesScramble, (void**)&o_AlliesScramble },
+    { T_NodeClick,      (void*)&h_NodeClick,      (void**)&o_NodeClick },
     { T_ResDejaVu, (void*)&h_ResDejaVu, (void**)&o_ResDejaVu },
     { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
     { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },
@@ -1931,6 +2318,7 @@ int hooks_install() {
     savefile_set_base(g_base);
     leave_set_base(g_base);
     overlay_set_base(g_base);
+    souljar_set_base(g_base);
 
     int installed = 0;
     for (const Binding& b : kBindings)
@@ -1939,6 +2327,10 @@ int hooks_install() {
     // The per-event stream fence over the frame-driven passive handlers (mgmp_rngframe). Not in the table above: these come from a generated
     // list of plain RVAs, each checked against the bytes it was generated from. Inert outside a room's battle.
     installed += rngframe_install(g_base);
+    installed += gains_install(g_base);
+    installed += dmgfence_install(g_base);
+    // The random picks from the AnyUnlocked ability pool and its kin (mgmp_poolfence, 0.1.75): the same kind of list, one derived stream per pick.
+    installed += poolfence_install(g_base);
 
     // After every hook is known, not before: a feature that is only safe while
     // another hook runs has to be told, and aim_set_base ran above -- before

@@ -141,8 +141,8 @@ constexpr uint64_t kStaleMs = 3000;
 
 // Send on movement, but never faster than this, and at least this often even
 // when nothing moved so a peer that joined mid-battle sees a cursor promptly.
-constexpr uint64_t kMinSendGapMs   = 50;
-constexpr uint64_t kHeartbeatMs    = 500;
+constexpr uint64_t kMinSendGapMs   = 80;     // 50 until 0.1.50 (see mgmp_aim)
+constexpr uint64_t kHeartbeatMs    = 1000;   // 500 until 0.1.50; still well inside kStaleMs
 
 struct Peer {
     CursorMsg msg;

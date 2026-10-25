@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
     F(CatDigestMsg, "catdigest", dec_catdigest);
     F(CheckpointMsg, "checkpoint", dec_checkpoint);
     F(PageMsg, "page", dec_page);
+    F(NodeVoteMsg, "nodevote", dec_nodevote);
     F(CatsMsg, "cats", dec_cats);
     F(SaveWaitMsg, "savewait", dec_savewait);
     F(RollMsg, "roll", dec_roll);
@@ -82,6 +83,8 @@ int main(int argc, char** argv) {
     F(UqdMsg, "uqd", dec_uqd);
     F(RnglMsg, "rngl", dec_rngl);
     F(DeepMsg, "deep", dec_deep);
+    F(BoardSumMsg, "boardsum", dec_boardsum);
+    F(BoardReqMsg, "boardreq", dec_boardreq);
     F(ChatMsg, "chat", dec_chat);
     F(SettingMsg, "setting", dec_setting);
     F(PropsMsg, "props", dec_props);

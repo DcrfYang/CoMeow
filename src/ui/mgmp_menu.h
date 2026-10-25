@@ -36,6 +36,10 @@ void menu_bring_up();
 // Once per frame, inside NewFrame/Render. Cheap when nothing is showing.
 void menu_draw();
 
+// 0.1.91: from the game's update hooks (the map, the combat menu): while a drawing tool is over the board the game's own cursor is hidden
+// for this frame (glaiel::TempHideMouseCursor, called only when the game's cursor exists), so the tool is the only pointer.
+void menu_board_cursor_tick();
+
 // From the game's Button::update detour, once per button per frame. Lets the
 // title entries follow the native ones' lifecycle: a native entry that stops
 // ticking (a modal sits over the menu, the scene is fading out) is one ours

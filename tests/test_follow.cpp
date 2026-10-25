@@ -500,6 +500,9 @@ unsigned unlock_publishes = 0, unlock_windows = 0;
 void unlocks_publish() { ++unlock_publishes; }
 void unlocks_window_open(const char*, bool) { ++unlock_windows; }
 void unlocks_on_map(bool) {}
+bool session_exp_treasure() { return false; }   // the shared treasure chest (mgmp_treasure): off here
+bool indepevt_hold_node() { return false; }     // own random events (mgmp_indepevt): the host never waits for a client here
+void treasure_publish_luck(uint64_t) {}         // the host's party luck for the shared chest (mgmp_treasure, proto 101): off here
 bool net_send_mapseeds(const MapSeedsMsg&) { ++seeds_published; return true; }
 int room_troubles = 0;
 void room_sync_trouble(const char*) { ++room_troubles; }   // a sync that ran out of time tells the player (mgmp_room)

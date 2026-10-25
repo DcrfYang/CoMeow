@@ -163,6 +163,9 @@ void roster_catselect_redirect(void* button);
 bool roster_party_swap_release();
 void roster_party_swap_after_node(uint32_t type);
 void roster_party_swap_on_map();
+// EXPERIMENTAL (mgmp_indepevt): a client puts its own cats in the party for its own random event, from inside the event's constructor
+// (after the shared draw, before the subject is picked). False: the shared party stays.
+bool roster_party_swap_for_own_event();
 void roster_party_swap_watch();
 void roster_party_swap_reset();
 

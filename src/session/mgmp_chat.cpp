@@ -3,8 +3,10 @@
 
 #include <windows.h>
 #include <cstring>
+#include <random>
 #include <string>
 
+#include "mgmp_emote.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
 #include "mgmp_signal.h"
@@ -41,6 +43,7 @@ void keep(const char* name, const char* text, bool self) {
     strncpy_s(l.name, sizeof(l.name), name, _TRUNCATE);
     strncpy_s(l.text, sizeof(l.text), text, _TRUNCATE);
     l.self = self;
+    l.at = GetTickCount64();
     g_show_until = GetTickCount64() + kChatShowMs;
 }
 
@@ -70,6 +73,19 @@ bool chat_submit(const char* text) {
     log_line("CHAT", "%s (me): %s", m.name, m.text);
     if (!net_send_chat(m)) log_line_lvl(LogLevel::Warn, "CHAT", "!! the line could not be sent");
     return true;
+}
+
+bool chat_submit_emote(int pick) {
+    Emote e;
+    e.pick = pick;
+    // A die is the sender's: rolled from the system's random source, never from a game RNG (the simulation must not see a draw).
+    if (pick == kEmoteD6 || pick == kEmoteD20) {
+        static std::mt19937 rng{ std::random_device{}() };
+        e.roll = 1 + (int)(rng() % (pick == kEmoteD6 ? 6u : 20u));
+    }
+    char tok[kChatTextMax];
+    if (!emote_token(e, tok, sizeof(tok))) return false;
+    return chat_submit(tok);
 }
 
 int chat_count() { return g_count; }

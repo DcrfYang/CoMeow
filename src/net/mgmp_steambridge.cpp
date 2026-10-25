@@ -403,6 +403,39 @@ void poll_status() {
     }
 }
 
+// THE LINK AS STEAM SEES IT (0.1.84, room HA2K 2026-10-24: the mod's round trip went 1 s -> 17 s -> 29 s on a Steam link and the log could not say whether Steam was
+// holding the bytes or the network was). SteamNetConnectionRealTimeStatus_t: state @0, ping @4, quality here/there @8/@12 (0..1, -1 unknown), out packets/bytes a second
+// @16/@20, in @24/@28, the send rate Steam allows @32, pending unreliable/reliable bytes @36/@40, sent and not yet acknowledged @44, queue time (us, int64) @48.
+bool read_rt(uint32_t h, unsigned char* st) {
+    __try { return A.rt_status(A.sockets, h, st, 0, nullptr); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void log_link_status() {
+    static ULONGLONG next = 0, quiet_at = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next || !A.rt_status) return;
+    next = now + 10000;
+    bool logged = false;
+    for (int i = 0; i < kMaxEntries; ++i) {
+        const Entry& e = g_e[i];
+        if (!e.used || !e.connected || e.closing) continue;
+        alignas(8) unsigned char st[512] = {};
+        if (!read_rt(e.h, st)) continue;
+        int ping = 0, rate = 0, pend_u = 0, pend_r = 0, unacked = 0; float ql = 0, qr = 0, out_b = 0, in_b = 0; long long queue_us = 0;
+        memcpy(&ping, st + 4, 4); memcpy(&ql, st + 8, 4); memcpy(&qr, st + 12, 4); memcpy(&out_b, st + 20, 4); memcpy(&in_b, st + 28, 4);
+        memcpy(&rate, st + 32, 4); memcpy(&pend_u, st + 36, 4); memcpy(&pend_r, st + 40, 4); memcpy(&unacked, st + 44, 4); memcpy(&queue_us, st + 48, 8);
+        // quality: 0.1.86 70% (90% flagged every line of a fine link at 80-88%, 2026-10-24 room QP2X)
+        const bool notable = ping >= 300 || (ql >= 0 && ql < 0.7f) || (qr >= 0 && qr < 0.7f) || pend_r + unacked > 32 * 1024 || queue_us > 300000;
+        if (!notable && now - quiet_at < 60000) continue;
+        logged = true;
+        log_line("STEAMNET", "%sconnection %u: ping %d ms, quality here %.0f%% there %.0f%%, out %.1f KB/s in %.1f KB/s, send rate %d KB/s, waiting in Steam: reliable %d B, "
+                             "unacknowledged %d B, unreliable %d B, queue time %lld ms%s",
+                 notable ? "!! " : "", e.h, ping, ql * 100.0f, qr * 100.0f, out_b / 1024.0f, in_b / 1024.0f, rate / 1024, pend_r, unacked, pend_u, queue_us / 1000,
+                 notable ? " -- the Steam link itself is slow or lossy (compare the PERF round trip)" : "");
+    }
+    if (logged) quiet_at = now;
+}
+
 void handle_rev() {
     const LONG st = InterlockedCompareExchange(&g_rev.state, 0, 0);
     if (st == 5) {                                          // the joiner stopped waiting
@@ -480,6 +513,7 @@ DWORD WINAPI worker(LPVOID) {
         }
         A.run_callbacks(A.sockets);
         poll_status();
+        log_link_status();
         handle_dial_request();
         handle_rev();
         handle_out();

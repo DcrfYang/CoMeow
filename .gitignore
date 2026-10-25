@@ -68,6 +68,8 @@ desktop.ini
 
 # CoMeow release hygiene
 /assets/
+# the chat emotes (The Binding of Isaac's online emotes, built by scratch/make_emote_atlas.py): shipped in the release, never committed
+/assets/emotes/
 /_buildcheck/
 docs/*.orig-*
 *.out

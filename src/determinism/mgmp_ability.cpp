@@ -1,6 +1,9 @@
 #include "mgmp_ability.h"
 
 #include "mgmp_mem.h"
+#include "mgmp_addresses.h"
+#include "mgmp_resolve.h"
+#include <windows.h>
 
 #include <cstring>
 
@@ -56,6 +59,29 @@ AbilitySlot ability_slot_of(const void* character, const void* ability) {
         }
     }
     return s;
+}
+
+typedef void* (__fastcall* fn_find_ability)(const void* chr, const void* name, bool quiet);
+typedef void* (__fastcall* fn_cstr)(void* out, const char* s);
+typedef void  (__fastcall* fn_sdtor)(void* s);
+void* ability_by_gon_name(const void* character, const char* gon) {
+    const uintptr_t fa = addr_of_call(C_FindAbility), sc = addr_of_call(C_StrFromCStr), sd = addr_of_call(C_GameStrDtor);
+    if (!fa || !sc || !sd || !character || !gon || !gon[0]) return nullptr;
+    // the slot names FindAbility also understands are not GON names: never let a peer's text reach them
+    static const char* const kSlotWords[] = { "none", "move", "attack", "bonus", "weapon", "trinket" };
+    for (const char* w : kSlotWords) if (strcmp(gon, w) == 0) return nullptr;
+    if (strncmp(gon, "spell", 5) == 0) return nullptr;
+    void* found = nullptr;
+    __try {
+        alignas(16) uint8_t s[32];
+        memset(s, 0, sizeof(s));
+        ((fn_cstr)sc)(s, gon);
+        found = ((fn_find_ability)fa)(character, s, true);
+        ((fn_sdtor)sd)(s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { found = nullptr; }
+    char got[64];
+    if (found && (!ability_gon_name(found, got, sizeof(got)) || strcmp(got, gon) != 0)) found = nullptr;   // validate: exactly that ability
+    return found;
 }
 
 void* ability_from_slot(const void* character, AbilitySlot slot) {

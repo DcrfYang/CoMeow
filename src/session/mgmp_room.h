@@ -100,6 +100,9 @@ void room_say_recovery_host(const char* name);
 void room_say_cat_census(unsigned lost, const char* lost_names, unsigned duplicated, const char* dup_names);   // the names: "Cisol, Grimmsley" (or "-")
 void room_say_reserved_real();   // the setup paused rather than overwrite a real cat on a reserved id (catsync)   // the cat census found missing / duplicated cats after a run (catsync)
 bool room_peer_name(uint8_t id, char* out, size_t cap);
+// Another module's notice (an OK closes it) / one-line toast, in the room's queue.
+void room_push_notice(const char* text);
+void room_toast(const char* text);
 
 // --- solo house boss ---------------------------------------------------------------------------------
 bool room_solo_active();        // this player is away fighting a house boss on its own

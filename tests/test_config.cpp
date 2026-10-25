@@ -250,6 +250,18 @@ int main() {
         const std::string f = config_rewrite_ui_bool(e, "block_new_cats", false);
         check(f.find("\"block_new_cats\": false") != std::string::npos && f.find("true") == std::string::npos, "and replaced in place afterwards");
 
+        // 0.1.89: ui.player_name, a string value -- replaced whole even with spaces in it, escaped, read back
+        check(config_json_string("a\"b\\c") == "\"a\\\"b\\\\c\"", "a JSON string literal escapes quotes and backslashes");
+        const std::string pn = config_rewrite_ui_value(R"({ "ui": { "player_name": "Old Name Here", "key": "F4" } })", "player_name", "\"New\"");
+        check(pn == R"({ "ui": { "player_name": "New", "key": "F4" } })", "a string value with spaces is replaced whole");
+        check(!strcmp(load(R"({ "ui": { "player_name": "Dcrf" }, "signal": { "name": "x" } })").ui_player_name, "Dcrf"), "ui.player_name is read");
+        load("{\n  \"ui\": { \"key\": \"F4\" }\n}\n");
+        check(config_set_player_name("My \"Cat\" Name"), "config_set_player_name writes the file");
+        check(!config_set_player_name("My \"Cat\" Name"), "the same name again is not written");
+        config_load(g_dir);
+        check(!strcmp(config().ui_player_name, "My \"Cat\" Name") && config().ui_key == 0x73, "the reload reads the name back and keeps the rest");
+        check(config_set_player_name("Two Words") && (config_load(g_dir), !strcmp(config().ui_player_name, "Two Words")), "and a later name replaces it");
+
         // end to end through the file; the loader reads the result back
         load("{\n  // keep me\n  \"net\": { \"port\": 27611 },\n  \"ui\": { \"key\": \"F4\" }\n}\n");
         check(config_set_beta_notice(false), "config_set_beta_notice writes the file");

@@ -198,6 +198,9 @@ void hook_defaults() {
     // The two MewSaveFile blob accessors exist only to serve mgmp_invsync, and
     // every blob in the save file passes through them, so a single-player
     // session should not have a mod hook sitting on its save path at all.
+    // The Scrambled status's roll (slot 33, 0x1400A1AB0) is one of the frame-driven passive handlers mgmp_rngframe wraps with a per-event stream fence;
+    // a hook of ours there changes its first bytes and the fence refuses to wrap it (0.1.44's diagnostics did that). Off: the fence matters more.
+    g_cfg.hook[T_ScrambleRoll] = false;
     g_cfg.hook[T_SFStoreBlob] = false;
     g_cfg.hook[T_SFLoadBlob]  = false;
 
@@ -395,6 +398,18 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*ui, "dev_tools", g_cfg.dev_tools);
         read_bool(*ui, "beta_notice", g_cfg.beta_notice);
         read_bool(*ui, "block_new_cats", g_cfg.block_new_cats);
+        read_bool(*ui, "exp_treasure", g_cfg.exp_treasure);
+        if (const json* v = member(*ui, "enemy_scale")) {
+            if (v->is_number()) {
+                double d = v->get<double>();
+                if (d < 2.0 || d > 8.0) warn("ui.enemy_scale = %g is outside 2..8, clamped", d);
+                d = d < 2.0 ? 2.0 : d > 8.0 ? 8.0 : d;
+                g_cfg.enemy_scale_half = (uint8_t)(d * 2.0 + 0.5);
+            } else warn("ui.enemy_scale is not a number, kept %g", g_cfg.enemy_scale_half / 2.0);
+        }
+        read_bool(*ui, "exp_house_coop", g_cfg.exp_house_coop);
+        read_bool(*ui, "exp_indep_events", g_cfg.exp_indep_events);
+        read_str (*ui, "player_name", g_cfg.ui_player_name, sizeof(g_cfg.ui_player_name));
         read_bool(*ui, "auto_upload_crash_log", g_cfg.auto_upload_crash_log);
     }
 
@@ -546,7 +561,10 @@ size_t skip_blank(const std::string& t, size_t from) {
 } // namespace
 
 std::string config_rewrite_ui_bool(const std::string& text, const char* key, bool on) {
-    const char* val = on ? "true" : "false";
+    return config_rewrite_ui_value(text, key, on ? "true" : "false");
+}
+
+std::string config_rewrite_ui_value(const std::string& text, const char* key, const char* val) {
     const std::vector<StrTok> toks = string_tokens(text);
     const auto is = [&](const StrTok& k, const char* name) {
         const size_t n = strlen(name);
@@ -560,7 +578,12 @@ std::string config_rewrite_ui_bool(const std::string& text, const char* key, boo
         if (i >= text.size() || text[i] != ':') continue;
         i = skip_blank(text, i + 1);
         size_t e = i;
-        while (e < text.size() && !isspace((unsigned char)text[e]) && text[e] != ',' && text[e] != '}' && text[e] != '/') ++e;
+        if (i < text.size() && text[i] == '"') {                          // a string value (0.1.89, ui.player_name): to its closing quote, spaces and all
+            bool closed = false;
+            for (const StrTok& s : toks) if (s.b == i) { e = s.e; closed = true; break; }
+            if (!closed) return std::string();
+        } else
+            while (e < text.size() && !isspace((unsigned char)text[e]) && text[e] != ',' && text[e] != '}' && text[e] != '/') ++e;
         if (e == i) return std::string();
         return text.substr(0, i) + val + text.substr(e);
     }
@@ -587,7 +610,10 @@ std::string config_rewrite_ui_bool(const std::string& text, const char* key, boo
 
 std::string config_rewrite_beta_notice(const std::string& text, bool on) { return config_rewrite_ui_bool(text, "beta_notice", on); }
 
-static bool write_ui_bool(const char* key, bool on) {
+static bool write_ui_value(const char* key, const char* val);
+static bool write_ui_bool(const char* key, bool on) { return write_ui_value(key, on ? "true" : "false"); }
+
+static bool write_ui_value(const char* key, const char* val) {
     if (!g_dir[0]) return false;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\mgmp.json", g_dir);
@@ -599,8 +625,8 @@ static bool write_ui_bool(const char* key, bool on) {
         if (in) { existed = true; text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()); }
     }
     std::string out;
-    if (existed) out = config_rewrite_ui_bool(text, key, on);
-    else         out = std::string("{\n  \"ui\": { \"") + key + "\": " + (on ? "true" : "false") + " }\n}\n";
+    if (existed) out = config_rewrite_ui_value(text, key, val);
+    else         out = std::string("{\n  \"ui\": { \"") + key + "\": " + val + " }\n}\n";
     if (out.empty()) return false;   // a file we cannot edit safely (not an object): leave it alone
 
     // Write to a sibling and swap it in, so a crash mid-write cannot leave a half-written mgmp.json.
@@ -618,5 +644,39 @@ static bool write_ui_bool(const char* key, bool on) {
 bool config_set_beta_notice(bool on) { g_cfg.beta_notice = on; return write_ui_bool("beta_notice", on); }
 
 bool config_set_block_new_cats(bool on) { g_cfg.block_new_cats = on; return write_ui_bool("block_new_cats", on); }
+
+bool config_set_exp_treasure(bool on) { g_cfg.exp_treasure = on; return write_ui_bool("exp_treasure", on); }
+
+bool config_set_exp_house_coop(bool on) { g_cfg.exp_house_coop = on; return write_ui_bool("exp_house_coop", on); }
+
+bool config_set_exp_indep_events(bool on) { g_cfg.exp_indep_events = on; return write_ui_bool("exp_indep_events", on); }
+
+std::string config_json_string(const char* s) {
+    std::string out = "\"";
+    for (const unsigned char* p = (const unsigned char*)(s ? s : ""); *p; ++p) {
+        if (*p == '"' || *p == '\\') { out += '\\'; out += (char)*p; }
+        else if (*p < 0x20) { char u[8]; _snprintf_s(u, sizeof(u), _TRUNCATE, "\\u%04x", (unsigned)*p); out += u; }
+        else out += (char)*p;
+    }
+    return out + "\"";
+}
+
+bool config_set_player_name(const char* name) {
+    char clean[sizeof(g_cfg.ui_player_name)] = {};
+    strncpy_s(clean, sizeof(clean), name ? name : "", _TRUNCATE);
+    if (!strcmp(clean, g_cfg.ui_player_name)) return false;               // unchanged: no write
+    strncpy_s(g_cfg.ui_player_name, sizeof(g_cfg.ui_player_name), clean, _TRUNCATE);
+    return write_ui_value("player_name", config_json_string(clean).c_str());
+}
+
+bool config_set_enemy_scale_half(uint8_t half, bool persist) {
+    if (half < 4) half = 4;
+    if (half > 16) half = 16;
+    g_cfg.enemy_scale_half = half;
+    if (!persist) return true;
+    char val[16];
+    _snprintf_s(val, sizeof(val), _TRUNCATE, half % 2 ? "%u.5" : "%u", (unsigned)(half / 2));
+    return write_ui_value("enemy_scale", val);
+}
 
 } // namespace mgmp

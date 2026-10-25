@@ -7,6 +7,8 @@
 //
 //     cl /nologo /EHsc /std:c++17 /I..\src\net test_proto.cpp && test_proto.exe
 #include "mgmp_proto.h"
+#include "mgmp_treasure.h"   // TreasureLedger (pure)
+#include "mgmp_mapvote.h"    // MapVoteBook (pure)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +95,15 @@ int main() {
         check(strcmp(o.name, "host") == 0, "name");
         check(o.rules == 1, "the host's rule bits ride in the HELLO (proto 51)");
         check(kProtoVersion >= 51, "the rule bits require protocol 51 or later");
+        check(session_is_gained(session_gained_id(0)) && session_is_gained(session_gained_id(kGainedSlots - 1)) && !session_is_gained(session_gained_id(kGainedSlots)), "the gained-cat ids (proto 96)");
+        check(session_cat_owner(session_gained_id(0)) < 0 && !session_is_gained(0x70000001ull) && !session_is_gained(0x71000000ull + kGainedSlot0), "a gained id is no clone slot and only in the host namespace");
+        check(o.enemy_scale_half == 4, "the default enemy multiplier is x2 (4 halves)");
+        h.enemy_scale_half = 11;
+        n = enc_hello(buf, sizeof(buf), h);
+        Reader r2(buf, n); r2.u8v(); Hello o2{};
+        check(dec_hello(r2, o2) && o2.enemy_scale_half == 11, "the host's enemy multiplier (x5.5) rides in the HELLO (proto 95)");
+        Reader r3(buf, n - 1); r3.u8v(); Hello o3{};
+        check(dec_hello(r3, o3) && o3.enemy_scale_half == 4, "an older HELLO without it still decodes (x2)");
     }
 
     printf("\n-- Welcome carries all four xoshiro words --\n");
@@ -426,7 +437,7 @@ int main() {
         check(kProtoVersion >= 72, "the host-decided roll and the end-turn facing need protocol 72");
     }
     {
-        for (uint8_t kind : {kChapterReady, kChapterSelect}) {
+        for (uint8_t kind : {kChapterReady, kChapterSelect, kChapterFlags}) {
             ChapterMsg m{};
             m.kind = kind; m.generation = 42;
             if (kind == kChapterSelect) { m.act = 3; m.difficulty = 4; }
@@ -442,6 +453,44 @@ int main() {
             }
             m.generation = 0;
             check(!enc_chapter(bytes, sizeof(bytes), m), "chapter requires setup generation");
+        }
+        {   // proto 99: a client's map flag report carries no act and no difficulty
+            ChapterMsg f{}; f.kind = kChapterFlags; f.generation = 1; f.mapflags = 0xFFFFFFFFu; uint8_t fb[15]{};
+            check(enc_chapter(fb, sizeof(fb), f) == 15, "a map flag report encodes");
+            f.act = 2; check(!enc_chapter(fb, sizeof(fb), f), "a map flag report with an act is refused");
+            f.act = 0; f.difficulty = 3; check(!enc_chapter(fb, sizeof(fb), f), "a map flag report with a difficulty is refused");
+            f.difficulty = 0; f.kind = 5; check(!enc_chapter(fb, sizeof(fb), f), "an unknown chapter kind is refused");
+        }
+        {   // proto 102: a client is done with its own random event -- the node seed in generation (low) and mapflags (high)
+            ChapterMsg d{}; d.kind = kChapterEventDone; d.generation = 0x89ABCDEFu; d.mapflags = 0x01234567u; uint8_t db[15]{};
+            check(kProtoVersion >= 102, "the own random events need protocol 102");
+            check(enc_chapter(db, sizeof(db), d) == 15, "an event-done report encodes");
+            Reader r(db, sizeof(db)); r.u8v(); ChapterMsg copy{};
+            check(dec_chapter(r, copy) && copy.kind == kChapterEventDone && ((uint64_t)copy.mapflags << 32 | copy.generation) == 0x0123456789ABCDEFull,
+                  "an event-done report carries the whole node seed");
+            d.act = 1; check(!enc_chapter(db, sizeof(db), d), "an event-done report with an act is refused");
+        }
+        {   // proto 104: the ping with frame statistics
+            PingMsg g; g.kind = 1; g.seq = 7; g.t = 0xABCDEF01u; g.frames = 120; g.avg_x10 = 166; g.max_ms = 812; g.slow = 3; g.mod_max_x10 = 42; uint8_t gb[96]{};
+            g.n_rtt = 2; g.rtt_peer[0] = 1; g.rtt_ms[0] = 85; g.rtt_peer[1] = 3; g.rtt_ms[1] = 17000;
+            check(kProtoVersion >= 105, "the ping's round-trip list needs protocol 105");
+            const uint32_t gn = enc_ping(gb, sizeof(gb), g);
+            check(gn == 2 + 4 + 4 + 5 * 4 + 1 + 2 * 5, "a ping encodes to its exact size");
+            Reader r(gb, gn); r.u8v(); PingMsg c{};
+            check(dec_ping(r, c) && c.kind == 1 && c.seq == 7 && c.t == 0xABCDEF01u && c.frames == 120 && c.avg_x10 == 166 && c.max_ms == 812 && c.slow == 3 && c.mod_max_x10 == 42, "a ping round-trips");
+            check(c.n_rtt == 2 && c.rtt_peer[0] == 1 && c.rtt_ms[0] == 85 && c.rtt_peer[1] == 3 && c.rtt_ms[1] == 17000, "a ping's round-trip list round-trips");
+            for (uint32_t cut = 1; cut < gn; ++cut) { Reader sr(gb, cut); sr.u8v(); PingMsg x{}; check(!dec_ping(sr, x), "a truncated ping is refused"); }
+            g.kind = 2; check(!enc_ping(gb, sizeof(gb), g), "a ping of an unknown kind is refused");
+            g.kind = 0; g.n_rtt = kMaxPeers + 1; check(!enc_ping(gb, sizeof(gb), g), "a ping listing more members than a room holds is refused");
+        }
+        {   // proto 103: the host's drawn event of a node -- the seed's low 32 bits and the name hash
+            ChapterMsg n{}; n.kind = kChapterEventName; n.generation = 0x89ABCDEFu; n.mapflags = 0x1234ABCDu; uint8_t nb[15]{};
+            check(kProtoVersion >= 103, "the host's drawn event needs protocol 103");
+            check(enc_chapter(nb, sizeof(nb), n) == 15, "an event-name message encodes");
+            Reader r(nb, sizeof(nb)); r.u8v(); ChapterMsg copy{};
+            check(dec_chapter(r, copy) && copy.kind == kChapterEventName && copy.generation == 0x89ABCDEFu && copy.mapflags == 0x1234ABCDu, "an event-name message round-trips");
+            n.mapflags = 0; check(!enc_chapter(nb, sizeof(nb), n), "an event-name message without a hash is refused");
+            n.mapflags = 1; n.difficulty = 2; check(!enc_chapter(nb, sizeof(nb), n), "an event-name message with a difficulty is refused");
         }
         {
             MapSeedsMsg m{};
@@ -509,6 +558,93 @@ int main() {
                 for (uint32_t cut = 1; cut < hn; ++cut) { Reader sr(hb, cut); sr.u8v(); BoardMsg x{}; if (dec_board(sr, x)) { check(false, "a truncated player board decoded"); break; } }
             }
             for (uint32_t cut = 1; cut < n; ++cut) { Reader sr(bytes, cut); sr.u8v(); check(!dec_board(sr, copy), "truncated board rejected"); }
+            {   // proto 98: the board as one digest per unit
+                BoardUnit u0 = m.units[0], u1 = u0;
+                check(board_unit_digest(u0) == board_unit_digest(u1), "the same row has the same digest");
+                u1.fx = -u0.fx + 7; u1.fy = 3; u1.speed = u0.speed + 5;
+                check(board_unit_digest(u0) == board_unit_digest(u1), "facing and speed are not in the digest (the client does not repair them)");
+                check(u0.flags == 0, "the sample row is a living enemy");
+                int32_t BoardUnit::* const fields[] = { &BoardUnit::hp, &BoardUnit::shield, &BoardUnit::maxhp, &BoardUnit::tx, &BoardUnit::ty, &BoardUnit::key_a, &BoardUnit::key_b,
+                                                         &BoardUnit::init_base, &BoardUnit::faction, &BoardUnit::mana };
+                bool all = true;
+                for (auto f : fields) { BoardUnit x = u0; x.*f += 1; if (board_unit_digest(x) == board_unit_digest(u0)) all = false; }
+                check(all, "every field the client repairs on a living enemy is in the digest");
+                { BoardUnit x = u0; x.ident ^= 1; check(board_unit_digest(x) != board_unit_digest(u0), "the kind is in the digest"); }
+                { BoardUnit x = u0; x.flags ^= kBoardDead; check(board_unit_digest(x) != board_unit_digest(u0), "the life flag is in the digest"); }
+                { BoardUnit x = u0; x.flags ^= kBoardRemoved; check(board_unit_digest(x) != board_unit_digest(u0), "the removed flag is in the digest"); }
+                { BoardUnit x = u0; x.index = (uint8_t)(u0.index + 1); check(board_unit_digest(x) != board_unit_digest(u0), "the index is in the digest"); }
+                // what board_apply does NOT rewrite stays out, or a client would ask for the board at every boundary
+                { BoardUnit x = u0; x.def[0] = x.def[0] ? 0 : 'Z'; x.carried = 9; x.flags |= kBoardLinked | kBoardChampion; check(board_unit_digest(x) == board_unit_digest(u0), "name, follower slot, linked and champion flags are not in the digest"); }
+                { BoardUnit x = u0, y = u0; x.flags = y.flags = kBoardHuman; x.stat[2] = 4; y.stat[2] = 5; x.maxhp = 30; y.maxhp = 31; x.faction = 1; y.faction = 2; x.carried = 1; y.carried = -1;
+                  check(board_unit_digest(x) == board_unit_digest(y), "a player's stats, max hp, faction and follower slot are not (not written)"); }
+                { BoardUnit x = u0, y = u0; x.flags = y.flags = kBoardHuman; x.mana = 1; y.mana = 2; check(board_unit_digest(x) != board_unit_digest(y), "a player's mana is (written)"); }
+                { BoardUnit x = u0, y = u0; x.flags = y.flags = kBoardHuman; x.hp = 1; y.hp = 2; check(board_unit_digest(x) != board_unit_digest(y), "a player's hit points are (layer 1)"); }
+                { BoardUnit x = u0, y = u0; x.flags = y.flags = kBoardDead; x.mana = 1; y.mana = 2; x.faction = 1; y.faction = 2; check(board_unit_digest(x) == board_unit_digest(y), "a dead enemy's mana and faction are not (only a living one's are written)"); }
+                { BoardUnit x{}, y{}; x.index = y.index = 3; x.flags = y.flags = kBoardGone; x.hp = 9; check(board_unit_digest(x) == board_unit_digest(y), "a gone unit's row is not state"); }
+
+                static BoardSumMsg sm; sm = BoardSumMsg{};
+                sm.battle = 0x0123456789ABCDEFull; sm.turn = 17; sm.cats = kBoardMax;
+                for (int k = 0; k < 4; ++k) sm.rng[k] = 0x1111111111111111ull * (k + 1);
+                for (uint32_t i = 0; i < kBoardMax; ++i) sm.digest[i] = 0x9E3779B9u * (i + 3);
+                static uint8_t sb[16 + 4 + 4 + 32 + 4 * kBoardMax];
+                const uint32_t sn = enc_boardsum(sb, sizeof(sb), sm);
+                check(sn == 1 + 8 + 4 + 4 + 32 + 4 * kBoardMax, "a full board digest fits net_board_publish's buffer");
+                Reader sr(sb, sn); check(sr.u8v() == MSG_BOARDSUM, "type BOARDSUM");
+                static BoardSumMsg so; so = BoardSumMsg{};
+                check(dec_boardsum(sr, so) && so.battle == sm.battle && so.turn == 17 && so.cats == kBoardMax && so.rng[3] == sm.rng[3] && so.digest[kBoardMax - 1] == sm.digest[kBoardMax - 1], "a board digest round-trips");
+                bool str = true;
+                for (uint32_t cut = 1; cut < sn; ++cut) { Reader c(sb, cut); c.u8v(); static BoardSumMsg x; if (dec_boardsum(c, x)) { str = false; break; } }
+                check(str, "no truncated board digest decodes");
+                BoardSumMsg* bad_sum = &so; bad_sum->cats = kBoardMax + 1; check(!enc_boardsum(sb, sizeof(sb), *bad_sum), "a digest past the roster cap is refused");
+                so.cats = 4; so.battle = 0; check(!enc_boardsum(sb, sizeof(sb), so), "a digest of no battle is refused");
+
+                BoardReqMsg q{}; q.battle = 77; q.turn = 12; q.flags = kBoardReqStream;
+                uint8_t qb[32]; const uint32_t qn = enc_boardreq(qb, sizeof(qb), q);
+                check(qn == 1 + 8 + 4 + 1, "a board request is 14 bytes");
+                Reader qr(qb, qn); check(qr.u8v() == MSG_BOARDREQ, "type BOARDREQ");
+                BoardReqMsg qo{}; check(dec_boardreq(qr, qo) && qo.battle == 77 && qo.turn == 12 && qo.flags == kBoardReqStream, "a board request round-trips");
+                BoardReqMsg qbad = q; qbad.flags = 2; check(!enc_boardreq(qb, sizeof(qb), qbad), "a request with an unknown flag is refused");
+                check(strcmp(msg_name(MSG_BOARDSUM), "BOARDSUM") == 0 && strcmp(msg_name(MSG_BOARDREQ), "BOARDREQ") == 0, "the new frames have names");
+            }
+            {   // proto 100: the cat a Soul Jar holds
+                check(kProtoVersion >= 100, "SOULCAT needs protocol 100");
+                uint8_t img[300]; for (uint32_t i = 0; i < sizeof(img); ++i) img[i] = (uint8_t)(i * 7 + 1);
+                SoulCatMsg s{}; s.owner = 1; s.aux = 0x70000003; s.holder = 0x71000002ull; s.status = kSoulCatImage; s.size = sizeof(img); s.hash = 0x1234ull; s.data = img;
+                static uint8_t sb2[512];
+                const uint32_t n = enc_soulcat(sb2, sizeof(sb2), s);
+                check(n == 1 + 1 + 4 + 8 + 1 + 4 + 8 + sizeof(img) && n <= soulcat_frame_size(s), "a soul jar's cat frame is its header plus the image");
+                Reader r(sb2, n); check(r.u8v() == MSG_SOULCAT, "type SOULCAT");
+                SoulCatMsg o{};
+                check(dec_soulcat(r, o) && o.owner == 1 && o.aux == 0x70000003 && o.holder == 0x71000002ull && o.status == kSoulCatImage && o.size == sizeof(img) && o.hash == 0x1234ull &&
+                      o.data && memcmp(o.data, img, sizeof(img)) == 0, "a soul jar's cat round-trips");
+                free(o.data);
+                bool cut_ok = true;
+                for (uint32_t cut = 1; cut < n; ++cut) { Reader c(sb2, cut); c.u8v(); SoulCatMsg x{}; if (dec_soulcat(c, x)) { cut_ok = false; free(x.data); break; } }
+                check(cut_ok, "no truncated SOULCAT decodes");
+                SoulCatMsg miss{}; miss.owner = 0; miss.aux = 5; miss.holder = 0x70000001ull; miss.status = kSoulCatMissing;
+                const uint32_t mn = enc_soulcat(sb2, sizeof(sb2), miss);
+                Reader mr(sb2, mn); mr.u8v(); SoulCatMsg mo{};
+                check(mn && dec_soulcat(mr, mo) && mo.status == kSoulCatMissing && mo.size == 0 && !mo.data && mo.aux == 5, "a 'the owner has no such cat' frame round-trips");
+                SoulCatMsg bad = s; bad.aux = -1; check(!enc_soulcat(sb2, sizeof(sb2), bad), "an empty jar (aux -1) is not sent");
+                bad = s; bad.owner = kMaxPeers; check(!enc_soulcat(sb2, sizeof(sb2), bad), "a seat past the room is refused");
+                bad = s; bad.status = 3; check(!enc_soulcat(sb2, sizeof(sb2), bad), "an unknown status is refused");
+                bad = miss; bad.size = 4; bad.data = img; check(!enc_soulcat(sb2, sizeof(sb2), bad), "a 'missing' frame carries no image");
+                check(strcmp(msg_name(MSG_SOULCAT), "SOULCAT") == 0, "SOULCAT has a name");
+            }
+            {   // proto 101: the host's party luck for a treasure node
+                check(kProtoVersion >= 101, "the shared chest's luck needs protocol 101");
+                TreasureMsg t{}; t.kind = kTreasureLuck; t.node = 0x1234ull; t.luck_e6 = 800000;
+                uint8_t tb[64]; const uint32_t tn = enc_treasure(tb, sizeof(tb), t);
+                check(tn == 1 + 1 + 8 + 8, "a luck frame is 18 bytes");
+                Reader tr(tb, tn); check(tr.u8v() == MSG_TREASURE, "type TREASURE");
+                TreasureMsg to{}; check(dec_treasure(tr, to) && to.kind == kTreasureLuck && to.node == 0x1234ull && to.luck_e6 == 800000, "the host's party luck round-trips");
+                t.luck_e6 = -300000; const uint32_t tn2 = enc_treasure(tb, sizeof(tb), t);
+                Reader tr2(tb, tn2); tr2.u8v(); TreasureMsg to2{}; check(dec_treasure(tr2, to2) && to2.luck_e6 == -300000, "a negative party luck round-trips");
+                bool cut = true;
+                for (uint32_t c = 1; c < tn; ++c) { Reader cr(tb, c); cr.u8v(); TreasureMsg x{}; if (dec_treasure(cr, x)) { cut = false; break; } }
+                check(cut, "no truncated luck frame decodes");
+                TreasureMsg nonode = t; nonode.node = 0; check(!enc_treasure(tb, sizeof(tb), nonode), "a luck frame of no node is refused");
+            }
             BoardMsg bad = m; bad.battle = 0; check(!enc_board(bytes, sizeof(bytes), bad), "board without a battle rejected");
             bad = m; bad.units[0].index = 40; check(!enc_board(bytes, sizeof(bytes), bad), "board unit past the roster rejected");
             bad = m; bad.first = 20; check(!enc_board(bytes, sizeof(bytes), bad), "board chunk past the end rejected");
@@ -530,7 +666,7 @@ int main() {
             m.n_weather = 2; strcpy_s(m.weather[0], "OilSpill"); strcpy_s(m.weather[1], "GeomagneticStorm"); m.build_info = 1;
             uint8_t bytes[400]{};
             const uint32_t n = enc_unlocks(bytes, sizeof(bytes), m);
-            check(n == 1 + 4 + 4 + 4 + 16 + 1 + 1 + 4 + 1 + 1 + 3 * 4 + 1 + 2 * 12 + 8 + 1 + 12 + 3 + 4 * 16 + 1 + (1 + 8) + (1 + 16) + 1 + 2, "unlock snapshot wire size");
+            check(n == 1 + 4 + 4 + 4 + 16 + 1 + 1 + 4 + 1 + 1 + 3 * 4 + 1 + 2 * 12 + 8 + 1 + 12 + 3 + 4 * 16 + 3 * 4 + 1 + (1 + 8) + (1 + 16) + 1 + 2, "unlock snapshot wire size (proto 92: + each queue's true length)");
             {   // proto 78: the host's class names ride along; 255 = not sent
                 UnlocksMsg cm = m;
                 cm.n_classes[0] = 4; cm.n_classes[1] = 5;
@@ -560,10 +696,32 @@ int main() {
             for (uint32_t cut = 1; cut < n; ++cut) { Reader sr(bytes, cut); sr.u8v(); check(!dec_unlocks(sr, copy), "truncated unlock snapshot rejected"); }
             UnlocksMsg bad = m; bad.epoch = 0; check(!enc_unlocks(bytes, sizeof(bytes), bad), "epoch zero rejected");
             bad = m; bad.n_items = 200; check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized list rejected");
-            bad = m; bad.n_spawn = 9; check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized spawn order rejected");
+            bad = m; bad.n_spawn = (uint8_t)(kSpawnMax + 1); check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized spawn order rejected");
             bad = m; bad.n_weather = (uint8_t)(kWeatherNames + 1); check(!enc_unlocks(bytes, sizeof(bytes), bad), "too many weathers rejected");
             bad = m; bad.n_pending[1] = (uint8_t)(kPendingMax + 1); check(!enc_unlocks(bytes, sizeof(bytes), bad), "oversized returning-enemy queue rejected");
             bad = m; bad.n_events = 65; check(!enc_unlocks(bytes, sizeof(bytes), bad), "too many event properties rejected");
+            {   // proto 92: 100 entries per queue fit net_send_unlocks's 8192 bytes with everything else at its largest, and each queue's true length round-trips
+                static UnlocksMsg big; big = m;
+                big.n_items = 128; big.n_events = 64; big.n_spawn = (uint8_t)kSpawnMax; for (uint32_t i = 0; i < kSpawnMax; ++i) { big.spawn_ids[i] = 0x70000000ull + i; big.spawn_keys[i] = (int32_t)i; } big.n_level_name = 63; memset(big.level_name, 'x', 63); big.level_name[63] = 0;
+                big.n_weather = (uint8_t)kWeatherNames; for (uint32_t i = 0; i < kWeatherNames; ++i) { memset(big.weather[i], 'w', kWeatherLen - 1); big.weather[i][kWeatherLen - 1] = 0; }
+                for (int f = 0; f < 2; ++f) { big.n_classes[f] = (uint8_t)kClassMax; for (uint32_t i = 0; i < kClassMax; ++i) { memset(big.classes[f][i], 'c', kClassLen - 1); big.classes[f][i][kClassLen - 1] = 0; } }
+                for (uint32_t q = 0; q < kPendingQueues; ++q) {
+                    big.n_pending[q] = (uint8_t)kPendingMax; big.pending_total[q] = kPendingMax + 7 * q;
+                    for (uint32_t i = 0; i < kPendingMax; ++i) { big.pending[q][i].ident = 0x1000u + i; big.pending[q][i].remaining = 1; big.pending[q][i].hp = (int32_t)i; big.pending[q][i].mode = 1; }
+                }
+                static uint8_t bb[16384];
+                const uint32_t bn = enc_unlocks(bb, sizeof(bb), big);
+                check(bn > 0, "every list at its cap (100 per queue, 100 spawn keys, 16 weathers, 32 classes) fits the 16384-byte send buffer");
+                Reader br(bb, bn); br.u8v(); static UnlocksMsg bc; bc = UnlocksMsg{};
+                bool same = dec_unlocks(br, bc);
+                for (uint32_t q = 0; same && q < kPendingQueues; ++q) same = bc.n_pending[q] == kPendingMax && bc.pending_total[q] == kPendingMax + 7 * q && bc.pending[q][kPendingMax - 1].ident == 0x1000u + kPendingMax - 1;
+                check(same, "a full queue and its true length (longer than what was sent) round-trip");
+                // a true length below the entries sent is malformed
+                UnlocksMsg one = m; one.n_pending[0] = 2; one.pending_total[0] = 2;
+                uint8_t ob[1024]; const uint32_t on = enc_unlocks(ob, sizeof(ob), one);
+                Reader orr(ob, on); orr.u8v(); UnlocksMsg oc{};
+                check(on > 0 && dec_unlocks(orr, oc) && oc.pending_total[0] == 2, "a queue that came whole says so (true length == entries)");
+            }
             {   // the longest level path in the game data is 54 characters ('levels/desert/miniboss/butchercat/butcherminiboss2.lvl'); a 48-byte field refused it
                 const char* longest = "levels/desert/miniboss/butchercat/butcherminiboss2.lvl";
                 UnlocksMsg lm = m; lm.n_level_name = (uint8_t)strlen(longest); memcpy(lm.level_name, longest, lm.n_level_name); lm.level_name[lm.n_level_name] = 0;
@@ -979,37 +1137,71 @@ int main() {
         Reader r(b, n); check(r.u8v() == MSG_UQD, "type UQD");
         UqdMsg o{}; check(dec_uqd(r, o) && o.battle == u.battle && o.seq == 41 && o.turn == 5 && o.action == 2 && o.n == 712 && o.kind[5] == 105 && o.digest == 0xF004EF18u && o.first_rng == 0x93037D36u, "a UQD digest round-trips");
         UqdMsg none{}; check(enc_uqd(b, sizeof(b), none) == 0, "a digest of no battle is not sent");
+        {   // proto 98: an action that asked nothing is short
+            UqdMsg e{}; e.battle = 5; e.seq = 3; e.turn = 1; e.action = 0; e.digest = 0x811C9DC5u;
+            uint8_t eb[128];
+            const uint32_t en = enc_uqd(eb, sizeof(eb), e);
+            check(en == 1 + 8 + 4 * 4 + 1 + 4, "an empty UQD is short (no kinds, no first rng)");
+            Reader er(eb, en); er.u8v(); UqdMsg eo{}; eo.kind[2] = 9; eo.first_rng = 7;
+            check(dec_uqd(er, eo) && eo.n == 0 && eo.digest == 0x811C9DC5u && eo.kind[2] == 0 && eo.first_rng == 0 && eo.seq == 3, "an empty UQD round-trips with zero kinds");
+            bool etr = true;
+            for (uint32_t cut = 1; cut < en; ++cut) { Reader c(eb, cut); c.u8v(); UqdMsg x{}; if (dec_uqd(c, x)) { etr = false; break; } }
+            check(etr, "no truncated empty UQD decodes");
+            eb[1 + 8 + 4 * 4] = 1;                                         // claims the long form without its fields
+            Reader fr(eb, en); fr.u8v(); UqdMsg fo{}; check(!dec_uqd(fr, fo), "a short UQD claiming the long form is refused");
+        }
         bool tr = true;
         for (uint32_t cut = 1; cut < n; ++cut) { Reader c(b, cut); c.u8v(); UqdMsg x{}; if (dec_uqd(c, x)) { tr = false; break; } }
         check(tr, "no truncated digest decodes");
 
         {   // proto 80: the RNG ledger and the derived-value digest
-            RnglMsg l{}; l.battle = 0x1122334455667788ull; l.seq = 9; l.turn = 4; l.action = 3; l.n = 120; l.digest = 0xCAFEF00Du; l.n_loose = 5; l.digest_loose = 0x1234ABCDu; l.sites = kRnglSites; l.more = 7;
+            RnglMsg l{}; l.battle = 0x1122334455667788ull; l.seq = 9; l.turn = 4; l.action = 3; l.n = 120; l.digest = 0xCAFEF00Du; l.n_loose = 5; l.digest_loose = 0x1234ABCDu; l.sites = kRnglSites; l.more = 7; l.detail = 1;
             for (uint32_t i = 0; i < kRnglSites; ++i) { l.key[i] = 0x10000000u + i * 3; l.count[i] = i + 1; }
             uint8_t lb[512];
             uint32_t ln = enc_rngl(lb, sizeof(lb), l);
             check(ln > 0 && ln <= 512, "a full RNG ledger fits the send buffer");
             Reader lr(lb, ln); check(lr.u8v() == MSG_RNGL, "type RNGL");
             RnglMsg lo{};
-            check(dec_rngl(lr, lo) && lo.battle == l.battle && lo.seq == 9 && lo.n == 120 && lo.digest == 0xCAFEF00Du && lo.n_loose == 5 && lo.digest_loose == 0x1234ABCDu && lo.sites == kRnglSites && lo.more == 7 &&
+            check(dec_rngl(lr, lo) && lo.battle == l.battle && lo.seq == 9 && lo.n == 120 && lo.digest == 0xCAFEF00Du && lo.n_loose == 5 && lo.digest_loose == 0x1234ABCDu && lo.sites == kRnglSites && lo.more == 7 && lo.detail == 1 &&
                   lo.key[39] == 0x10000000u + 39 * 3 && lo.count[39] == 40, "an RNG ledger round-trips");
             RnglMsg lbad = l; lbad.sites = (uint8_t)(kRnglSites + 1); check(enc_rngl(lb, sizeof(lb), lbad) == 0, "a ledger with too many sites is refused");
             RnglMsg lnone{}; check(enc_rngl(lb, sizeof(lb), lnone) == 0, "a ledger of no battle is not sent");
             bool ltr = true;
             for (uint32_t cut = 1; cut < ln; ++cut) { Reader c(lb, cut); c.u8v(); RnglMsg x{}; if (dec_rngl(c, x)) { ltr = false; break; } }
             check(ltr, "no truncated ledger decodes");
+            {   // proto 98: the summary every action sends -- no site table
+                RnglMsg sm = l; sm.detail = 0;
+                check(enc_rngl(lb, sizeof(lb), sm) == 0, "a summary with a site table is refused");
+                sm.sites = 0; sm.more = 0;
+                const uint32_t sn = enc_rngl(lb, sizeof(lb), sm);
+                check(sn == 1 + 8 + 4 * 7 + 1, "an RNGL summary is 38 bytes");
+                Reader sr(lb, sn); sr.u8v(); RnglMsg so{}; so.sites = 3;
+                check(dec_rngl(sr, so) && so.detail == 0 && so.sites == 0 && so.n == 120 && so.digest_loose == 0x1234ABCDu, "an RNGL summary round-trips");
+                lb[1 + 8 + 4 * 7] = 2;
+                Reader br(lb, sn); br.u8v(); RnglMsg bo{}; check(!dec_rngl(br, bo), "an RNGL of an unknown form is refused");
+            }
 
-            DeepMsg d{}; d.battle = 0xAA55AA55AA55AA55ull; d.turn = 12; d.n = kDeepUnits;
+            DeepMsg d{}; d.battle = 0xAA55AA55AA55AA55ull; d.turn = 12; d.n = kDeepUnits; d.detail = 1;
             for (uint32_t i = 0; i < kDeepUnits; ++i) d.digest[i] = 0x9E3779B1u * (i + 1);
-            uint8_t db[384];
+            uint8_t db[2048];                                  // net_send_deep's buffer (proto 93: 254 units)
             uint32_t dn = enc_deep(db, sizeof(db), d);
-            check(dn > 0 && dn <= 384, "a full derived-value digest fits the send buffer");
+            check(dn > 0 && dn <= 2048, "a full derived-value digest fits the send buffer");
             Reader dr(db, dn); check(dr.u8v() == MSG_DEEP, "type DEEP");
-            DeepMsg dd{}; check(dec_deep(dr, dd) && dd.battle == d.battle && dd.turn == 12 && dd.n == kDeepUnits && dd.digest[63] == 0x9E3779B1u * 64, "a derived-value digest round-trips");
+            DeepMsg dd{}; check(dec_deep(dr, dd) && dd.battle == d.battle && dd.turn == 12 && dd.n == kDeepUnits && dd.digest[63] == 0x9E3779B1u * 64 && dd.detail == 1, "a derived-value digest round-trips");
+            check(dd.sum == deep_combine(d.digest, kDeepUnits), "a decoded list carries its own summary");
             DeepMsg dbad = d; dbad.n = (uint8_t)(kDeepUnits + 1); check(enc_deep(db, sizeof(db), dbad) == 0, "a digest of too many units is refused");
             bool dtr = true;
             for (uint32_t cut = 1; cut < dn; ++cut) { Reader c(db, cut); c.u8v(); DeepMsg x{}; if (dec_deep(c, x)) { dtr = false; break; } }
             check(dtr, "no truncated derived-value digest decodes");
+            {   // proto 98: the summary every boundary sends
+                DeepMsg ds{}; ds.battle = 9; ds.turn = 3; ds.n = 40; ds.detail = 0; ds.sum = 0xDEADBEEFu;
+                const uint32_t sn = enc_deep(db, sizeof(db), ds);
+                check(sn == 1 + 8 + 4 + 1 + 1 + 4, "a DEEP summary is 19 bytes whatever the roster");
+                Reader sr(db, sn); sr.u8v(); DeepMsg so{};
+                check(dec_deep(sr, so) && so.detail == 0 && so.n == 40 && so.sum == 0xDEADBEEFu && so.turn == 3, "a DEEP summary round-trips");
+                uint32_t a1[3] = { 1, 2, 3 }, a2[3] = { 1, 3, 2 };
+                check(deep_combine(a1, 3) != deep_combine(a2, 3), "the summary depends on which unit holds which digest");
+            }
 
             // proto 81: a line of chat
             ChatMsg c{}; strncpy_s(c.name, sizeof(c.name), "Dcrf", _TRUNCATE); strncpy_s(c.text, sizeof(c.text), "hello \xE4\xBD\xA0\xE5\xA5\xBD", _TRUNCATE);
@@ -1101,6 +1293,128 @@ int main() {
             bool etr = true;
             for (uint32_t cut = 1; cut < en; ++cut) { Reader c4(eb, cut); c4.u8v(); EquipMsg x{}; if (dec_equip(c4, x)) { etr = false; break; } }
             check(etr, "no truncated auto-equip decodes");
+
+            // proto 94: the experimental house boss co-op -- statuses, the ask, the vote
+            {
+                HouseCoopMsg hs{}; hs.kind = kHcStatus; hs.flags = kHcInHouse | kHcToday; hs.times_fought = 2; hs.difficulty = -1;
+                strcpy_s(hs.boss, "house_boss_guillotina");
+                uint8_t hb[96];                                    // net_send_housecoop's buffer
+                uint32_t hn = enc_housecoop(hb, sizeof(hb), hs);
+                check(hn > 0, "a house co-op status encodes");
+                Reader hr(hb, hn); check(hr.u8v() == MSG_HOUSECOOP, "type HOUSECOOP");
+                HouseCoopMsg ho{}; check(dec_housecoop(hr, ho) && ho.kind == kHcStatus && ho.flags == hs.flags && ho.times_fought == 2 && ho.difficulty == -1 && strcmp(ho.boss, hs.boss) == 0, "a house co-op status round-trips");
+                HouseCoopMsg ha = hs; ha.kind = kHcAsk; ha.round = 0;
+                check(enc_housecoop(hb, sizeof(hb), ha) == 0, "an ask without a round is not sent");
+                ha.round = 0x12345678;
+                HouseCoopMsg hlong = ha; memset(hlong.boss, 'x', sizeof(hlong.boss));
+                check(enc_housecoop(hb, sizeof(hb), hlong) == 0, "a boss name that fills the field is not sent");
+                HouseCoopMsg hmax = ha; memset(hmax.boss, 'y', kHcBossLen - 1); hmax.boss[kHcBossLen - 1] = 0;
+                hn = enc_housecoop(hb, sizeof(hb), hmax);
+                check(hn > 0 && hn <= sizeof(hb), "the longest boss name fits the send buffer");
+                hn = enc_housecoop(hb, sizeof(hb), ha);
+                bool htr = true;
+                for (uint32_t cut = 1; cut < hn; ++cut) { Reader c(hb, cut); c.u8v(); HouseCoopMsg x{}; if (dec_housecoop(c, x)) { htr = false; break; } }
+                check(htr, "no truncated house co-op message decodes");
+                HouseCoopMsg hv{}; hv.kind = kHcVote; hv.round = 7; hv.flags = 1;
+                hn = enc_housecoop(hb, sizeof(hb), hv);
+                Reader hr2(hb, hn); hr2.u8v(); HouseCoopMsg hvo{};
+                check(dec_housecoop(hr2, hvo) && hvo.kind == kHcVote && hvo.round == 7 && hvo.flags == 1 && !hvo.boss[0], "a vote without a boss round-trips");
+            }
+            // proto 90: the experimental shared treasure chest -- a claim, and the host's ledger
+            TreasureMsg tc{}; tc.kind = kTreasureClaim; tc.node = 0x1122334455667788ull; tc.slot = 3; tc.key = 0xABCDEF0123456789ull;
+            uint8_t tb[160];                                   // net_send_treasure's buffer
+            uint32_t tn = enc_treasure(tb, sizeof(tb), tc);
+            check(tn > 0, "a treasure claim encodes");
+            Reader tr1(tb, tn); check(tr1.u8v() == MSG_TREASURE, "type TREASURE");
+            TreasureMsg to{}; check(dec_treasure(tr1, to) && to.kind == kTreasureClaim && to.node == tc.node && to.slot == 3 && to.key == tc.key, "a treasure claim round-trips");
+            TreasureMsg ts{}; ts.kind = kTreasureState; ts.node = tc.node; ts.n = kTreasureMaxSlots;
+            for (uint8_t i = 0; i < kTreasureMaxSlots; ++i) { ts.taker[i] = i == 2 ? 1 : kTreasureNobody; ts.keys[i] = 1000 + i; }
+            tn = enc_treasure(tb, sizeof(tb), ts);
+            check(tn > 0 && tn <= sizeof(tb), "a full treasure ledger fits the send buffer");
+            Reader tr2(tb, tn); tr2.u8v(); TreasureMsg tso{};
+            bool same = dec_treasure(tr2, tso) && tso.kind == kTreasureState && tso.n == kTreasureMaxSlots;
+            for (uint8_t i = 0; same && i < kTreasureMaxSlots; ++i) same = tso.taker[i] == ts.taker[i] && tso.keys[i] == ts.keys[i];
+            check(same, "a treasure ledger round-trips");
+            TreasureMsg tz = tc; tz.node = 0;
+            check(enc_treasure(tb, sizeof(tb), tz) == 0, "a treasure message without a node is not sent");
+            TreasureMsg tbad = tc; tbad.slot = kTreasureMaxSlots;
+            check(enc_treasure(tb, sizeof(tb), tbad) == 0, "a claim on a slot past the last is not sent");
+            {   // a state that claims more slots than there are is malformed
+                tn = enc_treasure(tb, sizeof(tb), ts);
+                tb[1 + 1 + 8] = kTreasureMaxSlots + 1; Reader bad(tb, tn); bad.u8v(); TreasureMsg x{};
+                check(!dec_treasure(bad, x), "a ledger of too many slots is refused");
+            }
+            tn = enc_treasure(tb, sizeof(tb), ts);
+            bool ttr = true;
+            for (uint32_t cut = 1; cut < tn; ++cut) { Reader c5(tb, cut); c5.u8v(); TreasureMsg x{}; if (dec_treasure(c5, x)) { ttr = false; break; } }
+            check(ttr, "no truncated treasure ledger decodes");
+
+            // the ledger: first come, first served; one slot per player; another node is refused
+            TreasureLedger L; L.reset(77);
+            check(L.claim(77, 1, 0) == TreasureLedger::Granted, "the first claim on a slot is granted");
+            check(L.claim(77, 2, 0) == TreasureLedger::SlotTaken, "a second player's claim on the same slot is refused");
+            check(L.claim(77, 1, 0) == TreasureLedger::AlreadyMine, "the same claim again is the player's already");
+            check(L.claim(77, 1, 1) == TreasureLedger::HoldsAnother, "a player who holds a slot cannot take another");
+            check(L.claim(77, 2, 1) == TreasureLedger::Granted, "the second player takes another slot");
+            check(L.claim(78, 3, 2) == TreasureLedger::Bad, "a claim for another node is refused");
+            check(L.claim(77, 3, kTreasureMaxSlots) == TreasureLedger::Bad, "a claim past the last slot is refused");
+            check(L.claim(77, kTreasureNobody, 2) == TreasureLedger::Bad, "nobody cannot claim");
+            check(L.taker[0] == 1 && L.taker[1] == 2 && L.taker[2] == kTreasureNobody, "the ledger names the takers");
+            L.reset(78);
+            check(L.taker[0] == kTreasureNobody && L.claim(78, 2, 0) == TreasureLedger::Granted, "a new node starts with every slot free");
+
+            // 0.1.95 (proto 106): a player's pick of the next map node
+            {
+                check(kProtoVersion >= 106, "the map vote needs protocol 106");
+                NodeVoteMsg nv; nv.seed0 = 0x123456789ABCDEF0ull; nv.index = 17; nv.on = 1;
+                uint8_t nb[32]{};
+                const uint32_t nn = enc_nodevote(nb, sizeof(nb), nv);
+                check(nn == 1 + 8 + 4 + 1, "a node pick encodes to its exact size");
+                Reader nr(nb, nn); check(nr.u8v() == MSG_NODEVOTE, "type NODEVOTE");
+                NodeVoteMsg o{}; check(dec_nodevote(nr, o) && o.seed0 == nv.seed0 && o.index == 17 && o.on == 1, "a node pick round-trips");
+                bool cut_ok = true;
+                for (uint32_t cut = 1; cut < nn; ++cut) { Reader c(nb, cut); c.u8v(); NodeVoteMsg x{}; if (dec_nodevote(c, x)) { cut_ok = false; break; } }
+                check(cut_ok, "no truncated node pick decodes");
+                NodeVoteMsg bad = nv; bad.on = 2; check(!enc_nodevote(nb, sizeof(nb), bad), "a pick that is neither on nor off is not sent");
+                bad = nv; bad.index = 5000; uint8_t bb[32]{}; const uint32_t bn = enc_nodevote(bb, sizeof(bb), bad);
+                Reader br(bb, bn); br.u8v(); NodeVoteMsg bo{}; check(bn && !dec_nodevote(br, bo), "a node index past any map is refused on arrival");
+                check(strcmp(msg_name(MSG_NODEVOTE), "NODEVOTE") == 0, "NODEVOTE has a name");
+
+                // the book: toggling, switching, who has picked
+                MapVoteBook bk;
+                const uint8_t ids[3] = {0, 1, 2};
+                check(!bk.any() && !bk.all(ids, 3), "nobody has picked at first");
+                check(bk.toggle(1, 0xAA, 4) && bk.has(1) && bk.is(1, 0xAA, 4), "a click picks a node");
+                check(!bk.toggle(1, 0xAA, 4) && !bk.has(1), "the same node again takes the pick back");
+                check(bk.toggle(1, 0xAA, 4) && bk.toggle(1, 0xBB, 9) && bk.is(1, 0xBB, 9) && !bk.is(1, 0xAA, 4), "another node moves the pick");
+                bk.put(0, 0xBB, 9); bk.put(2, 0xCC, 3);
+                check(bk.count(ids, 3) == 3 && bk.all(ids, 3), "all three have picked (different nodes are fine)");
+                check(bk.drop(2) && !bk.all(ids, 3) && bk.count(ids, 3) == 2, "a pick taken back means not everybody has picked");
+                check(!bk.put(0, 0xBB, 9) && bk.put(0, 0xBB, 10), "put says whether the pick changed");
+                check(!bk.put(kMaxPeers, 1, 1) && !bk.drop(kMaxPeers) && !bk.has(kMaxPeers), "a peer id past the room is ignored");
+                check(!bk.all(ids, 0), "an empty room is never 'everybody'");
+                bk.clear(); check(!bk.any(), "clear forgets every pick");
+            }
+
+            // 0.1.87: an item's description, from the game's markup to the panel's plain lines
+            const char* (*word)(const char*, size_t) = [](const char* n, size_t l) -> const char* {
+                if (l == 3 && !strncmp(n, "con", 3)) return "CON";
+                if (l == 3 && !strncmp(n, "spd", 3)) return "SPD";
+                return nullptr;
+            };
+            char dtxt[128];
+            treasure_desc_plain("Use:\xE2\x80\x8B [img:con]+2, [img:spd]-1.\n[s:.7](Once per battle.)[/s]", dtxt, sizeof(dtxt), word);
+            check(!strcmp(dtxt, "Use: CON+2, SPD-1.\n\x01(Once per battle.)"), "a description: zero-width spaces out, stat icons as words, the small print marked");
+            treasure_desc_plain("[b]bold[/b] {aux} gold&nbsp;x\xC2\xA0[img:unknown]y", dtxt, sizeof(dtxt), word);
+            check(!strcmp(dtxt, "bold  gold x y"), "other tags, placeholders and an icon without a word are dropped; &nbsp; is a space");
+            treasure_desc_plain("[s:.7]a\nb[/s]\nc", dtxt, sizeof(dtxt), word);
+            check(!strcmp(dtxt, "\x01" "a\n\x01" "b\nc"), "every line that starts inside the small print is marked");
+            treasure_desc_plain("a [ b {c\nx\n\n", dtxt, sizeof(dtxt), word);
+            check(!strcmp(dtxt, "a [ b {c\nx"), "an unclosed bracket stays; no empty last line");
+            check(treasure_desc_plain("abcdef", dtxt, 4, word) == 3 && !strcmp(dtxt, "abc"), "the output is cut at its size and terminated");
+            check(treasure_desc_plain(nullptr, dtxt, sizeof(dtxt), word) == 0 && !dtxt[0], "no text: an empty description");
+            treasure_desc_plain("+1[nbsp][img:con], -1[nbsp][img:spd]", dtxt, sizeof(dtxt), word);
+            check(!strcmp(dtxt, "+1 CON, -1 SPD"), "the builder's [nbsp] is a space (0.1.87 live: LionMane)");
         }
 
         PropsMsg p{}; p.epoch = 77; p.total = 250; p.first = 100; p.count = kPropsChunk;
@@ -1145,14 +1459,22 @@ int main() {
         w.i32v(0); w.i32v(0); w.i32v(0); w.i32v(0);
         char big[200]; memset(big, 'x', sizeof(big)); big[199] = 0;
         w.str(big);                     // Writer clamps to 255
-        w.u32v(0xFEEDFACE);             // a sentinel after the string
+        w.u32v(0xFEEDFACE);             // the field after the string (proto 97: the chain position)
 
         Reader r(buf, w.len); r.u8v();
         ActionMsg a{};
         check(dec_action(r, a), "decodes");
         check(a.battle_id == 9 && a.turn == 1, "battle_id and turn survive ahead of it");
         check(strlen(a.gon) == sizeof(a.gon) - 1, "name truncated to the field");
-        check(r.u32v() == 0xFEEDFACE, "the cursor still lands on the next field");
+        check(a.chain == 0xFEEDFACE, "the cursor still lands on the next field (the chain position)");
+        // ... and a decision without one (an older build) still decodes, as "not known"
+        Reader r2(buf, w.len - 4); r2.u8v();
+        ActionMsg b{};
+        check(dec_action(r2, b) && b.chain == 0xFFFFFFFFu, "an action without a chain position decodes as unknown (proto 97)");
+        ActionMsg c{}; c.battle_id = 5; c.turn = 3; c.type = 3; c.chain = 17;
+        const uint32_t cn = enc_action(buf, sizeof(buf), c);
+        Reader r3(buf, cn); r3.u8v(); ActionMsg d{};
+        check(cn && dec_action(r3, d) && d.chain == 17, "the chain position round-trips (proto 97)");
     }
 
     printf("\n-- SAVEFILE carries the bytes, and owns them on arrival --\n");

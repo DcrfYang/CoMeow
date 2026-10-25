@@ -115,8 +115,8 @@ constexpr uintptr_t kPBrain_Dir     = 0x360;   // iVec2D
 // On change, and never faster than this. The same numbers mgmp_cursor uses, and
 // for the same reason: an aim moves as fast as a mouse, and a preview that
 // arrives 50 ms late is a preview that arrived.
-constexpr uint32_t kMinGapMs   = 50;
-constexpr uint32_t kHeartbeatMs = 500;
+constexpr uint32_t kMinGapMs   = 80;     // 50 until 0.1.50: 12 frames a second is still a moving preview, at two thirds of the traffic
+constexpr uint32_t kHeartbeatMs = 1000;   // 500 until 0.1.50: a held aim is redrawn from the last frame anyway
 
 struct Held {
     bool     have  = false;
@@ -378,6 +378,11 @@ void publish(void* brain, uint8_t cat) {
             m.tx = target.x; m.ty = target.y;
             m.dx = dir.x;    m.dy = dir.y;
             ability_gon_name(ability, m.gon, sizeof(m.gon));
+            // A cat that is not on the board (swallowed by the Spewer or the Husk) aims from nowhere: its target and direction are not tiles.
+            // The receiver refuses what it cannot draw (dec_aim's bounds) -- send the stop instead of a frame it would refuse.
+            if (m.tx < -1000 || m.tx > 1000 || m.ty < -1000 || m.ty > 1000 || m.dx < -8 || m.dx > 8 || m.dy < -8 || m.dy > 8) {
+                m = AimMsg{}; m.battle_id = lockstep_battle_id(); m.cat = cat; m.active = 0;
+            }
         }
     }
 

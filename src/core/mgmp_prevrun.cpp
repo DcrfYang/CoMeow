@@ -181,6 +181,24 @@ bool prevrun_auto_start() {
 
 bool prevrun_auto_started() { return g_auto_started; }
 
+void prevrun_drop_upload(const char* what, const char* room) {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!config().auto_upload_crash_log || (last && now - last < 600000)) return;
+    LogUploadRequest req;
+    fill_server(req);
+    if (loopback_or_empty(req.addr)) return;
+    wchar_t cur[MAX_PATH] = {};
+    if (!log_current_path(cur, MAX_PATH)) return;
+    wcsncpy_s(req.files[req.nfiles++], MAX_PATH, cur, _TRUNCATE);
+    _snprintf_s(req.desc, sizeof(req.desc), _TRUNCATE, "(automatic) a player dropped out in the middle of a run: %s", what ? what : "?");
+    _snprintf_s(req.info, sizeof(req.info), _TRUNCATE, "proto %u, a drop-out, room %s", (unsigned)kProtoVersion, room && room[0] ? room : "-");
+    log_line("PREVRUN", "a player dropped out mid-run -- this log is sent to %s:%u in the background, so the drop can be looked into", req.addr, (unsigned)req.port);
+    log_flush();
+    if (!logupload_start(req)) { log_line("PREVRUN", "  (another upload is running -- not sent; F2 can send it)"); return; }
+    last = now;
+}
+
 void prevrun_crash_upload() {
     if (InterlockedCompareExchange(&g_crash_once, 1, 0) != 0) return;
     if (!config().auto_upload_crash_log) return;
@@ -196,6 +214,7 @@ void prevrun_crash_upload() {
     strncpy_s(req.desc, sizeof(req.desc), "(automatic) sent by the crash handler: the game crashed", _TRUNCATE);
     _snprintf_s(req.info, sizeof(req.info), _TRUNCATE, "proto %u, crash handler, %d file(s)", (unsigned)kProtoVersion, req.nfiles);
     if (g_own[0]) wcsncpy_s(req.on_ok_delete[req.ndelete++], MAX_PATH, g_own, _TRUNCATE);
+    log_flush();                 // 0.1.50: the log is buffered -- what it holds goes into the file before the file is read
     if (!logupload_start(req)) return;
     logupload_wait(12000);
     const LogUploadStatus st = logupload_status();

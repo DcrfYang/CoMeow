@@ -6,6 +6,7 @@
 
 #include "mgmp_log.h"
 #include "mgmp_net.h"
+#include "mgmp_page.h"
 #include "mgmp_proto.h"
 
 namespace mgmp {
@@ -89,6 +90,14 @@ void check_all() {
     log_line("ABANDON", "every player agreed (proposal %u from peer %u) -- abandoning the adventure",
              (unsigned)g_st.nonce, (unsigned)g_st.proposer);
     end_vote();
+    // ONLY A PEER THAT IS IN A RUN ENDS ONE (0.1.80, DONGLOU 2026-10-24: the host was still in the House -- its box had just set off empty -- when the client's
+    // proposal passed; start_transition("defeat") ran on a director with no adventure and the game crashed at 0x14008F8C6). A peer anywhere else agreed and
+    // has nothing to end: the proposer's own run is ended on the proposer's game.
+    const PageState pg = page_self();
+    if (pg != PageState::InGame) {
+        log_line_lvl(LogLevel::Warn, "ABANDON", "this player is not in a run (page '%s') -- nothing to abandon here; the run ends on the players who are in it", page_name(pg));
+        return;
+    }
     notice(AbandonNoticeKind::Going);
     if (!abandon_run_native())
         log_line("ABANDON", "!! the game's abandon could not be started on this peer");

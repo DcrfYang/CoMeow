@@ -10,6 +10,7 @@
 #include "mgmp_nodehash.h"
 #include "mgmp_abandon.h"
 #include "mgmp_room.h"
+#include "mgmp_i18n.h"       // tr: the version-mismatch texts
 #include "mgmp_balance.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_runhist.h"
@@ -18,6 +19,8 @@
 #include "mgmp_unlocks.h"
 #include "mgmp_chat.h"
 #include "mgmp_draw.h"
+#include "mgmp_treasure.h"
+#include "mgmp_souljar.h"    // souljar_reset at a session's start
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_page.h"
@@ -60,9 +63,16 @@ struct State {
     Request  request = Request::None;
     bool     host_rules_known = false;      // a client has seen the host's HELLO
     bool     host_block_new_cats = false;   // ... and this is the host's ui.block_new_cats
+    bool     host_exp_treasure = false;     // ... and the host's ui.exp_treasure (HELLO rules bit 1, proto 90)
+    bool     host_exp_house_coop = false;   // ... and the host's ui.exp_house_coop (HELLO rules bit 2, proto 94)
+    bool     host_exp_indep_events = false; // ... and the host's ui.exp_indep_events (HELLO rules bit 3, proto 102)
+    uint8_t  host_enemy_scale_half = 4;     // ... and the host's ui.enemy_scale in halves (HELLO, proto 95)
     char     req_addr[192] = {};      // one address or a comma-separated list (see net_join)
     uint16_t req_port = 0;
     char     last_action[128] = {};
+    // 0.1.57: the last "your versions differ" message, and when each peer was last told about (a refused client repeats its HELLO every 3 s)
+    char      ver_text[1024] = {};
+    ULONGLONG ver_at[kMaxPeers] = {};
 };
 
 State g;
@@ -167,15 +177,24 @@ Hello our_hello() {
     h.proto      = kProtoVersion;
     h.gpak_hash  = g.gpak_hash;
     h.build_hash = g.build_hash;
-    h.rules      = config().block_new_cats ? 1 : 0;    // meaningful from the host only
+    h.rules      = (config().exp_treasure ? 2 : 0) | (config().exp_house_coop ? 4 : 0) | (config().exp_indep_events ? 8 : 0);    // meaningful from the host only (bit 0, ui.block_new_cats, is gone: 2026-10-21)
+    h.enemy_scale_half = config().enemy_scale_half;
     _snprintf_s(h.name, sizeof(h.name), _TRUNCATE, "%s",
                 net_role() == NetRole::Host ? "host" : "client");
     return h;
 }
 
+// THE HANDSHAKE IS ASKED AGAIN (2026-10-20, a client of a 3-player room over Steam: connected, chat both ways, the host's PEERS list arrived --
+// but no HELLO/WELCOME from the host ever did, the client stayed short of Ready, and every save click did nothing until the room was made
+// again). Our one HELLO went out the moment the link said "connected"; whatever lost it, nothing asked again. A client now repeats it every
+// few seconds until the host answers. The host answers a repeated HELLO with the same HELLO + WELCOME (handle_hello; go_ready is idempotent).
+ULONGLONG g_hello_at = 0;
+int g_hello_tries = 0;
 void send_our_hello() {
     net_send_hello(our_hello());
     g.phase = Phase::HelloSent;
+    g_hello_at = GetTickCount64(); g_hello_tries = 1;
+    log_line("SESSION", "HELLO sent (%s)", net_role() == NetRole::Host ? "host" : "client");
 }
 
 void go_ready(const char* how) {
@@ -205,6 +224,41 @@ void go_ready(const char* how) {
     overlay_init();
 }
 
+// THE REASON, IN WORDS (0.1.57; the report: "it keeps saying it is connecting to the host", and it was two different mod versions -- the refusal was
+// in the log and nowhere else). `why` is the refuser's sentence from check_peer: "protocol <the refused peer's>, this build speaks <the refuser's>".
+// `we_refused`: this peer wrote it (so the first number is the other player's); else it was sent to us (the first number is ours). The lower protocol
+// is the older mod, and that player is the one who has to update.
+bool parse_proto_reason(const char* why, uint32_t& first, uint32_t& second) {
+    unsigned a = 0, b = 0;
+    if (!why || sscanf_s(why, "protocol %u, this build speaks %u", &a, &b) != 2) return false;
+    first = a; second = b;
+    return true;
+}
+
+void announce_mismatch(uint8_t peer, const char* why, bool we_refused) {
+    if (peer < kMaxPeers) {                                   // said once a minute per player: the refused client asks again every 3 seconds
+        const ULONGLONG now = GetTickCount64();
+        if (g.ver_at[peer] && now - g.ver_at[peer] < 60000) return;
+        g.ver_at[peer] = now;
+    }
+    char who[64] = {};
+    if (net_role() != NetRole::Host && peer == kHostPeer) strncpy_s(who, sizeof(who), tr(Tx::R_THE_HOST), _TRUNCATE);
+    else if (!room_peer_name(peer, who, sizeof(who)) || !who[0]) _snprintf_s(who, sizeof(who), _TRUNCATE, "P%u", (unsigned)peer + 1);
+    uint32_t a = 0, b = 0;
+    char text[1024];
+    if (parse_proto_reason(why, a, b)) {
+        const uint32_t theirs = we_refused ? a : b, ours = we_refused ? b : a;
+        log_line("SESSION", "!! VERSION: peer %u '%s' speaks protocol %u, this build %u -- the %s mod is older and has to be updated", (unsigned)peer, who, theirs, ours, theirs < ours ? "other player's" : "local");
+        if (theirs < ours) _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_VER_THEY_OLD), who, theirs, ours, who);
+        else               _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_VER_WE_OLD), who, ours, theirs);
+    } else {
+        log_line("SESSION", "!! VERSION: peer %u '%s' cannot play with this build: %s", (unsigned)peer, who, why ? why : "?");
+        _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_VER_OTHER), who, why ? why : "?");
+    }
+    strncpy_s(g.ver_text, sizeof(g.ver_text), text, _TRUNCATE);
+    room_push_notice(text);
+}
+
 // Refuse one peer. On the host the session survives it -- the other players keep
 // playing and the refused peer is simply never welcomed. On a client, being
 // refused by the host is the end of the session, because the host is the only
@@ -212,6 +266,7 @@ void go_ready(const char* how) {
 void refuse_peer(uint8_t peer, const char* why) {
     log_line("SESSION", "!! refusing peer %u: %s", (unsigned)peer, why);
     net_send_refuse_to(peer, why);
+    announce_mismatch(peer, why, true);
     if (net_role() != NetRole::Host) {
         g.phase = Phase::Refused;
         set_status("refused: %s", why);
@@ -278,8 +333,15 @@ void handle_hello(uint8_t from, const Hello& h) {
     // A client plays by the HOST's rules (ui.block_new_cats), whatever its own setting says.
     if (net_role() == NetRole::Client && from == kHostPeer) {
         g.host_block_new_cats = (h.rules & 1) != 0;
+        g.host_exp_treasure = (h.rules & 2) != 0;
+        g.host_exp_house_coop = (h.rules & 4) != 0;
+        g.host_exp_indep_events = (h.rules & 8) != 0;
+        g.host_enemy_scale_half = h.enemy_scale_half < 4 ? 4 : h.enemy_scale_half > 16 ? 16 : h.enemy_scale_half;
+        log_line("SESSION", "the host's rule: enemy health and armor x%.1f", g.host_enemy_scale_half / 2.0);
         g.host_rules_known = true;
         log_line("SESSION", "the host's rule: \"a new cat joins\" effects are %s", g.host_block_new_cats ? "BLOCKED" : "left as they are");
+        log_line("SESSION", "the host's experimental features: shared treasure chests %s, house boss co-op %s, independent random events %s",
+                 g.host_exp_treasure ? "ON" : "off", g.host_exp_house_coop ? "ON" : "off", g.host_exp_indep_events ? "ON" : "off");
     }
 
     if (net_role() != NetRole::Host) return;
@@ -314,6 +376,7 @@ void handle_hello(uint8_t from, const Hello& h) {
     // To that peer only. A broadcast would re-welcome the players already in
     // the battle and hand them a fresh RNG state mid-run.
     net_send_welcome_to(from, w);
+    settings_peer_joined();   // the combat speed, to the player just accepted too
 
     // Ordering matters: go_ready is what arms the savefile module on the very
     // first peer, and it is a no-op on every peer after that. Either way it has
@@ -465,6 +528,9 @@ bool begin(bool host, const char* addr, uint16_t port) {
     }
 
     g.phase = Phase::Waiting;
+    souljar_reset();
+    g.ver_text[0] = 0;
+    memset(g.ver_at, 0, sizeof(g.ver_at));
     if (host) set_status("hosting on port %u", (unsigned)port);
     else      set_status("joining %s:%u", addr, (unsigned)port);
     return true;
@@ -554,6 +620,27 @@ bool session_block_new_cats() {
     return config().block_new_cats;
 }
 
+// The experimental features (ui.exp_*): the HOST decides, like the rule above. A client that has not seen the host's HELLO yet says no.
+bool session_exp_treasure() {
+    if (net_role() == NetRole::Client) return g.host_rules_known && g.host_exp_treasure;
+    return config().exp_treasure;
+}
+
+uint8_t session_enemy_scale_half() {
+    if (net_role() == NetRole::Client && g.host_rules_known) return g.host_enemy_scale_half;
+    return config().enemy_scale_half;
+}
+
+bool session_exp_house_coop() {
+    if (net_role() == NetRole::Client) return g.host_rules_known && g.host_exp_house_coop;
+    return config().exp_house_coop;
+}
+
+bool session_exp_indep_events() {
+    if (net_role() == NetRole::Client) return g.host_rules_known && g.host_exp_indep_events;
+    return config().exp_indep_events;
+}
+
 void session_request_host(uint16_t port) {
     // A PEER CONTINUING ALONE IS NOT PAIRED AGAIN UNTIL THE WAREHOUSE (2026-09-22). The
     // request is refused HERE rather than at the socket, so the panel's buttons and any
@@ -627,6 +714,12 @@ void session_update() {
     // unconditionally, so neither has to know who speaks first.
     if (g.phase == Phase::Waiting && net_state() == NetState::Connected)
         send_our_hello();
+    if (g.phase == Phase::HelloSent && net_role() == NetRole::Client && net_state() == NetState::Connected &&
+        GetTickCount64() - g_hello_at > 3000 && g_hello_tries < 40) {
+        net_send_hello(our_hello());
+        g_hello_at = GetTickCount64(); ++g_hello_tries;
+        log_line_lvl(LogLevel::Warn, "SESSION", "!! no answer to our HELLO from the host yet -- sent again (%d)", g_hello_tries);
+    }
 
     if (g.phase == Phase::Ready) {
         lockstep_pump();
@@ -687,6 +780,10 @@ void session_update() {
 
             case MSG_DRAW:
                 draw_on_message(m.from, m.draw);
+                break;
+
+            case MSG_TREASURE:
+                treasure_on_message(m.from, m.treasure);
                 break;
 
             case MSG_SETTING:
@@ -791,9 +888,18 @@ void session_update() {
                 break;
 
             case MSG_REFUSE:
+                // 0.1.57: ONLY A CLIENT IS ENDED BY BEING REFUSED. A host that took this branch (a client on another version turned the host's HELLO
+                // down and said so -- measured 2026-10-22, room WNM3) put ITSELF in Refused: session_update then returned early for good, the host
+                // never reached Ready, and the players on the right version who joined next could not be welcomed either.
+                if (net_role() == NetRole::Host) {
+                    log_line("SESSION", "!! peer %u turned this host down: %s -- the session stays up for the other players", (unsigned)m.from, m.refuse);
+                    announce_mismatch(m.from, m.refuse, false);
+                    break;
+                }
                 g.phase = Phase::Refused;
                 set_status("peer refused: %s", m.refuse);
                 log_line("SESSION", "!! peer refused us: %s", m.refuse);
+                announce_mismatch(m.from, m.refuse, false);
                 return;
 
             // NOT silent, deliberately.
@@ -827,5 +933,11 @@ void session_update() {
 
 bool        session_ready()  { return g.phase == Phase::Ready; }
 const char* session_status() { return g.status; }
+
+bool session_version_problem(char* out, size_t cap) {
+    if (!out || !cap || g.phase == Phase::Ready || !g.ver_text[0]) return false;
+    strncpy_s(out, cap, g.ver_text, _TRUNCATE);
+    return true;
+}
 
 } // namespace mgmp

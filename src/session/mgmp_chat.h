@@ -17,6 +17,7 @@ struct ChatLine {
     char name[kChatNameMax] = {};
     char text[kChatTextMax] = {};
     bool self = false;
+    uint64_t at = 0;                          // GetTickCount64 when it was kept (a die's roll plays from here)
 };
 
 // A session with at least one other player: there is somebody to talk to.
@@ -26,6 +27,8 @@ bool chat_available();
 void chat_on_message(uint8_t from, const ChatMsg& m);
 // This player's own line (the UI sends it with Enter): kept in the history and sent to the others. Empty after trimming = nothing happens. Returns whether a line was sent.
 bool chat_submit(const char* text);
+// An emote from the picker (mgmp_emote: 0..kEmoteCount-1) as a line of its own; a die is rolled here.
+bool chat_submit_emote(int pick);
 
 int  chat_count();
 const ChatLine& chat_line(int index);        // 0 = the oldest kept

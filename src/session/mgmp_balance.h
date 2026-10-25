@@ -30,7 +30,7 @@
 
 namespace mgmp {
 
-constexpr int32_t kEnemyScale = 2;
+constexpr int32_t kEnemyScale = 2;   // the default (and the value the ruleset id was always built with); the room's own multiplier is ui.enemy_scale
 
 // Is a faction value (the game's enum) an enemy faction: enemies 2, cavemen 8, sabertooths 9, mammoths 10,
 // kaiju1 11, kaiju2 12.
@@ -39,7 +39,9 @@ bool balance_is_enemy_faction(int32_t faction);
 // Scale a character the definition loader has just filled. `hp_before` is its current health from BEFORE the
 // loader ran: the loader only writes health for an initial_health definition, and a character that already
 // had its health (a reload in place) must not be doubled a second time. True when anything changed.
-bool balance_scale_enemy(void* chr, int32_t hp_before);
+// `scale_half` is the multiplier in halves (4 = x2 .. 16 = x8): the host's ui.enemy_scale (session_enemy_scale_half). Half values round to
+// the nearest whole point, upward on a .5 -- the same integer arithmetic on every peer.
+bool balance_scale_enemy(void* chr, int32_t hp_before, uint32_t scale_half = 2 * kEnemyScale);
 
 // THE RULESET both peers must share (2026-10-01): everything that changes what a battle computes but is not in the
 // game's data -- the enemy multiplier and the test aid. Folded into the handshake identity, so two builds (or two

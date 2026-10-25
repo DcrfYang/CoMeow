@@ -21,5 +21,9 @@ bool prevrun_auto_start();                       // starts that upload in the ba
 bool prevrun_auto_started();
 void prevrun_dismiss();                          // the player does not want it uploaded: the pending runs are forgotten
 void prevrun_crash_upload();                     // from the crash handler (see above); bounded in time
+// A PLAYER DROPPED OUT IN THE MIDDLE OF A RUN (0.1.76: "the cat struggles free of the Mother's tumor and the player drops out" -- and a dropped player
+// never reached F2 to send a log). Every peer that sees a drop sends ITS log at once, in the background: the side that closed the link says why
+// ("undecodable ... -- closing", "bad frame length"), the other says what it was doing. At most once every ten minutes; "ui.auto_upload_crash_log" too.
+void prevrun_drop_upload(const char* what, const char* room);
 
 } // namespace mgmp

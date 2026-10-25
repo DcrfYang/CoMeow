@@ -11,6 +11,7 @@
 #include "mgmp_catview.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_checkpoint_io.h"
+#include "mgmp_housecoop.h"
 #include "mgmp_config.h"
 #include "mgmp_leave.h"
 #include "mgmp_lockstep.h"
@@ -19,10 +20,13 @@
 #include "mgmp_menu.h"
 #include "mgmp_net.h"
 #include "mgmp_page.h"
+#include "mgmp_perf.h"
+#include "mgmp_prevrun.h"
 #include "mgmp_proto.h"
 #include "mgmp_resolve.h"
 #include "mgmp_session.h"
 #include "mgmp_signal.h"
+#include "mgmp_upnp.h"
 
 namespace mgmp {
 namespace {
@@ -216,8 +220,25 @@ void tick_solo() {
             // A co-op day that ends in a warehouse on a boss day: the same rule, from the House.
             if (!net_active() || !in_room() || net_peer_count() < 2) return;
             if (scr != MenuScreen::House) return;
+            if (housecoop_holds_solo()) {   // EXPERIMENTAL house boss co-op: the others are asked first (mgmp_housecoop)
+                // 0.1.92 diagnostics (HOUSEBOSS): why the solo fight does not start, each time the reason changes
+                static char last[400] = {};
+                char why[400];
+                housecoop_hold_reason(why, sizeof(why));
+                if (strcmp(why, last) != 0) { strncpy_s(last, sizeof(last), why, _TRUNCATE); log_line("HOUSEBOSS", "in a room, in the warehouse: the solo house boss fight is HELD by the co-op -- %s", why[0] ? why : "?"); }
+                return;
+            }
             bool known = false;
-            if (houseboss_today_live(known) && known) start_solo(-1);
+            const bool today = houseboss_today_live(known);
+            {   // 0.1.92 diagnostics (HOUSEBOSS): what the room reads of this House, each time it changes
+                static int last = -2;
+                const int now = !known ? -1 : today ? 1 : 0;
+                if (now != last) {
+                    last = now;
+                    log_line("HOUSEBOSS", "in a room, in the warehouse: the house boss is %s", now < 0 ? "UNREADABLE (no solo fight can be started)" : now ? "today -- the solo fight starts" : "not today");
+                }
+            }
+            if (today && known) start_solo(-1);
             return;
         }
         case Solo::Leaving:
@@ -334,6 +355,7 @@ void tick_notices() {
             _snprintf_s(text + len, sizeof(text) - len, _TRUNCATE, " %s", tr(Tx::R_PEER_DROPPED_FIGHT));
         }
         push_notice(text);
+        if (!away) prevrun_drop_upload(text, signal_room());    // 0.1.76: the log goes to the server by itself -- a dropped player rarely reaches F2
     };
 
     // Gone from the session.
@@ -379,7 +401,46 @@ void tick_notices() {
 
 } // namespace
 
+// A SLOW LINK IS NOT A FREEZE (0.1.84, room HA2K 2026-10-24). After a battle the client sat on the map for most of a minute and reported "stuck": every step of the node's
+// checkpoint (arrival, prepare, staged, commit, committed, advance) crossed a Steam link whose round trip had grown to 17-29 s, so the host could not lead on and nothing on
+// either screen said why. Said every 30 s while the worst link of the room is 5 s or slower.
+constexpr uint32_t kSlowLinkMs = 5000;
+constexpr ULONGLONG kSlowLinkEveryMs = 30000;
+static void tick_slow_link() {
+    static ULONGLONG said_at = 0;
+    uint8_t who = kNoPeer;
+    const uint32_t ms = perf_link_slow_ms(&who);
+    if (ms < kSlowLinkMs || who == kNoPeer) return;
+    const ULONGLONG now = GetTickCount64();
+    if (said_at && now - said_at < kSlowLinkEveryMs) return;
+    said_at = now;
+    char name[64] = {};
+    if (net_role() != NetRole::Host && who == kHostPeer) strncpy_s(name, sizeof(name), tr(Tx::R_THE_HOST), _TRUNCATE);
+    else if (!room_peer_name(who, name, sizeof(name)) || !name[0]) _snprintf_s(name, sizeof(name), _TRUNCATE, "P%u", (unsigned)who + 1);
+    char text[512];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_SLOW_LINK), name, (ms + 500) / 1000);
+    toast(text);
+    log_line("ROOM", "!! the link to peer %u ('%s') is slow: %u ms (the larger of its last round trip and its oldest unanswered ping) -- said to the player", (unsigned)who, name, ms);
+}
+
+// A DIRECT ROOM NOBODY CAN REACH (0.1.86, room AEZS 2026-10-24): the server's probe of the host's port said "not reachable" (here a router behind another NAT),
+// a joiner dialled twice and left after five seconds each time, and the host's screen said nothing -- "creating the room again" only helped because the next
+// one was made with Steam. Said once per room, to the host.
+static void tick_direct_unreachable() {
+    static char said_room[16] = {};
+    if (!in_room() || _stricmp(signal_role(), "host") != 0 || strcmp(signal_room_transport(), "direct") != 0 || signal_reach() != 2) return;
+    if (strcmp(said_room, signal_room()) == 0) return;
+    strncpy_s(said_room, sizeof(said_room), signal_room(), _TRUNCATE);
+    char text[sizeof(g.notice[0])];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_DIRECT_UNREACHABLE), (unsigned)config().net_port, upnp_double_nat() ? tr(Tx::R_DOUBLE_NAT) : "");
+    push_notice(text);
+    log_line("ROOM", "!! direct room %s: the server cannot reach this host's port %u%s -- the host is told to use Steam or the server relay", signal_room(),
+             (unsigned)config().net_port, upnp_double_nat() ? " (the router sits behind another NAT)" : "");
+}
+
 void room_tick() {
+    tick_slow_link();
+    tick_direct_unreachable();
     // Names: to everyone on a change of membership, else every few seconds.
     if (net_active() && net_peer_count() >= 2) {
         const uint8_t me = net_self(), cnt = net_peer_count();
@@ -405,6 +466,7 @@ void room_tick() {
         room_abort_selection();
     }
 
+    housecoop_tick();
     tick_solo();
     tick_redial();
     tick_party_limit();
@@ -444,8 +506,27 @@ bool room_on_slot_click(int slot, const wchar_t* path) {
     // In a room, a save is only ever picked together. A player whose session is not up would otherwise
     // load alone and walk the room's host out of hosting.
     if (!net_active()) { toast(tr(Tx::R_NOT_CONNECTED)); return true; }
+    if (!session_ready()) {
+        // 0.1.57: "wait a few seconds" is only true when nothing is wrong. A player on another mod version is refused (and the host refuses it) and the
+        // handshake never completes -- the click now says that, and which side has to update.
+        char why[1024];
+        if (session_version_problem(why, sizeof(why))) {
+            toast(why);
+            log_line("ROOM", "save slot %d clicked, but the versions of the players differ -- told the player why instead of asking to wait", slot);
+            return true;
+        }
+        toast(tr(Tx::R_HANDSHAKE_WAIT));
+        log_line("ROOM", "save slot %d clicked before the handshake with the host is complete -- asked to wait", slot);
+        return true;
+    }
 
-    if (houseboss_today_file(path)) { start_solo(slot); return true; }
+    // With the house boss co-op on (the host's setting) a boss-day save is loaded with everybody: the others are asked in the warehouse.
+    {   // 0.1.92 diagnostics (HOUSEBOSS)
+        const bool today = houseboss_today_file(path);
+        log_line("HOUSEBOSS", "save slot %d picked in a room: its house boss is %s%s", slot, today ? "TODAY" : "not today (or none, or unreadable)",
+                 !today ? "" : session_exp_house_coop() ? " -- the co-op is on: the save is loaded with everybody and the others are asked in the warehouse" : " -- played alone (the room is left)");
+    }
+    if (!session_exp_house_coop() && houseboss_today_file(path)) { start_solo(slot); return true; }
 
     // Already picked in this round: the pick stands until somebody starts the round over.
     if (checkpoint_round_open()) {
@@ -634,6 +715,9 @@ void room_say_cat_census(unsigned lost, const char* lost_names, unsigned duplica
     _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_CAT_CENSUS), lost, lost_names ? lost_names : "-", duplicated, dup_names ? dup_names : "-");
     push_notice(text);
 }
+
+void room_push_notice(const char* text) { if (text && text[0]) push_notice(text); }
+void room_toast(const char* text) { if (text && text[0]) toast(text); }
 
 bool room_peer_name(uint8_t id, char* out, size_t cap) {
     if (!out || !cap) return false;

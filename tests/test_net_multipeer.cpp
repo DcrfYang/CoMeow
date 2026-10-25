@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <cwchar>
 using namespace mgmp;
-namespace mgmp { void log_line(const char*,const char*,...){} }
+namespace mgmp { void log_line(const char*,const char*,...){} void log_line_lvl(LogLevel, const char*, const char*, ...) {} }
 int run(bool host,unsigned port){
     if(!(host?net_host((uint16_t)port):net_join("127.0.0.1",(uint16_t)port)))return 2;
     PROCESS_INFORMATION children[3]{};

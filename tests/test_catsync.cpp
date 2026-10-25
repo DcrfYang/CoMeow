@@ -701,6 +701,32 @@ void copies_at_home_do_not_make_the_original_ambiguous() {
     entries.clear(); peer_position = 0; catsync_forget();
 }
 
+// THE FALLBACK FILTER (0.1.79, "the other player's cat came home to my House"): when the ownership filter refuses and nobody else is connected, the run used to
+// end unfiltered and the other player's copies became cats of this House. The fallback takes out only the other positions' cats -- by owner note, or by a clone /
+// gained-cat slot of another position when there is no note -- and leaves this player's cats and real cats of older builds (high slots) alone.
+void the_fallback_filter_takes_out_only_other_players_cats() {
+    entries.clear(); peer_position = 0; peer_count = 1; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    uint64_t lst[4] = {0x70000001ull, 0x71000001ull, 0x70000002ull, 0x71000050ull};      // 0x71000050: a real cat of an older build
+    uint64_t mir[4] = {0x70000001ull, 0x71000001ull, 0x70000002ull, 0x71000050ull};
+    uint64_t fam[4] = {0x71000002ull, 0x70000019ull, 0x71000019ull, 0x355ull};          // a peer copy, the host's gained cat, a client-side gained slot, an ordinary cat
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdCap, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_MirrorCount, uint32_t(4)); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)mir);
+    put(director, kDir_CatFamiliars, uint32_t(4)); put(director, kDir_CatFamiliars + 4, uint32_t(4)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    notes_ready = false;                                                                 // no owner notes: the ids alone decide
+    CHECK(catsync_strip_peer_copies_for_settlement(director));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 3 && lst[0] == 0x70000001ull && lst[1] == 0x70000002ull && lst[2] == 0x71000050ull);
+    CHECK(get<uint32_t>(director, kDir_MirrorCount) == 3 && mir[0] == 0x70000001ull && mir[1] == 0x70000002ull && mir[2] == 0x71000050ull);
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 2 && fam[0] == 0x70000019ull && fam[1] == 0x355ull);
+    CHECK(catsync_strip_peer_copies_for_settlement(director));                           // a second pass finds nothing more
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 3 && get<uint32_t>(director, kDir_CatFamiliars + 4) == 2);
+    catsync_forget();
+    put(director, kDir_CatIdData, (const uint64_t*)party); put(director, kDir_CatIdCount, uint32_t(4));
+    put(director, kDir_MirrorData, (const uint64_t*)party); put(director, kDir_MirrorCount, uint32_t(0));
+    put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
+    peer_count = 2;
+}
+
 void settlement_survives_the_other_player_leaving() {
     // 2026-10-03: the other player crashed mid-run. The survivor's settlement then (a) was held for ever (the filter refused a clone of a peer that is no longer counted), or (b) skipped the filter
     // altogether because the session was down, and settled the departed player's clones and never merged its own. The filter now works with whoever is left, a real cat of an older build on a
@@ -925,6 +951,96 @@ void host_save_with_squatters_and_a_session_range_counter() {
     CHECK(census_notices == 3 && census_dup >= 1);
     printf("census notice names: lost [%s] dup [%s]\n", census_lost_names, census_dup_names);
     CHECK(census_dup_names[0] && strcmp(census_dup_names, "-") != 0);                                               // ... and the cat two House entities carry
+
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
+    put(director, kDir_MirrorCount, uint32_t(0)); put(director, kDir_MirrorData, (const uint64_t*)nullptr);
+    catsync_origin_clear();
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
+// THE HOST'S RUN OF 2026-10-23, rebuilt: a cat that PERISHED long ago (flags 40021) sat on the reserved id 70000002. The setup moved it away and noted a House
+// rename for it -- a House entity it never had -- and at the settlement that note took the entity of this run's clone 70000002, kept as a new cat: the House
+// showed the dead cat, the new cat was in no entity. Now: no note for a dead squatter, and the House check puts an entity on a dead cat right when a cat
+// that came home is missing.
+void a_dead_squatter_does_not_take_a_new_cats_house_entity() {
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : party) entries.erase(id);
+    static uint64_t box[2] = {0x300ull, 0x301ull};
+    auto make = [](uint64_t id, uint64_t seed, uint64_t flags, int32_t stat) {
+        void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, 0, seed); put(c, kCatData_Flags, flags); put(c, 0x70C, stat); entries[id].cat = c; return c;
+    };
+    void* a = make(box[0], 0x1111, kHome, 11);
+    make(box[1], 0x2222, kHome, 12);
+    void* dead = make(0x70000002ull, 0x3333, 0x40021ull, 5);
+    pedigree.clear(); sync_pedigree();
+    counter = 0x301ull;
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_CatIdData, (const uint64_t*)box);
+    put(director, kDir_MirrorCount, uint32_t(2)); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)box);
+    sync_list();
+    put(a, kCatData_Flags, uint64_t(kAway));
+
+    CHECK(catsync_relocate_squatters("t") == 1);                                         // the dead cat leaves the reserved id
+    uint64_t dead_id = 0;
+    for (auto& e : entries) if (e.second.cat == dead) dead_id = e.first;
+    CHECK(dead_id && dead_id != 0x70000002ull && (flags_of(dead_id) & 0x40000));
+
+    SetupMsg m{}; CHECK(catsync_prepare_party_setup(m, 0)); free_msg_cats(m);
+    entries.erase(box[1]); sync_list();                                                  // the second cat's original is gone: its clone is kept as a new cat
+    settle_clone(0x70000001ull, 71); settle_clone(0x70000002ull, 72);
+    CHECK(catsync_merge_session_cats("t") == 2);
+    uint64_t new_id = 0;
+    for (auto& e : entries) if (e.first != box[0] && e.first != dead_id && !(e.first >= 0x70000000ull) && get<int32_t>(e.second.cat, 0x70C) == 72) new_id = e.first;
+    CHECK(new_id != 0);
+
+    // the House: the clones' entities, plus entities the save already had on cats that are not alive (a dead cat, an older build's retired clone).
+    // The clone's own entity is written as the new cat -- no note for the dead squatter takes it -- and the save's own odd entities are left alone,
+    // without a notice (0.1.78 judged them too and told the players 14 cats were lost).
+    census_notices = 0;
+    void* old_clone = allocate(0xC58); put(old_clone, kCatData_SaveId, uint64_t(0x71000005ull)); put(old_clone, kCatData_Flags, uint64_t(0)); entries[0x71000005ull].cat = old_clone;
+    FakeHouse h({dead_id, 0x70000001ull, 0x70000002ull, 0x71000005ull});
+    catsync_house_save(h.house);
+    CHECK(h.id(0) == dead_id);                                                           // the save's own entity: untouched
+    CHECK(h.id(1) == box[0]);
+    CHECK(h.id(2) == new_id);                                                            // the cat that came home, not the dead one
+    CHECK(h.id(3) == 0x71000005ull);
+    CHECK(census_notices == 0);
+
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
+    put(director, kDir_MirrorCount, uint32_t(0)); put(director, kDir_MirrorData, (const uint64_t*)nullptr);
+    catsync_origin_clear();
+    entries.clear(); peer_position = 0; catsync_forget();
+}
+
+// NOT EVERY LIVING CAT HAS A HOUSE ENTITY (0.1.86, DESKTOP-RNOL7FR 2026-10-24: two cats, flags 1003, sat on 70000001/2 with no entity; moved, they were
+// reported as two lost cats). A squatter the House names is renamed in it; one the House does not name is not expected there -- no notice.
+void a_squatter_without_a_house_entity_is_not_lost() {
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : party) entries.erase(id);
+    static uint64_t box[1] = {0x300ull};
+    auto make = [](uint64_t id, uint64_t seed, uint64_t flags, int32_t stat) {
+        void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, 0, seed); put(c, kCatData_Flags, flags); put(c, 0x70C, stat); entries[id].cat = c; return c;
+    };
+    make(box[0], 0x1111, kHome, 11);
+    void* away_from_house = make(0x72000001ull, 0x4444, 0x1003ull, 21);
+    void* in_house = make(0x72000002ull, 0x5555, 0x3ull, 22);
+    pedigree.clear(); sync_pedigree();
+    counter = 0x300ull;
+    put(director, kDir_CatIdCount, uint32_t(1)); put(director, kDir_CatIdData, (const uint64_t*)box);
+    put(director, kDir_MirrorCount, uint32_t(1)); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)box);
+    sync_list();
+    FakeHouse h({box[0], 0x72000002ull});
+    catsync_house_save(h.house);                                                         // the House is seen: it names 72000002, not 72000001
+    census_notices = 0;
+    CHECK(catsync_relocate_squatters("t") == 2);
+    uint64_t id21 = 0, id22 = 0;
+    for (auto& e : entries) { if (e.second.cat == away_from_house) id21 = e.first; if (e.second.cat == in_house) id22 = e.first; }
+    CHECK(id21 && id21 < 0x70000000ull && id22 && id22 < 0x70000000ull);
+    catsync_house_save(h.house);
+    CHECK(h.id(0) == box[0]);
+    CHECK(h.id(1) == id22);                                                              // the House's squatter: renamed
+    CHECK(census_notices == 0);                                                          // the other one was never in the House: not lost
 
     put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)party);
     put(director, kDir_MirrorCount, uint32_t(0)); put(director, kDir_MirrorData, (const uint64_t*)nullptr);
@@ -1356,7 +1472,7 @@ int main() {
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
     in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals(); alone_check_finds_this_players_position(); a_player_who_drops_out_loses_their_cats_for_everyone_else();
-    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
+    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_dead_squatter_does_not_take_a_new_cats_house_entity(); a_squatter_without_a_house_entity_is_not_lost(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); the_fallback_filter_takes_out_only_other_players_cats(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);
     std::free(ids->data);

@@ -78,6 +78,23 @@ int main() {
     balance_scale_enemy(chr, 30);
     CHECK(F(kChr_Hp) == 30);
 
+    printf("-- the room's own multiplier (ui.enemy_scale, in halves) --\n");
+    make(2, 5, 67, 0);
+    balance_scale_enemy(chr, 0x3fffffff, 5);                         // x2.5: 167.5 rounds up
+    CHECK(max_hp(5) == 168 && F(kChr_HpBonusBase) == F(kChr_HpBonus));
+    make(8, 5, 300, 51);
+    balance_scale_enemy(chr, 0x3fffffff, 16);                        // x8
+    CHECK(max_hp(5) == 2400 && F(kChr_Shield) == 408);
+    make(2, 5, 100, 7, 30);
+    balance_scale_enemy(chr, 0x3fffffff, 7);                         // x3.5: initial health 105, armor 24.5 -> 25
+    CHECK(F(kChr_Hp) == 105 && F(kChr_Shield) == 25 && max_hp(5) == 350);
+    make(2, 5, 40, 0);
+    balance_scale_enemy(chr, 0x3fffffff, 99);                        // out of range: clamped to x8
+    CHECK(max_hp(5) == 320);
+    make(2, 5, 0, 100);
+    balance_scale_enemy(chr, 0x3fffffff, 4);                         // x2 by halves is the old rule exactly
+    CHECK(max_hp(5) == 0 && F(kChr_Shield) == 200);
+
     printf("-- not enemies: untouched --\n");
     for (int f : { 0, 1, 3, 6, 7 }) {
         make(f, 5, 40, 10);

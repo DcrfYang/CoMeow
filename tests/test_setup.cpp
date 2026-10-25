@@ -75,6 +75,15 @@ uint32_t unlocks_mapflags(){return test_flags[net_peer_pos()];}
 uint32_t override_flags[4]={};int override_sets[4]={};int override_clears=0;
 void unlocks_override_set(uint32_t f){override_flags[net_peer_pos()]=f;++override_sets[net_peer_pos()];}
 void unlocks_override_clear(){++override_clears;}
+void unlocks_publish(){}
+// the area gate (mgmp_areagate) is told every client's map flags: its READY's and its kChapterFlags reports
+int ag_calls=0;uint8_t ag_from=255;uint32_t ag_flags=0;
+void areagate_on_flags(uint8_t from,uint32_t flags,const char*){++ag_calls;ag_from=from;ag_flags=flags;}
+// experimental own random events (mgmp_indepevt): a client says it is done with its event on a node (kChapterEventDone)
+static int ie_calls=0;static uint8_t ie_from=0xFF;static uint64_t ie_seed=0;
+void indepevt_on_done(uint8_t from,uint64_t seed){++ie_calls;ie_from=from;ie_seed=seed;}
+static int ien_calls=0;static uint8_t ien_from=0xFF;static uint32_t ien_lo=0,ien_hash=0;
+void indepevt_on_host_event(uint8_t from,uint32_t lo,uint32_t h){++ien_calls;ien_from=from;ien_lo=lo;ien_hash=h;}
 }
 namespace {
 int eq_calls=0; bool eq_legacy=false,eq_missing=false;int64_t eq_location=-1;
@@ -245,6 +254,17 @@ int main(){
  // Old reply after run reset cannot satisfy a new request.
  reset(2,0);prepare();SetupMsg old{};at(0,[&]{CHECK(retain(old,g.reply));});
  for(unsigned p=0;p<2;++p)at(p,[]{setup_reset_run();});tick(1);at(1,[&]{setup_on_message(old,0);CHECK(!g.host_reply_seen);});free_msg(old);drain();tick(0);retry();
+ // proto 99: a client's own map flags reach the area gate whatever the round, and change nothing in the preparation
+ reset(2,0);prepare();at(0,[]{const bool ready=g.ready[1];const int before=ag_calls;ChapterMsg m{};m.kind=kChapterFlags;m.generation=1;m.mapflags=0x1234u;
+  setup_on_chapter_message(m,1);CHECK(ag_calls==before+1&&ag_from==1&&ag_flags==0x1234u);CHECK(g.ready[1]==ready);
+  m.generation=0;CHECK(!valid_chapter(m));m.generation=1;m.act=1;CHECK(!valid_chapter(m));});
+ at(0,[]{const int before=ag_calls;ChapterMsg m{};m.kind=kChapterReady;m.generation=g.round;m.mapflags=0x55u;setup_on_chapter_message(m,1);CHECK(ag_calls==before+1&&ag_flags==0x55u);});
+ // proto 102: a client's "done with my own random event" goes to mgmp_indepevt with the whole node seed, and nowhere else
+ at(0,[]{const int before=ie_calls,agb=ag_calls;const bool ready=g.ready[1];ChapterMsg m{};m.kind=kChapterEventDone;m.generation=0x89ABCDEFu;m.mapflags=0x01234567u;
+  setup_on_chapter_message(m,1);CHECK(ie_calls==before+1&&ie_from==1&&ie_seed==0x0123456789ABCDEFull);CHECK(ag_calls==agb&&g.ready[1]==ready);});
+ // proto 103: the host's drawn event goes to mgmp_indepevt with the seed's low half and the hash, and nowhere else
+ at(1,[]{const int before=ien_calls,ieb=ie_calls;ChapterMsg m{};m.kind=kChapterEventName;m.generation=0x89ABCDEFu;m.mapflags=0x1234ABCDu;
+  setup_on_chapter_message(m,0);CHECK(ien_calls==before+1&&ien_from==0&&ien_lo==0x89ABCDEFu&&ien_hash==0x1234ABCDu);CHECK(ie_calls==ieb);});
  for(unsigned p=0;p<4;++p)at(p,[]{setup_shutdown();});
  printf("test_setup: %u checks, 336 party combinations passed\n",checks);
 }

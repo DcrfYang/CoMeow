@@ -262,6 +262,13 @@ void set_keepalive(SOCKET s) {
     setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#ifdef TCP_USER_TIMEOUT
+    // KEEPALIVE DOES NOT RUN WHILE DATA IS UNACKNOWLEDGED (2026-10-22: a room whose host had gone stayed in the list for over twenty minutes). The server
+    // keeps writing to a peer it believes in -- room broadcasts, list answers -- so the dead one always has data in flight, the probes above never start,
+    // and the kernel gives up only after its retransmission limit (tcp_retries2, about 15 minutes). This bounds that to the keepalive's own window.
+    int uto = 75000;
+    setsockopt(s, IPPROTO_TCP, TCP_USER_TIMEOUT, &uto, sizeof(uto));
+#endif
 #endif
 }
 
@@ -389,6 +396,7 @@ constexpr size_t   kUpChunkMax = 2600;        // raw bytes in one chunk
 constexpr size_t   kUpTextMax  = 1500;        // the description's cap, UTF-8 bytes
 constexpr int      kUpPerHour  = 12;          // uploads one address may make per hour
 constexpr int      kUpStoreMax = 3000;        // stored uploads before the server refuses more
+constexpr uint64_t kHeartbeatLostMs = 75000;   // a connection that heartbeats (a mod from 0.1.57 on pings every 20 s) and is silent this long is dropped
 constexpr uint64_t kUpIdleMs  = 60000;       // a stalled upload is dropped (and its partial files deleted)
 constexpr size_t   kPwMax      = 64;      // the longest password digest accepted
 constexpr int      kPwTries    = 6;       // wrong passwords before a connection is dropped
@@ -504,6 +512,8 @@ struct Client {
     bool     away    = false;       // playing on its own for a while; see "away"
     int      pw_fails = 0;          // wrong passwords tried on this connection
     uint32_t gen        = 0;        // which connection this slot holds (slots are reused)
+    uint64_t last_rx    = 0;        // when a byte last arrived from this connection
+    bool     beats      = false;    // it has sent {"t":"ping"}: a mod that heartbeats, so silence for kHeartbeatLostMs means it is gone
     int      probes_made = 0;       // reachability probes started for this connection
     int      relays_made = 0;       // "relay" requests forwarded for this connection (capped)
     char     steam[24]   = {};      // the peer's SteamID64 (digits), when it said so
@@ -836,6 +846,47 @@ void leave_room(int slot, const char* why) {
     else { r.used = false; logf("room %s destroyed -- empty", r.id); }
 }
 
+// A ROOM WHOSE HOST IS NOT THERE (2026-10-22: "the host left and the room is still in the list"). leave_room destroys a room when its host's
+// connection ends, so a room that outlives that means the two tables disagree -- or, far more often, that the connection has not ended yet (see
+// set_keepalive). Once a second every room is checked against its host's connection, and one without a live host is destroyed the way leave_room
+// would have: its members are told and sent back to the lobby.
+void sweep_rooms() {
+    for (int ri = 0; ri < kMaxRooms; ++ri) {
+        Room& r = g_rooms[ri];
+        if (!r.used) continue;
+        bool bad = r.count <= 0;
+        if (!bad) {
+            const int hs = r.members[0];
+            bad = hs < 0 || hs >= kMaxClients || !g_clients[hs].used || g_clients[hs].kind != 0 || g_clients[hs].room != ri;
+        }
+        if (!bad) continue;
+        logf("room %s destroyed -- its host's connection is gone (found by the sweep)", r.id);
+        for (int i = 0; i < kMaxClients; ++i)                       // the room's relay pipes go with it, as leave_room does
+            if (g_clients[i].used && g_clients[i].kind != 0 && g_clients[i].pipe_room == ri) close_client(i);
+        for (int i = 0; i < r.count; ++i) {
+            const int ms = r.members[i];
+            if (ms < 0 || ms >= kMaxClients || !g_clients[ms].used || g_clients[ms].room != ri) continue;
+            g_clients[ms].room = -1;
+            g_clients[ms].away = false;
+            json o = json::object();
+            o["t"]   = "closed";
+            o["msg"] = "the host left the room";
+            send_json(g_clients[ms].sock, o);
+        }
+        r = Room{};
+    }
+}
+
+// A connection that heartbeats and went silent is dropped like one that closed (leave_room then destroys its room if it was the host's).
+void reap_silent(uint64_t now) {
+    for (int i = 0; i < kMaxClients; ++i) {
+        Client& c = g_clients[i];
+        if (!c.used || c.kind != 0 || !c.beats || now - c.last_rx <= kHeartbeatLostMs) continue;
+        logf("peer '%s' (%s) has been silent for %llu s although it heartbeats -- dropped", c.name[0] ? c.name : "?", c.ip, (unsigned long long)((now - c.last_rx) / 1000));
+        close_client(i);
+    }
+}
+
 // --- log collection ---------------------------------------------------------
 
 std::string g_logdir;                  // where uploads are stored (--logdir; default: beside the exe)
@@ -1094,6 +1145,7 @@ void handle_line(int slot, const std::string& line) {
     if (!c.helloed) { send_error(c.sock, "send hello first"); return; }
 
     if (t == "ping") {
+        c.beats = true;
         json o = json::object();
         o["t"] = "pong";
         send_json(c.sock, o);
@@ -1319,6 +1371,7 @@ void on_readable(int slot) {
     const int n = (int)recv(c.sock, buf, sizeof(buf), 0);
     if (n < 0 && interrupted()) return;          // a signal, not a dead peer: the next select brings it back
     if (n <= 0) { close_client(slot); return; }
+    c.last_rx = tick_ms();
     if (c.kind == 1) return;                      // a pipe still waiting for the host sends nothing: ignore stray bytes
 
     if (c.rlen + (uint32_t)n > kLineMax) {
@@ -1620,6 +1673,7 @@ int accept_one() {
     c.sock = s;
     c.room = -1;
     c.gen  = ++g_gen;
+    c.last_rx = tick_ms();
 
     char ip[64] = {};
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -1746,6 +1800,11 @@ void serve_loop() {
                 }
         }
         probe_tick();
+        {   // once a second: silent heartbeating peers and rooms without a host
+            static uint64_t last_sweep = 0;
+            const uint64_t now = tick_ms();
+            if (now - last_sweep >= 1000) { last_sweep = now; reap_silent(now); sweep_rooms(); }
+        }
         {   // relay housekeeping: refill each relay room's allowance; give up on pipes the host never answered
             const uint64_t now = tick_ms();
             for (int i = 0; i < kMaxRooms; ++i) {

@@ -53,6 +53,7 @@ add_library(mgmp SHARED
     src/determinism/mgmp_rng.cpp
     src/determinism/mgmp_rngfix.cpp
     src/determinism/mgmp_rngframe.cpp
+    src/determinism/mgmp_poolfence.cpp
     src/determinism/mgmp_replay.cpp
     src/net/mgmp_net.cpp
     src/net/mgmp_signal.cpp
@@ -78,7 +79,17 @@ add_library(mgmp SHARED
     src/session/mgmp_diag.cpp
     src/session/mgmp_storage_diag.cpp
     src/session/mgmp_draw.cpp
+    src/session/mgmp_treasure.cpp
+    src/session/mgmp_housecoop.cpp
+    src/session/mgmp_areagate.cpp
+    src/session/mgmp_indepevt.cpp
+    src/session/mgmp_perf.cpp
+    src/session/mgmp_souljar.cpp
+    src/session/mgmp_gains.cpp
+    src/session/mgmp_mapvote.cpp
+    src/determinism/mgmp_dmgfence.cpp
     src/session/mgmp_chat.cpp
+    src/session/mgmp_emote.cpp
     src/session/mgmp_leave.cpp
     src/session/mgmp_listprobe.cpp
     src/session/mgmp_spawntest.cpp

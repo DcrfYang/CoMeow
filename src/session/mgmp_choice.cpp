@@ -1,6 +1,12 @@
 // mgmp_choice -- see mgmp_choice.h for why replicating the CHOICE replaces
 // replicating everything the choice does.
 #include "mgmp_choice.h"
+#include "mgmp_areagate.h"
+#include "mgmp_indepevt.h"   // experimental: each player's own random events
+#include "mgmp_event_class.h"  // event_class_independent: does this event touch only the player's own state
+#include "mgmp_i18n.h"
+#include "mgmp_room.h"
+#include "mgmp_session.h"
 #include "mgmp_follow.h"
 #include "mgmp_net.h"
 #include "mgmp_config.h"
@@ -28,6 +34,7 @@
 #include <cstring>
 
 namespace mgmp {
+void story_kaiju_snapshot();   // below: the House's surviving kaiju, taken before a replayed story event's result
 namespace {
 
 // --- the two option arrays -------------------------------------------------
@@ -61,6 +68,8 @@ constexpr uintptr_t kEvtOpt_Stat = 64;
 // on the wire already (it is published the moment its screen opens), and in the
 // per-player case waiting longer would just be a screen that does not respond.
 constexpr uint64_t kEventOwnWaitMs = 1000;
+constexpr float    kEventGreyMul    = 0.6f;     // the RGB multiplier of a greyed option (0.1.64)
+constexpr uint64_t kFollowOwnClickMs = 20000;   // a follow-class event that differs from the host's: this player's own click is taken only after this long (0.1.62)
 
 // --- PARALLEL LEVEL-UPS (2026-09-23) -------------------------------------------------
 //
@@ -375,6 +384,8 @@ struct State {
     uint32_t event_local_index  = 0;
     void*    event_local_screen = nullptr;
     uint64_t event_local_at     = 0;
+    uint64_t event_tick_ms      = 0;    // the last frame a WorldEvent updated (the option buttons are only looked at while one is up)
+    uint64_t grey_said_seed     = 0;    // the node whose greyed options were announced
     bool     event_local_have   = false;
     void* probed_update_screen = nullptr;
     void* probed_button_screen = nullptr;
@@ -390,6 +401,8 @@ struct State {
     uint64_t pending_seed[2]     = {0, 0};
     uint64_t here_seed           = 0;
     uint64_t story_block_seed    = 0;     // the node whose event this client replays from the host: its save is not changed by the result (see choice_story_event_block_active)
+    char     kaiju_snap[64]      = {};    // the House's surviving kaiju (House+0x4B8) as it was before that event's result (see choice_story_guard_tick)
+    bool     kaiju_have          = false;
     uint32_t story_block_said    = 0;     // bit per kind already logged for that node
 
     // NODES THIS PEER WILL NEVER ENTER, so a choice that arrives for one after
@@ -886,6 +899,7 @@ void apply_event_pending(void* screen) {
         const bool story = strncmp(page, "Quest_", 6) == 0 || event_is_story(begin, count) || strcmp(m.name, "quest") == 0 || strcmp(m.name, "home") == 0;
         if (story) {
             if (g.story_block_seed != g.here_seed) { g.story_block_seed = g.here_seed; g.story_block_said = 0; }
+            story_kaiju_snapshot();   // before the result runs: `clear_surviving_kaiju` has no function of its own to stop (see choice_story_guard_tick)
             log_line("CHOICE", "STORY EVENT '%s' (option '%s') replayed from the host: until this node ends the result's changes to THIS peer's save (legacy tokens, quest progress, adventure unlocks, legacy counters, the items it gives) are skipped", page, m.name);
         } else {
             log_line("CHOICE", "event '%s' (option '%s') replayed from the host is a RANDOM one: its result is applied to this peer's save as it always was", page, m.name);
@@ -1113,6 +1127,21 @@ bool choice_on_event_commit(void* cap) {
     if (!mem_read((const uint8_t*)cap + 16, &entry, sizeof(entry))) return true;
     g.world_event = we;
 
+    // EXPERIMENTAL (ui.exp_indep_events, mgmp_indepevt): this player's own random event -- its own cats, its own choice. The click stands
+    // on every peer and nothing crosses the wire (the host does not publish it, a client does not wait for the host's).
+    if (indepevt_is_own(we)) {
+        // the same gate the host's own commits always had: a page in transition takes no click (WorldEvent+0x19F9)
+        if (g.event_faulted || !event_ready(we)) return false;
+        if (entry) {
+            uint8_t* b = nullptr; uint32_t n = 0;
+            char key[48] = {};
+            if (read_options(we, kEvt_OptBegin, kEvt_OptEnd, b, n) && (uint8_t*)entry >= b && (uint8_t*)entry < b + (uintptr_t)n * kOptStride)
+                option_name(kChoiceEvent, (const uint8_t*)entry, key, sizeof(key));
+            log_line("INDEPEVT", "this player's own event: option '%s' chosen here, nothing published", key[0] ? key : "?");
+        }
+        return true;
+    }
+
     uint8_t* begin = nullptr; uint32_t count = 0;
     const bool have = read_options(we, kEvt_OptBegin, kEvt_OptEnd, begin, count);
 
@@ -1155,9 +1184,15 @@ bool choice_on_event_commit(void* cap) {
     }
 
     if (g.is_client) {
-        // Swallow as before, and KEEP the click: whether it is used depends on evidence
+        // THE OPTIONS OF A FOLLOW EVENT ARE GREY ON A CLIENT (0.1.64): a click on one is not kept (nothing could use it: the host chooses), only answered.
+        {
+            static uint64_t said_ms = 0;
+            const uint64_t now = GetTickCount64();
+            if (now - said_ms > 3000) { said_ms = now; room_toast(tr(Tx::IE_OPTIONS_GREY)); }
+        }
+        // (older) Swallow as before, and KEEP the click: whether it is used depends on evidence
         // that has not arrived yet. See apply_event_pending and the update tick.
-        if (have) {
+        if (false && have) {
             const uintptr_t delta = (uintptr_t)((uint8_t*)entry - begin);
             if (delta % kOptStride == 0 && delta / kOptStride < count) {
                 g.event_local_index  = (uint32_t)(delta / kOptStride);
@@ -1189,6 +1224,8 @@ bool choice_on_event_commit(void* cap) {
     }
 
     if (g.event_faulted || !event_ready(we)) return false;
+    // 0.1.53: an option that takes the room into an area another player has not unlocked (the rift, a time machine) waits for the host's answer (mgmp_areagate)
+    if (areagate_hold_event(we, (uint32_t)(delta / kOptStride), (const uint8_t*)entry)) return false;
     ChoiceMsg m{};
     m.kind = kChoiceEvent; m.index = (uint32_t)(delta / kOptStride); m.count = count;
     m.node_seed = follow_here_seed(); m.level_step = g.event_step;
@@ -1208,6 +1245,42 @@ bool choice_story_event_block_active() {
     return g.on && g.is_client && g.story_block_seed != 0 && g.story_block_seed == g.here_seed;
 }
 
+// THE HOUSE'S SURVIVING KAIJU (2026-10-16, the quest review). `clear_surviving_kaiju` (an obelisk's activation) is done inline by the result
+// interpreter -- House+0x4B8 is assigned an empty string (0x140919559), no function of its own to skip -- so on a client replaying the host's story
+// event it cleared THIS save's surviving kaiju, the state its own collar quest (quest_begin_pcollar / zcollar) depends on. The name is taken when
+// the client starts replaying a story event, and every frame while that event's block lasts a changed name is put back, the game's way.
+static bool house_kaiju_string(uint8_t*& s) {
+    s = nullptr;
+    const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+    const uint8_t* dir = nullptr; uint8_t* house = nullptr;
+    if (!at || !mem_read((const void*)at, &dir, sizeof(dir)) || !dir || !mem_read(dir + 0x5A8, &house, sizeof(house)) || !house) return false;
+    s = house + 0x4B8;
+    return true;
+}
+static bool kaiju_restore_call(uint8_t* s, const char* text) {
+    const uintptr_t sdtor = addr_of_call(C_GameStrDtor), sctor = addr_of_call(C_StrFromCStr);
+    if (!sdtor || !sctor) return false;
+    __try {
+        ((void (__fastcall*)(void*))sdtor)(s);                         // released the game's way, then built again in place
+        ((void* (__fastcall*)(void*, const char*))sctor)(s, text);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void story_kaiju_snapshot() {
+    uint8_t* s = nullptr;
+    g.kaiju_have = house_kaiju_string(s) && mem_read_std_string(s, g.kaiju_snap, sizeof(g.kaiju_snap));
+}
+void choice_story_guard_tick() {
+    if (!g.kaiju_have || !choice_story_event_block_active()) return;
+    uint8_t* s = nullptr;
+    char now[64] = {};
+    if (!house_kaiju_string(s) || !mem_read_std_string(s, now, sizeof(now)) || strcmp(now, g.kaiju_snap) == 0) return;
+    const bool ok = kaiju_restore_call(s, g.kaiju_snap);
+    choice_story_event_blocked("clear_surviving_kaiju");
+    log_line_lvl(ok ? LogLevel::Warn : LogLevel::Error, "CHOICE", "STORY EVENT: the House's surviving kaiju became '%s' -- %s '%s' (the host's choice changes the host's save only)",
+                 now, ok ? "put back to" : "!! could NOT be put back to", g.kaiju_snap);
+}
+
 void choice_story_event_blocked(const char* what) {
     uint32_t bit = 0;
     for (const char* c = what ? what : ""; *c; ++c) bit = bit * 31 + (unsigned char)*c;
@@ -1218,10 +1291,25 @@ void choice_story_event_blocked(const char* what) {
 }
 
 void choice_on_event_update(void* world_event) {
+    indepevt_on_event_frame(world_event);
     if (!g.on || !world_event) return;
     Guard guard;
     g.world_event = world_event;
-    if (g.is_client) apply_event_pending(world_event);
+    g.event_tick_ms = GetTickCount64();
+    // an own random event (experimental, mgmp_indepevt) takes no choice from the host
+    if (g.is_client && !indepevt_is_own(world_event)) apply_event_pending(world_event);
+    // HOST: the option confirmed in the area question, committed through the game's own commit -- NOT as an injection, so it goes through
+    // choice_on_event_commit like the host's click (published to the room), and mgmp_areagate lets this one option through.
+    uint32_t confirmed = 0;
+    if (!g.is_client && areagate_take_confirmed_event(world_event, confirmed)) {
+        uint8_t* begin = nullptr; uint32_t count = 0;
+        if (g.evt_commit && read_options(world_event, kEvt_OptBegin, kEvt_OptEnd, begin, count) && confirmed < count) {
+            void* cap[3] = { nullptr, world_event, begin + (uintptr_t)confirmed * kOptStride };
+            g.evt_commit(cap);
+        } else {
+            log_line_lvl(LogLevel::Warn, "CHOICE", "!! the confirmed event option %u could not be committed (the options cannot be read)", confirmed);
+        }
+    }
 
     // ...AND IF NOTHING ANSWERED OUR CLICK, TAKE IT OURSELVES (2026-09-22). The bound is
     // what turns "waiting for the peer" from a way to stop the run into a delay: in the
@@ -1237,6 +1325,35 @@ void choice_on_event_update(void* world_event) {
                  (unsigned long long)kEventOwnWaitMs);
         apply_local_event_choice(world_event);
     }
+    // EXPERIMENTAL (mgmp_indepevt): an event that follows the host, but the host is on ANOTHER event at this node (this peer's own state
+    // forced one, ExtraLife after a death) -- no choice of the host's can ever fit it, so this peer's own click stands. Only on the first
+    // page, where the host's event name and ours are the same thing.
+    if (!tune::kPerPlayerNodes && session_exp_indep_events() && g.is_client && g.event_local_have && g.event_local_screen == world_event &&
+        !g.event_count && !g.event_faulted && g.event_step == 0 && event_ready(world_event) &&
+        (GetTickCount64() - g.event_local_at) >= kEventOwnWaitMs) {
+        char host_evt[64] = {}, ours[64] = {};
+        if (nodehash_peer_event_name(g.here_seed, host_evt, sizeof(host_evt)) &&
+            read_game_string((const uint8_t*)world_event + kEvt_EventName, ours, sizeof(ours)) && ours[0] && strcmp(host_evt, ours) != 0) {
+            // A FOLLOW-CLASS EVENT'S CLICK RUNS ITS SHARED EFFECTS (the next fight's spawns, familiars, a fight, a shop ...) HERE ALONE when the host is on another event
+            // (0.1.62; the draw is aligned with the host's when the node draws, so this is the rare leftover: the host's name did not arrive in time). Only an event of
+            // the player's own kind is clicked after the short wait; the other waits for the host's choice and is clicked after a long one, so the screen can never stay dead.
+            const bool ours_own = strncmp(ours, "Quest_", 6) != 0 && event_class_independent(ours);
+            const ULONGLONG waited = GetTickCount64() - g.event_local_at;
+            if (!ours_own && waited < kFollowOwnClickMs) {
+                static uint64_t said_seed = 0;
+                if (said_seed != g.here_seed) {
+                    said_seed = g.here_seed;
+                    log_line_lvl(LogLevel::Warn, "INDEPEVT", "!! this player's event '%s' follows the host but the host is on '%s' -- waiting up to %llu s before this player's own click is taken (it would run the shared effects here alone)",
+                                 ours, host_evt, (unsigned long long)(kFollowOwnClickMs / 1000));
+                    room_toast(tr(Tx::IE_WAIT_HOST_EVENT));
+                }
+                return;
+            }
+            log_line("INDEPEVT", "the host is on event '%s', this player on '%s' -- this player's own click is taken%s", host_evt, ours,
+                     ours_own ? "" : " (!! it follows the host: its shared effects run here alone)");
+            apply_local_event_choice(world_event);
+        }
+    }
 }
 
 // --- the level-up screen ---------------------------------------------------
@@ -1251,6 +1368,33 @@ void choice_on_event_update(void* world_event) {
 //
 // The name is read per button per frame, which is the cost tune::kLogButtons already
 // pays -- hence a temporary instrument rather than a design.
+void choice_grey_event_button(void* button) {
+    // The cheap tests first: this runs for every button every frame, twice.
+    if (!button || !g.on || !g.is_client || !g.event_tick_ms || !net_active()) return;
+    if (GetTickCount64() - g.event_tick_ms > 1500) return;                       // no world event updated lately: none is up
+    if (indepevt_is_own(g.world_event)) return;                                  // this player's own event: its options are its own to pick
+    char name[40];
+    if (!mem_read_std_string((const uint8_t*)button + kBtn_Name, name, sizeof(name)) || strcmp(name, kBtnName_EventChoice) != 0) return;
+    // The root clip's colour transform: multipliers in a sane range (an unread or wild value is left alone), the RGB ones pulled to kEventGreyMul.
+    uint8_t* clip = nullptr;
+    float mul[4] = {};
+    if (!mem_read((const uint8_t*)button + kBtn_RootClip, &clip, sizeof(clip)) || !clip || !mem_read(clip + kClip_MulR, mul, sizeof(mul))) return;
+    for (float v : mul) if (!(v >= 0.0f && v <= 4.0f)) return;
+    if (g.grey_said_seed != g.here_seed) {
+        log_line("CHOICE", "colour multipliers of an option button's root clip: R %.2f G %.2f B %.2f A %.2f (clip %p)", mul[0], mul[1], mul[2], mul[3], (void*)clip);
+    }
+    const float grey = kEventGreyMul;
+    if (mul[0] != grey) mem_write(clip + kClip_MulR, &grey, sizeof(grey));
+    if (mul[1] != grey) mem_write(clip + kClip_MulG, &grey, sizeof(grey));
+    if (mul[2] != grey) mem_write(clip + kClip_MulB, &grey, sizeof(grey));
+    if (g.grey_said_seed != g.here_seed) {
+        g.grey_said_seed = g.here_seed;
+        log_line("CHOICE", "this event follows the host (%s): the option buttons are tinted grey on this client -- the host chooses",
+                 session_exp_indep_events() ? "its effects reach the shared run" : "independent events are off, every event follows the host");
+        if (session_exp_indep_events()) room_toast(tr(Tx::IE_OPTIONS_GREY));   // only where some events ARE the player's own: it says why this one is grey
+    }
+}
+
 void choice_on_button(void* button) {
     if (!g.on || !button || !tune::kLevelUpProbe) return;
 

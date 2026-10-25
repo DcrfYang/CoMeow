@@ -24,15 +24,20 @@
 #include "mgmp_leave.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_addresses.h"
+#include "mgmp_resolve.h"     // addr_of_call: TempHideMouseCursor (the drawing board's pointer)
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
 #include "mgmp_saveslots.h"
 #include "mgmp_roomhist.h"
 #include "mgmp_chat.h"
+#include "mgmp_emote.h"
 #include "mgmp_draw.h"
 #include "mgmp_unlocks.h"     // settings_room_speed: the combat speed line
 #include "mgmp_page.h"
+#include "mgmp_perf.h"       // the room panel's latency line
+#include "mgmp_mapvote.h"     // the players' picks of the next map node
+#include "mgmp_follow.h"      // follow_on_map: the paws only while the map ticks
 #include "mgmp_abandon.h"
 #include "mgmp_room.h"
 #include "mgmp_catview.h"
@@ -46,6 +51,9 @@
 #include "mgmp_steambridge.h"
 #include "mgmp_logupload.h"
 #include "mgmp_prevrun.h"
+#include "mgmp_treasure.h"
+#include "mgmp_housecoop.h"
+#include "mgmp_areagate.h"
 
 namespace mgmp {
 namespace {
@@ -160,7 +168,14 @@ struct Menu {
     ImFont* font = nullptr;
 
     Tex paper_panel, paper_tag, cursor_def, cursor_over;
+    // 0.1.91: the drawing board's tool is the mouse pointer while it is over the board (draw_board sets it each frame, draw_cursor draws it,
+    // menu_board_cursor_tick hides the game's own cursor meanwhile)
+    int     board_cursor = 0;          // 0 none, 1 pen, 2 eraser
+    ImU32   board_cursor_col = 0;
+    float   board_cursor_r = 0;        // the eraser's reach, screen pixels
+    ULONGLONG board_cursor_at = 0;
     Tex icon_multi, icon_cats, cat_head, cat_ear_l, cat_ear_r;
+    Tex emote_atlas;                  // the chat's emotes (mgmp_emote; assets/emotes, not in git)
 
     Win  win = Win::None;
     // Written by the button detour, read by menu_draw: the title entries follow the
@@ -216,11 +231,18 @@ struct Menu {
     bool     log_prev   = false;   // the window shows the PREVIOUS run (it ended badly): its log and dump, not this run's (mgmp_prevrun.h)
     int      prev_stage = 0;       // 0 not looked yet, 1 an automatic upload of it is running, 2 handled
     bool     log_inited = false;
+    // 0.1.93: F2's history page -- the earlier runs' logs (log_history), read again every two seconds while it is up
+    bool     log_hist   = false;
+    LogHistoryEntry hist[kLogHistoryKeep];
+    int      hist_n     = 0;
+    ULONGLONG hist_at   = 0;
+    int      hist_sent  = -1;      // the row the last upload from this page was for
     char     log_addr[64] = {};
     char     log_desc[kLogUploadDescMax + 1] = {};
     // The first-run beta notice.
     bool     beta_closed = false;     // dismissed for this run
     bool     beta_dont   = false;     // its "do not show again" box
+    bool     ag_dont     = false;     // the area question's "do not ask again in this game" box
     bool inited    = false;
     double next_list = 0;
     bool  was_in_room = false;
@@ -246,6 +268,14 @@ struct Menu {
     // Overwrite asks for the backup's name in the dialog itself (2026-10-10), starting from the name it has; the page's name box is for an empty position.
     char    dlg_name[kSaveNameMax] = {};
     bool    dlg_focus = false;
+    // WHICH ACCOUNT'S SAVES (2026-10-15): the folder line of the backup page, the switch's warning, the list of folders
+    char        acct_label[200] = {};
+    bool        acct_warn = false;       // the switch's warning is up (the backup page's button)
+    bool        acct_list = false;       // the list is up for a switch (the title screen's question needs no flag: it shows while the folder is unsure)
+    SaveAccount acct[8];
+    int         acct_n = 0;
+    double      acct_at = -10;           // when the list was read
+    double      title_since = 0;         // the title screen up since (the question waits a moment for Steam's id)
     SaveSlotInfo current[kGameSlots];
     double  refreshed_at = 0;
     // The page that restores a slot from a handshake save (inside the backup window); sync_slot/sync_idx = the entry the confirm dialog is about (-1 = closed).
@@ -435,7 +465,7 @@ bool paper_button(const char* id, ImVec2 a, ImVec2 b, const char* label, float f
     return clicked;
 }
 
-bool overlay_window_begin(const char* id, ImVec2 pos, ImVec2 size, bool focus = true) {
+bool overlay_window_begin(const char* id, ImVec2 pos, ImVec2 size, bool focus = true, bool inputs = true) {
     ImGui::SetNextWindowPos(pos);
     ImGui::SetNextWindowSize(size);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -446,6 +476,7 @@ bool overlay_window_begin(const char* id, ImVec2 pos, ImVec2 size, bool focus = 
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                           ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground;
     if (!focus) fl |= ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    if (!inputs) fl |= ImGuiWindowFlags_NoInputs;          // drawn only: the mouse goes through it to what is under it
     const bool open = ImGui::Begin(id, nullptr, fl);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(3);
@@ -511,10 +542,11 @@ bool contains_ci(const char* hay, const char* needle) {
 float wrap_text(ImDrawList* dl, float x, float y, float maxw, float fs, float line_h, ImU32 col, const char* text) {
     const char* s = text;
     while (*s) {
+        if (*s == '\n') { y += line_h; ++s; continue; }   // an empty line ("\n\n")
         const char* e = s;
         const char* fit = s;
         const char* space = nullptr;   // just after the last space that still fits
-        while (*e) {
+        while (*e && *e != '\n') {
             const unsigned char c = (unsigned char)*e;
             const int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
             const char* nx = e + len;
@@ -524,14 +556,15 @@ float wrap_text(ImDrawList* dl, float x, float y, float maxw, float fs, float li
             if (c == ' ') space = nx;
         }
         const char* cut = fit;
-        if (*e && *e != ' ' && space && space > s) cut = space;   // broke inside a word: back up to the last space
+        if (*e && *e != ' ' && *e != '\n' && space && space > s) cut = space;   // broke inside a word: back up to the last space
         if (cut == s) cut = s + 1;
         std::string ln(s, cut);
         while (!ln.empty() && ln.back() == ' ') ln.pop_back();
-        text_at(dl, ImVec2(x, y), fs, col, ln.c_str());
+        if (dl) text_at(dl, ImVec2(x, y), fs, col, ln.c_str());   // no draw list: only measured
         y += line_h;
         s = cut;
-        while (*s == ' ') ++s;
+        if (*s == '\n') ++s;                                // the line's own end
+        else while (*s == ' ') ++s;
     }
     return y;
 }
@@ -575,7 +608,7 @@ bool paper_multiline(const char* id, ImVec2 a, ImVec2 b, char* buf, size_t cap, 
 // The game's paw, traced from the native hover (measured 2026-09-30 at 2560x1600
 // from a screenshot: 118 px wide, 87 px tall; connected-component boxes of the five
 // white blobs). Units are fractions of the paw's width, from the centre of its box.
-void draw_paw(ImDrawList* dl, ImVec2 c, float w, ImU32 col) {
+void draw_paw(ImDrawList* dl, ImVec2 c, float w, ImU32 col, float angle = 0.0f) {
     struct Blob { float x, y, rx, ry; };
     static const Blob b[5] = {
         {  0.000f,  0.153f, 0.237f, 0.216f },   // pad
@@ -587,8 +620,11 @@ void draw_paw(ImDrawList* dl, ImVec2 c, float w, ImU32 col) {
     // The entry's window clips to the label; the paw starts bigger and further left
     // than that, and a clipped left toe is what it looked like.
     dl->PushClipRectFullScreen();
-    for (const Blob& e : b)
-        dl->AddEllipseFilled(ImVec2(c.x + e.x * w, c.y + e.y * w), ImVec2(e.rx * w, e.ry * w), col, 0.0f, 32);
+    const float ca = cosf(angle), sa = sinf(angle);
+    for (const Blob& e : b) {
+        const float ox = e.x * w, oy = e.y * w;
+        dl->AddEllipseFilled(ImVec2(c.x + ox * ca - oy * sa, c.y + ox * sa + oy * ca), ImVec2(e.rx * w, e.ry * w), col, angle, 32);
+    }
     dl->PopClipRect();
 }
 
@@ -688,7 +724,8 @@ void ensure_inited() {
     const Config& c = config();
     const bool loop = !c.signal_addr[0] || strcmp(c.signal_addr, "127.0.0.1") == 0;
     strncpy_s(g.addr, sizeof(g.addr), loop ? "localhost" : c.signal_addr, _TRUNCATE);
-    strncpy_s(g.pname, sizeof(g.pname), c.signal_name, _TRUNCATE);
+    // 0.1.89: the name this player last connected with (ui.player_name), else the config's
+    strncpy_s(g.pname, sizeof(g.pname), c.ui_player_name[0] ? c.ui_player_name : c.signal_name, _TRUNCATE);
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +755,7 @@ int lan_connect_step(const char* addr, uint16_t port) {
     if (!g.lan_dialed) {
         signal_request_connect(addr, port, g.pname);
         g.lan_dialed = true;
+        if (config_set_player_name(g.pname)) log_line("MENU", "the player name '%s' is remembered for the next start (ui.player_name)", g.pname);
         log_line("MENU", "LAN: connecting to %s as '%s'", want, g.pname);
         return 0;
     }
@@ -1070,6 +1108,7 @@ void draw_multi_window(const View& v) {
             split_addr(g.addr, host, sizeof(host), port);
             signal_request_connect(host, port, g.pname);
             log_line("MENU", "connect requested: %s:%u as '%s'", host, (unsigned)port, g.pname);
+            if (config_set_player_name(g.pname)) log_line("MENU", "the player name '%s' is remembered for the next start (ui.player_name)", g.pname);
         }
         if (paper_button("back", ImVec2(X(W / 2 + 10), Y(H - 130)), ImVec2(X(W - 70), Y(H - 58)), tr(Tx::BACK), 34 * k))
             g.win = Win::None;
@@ -1417,6 +1456,16 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
             else if (!is_me)
                 text_at(dl, ImVec2(name_x, y + 42 * k), 24 * k, kGrey, tr(Tx::UNKNOWN));
         }
+        // 0.1.85: this player's round trip to that one (mgmp_perf's 2 s ping; between two clients it is the path through the host, the one their messages take)
+        if (!is_me && !away) {
+            uint32_t ms = 0;
+            bool via = false;
+            if (perf_peer_latency_ms(peer_for_row(i), &ms, &via)) {
+                char lat[96];
+                _snprintf_s(lat, sizeof(lat), _TRUNCATE, tr(via ? Tx::LATENCY_VIA_HOST : Tx::LATENCY_MS), (unsigned)ms);
+                text_at(dl, ImVec2(name_x, y + 72 * k), 20 * k, ms < 150 ? kGreen : ms < 500 ? kAmber : kRed, lat);
+            }
+        }
         if (nc) {
             dl->PopClipRect();
             draw_cat_cards(dl, ImVec2(o.x + name_col, y + 8 * k), k, w - name_col, cats, nc);
@@ -1676,9 +1725,120 @@ bool file_dialog_take() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// WHICH ACCOUNT'S SAVES (2026-10-15). On a PC where several accounts have Mewgenics saves and the Steam id names none of the folders, the
+// title screen asks which one is the player's (mgmp_savefile remembers the answer); the backup page shows the folder in use and can switch it,
+// behind a warning. Never in a room.
+// ---------------------------------------------------------------------------
+void acct_display(const SaveAccount& a, char* out, size_t cap) {
+    if (a.persona[0]) { strncpy_s(out, cap, a.persona, _TRUNCATE); return; }
+    char id[80] = {};
+    WideCharToMultiByte(CP_UTF8, 0, a.name, -1, id, sizeof(id), nullptr, nullptr);
+    _snprintf_s(out, cap, _TRUNCATE, "%s (%s)", tr(Tx::ACCT_UNKNOWN), id);
+}
+const char* acct_how_text() {
+    const char* how = savefile_dir_how();
+    if (!strcmp(how, "chosen")) return tr(Tx::ACCT_HOW_CHOSEN);
+    if (!strcmp(how, "steam"))  return tr(Tx::ACCT_HOW_STEAM);
+    if (!strcmp(how, "only"))   return tr(Tx::ACCT_HOW_ONLY);
+    if (!strcmp(how, "guess"))  return tr(Tx::ACCT_HOW_GUESS);
+    return "?";
+}
+void acct_refresh() {
+    g.acct_n = savefile_accounts(g.acct, 8);
+    g.acct_at = now();
+    g.acct_label[0] = 0;
+    for (int i = 0; i < g.acct_n; ++i) {
+        if (!g.acct[i].current) continue;
+        char who[120];
+        acct_display(g.acct[i], who, sizeof(who));
+        _snprintf_s(g.acct_label, sizeof(g.acct_label), _TRUNCATE, tr(Tx::ACCT_NOW), who, acct_how_text());
+    }
+}
+
+// The switch's warning (the backup page's button): what it is for, then the list.
+void draw_acct_warn(const View& v) {
+    if (in_room()) { g.acct_warn = false; return; }
+    const float k = v.k;
+    const float W = 860, H = 420;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    if (!modal_begin("##mgmp_acct_warn")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + W * k, a.y + H * k));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kInk, tr(Tx::ACCT_SWITCH_BTN));
+    wrap_text(dl, X(60), Y(110), (W - 120) * k, 26 * k, 38 * k, kRed, tr(Tx::ACCT_WARN));
+    if (paper_button("acct_go", ImVec2(X(60), Y(H - 100)), ImVec2(X(W / 2 - 10), Y(H - 36)), tr(Tx::ACCT_CONTINUE), 30 * k, true, Tone::Danger)) {
+        g.acct_warn = false; g.acct_list = true;
+        acct_refresh();
+        log_line("MENU", "save folder switch: the warning was confirmed -- the list of folders is shown");
+    }
+    if (paper_button("acct_no", ImVec2(X(W / 2 + 10), Y(H - 100)), ImVec2(X(W - 60), Y(H - 36)), tr(Tx::CANCEL), 30 * k)) g.acct_warn = false;
+    ImGui::End();
+}
+
+// The list of account folders. `forced`: the title screen's question (the folder is unsure); otherwise the backup page's switch.
+void draw_acct_list(const View& v, bool forced) {
+    if (in_room()) { g.acct_list = false; return; }
+    if (now() - g.acct_at > 2.0) acct_refresh();
+    const float k = v.k;
+    const int shown = g.acct_n < 6 ? g.acct_n : 6;
+    const float rowh = 108;
+    const float W = 1040, H = 100 + (forced ? 190 : 20) + rowh * (shown ? shown : 1) + 120;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    if (!modal_begin(forced ? "##mgmp_acct_ask" : "##mgmp_acct_list")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + W * k, a.y + H * k));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kInk, tr(Tx::ACCT_TITLE));
+    float y = 100;
+    if (forced) { wrap_text(dl, X(60), Y(y), (W - 120) * k, 24 * k, 34 * k, kInk, tr(Tx::ACCT_ASK)); y += 190; }
+    else y += 20;
+    for (int i = 0; i < shown; ++i) {
+        const SaveAccount& s = g.acct[i];
+        rough_rect(dl, ImVec2(X(50), Y(y)), ImVec2(X(W - 50), Y(y + rowh - 12)), s.current ? IM_COL32(120, 190, 130, 60) : IM_COL32(255, 255, 250, 50), kInk, 1.8f, 300 + i, 1.0f);
+        char who[160];
+        acct_display(s, who, sizeof(who));
+        if (s.current) { const size_t n = strlen(who); _snprintf_s(who + n, sizeof(who) - n, _TRUNCATE, "  [%s]", tr(Tx::ACCT_CURRENT)); }
+        text_at(dl, ImVec2(X(72), Y(y + 10)), 30 * k, kInk, who);
+        char when[40] = {};
+        if (s.newest) {
+            FILETIME ft{}, lt{}; SYSTEMTIME st{};
+            ft.dwLowDateTime = (DWORD)(s.newest & 0xFFFFFFFFull); ft.dwHighDateTime = (DWORD)(s.newest >> 32);
+            FileTimeToLocalFileTime(&ft, &lt); FileTimeToSystemTime(&lt, &st);
+            _snprintf_s(when, sizeof(when), _TRUNCATE, "%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+        } else strncpy_s(when, sizeof(when), tr(Tx::ACCT_NO_SAVE), _TRUNCATE);
+        char id[80] = {};
+        WideCharToMultiByte(CP_UTF8, 0, s.name, -1, id, sizeof(id), nullptr, nullptr);
+        char meta[260];
+        _snprintf_s(meta, sizeof(meta), _TRUNCATE, tr(Tx::ACCT_META), id, when, s.saves);
+        text_at(dl, ImVec2(X(72), Y(y + 52)), 22 * k, kGrey, meta);
+        char bid[24]; _snprintf_s(bid, sizeof(bid), _TRUNCATE, "acct_use_%d", i);
+        if (paper_button(bid, ImVec2(X(W - 300), Y(y + 18)), ImVec2(X(W - 72), Y(y + rowh - 30)), tr(Tx::ACCT_USE), 26 * k, true, Tone::Good)) {
+            if (savefile_choose_account(s.name)) {
+                char disp[160]; acct_display(s, disp, sizeof(disp));
+                say(tr(Tx::ACCT_DONE), disp);
+                g.acct_list = false;
+                acct_refresh();
+                if (g.win == Win::Backup) { saveslots_refresh(); saveslots_current(g.current); g.refreshed_at = now(); }
+            } else say("%s", tr(Tx::ACCT_FAIL));
+        }
+        y += rowh;
+    }
+    if (paper_button(forced ? "acct_later" : "acct_cancel", ImVec2(X(W / 2 - 160), Y(H - 96)), ImVec2(X(W / 2 + 160), Y(H - 36)),
+                     forced ? tr(Tx::ACCT_LATER) : tr(Tx::CANCEL), 28 * k)) {
+        if (forced) savefile_dir_dismiss_choice();
+        g.acct_list = false;
+    }
+    ImGui::End();
+}
+
 void refresh_backup_view() {
     saveslots_refresh();
     saveslots_current(g.current);
+    acct_refresh();
     g.refreshed_at = now();
     g.confirm = Confirm::None;
 }
@@ -1881,6 +2041,11 @@ void draw_backup_window(const View& v) {
 
     if (locked) {
         text_c(dl, X(W / 2), Y(232), 24 * k, kRed, tr(Tx::ROOM_NO_WRITE));
+    } else {
+        // the save folder in use and how it was decided; the switch is for a PC where several accounts have saves (2026-10-15)
+        if (!g.acct_label[0] && now() - g.acct_at > 2.0) acct_refresh();
+        text_at(dl, ImVec2(X(60), Y(230)), 22 * k, kGrey, g.acct_label);
+        if (paper_button("acct_switch", ImVec2(X(W - 330), Y(222)), ImVec2(X(W - 60), Y(262)), tr(Tx::ACCT_SWITCH_BTN), 22 * k, !dialog_open)) g.acct_warn = true;
     }
 
     // List.
@@ -2062,11 +2227,24 @@ void draw_backup_confirm(const View& v) {
 // ---------------------------------------------------------------------------
 // cursor + toast
 // ---------------------------------------------------------------------------
+void icon_pen(ImDrawList* dl, ImVec2 c, float s, ImU32 tip);
+void icon_eraser(ImDrawList* dl, ImVec2 c, float s);
+
 void draw_cursor(const View& v) {
     const ImGuiIO& io = ImGui::GetIO();
     if (io.MouseDrawCursor) return;                 // the debug panel is drawing its own arrow
-    if (!io.WantCaptureMouse) return;               // the game's cursor is showing and is right
     if (io.MousePos.x < -1e5f) return;
+    // 0.1.91: a drawing tool over the board IS the pointer -- the pen with its nib on the hotspot, the eraser on its circle (the game's own cursor
+    // is hidden meanwhile: menu_board_cursor_tick). Drawn whatever WantCaptureMouse says: the board's canvas is ours.
+    if (g.board_cursor) {
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        const float s = 40.0f * (v.h / 720.0f);
+        const ImVec2 m = io.MousePos;
+        if (g.board_cursor == 1) icon_pen(fg, ImVec2(m.x + 0.40f * s, m.y - 0.40f * s), s, g.board_cursor_col);   // the nib (-0.40, 0.40) on the mouse
+        else                     icon_eraser(fg, m, (g.board_cursor_r > 0 ? g.board_cursor_r * 2.0f : s) * 0.95f);
+        return;
+    }
+    if (!io.WantCaptureMouse) return;               // the game's cursor is showing and is right
 
     // The overlay is drawn AFTER the game's cursor, so over a sheet of paper the
     // game's arrow would be underneath it. Draw the same arrow on top, sized the
@@ -2113,8 +2291,31 @@ void wrap_split(const char* text, float fs, float maxw, std::vector<std::string>
     }
 }
 
+// THE EMOTES (0.1.70, mgmp_emote): The Binding of Isaac's online emotes (0.1.90: without its speech bubble). The atlas is 4x the game's pixels (scratch/make_emote_atlas.py),
+// so the linear filter keeps them sharp.
+bool emotes_ready() {
+    return tex_load(g.emote_atlas, "emotes\\emotes.png") && g.emote_atlas.w == kEmoteAtlasCols * 128 && g.emote_atlas.h >= (kEmoteAtlasCells / kEmoteAtlasCols) * 128;
+}
+void emote_image(ImDrawList* dl, ImVec2 a, ImVec2 b, int cell, ImU32 tint) {
+    if (cell < 0 || cell >= kEmoteAtlasCells || !g.emote_atlas.ok()) return;
+    const float cw = 128.0f / (float)g.emote_atlas.w, ch = 128.0f / (float)g.emote_atlas.h;
+    const ImVec2 uv0((cell % kEmoteAtlasCols) * cw, (cell / kEmoteAtlasCols) * ch);
+    dl->AddImage(g.emote_atlas.ref(), a, b, uv0, ImVec2(uv0.x + cw, uv0.y + ch), tint);
+}
+// `s` screen pixels per game pixel; `top_left` is the corner of the emote's place in the row (34 x 36 game pixels, the emote 32 x 32 centred in it).
+// 0.1.90: the emote alone -- the speech bubble that was drawn behind it (emotes/bubble.png) is gone, at the user's request ("only the emote").
+// Returns the width taken.
+float draw_emote(ImDrawList* dl, ImVec2 top_left, float s, int cell, float alpha) {
+    const ImVec2 c(top_left.x + 17 * s, top_left.y + 18 * s);
+    emote_image(dl, ImVec2(c.x - 16 * s, c.y - 16 * s), ImVec2(c.x + 16 * s, c.y + 16 * s), cell, mul_alpha(IM_COL32_WHITE, alpha));
+    return 34 * s;
+}
+
 // One chat line as "name: text", wrapped, in the colour of its sender's P1..P4 tag in the room panel (the room list's order, host first; the same four colours).
-struct ChatRow { std::string text; ImU32 col; };
+// A line that is one emote is a row of its own, "name:" and the emote, two lines tall.
+struct ChatRow { std::string text; ImU32 col; Emote emote; uint64_t at = 0; };
+constexpr float kEmoteRowLines = 2.0f;
+float chat_row_h(const ChatRow& r, float lh) { return r.emote.pick >= 0 ? lh * kEmoteRowLines : lh; }
 void chat_rows(float fs, float maxw, int first, std::vector<ChatRow>& rows) {
     static const ImU32 kPlayer[4] = { IM_COL32(205, 58, 52, 255), IM_COL32(58, 108, 205, 255), IM_COL32(214, 168, 24, 255), IM_COL32(56, 150, 68, 255) };
     SignalPeer peers[8];
@@ -2123,10 +2324,16 @@ void chat_rows(float fs, float maxw, int first, std::vector<ChatRow>& rows) {
         const ChatLine& l = chat_line(i);
         ImU32 col = kInk;                                           // somebody no longer in the room: plain ink
         for (uint32_t pi = 0; pi < np; ++pi) if (strcmp(peers[pi].name, l.name) == 0) { col = kPlayer[pi & 3]; break; }
+        Emote e;
+        if (emote_parse(l.text, e) && emotes_ready()) {             // no pictures: the token stays text
+            ChatRow r{ std::string(l.name) + ":", col, e, l.at };
+            rows.push_back(r);
+            continue;
+        }
         std::string full = std::string(l.name) + ": " + l.text;
         std::vector<std::string> parts;
         wrap_split(full.c_str(), fs, maxw, parts);
-        for (const std::string& p : parts) rows.push_back({ p, col });
+        for (const std::string& p : parts) rows.push_back({ p, col, Emote{}, l.at });
     }
 }
 
@@ -2252,6 +2459,7 @@ bool board_button(const char* id, ImVec2 a, ImVec2 b, int kind, bool active, ImU
 }
 
 void draw_board(const View& v) {
+    g.board_cursor = 0;
     draw_tick();
     uint64_t scope = 0;
     const int layer = draw_visible_layer(&scope);
@@ -2305,13 +2513,14 @@ void draw_board(const View& v) {
                     if (dx * dx + dy * dy >= 2.5f * 2.5f * k * k) { draw_pen_move(fx, fy); last = m; }
                 }
                 if (ImGui::IsItemDeactivated() || (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && draw_pen_active())) draw_pen_up();
-                if (hovered) fg->AddCircleFilled(m, 4.0f * k, mine, 12);
+                if (hovered) { g.board_cursor = 1; g.board_cursor_col = mine; g.board_cursor_at = GetTickCount64(); }   // the pen is the pointer (draw_cursor)
             } else if (tool == DrawTool::Eraser) {
                 const float r = 20.0f;   // stage pixels
                 if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) draw_erase_at(fx, fy, r);
                 if (hovered) {
                     fg->AddCircle(m, r * k, IM_COL32(255, 255, 255, 220), 24, 3.0f * k);
                     fg->AddCircle(m, r * k, kInk, 24, 1.5f * k);
+                    g.board_cursor = 2; g.board_cursor_r = r * k; g.board_cursor_at = GetTickCount64();      // and the eraser is the pointer (draw_cursor)
                 }
             }
         }
@@ -2361,7 +2570,8 @@ void draw_chat(const View& v) {
         }
         if (!modal_begin("##mgmp_chat")) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float W = 1100, H = 700;
+        const bool emotes = emotes_ready();
+        const float W = 1100, H = emotes ? 790.0f : 700.0f;
         const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
         paper(dl, v, a, ImVec2(a.x + W * k, a.y + H * k));
         auto X = [&](float x) { return a.x + x * k; };
@@ -2371,18 +2581,50 @@ void draw_chat(const View& v) {
         const float fs = 28 * k, lh = 38 * k, cw = (W - 120) * k;
         std::vector<ChatRow> rows;
         chat_rows(fs, cw, 0, rows);
-        const float hy0 = Y(84), hy1 = Y(H - 120);
+        const float hy0 = Y(84), hy1 = Y(H - (emotes ? 210 : 120));
         rough_rect(dl, ImVec2(X(40), hy0), ImVec2(X(W - 40), hy1), IM_COL32(255, 255, 250, 60), kInk, 2.2f, 31, 1.2f);
         ImGui::SetCursorScreenPos(ImVec2(X(48), hy0 + 6 * k));
         ImGui::BeginChild("##chat_hist", ImVec2((W - 96) * k, hy1 - hy0 - 12 * k), false, ImGuiWindowFlags_NoBackground);
         ImDrawList* cdl = ImGui::GetWindowDrawList();
         const ImVec2 cp = ImGui::GetCursorScreenPos();
+        const uint64_t tnow = GetTickCount64();
         if (rows.empty()) text_at(cdl, ImVec2(cp.x + 12 * k, cp.y + 10 * k), fs, kGrey, tr(Tx::CHAT_EMPTY));
-        for (size_t i = 0; i < rows.size(); ++i)
-            text_at(cdl, ImVec2(cp.x + 12 * k, cp.y + 6 * k + lh * (float)i), fs, rows[i].col, rows[i].text.c_str());
-        ImGui::Dummy(ImVec2(cw, lh * (float)(rows.empty() ? 1 : rows.size()) + 12 * k));
+        float ry = cp.y + 6 * k;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const ChatRow& r = rows[i];
+            text_at(cdl, ImVec2(cp.x + 12 * k, ry), fs, r.col, r.text.c_str());
+            if (r.emote.pick >= 0) {
+                const float rh = chat_row_h(r, lh), s = (rh - 4 * k) / 36.0f;
+                draw_emote(cdl, ImVec2(cp.x + 12 * k + text_size(fs, r.text.c_str()).x + 10 * k, ry + 2 * k), s, emote_cell(r.emote, tnow - r.at), 1.0f);
+            }
+            ry += chat_row_h(r, lh);
+        }
+        ImGui::Dummy(ImVec2(cw, (rows.empty() ? lh : ry - cp.y - 6 * k) + 12 * k));
         if (seen != chat_count()) { seen = chat_count(); ImGui::SetScrollHereY(1.0f); }      // the newest line is the one in view
         ImGui::EndChild();
+
+        // The emotes: one click sends one as a line of its own. With nothing typed the box closes, as Enter would; typed text stays for Enter.
+        // NOT an ImGui button (0.1.71): the input box below takes the keyboard focus back every frame (SetKeyboardFocusHere), which makes IT the active item, so a
+        // button pressed here lost its active state the next frame and never saw its release -- the click went nowhere. The press itself is the click.
+        if (emotes) {
+            const float cell = 46, gap = 2, x0 = (W - (cell + gap) * kEmoteCount + gap) * 0.5f, y0 = H - 196;
+            for (int i = 0; i < kEmoteCount; ++i) {
+                const ImVec2 ea(X(x0 + (cell + gap) * i), Y(y0)), eb(ea.x + cell * k, ea.y + cell * k);
+                const bool hov = ImGui::IsMouseHoveringRect(ea, eb, false);
+                const bool click = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left, false);
+                if (hov) { dl->AddRectFilled(ea, eb, IM_COL32(255, 255, 250, 150), 6 * k); dl->AddRect(ea, eb, kInk, 6 * k, 0, 1.6f * k); }
+                const float pad = hov ? 0 : 3 * k;
+                emote_image(dl, ImVec2(ea.x + pad, ea.y + pad), ImVec2(eb.x - pad, eb.y - pad), emote_icon_cell(i), IM_COL32_WHITE);
+                if (click) log_line("CHAT", "emote %s picked", emote_name(i));
+                if (click && chat_submit_emote(i) && !buf[0]) {
+                    was_open = false;
+                    chat_set_input_open(false);
+                    ImGui::GetIO().ClearInputKeys();
+                    ImGui::End();
+                    return;
+                }
+            }
+        }
 
         ImGui::SetKeyboardFocusHere();                                    // the box keeps the keyboard, so the game never gets a key while this is open
         paper_input("##chat_in", ImVec2(X(40), Y(H - 100)), ImVec2(X(W - 40), Y(H - 44)), buf, sizeof(buf), tr(Tx::CHAT_HINT), 28 * k);
@@ -2403,21 +2645,29 @@ void draw_chat(const View& v) {
     std::vector<ChatRow> rows;
     chat_rows(fs, cw, chat_count() > 24 ? chat_count() - 24 : 0, rows);
     if (rows.empty()) return;
-    const size_t maxrows = 16;
-    const size_t first = rows.size() > maxrows ? rows.size() - maxrows : 0;
-    const float h = lh * (float)(rows.size() - first) + 24 * k;
-    const ImVec2 pa(v.org.x + 28 * k, v.org.y + v.h - 150 * k - h), pb(pa.x + cw + 40 * k, pa.y + h);
-    (void)pb;
+    const float maxh = lh * 16;                                     // sixteen lines' height (an emote row counts as two)
+    size_t first = rows.size();
+    float h = 0;
+    while (first > 0 && h + chat_row_h(rows[first - 1], lh) <= maxh) h += chat_row_h(rows[--first], lh);
+    if (first == rows.size()) return;
+    h += 24 * k;
+    const ImVec2 pa(v.org.x + 28 * k, v.org.y + v.h - 150 * k - h);
     ImFont* f = g.font ? g.font : ImGui::GetFont();
     const ImU32 halo = mul_alpha(IM_COL32(240, 238, 228, 200), a);
     const float o = 1.5f * k;
+    float ry = pa.y + 12 * k;
     for (size_t i = first; i < rows.size(); ++i) {
-        const ImVec2 at(pa.x + 20 * k, pa.y + 12 * k + lh * (float)(i - first));
+        const ImVec2 at(pa.x + 20 * k, ry);
         const char* s = rows[i].text.c_str();
         for (int dx = -1; dx <= 1; ++dx)
             for (int dy = -1; dy <= 1; ++dy)
                 if (dx || dy) dl->AddText(f, fs, ImVec2(at.x + dx * o, at.y + dy * o), halo, s);
         dl->AddText(f, fs, at, mul_alpha(rows[i].col, a), s);
+        if (rows[i].emote.pick >= 0) {
+            const float rh = chat_row_h(rows[i], lh), sc = (rh - 4 * k) / 36.0f;
+            draw_emote(dl, ImVec2(at.x + text_size(fs, s).x + 10 * k, ry + 2 * k), sc, emote_cell(rows[i].emote, t - rows[i].at), a);
+        }
+        ry += chat_row_h(rows[i], lh);
     }
 }
 
@@ -2769,7 +3019,10 @@ void draw_room_notice(const View& v) {
     char text[1024];
     if (!room_notice(text, sizeof(text))) return;
     const float k = v.k;
-    const float W = 820, H = 410;   // room for the drop notice plus its fight sentence in the longer languages
+    const float W = 820;
+    // room for the drop notice plus its fight sentence in the longer languages -- and taller for a longer text (the house boss co-op's notices)
+    const float text_h = k > 0 ? wrap_text(nullptr, 0, 0, (W - 120) * k, 26 * k, 38 * k, kInk, text) / k : 0;
+    const float H = text_h + 210 > 410 ? text_h + 210 : 410;
     const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f - 60);
     const ImVec2 sz(W * k, H * k);
     if (!overlay_window_begin("##mgmp_room_notice", a, sz)) { ImGui::End(); return; }
@@ -2784,14 +3037,118 @@ void draw_room_notice(const View& v) {
     ImGui::End();
 }
 
+// EXPERIMENTAL house boss co-op (mgmp_housecoop): the helper's question, and the waiting lines of the helped player and of a held gear screen.
+void draw_housecoop(const View& v) {
+    HouseCoopView hv;
+    if (!housecoop_view(hv)) return;
+    const float k = v.k;
+    const bool ask = hv.panel == HcPanel::Ask;
+    const bool button = ask || hv.panel == HcPanel::WaitVotes || hv.panel == HcPanel::WaitHouse;
+    char text[1024];
+    switch (hv.panel) {
+        case HcPanel::Ask:       _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::HC_ASK), hv.px_row, hv.px_row, hv.px_row); break;
+        case HcPanel::WaitVotes: _snprintf_s(text, sizeof(text), _TRUNCATE, "%s", tr(Tx::HC_WAIT_VOTES)); break;
+        case HcPanel::WaitHouse: _snprintf_s(text, sizeof(text), _TRUNCATE, "%s", tr(Tx::HC_WAIT_HOUSE)); break;
+        case HcPanel::Voted:     _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::HC_VOTED), hv.px_row); break;
+        case HcPanel::GearWait:  _snprintf_s(text, sizeof(text), _TRUNCATE, "%s", tr(Tx::HC_GEAR_WAIT)); break;
+        default: text[0] = 0; break;
+    }
+    const float W = ask ? 880.0f : 760.0f;
+    const float text_h = k > 0 ? wrap_text(nullptr, 0, 0, (W - 100) * k, 25 * k, 36 * k, kInk, text) / k : 0;
+    const float H = 84 + text_h + (button ? 120.0f : 36.0f);
+    const ImVec2 a = ask ? P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f - 40) : P(v, (kStageW - W) * 0.5f, 96);
+    const ImVec2 sz(W * k, H * k);
+    if (!overlay_window_begin("##mgmp_housecoop", a, sz)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(32), 36 * k, kInk, tr(Tx::HC_TITLE));
+    wrap_text(dl, X(50), Y(84), (W - 100) * k, 25 * k, 36 * k, kInk, text);
+    if (ask) {
+        if (paper_button("hc_yes", ImVec2(X(60), Y(H - 92)), ImVec2(X(W / 2 - 10), Y(H - 34)), tr(Tx::HC_YES), 30 * k, true, Tone::Good)) housecoop_answer(true);
+        if (paper_button("hc_no", ImVec2(X(W / 2 + 10), Y(H - 92)), ImVec2(X(W - 60), Y(H - 34)), tr(Tx::HC_NO), 30 * k, true, Tone::Danger)) housecoop_answer(false);
+    } else if (button) {
+        if (paper_button("hc_solo", ImVec2(X(W / 2 - 150), Y(H - 84)), ImVec2(X(W / 2 + 150), Y(H - 30)), tr(Tx::HC_SOLO), 28 * k, true, Tone::Danger)) housecoop_fight_alone();
+    }
+    ImGui::End();
+}
+
+// THE AREA QUESTION (0.1.53, mgmp_areagate): the host is about to lead the room into an area another player has not unlocked.
+const char* area_name(int area) {
+    static const Tx kNames[] = { Tx::AREA_SEWERS, Tx::AREA_JUNKYARD, Tx::AREA_CAVES, Tx::AREA_BONEYARD, Tx::AREA_MEATWORLD, Tx::AREA_DESERT,
+                                 Tx::AREA_BUNKER, Tx::AREA_CRATER, Tx::AREA_CORE, Tx::AREA_MOON, Tx::AREA_DIMENSIONX, Tx::AREA_LAB,
+                                 Tx::AREA_ICEAGE, Tx::AREA_FUTURE, Tx::AREA_JURASSIC, Tx::AREA_THEEND, Tx::AREA_ENDOFTIME };   // mgmp_areagate's kAreas order
+    return area >= 0 && area < (int)(sizeof(kNames) / sizeof(kNames[0])) ? tr(kNames[area]) : "?";
+}
+void draw_area_gate(const View& v) {
+    AreaGateView av;
+    if (!areagate_view(av)) { g.ag_dont = false; return; }
+    const float k = v.k;
+    char who[240] = {}; size_t w = 0;
+    for (uint8_t i = 0; i < av.n; ++i) {
+        const int n = _snprintf_s(who + w, sizeof(who) - w, _TRUNCATE, "%s%s", i ? ", " : "", av.names[i]);
+        if (n > 0) w += (size_t)n;
+    }
+    char detail[512];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, tr(Tx::AG_DETAIL), area_name(av.area), who);
+    const float W = 900;
+    const float text_w = (W - 120) * k;
+    const float h1 = k > 0 ? wrap_text(nullptr, 0, 0, text_w, 27 * k, 39 * k, kInk, tr(Tx::AG_TEXT)) / k : 0;
+    const float h2 = k > 0 ? wrap_text(nullptr, 0, 0, text_w, 24 * k, 35 * k, kInk, detail) / k : 0;
+    const float H = 100 + h1 + 24 + h2 + 40 + 44 + 30 + 100;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f - 30);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_area_gate")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kInk, tr(Tx::BETA_TITLE));
+    float y = 100;
+    wrap_text(dl, X(60), Y(y), text_w, 27 * k, 39 * k, kInk, tr(Tx::AG_TEXT));
+    y += h1 + 24;
+    wrap_text(dl, X(60), Y(y), text_w, 24 * k, 35 * k, IM_COL32(150, 40, 30, 255), detail);
+    y += h2 + 40;
+
+    // "do not ask again in this game"
+    const ImVec2 b0(X(60), Y(y)), b1(X(60 + 44), Y(y + 44));
+    const char* lab = tr(Tx::AG_DONT_ASK);
+    const float lw = text_size(26 * k, lab).x;
+    ImGui::SetCursorScreenPos(b0);
+    ImGui::PushID("ag_dont");
+    const bool clicked = ImGui::InvisibleButton("##c", ImVec2(b1.x - b0.x + 16 * k + lw, b1.y - b0.y));
+    const bool hov = ImGui::IsItemHovered();
+    ImGui::PopID();
+    if (hov) g.hovering_button = true;
+    if (clicked) g.ag_dont = !g.ag_dont;
+    rough_rect(dl, b0, b1, hov ? kPaperHi : IM_COL32(255, 255, 250, 200), kInk, 2.4f, 317, 1.2f);
+    if (g.ag_dont) {
+        dl->AddLine(ImVec2(b0.x + 9 * k, b0.y + 23 * k), ImVec2(b0.x + 19 * k, b0.y + 34 * k), kInk, 4.5f * k);
+        dl->AddLine(ImVec2(b0.x + 19 * k, b0.y + 34 * k), ImVec2(b0.x + 36 * k, b0.y + 10 * k), kInk, 4.5f * k);
+    }
+    text_at(dl, ImVec2(b1.x + 16 * k, b0.y + 9 * k), 26 * k, kInk, lab);
+
+    const float by0 = H - 96, by1 = H - 34;
+    if (paper_button("ag_go", ImVec2(X(60), Y(by0)), ImVec2(X(W / 2 - 14), Y(by1)), tr(Tx::AG_GO), 30 * k, true, Tone::Danger)) {
+        areagate_answer(true, g.ag_dont);
+        g.ag_dont = false;
+    } else if (paper_button("ag_no", ImVec2(X(W / 2 + 14), Y(by0)), ImVec2(X(W - 60), Y(by1)), tr(Tx::CANCEL), 30 * k, true, Tone::Good)) {
+        areagate_answer(false, g.ag_dont);
+        g.ag_dont = false;
+    }
+    ImGui::End();
+}
+
 // The first-run notice: this is a test release, back your saves up. Shown over the title screen until dismissed;
 // "do not show again" writes ui.beta_notice = false into mgmp.json.
 // ---------------------------------------------------------------------------
 // the mod settings window (title screen)
 // ---------------------------------------------------------------------------
 void draw_settings_window(const View& v) {
-    const float W = 900, H = 460;
-    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f + 20);
+    // Laid out top to bottom: each part starts below the text of the one before (the notes wrap to a different number of lines per language).
+    const float W = 1200, H = 1060;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
     const ImVec2 sz(W * v.k, H * v.k);
     if (!overlay_window_begin("##mgmp_settings", a, sz)) { ImGui::End(); return; }
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2799,36 +3156,313 @@ void draw_settings_window(const View& v) {
     const float k = v.k;
     auto X = [&](float x) { return a.x + x * k; };
     auto Y = [&](float y) { return a.y + y * k; };
-    text_c(dl, X(W / 2), Y(46), 52 * k, kInk, tr(Tx::MENU_SETTINGS));
+    auto stage_y = [&](float screen_y) { return k > 0 ? (screen_y - a.y) / k : 0.0f; };
+    text_c(dl, X(W / 2), Y(40), 48 * k, kInk, tr(Tx::MENU_SETTINGS));
 
-    // "Disable the new-cat effects": a box and its words. Not while a room is open -- the two players must agree on it.
+    // Each setting: a box and its words, and a note under it. Not while a room is open -- the HOST's setting is the room's (its HELLO carries it).
+    // An experimental one carries the warning in amber after its words (or on its own line when they do not fit together). Returns the y after it.
     const bool locked = in_room() || net_active();
-    const bool on = config().block_new_cats;
-    const ImVec2 b0(X(70), Y(160)), b1(X(70 + 48), Y(160 + 48));
-    const char* lab = tr(Tx::SET_BLOCK_CATS);
-    const float lw = text_size(30 * k, lab).x;
-    ImGui::SetCursorScreenPos(b0);
-    ImGui::PushID("set_block_cats");
-    const bool clicked = ImGui::InvisibleButton("##c", ImVec2(b1.x - b0.x + 18 * k + lw, b1.y - b0.y)) && !locked;
-    const bool hov = ImGui::IsItemHovered() && !locked;
-    ImGui::PopID();
-    if (hov) g.hovering_button = true;
-    if (clicked) {
-        const bool saved = config_set_block_new_cats(!on);
-        log_line("MENU", "ui.block_new_cats = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+    bool clicked = false;
+    auto box = [&](const char* id, float y, bool on, const char* lab, const char* note, uint32_t seed, bool experimental) -> float {
+        const ImVec2 b0(X(70), Y(y)), b1(X(70 + 48), Y(y + 48));
+        const float lw = text_size(30 * k, lab).x;
+        ImGui::SetCursorScreenPos(b0);
+        ImGui::PushID(id);
+        clicked = ImGui::InvisibleButton("##c", ImVec2(b1.x - b0.x + 18 * k + lw, b1.y - b0.y)) && !locked;
+        const bool hov = ImGui::IsItemHovered() && !locked;
+        ImGui::PopID();
+        if (hov) g.hovering_button = true;
+        rough_rect(dl, b0, b1, hov ? kPaperHi : IM_COL32(255, 255, 250, locked ? 120 : 200), kInk, 2.4f, seed, 1.2f);
+        if (on) {
+            dl->AddLine(ImVec2(b0.x + 10 * k, b0.y + 25 * k), ImVec2(b0.x + 21 * k, b0.y + 37 * k), locked ? kGrey : kInk, 5 * k);
+            dl->AddLine(ImVec2(b0.x + 21 * k, b0.y + 37 * k), ImVec2(b0.x + 39 * k, b0.y + 11 * k), locked ? kGrey : kInk, 5 * k);
+        }
+        text_at(dl, ImVec2(b1.x + 18 * k, b0.y + 8 * k), 30 * k, locked ? kGrey : kInk, lab);
+        float note_y = y + 62;
+        if (experimental) {
+            const char* warn = tr(Tx::SET_EXP_WARN);
+            const float wx = b1.x + 18 * k + lw + 20 * k;
+            if (wx + text_size(22 * k, warn).x <= X(W - 50)) text_at(dl, ImVec2(wx, b0.y + 14 * k), 22 * k, kAmber, warn);
+            else { text_at(dl, ImVec2(X(70), Y(y + 60)), 22 * k, kAmber, warn); note_y += 32; }
+        }
+        return stage_y(wrap_text(dl, X(70), Y(note_y), (W - 140) * k, 22 * k, 29 * k, kInkSoft, note)) + 18;
+    };
+    float y = 96;
+    {   // THE ENEMY MULTIPLIER (2026-10-19): health and armor of every enemy in a room, x2 .. x8 in steps of 0.5 -- a slider; the file is written when it is let go
+        static bool s_drag = false;
+        const uint8_t cur = config().enemy_scale_half;
+        char head[160];
+        _snprintf_s(head, sizeof(head), _TRUNCATE, "%s:  x%g", tr(Tx::SET_ENEMY_SCALE), cur / 2.0);
+        text_at(dl, ImVec2(X(70), Y(y + 4)), 30 * k, locked ? kGrey : kInk, head);
+        const float tx0 = 100, tx1 = W - 100, ty = y + 70;          // the track
+        const int steps = 12;                                       // 4 .. 16 halves
+        dl->AddLine(ImVec2(X(tx0), Y(ty)), ImVec2(X(tx1), Y(ty)), locked ? kGrey : kInk, 3 * k);
+        for (int i = 0; i <= steps; ++i) {
+            const float x = tx0 + (tx1 - tx0) * i / steps;
+            const bool whole = i % 2 == 0;
+            dl->AddLine(ImVec2(X(x), Y(ty - (whole ? 10 : 6))), ImVec2(X(x), Y(ty + (whole ? 10 : 6))), locked ? kGrey : kInkSoft, 2 * k);
+            if (whole) { char t[8]; _snprintf_s(t, sizeof(t), _TRUNCATE, "%d", 2 + i / 2); text_c(dl, X(x), Y(ty + 28), 20 * k, kInkSoft, t); }
+        }
+        ImGui::SetCursorScreenPos(ImVec2(X(tx0 - 20), Y(ty - 24)));
+        ImGui::InvisibleButton("##enemy_scale", ImVec2((tx1 - tx0 + 40) * k, 48 * k));
+        const bool hov = ImGui::IsItemHovered() && !locked;
+        if (hov) g.hovering_button = true;
+        if (ImGui::IsItemActive() && !locked && k > 0) {
+            float f = (ImGui::GetIO().MousePos.x - X(tx0)) / ((tx1 - tx0) * k);
+            f = f < 0 ? 0 : f > 1 ? 1 : f;
+            const uint8_t want = (uint8_t)(4 + (int)(f * steps + 0.5f));
+            if (want != config().enemy_scale_half) config_set_enemy_scale_half(want, false);
+            s_drag = true;
+        } else if (s_drag) {
+            s_drag = false;
+            const bool saved = config_set_enemy_scale_half(config().enemy_scale_half, true);
+            log_line("MENU", "ui.enemy_scale = %.1f (%s)", config().enemy_scale_half / 2.0, saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
+        const uint8_t now_half = config().enemy_scale_half;
+        const float kx = tx0 + (tx1 - tx0) * (now_half - 4) / (float)steps;
+        rough_rect(dl, ImVec2(X(kx - 12), Y(ty - 18)), ImVec2(X(kx + 12), Y(ty + 18)), hov || s_drag ? kPaperHi : IM_COL32(255, 255, 250, locked ? 120 : 230),
+                   locked ? kGrey : kInk, 2.4f, 359, 1.2f);
+        y = stage_y(wrap_text(dl, X(70), Y(ty + 50), (W - 140) * k, 22 * k, 29 * k, kInkSoft, tr(Tx::SET_ENEMY_SCALE_NOTE))) + 18;
     }
-    rough_rect(dl, b0, b1, hov ? kPaperHi : IM_COL32(255, 255, 250, locked ? 120 : 200), kInk, 2.4f, 331, 1.2f);
-    if (on) {
-        dl->AddLine(ImVec2(b0.x + 10 * k, b0.y + 25 * k), ImVec2(b0.x + 21 * k, b0.y + 37 * k), locked ? kGrey : kInk, 5 * k);
-        dl->AddLine(ImVec2(b0.x + 21 * k, b0.y + 37 * k), ImVec2(b0.x + 39 * k, b0.y + 11 * k), locked ? kGrey : kInk, 5 * k);
+    // THE SETTINGS RUN FROM VERIFIED TO EXPERIMENTAL (the rule since 0.1.106): a feature that has been tested enough is listed here, ahead of the experimental section,
+    // with no warning (and usually on by default); the experimental section holds only what is still being tried out. A feature that is verified later moves up.
+    {   // the shared treasure chest (mgmp_treasure)
+        const bool on = config().exp_treasure;
+        y = box("set_exp_treasure", y, on, tr(Tx::SET_EXP_TREASURE), tr(Tx::SET_EXP_TREASURE_NOTE), 347, false);
+        if (clicked) {
+            const bool saved = config_set_exp_treasure(!on);
+            log_line("MENU", "ui.exp_treasure = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
     }
-    text_at(dl, ImVec2(b1.x + 18 * k, b0.y + 8 * k), 30 * k, locked ? kGrey : kInk, lab);
-    wrap_text(dl, X(70), Y(232), (W - 140) * k, 24 * k, 31 * k, kInkSoft, tr(Tx::SET_BLOCK_CATS_NOTE));
-    if (locked) text_at(dl, ImVec2(X(70), Y(322)), 24 * k, kAmber, tr(Tx::SET_IN_ROOM));
+    {   // each player's own random events (mgmp_indepevt)
+        const bool on = config().exp_indep_events;
+        y = box("set_exp_indep_events", y, on, tr(Tx::SET_EXP_INDEP_EVENTS), tr(Tx::SET_EXP_INDEP_EVENTS_NOTE), 359, false);
+        if (clicked) {
+            const bool saved = config_set_exp_indep_events(!on);
+            log_line("MENU", "ui.exp_indep_events = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
+    }
+    // THE EXPERIMENTAL FEATURES (2026-10-18): a section of their own, one box each, all off by default. A new experimental feature gets its
+    // own box here (and its own ui.exp_* key and HELLO rules bit).
+    {
+        dl->AddLine(ImVec2(X(60), Y(y)), ImVec2(X(W - 60), Y(y)), kInkSoft, 2 * k);
+        text_at(dl, ImVec2(X(70), Y(y + 14)), 36 * k, kInk, tr(Tx::SET_EXP_SECTION));
+        y = stage_y(wrap_text(dl, X(70), Y(y + 60), (W - 140) * k, 22 * k, 29 * k, kInkSoft, tr(Tx::SET_EXP_SECTION_NOTE))) + 16;
+    }
+    {   // helping the one player whose house boss is today (mgmp_housecoop)
+        const bool on = config().exp_house_coop;
+        y = box("set_exp_house_coop", y, on, tr(Tx::SET_EXP_HOUSE_COOP), tr(Tx::SET_EXP_HOUSE_COOP_NOTE), 353, true);
+        if (clicked) {
+            const bool saved = config_set_exp_house_coop(!on);
+            log_line("MENU", "ui.exp_house_coop = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
+    }
+    if (locked) text_at(dl, ImVec2(X(70), Y(H - 112)), 24 * k, kAmber, tr(Tx::SET_IN_ROOM));
 
-    if (paper_button("set_back", ImVec2(X(W / 2 - 150), Y(H - 90)), ImVec2(X(W / 2 + 150), Y(H - 30)), tr(Tx::BACK), 32 * k))
+    if (paper_button("set_back", ImVec2(X(W / 2 - 150), Y(H - 78)), ImVec2(X(W / 2 + 150), Y(H - 22)), tr(Tx::BACK), 32 * k))
         g.win = Win::None;
     ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// 0.1.95 THE MAP: EVERY PLAYER'S PICK OF THE NEXT NODE (mgmp_mapvote). A small paw in the player's colour at a corner of the node it picked: P1 top left, P2 top right,
+// P3 bottom left, P4 bottom right (the room list's order, host first -- the colours of the drawing board). The picture is the game's own paw, the one it shows
+// beside a menu entry under the mouse (traced for the mod's own title entries: draw_paw), outlined and filled in the player's colour.
+// Nothing here takes the mouse: the click is the game's (and swallowed by mgmp_mapvote).
+// ---------------------------------------------------------------------------
+void draw_mapvote(const View& v) {
+    if (page_self() != PageState::InGame) return;
+    { const ImVec2 mp = ImGui::GetIO().MousePos; if (mp.x > -1e6f && mp.y > -1e6f) mapvote_note_mouse((mp.x - v.org.x) / v.k, (mp.y - v.org.y) / v.k); }
+    // The paws show while the map itself ticks (MapScreen::update, seen by mapvote_tick) -- that is what a screen over the map (the level-up page: measured, the map
+    // stops) or a battle takes away. NOT draw_visible_layer(): after the chapter boss it said "battle" for good (the fight's last unit, a dove, was still standing,
+    // so the lockstep never left the battle) and 0.1.103 hid the paws on the whole next floor.
+    {
+        static int s_state = -1, s_lines = 0;
+        const bool map_on = mapvote_map_ticking(), lvl_tick = mapvote_level_ticking(), lvl_btn = page_button_live("Levelup_");
+        const bool pause = page_button_live("Button_PauseMenu_");
+        const int layer = draw_visible_layer(nullptr);
+        const int st = (map_on ? 1 : 0) | (lvl_tick ? 2 : 0) | (lvl_btn ? 4 : 0) | (pause ? 8 : 0) | ((layer + 1) << 4);
+        if (st != s_state && s_lines < 80) {
+            s_state = st; ++s_lines;
+            log_line("MAPVOTE", "overlay: map ticking %s, level-up screen ticking %s, level-up buttons %s, pause menu %s, board layer %d -> paws %s", map_on ? "yes" : "NO", lvl_tick ? "yes" : "no",
+                     lvl_btn ? "up" : "not up", pause ? "up" : "not up", layer, map_on && !pause ? "shown" : "hidden");
+        }
+        if (!map_on || pause) return;
+    }
+    MapVoteMark marks[kMaxPeers];
+    const int n = mapvote_marks(marks, kMaxPeers);
+    unsigned have = 0, total = 0;
+    bool mine = false;
+    const bool counts = mapvote_counts(have, total, mine);
+    if (!n && !counts) return;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const float k = v.k;
+
+    for (int i = 0; i < n; ++i) {
+        const MapVoteMark& m = marks[i];
+        int row = room_row_of_peer(m.peer);
+        if (row < 0) row = m.peer;
+        const int corner = row & 3;
+        const float dx = (corner & 1) ? 1.0f : -1.0f, dy = (corner & 2) ? 1.0f : -1.0f;
+        const float px = m.cx + dx * m.half * 0.72f, py = m.cy + dy * m.half * 0.72f;
+        const ImU32 col = board_color(m.peer);
+        float w = m.half * 0.45f;                                   // the paw's width in stage units: about half what it was (0.1.96), a fifth of the node
+        w = w < 17.0f ? 17.0f : (w > 36.0f ? 36.0f : w);
+        const ImVec2 c = P(v, px, py);
+        draw_paw(dl, c, w * k * 1.2f, kInk, m.angle);              // the dark outline: the same paw, a little larger
+        draw_paw(dl, c, w * k, col, m.angle);
+    }
+    if (counts) {
+        char line[160];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::MV_STATUS), have, total);
+        text_c(dl, P(v, 960, 0).x, P(v, 0, 1000).y, 26 * k, kCreamHi, line, true);
+    }
+}
+
+// 0.1.87: an item's description (the game's own text, made plain by treasure_desc_plain) in a paper box whose top edge is centred on (cx, top), in stage
+// units; kept on the stage. A line marked '\x01' is the game's small print: smaller and grey.
+void draw_item_desc(const View& v, float cx, float top, const char* text, uint32_t seed) {
+    if (!text || !text[0]) return;
+    const float k = v.k;
+    const float W = 560, pad = 22;
+    const float fs = 24 * k, lh = 32 * k, fs_s = 20 * k, lh_s = 27 * k;
+    const float maxw = (W - 2 * pad) * k;
+    // the lines, and the height they take
+    std::vector<std::pair<std::string, bool>> lines;
+    for (const char* s = text; *s;) {
+        const char* e = strchr(s, '\n');
+        std::string ln = e ? std::string(s, e) : std::string(s);
+        const bool fine_print = !ln.empty() && ln[0] == '\x01';
+        if (fine_print) ln.erase(0, 1);
+        lines.emplace_back(ln, fine_print);
+        if (!e) break;
+        s = e + 1;
+    }
+    float h = 0;
+    for (auto& l : lines) h += l.first.empty() ? (l.second ? lh_s : lh) * 0.5f : wrap_text(nullptr, 0, 0, maxw, l.second ? fs_s : fs, l.second ? lh_s : lh, kInk, l.first.c_str());
+    const float H = h / k + 2 * pad - 6;
+    float x0 = cx - W * 0.5f;
+    if (x0 < 20) x0 = 20;
+    if (x0 + W > kStageW - 20) x0 = kStageW - 20 - W;
+    float y0 = top;
+    if (y0 + H > kStageH - 20) y0 = kStageH - 20 - H;
+    const ImVec2 a = P(v, x0, y0);
+    if (!overlay_window_begin("##mgmp_item_desc", a, ImVec2(W * k, H * k), false, false)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    rough_rect(dl, a, ImVec2(a.x + W * k, a.y + H * k), IM_COL32(244, 242, 234, 240), kInk, 1.8f, 970 + seed, 1.0f);
+    float y = a.y + (pad - 3) * k;
+    for (auto& l : lines) {
+        if (l.first.empty()) { y += (l.second ? lh_s : lh) * 0.5f; continue; }
+        y = wrap_text(dl, a.x + pad * k, y, maxw, l.second ? fs_s : fs, l.second ? lh_s : lh, l.second ? kGrey : kInk, l.first.c_str());
+    }
+    ImGui::End();
+}
+
+// EXPERIMENTAL: the shared treasure chest, its items shown by the game in the treasure room itself (mgmp_treasure: a row of the room's own item
+// clips). Here only what the game cannot draw: an invisible hit area over each item (hover lifts it and names it in the room's banner, a click
+// asks for it), a tag under an item that is taken or being asked for, and "take nothing".
+void draw_treasure_row(const View& v, const TreasureView& tv) {
+    const float k = v.k;
+    const float h = tv.half;
+    bool any = false;
+    float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+    for (uint8_t i = 0; i < tv.n; ++i) {
+        if (!tv.shown[i]) continue;
+        if (!any) { x0 = x1 = tv.cx[i]; y0 = y1 = tv.cy[i]; any = true; }
+        x0 = tv.cx[i] < x0 ? tv.cx[i] : x0; x1 = tv.cx[i] > x1 ? tv.cx[i] : x1;
+        y0 = tv.cy[i] < y0 ? tv.cy[i] : y0; y1 = tv.cy[i] > y1 ? tv.cy[i] : y1;
+    }
+    if (!any || h <= 0) return;
+    // One window over the row; inside it, one hit area per item still in the row, exactly over its picture (mgmp_treasure works the
+    // centres out every frame from the clips themselves). Every player takes one: there is no "take nothing".
+    const float wx0 = x0 - h - 20, wx1 = x1 + h + 20, wy0 = y0 - h - 20, wy1 = y1 + h + (tv.mismatch ? 110.0f : 70.0f);
+    const ImVec2 a = P(v, wx0, wy0);
+    const ImVec2 sz((wx1 - wx0) * k, (wy1 - wy0) * k);
+    if (!overlay_window_begin("##mgmp_treasure_row", a, sz)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    int hovered = -1;
+    for (uint8_t i = 0; i < tv.n; ++i) {
+        if (!tv.shown[i]) continue;
+        const ImVec2 r0 = P(v, tv.cx[i] - h, tv.cy[i] - h), r1 = P(v, tv.cx[i] + h, tv.cy[i] + h);
+        char id[16];
+        _snprintf_s(id, sizeof(id), _TRUNCATE, "##tr_slot%u", (unsigned)i);
+        ImGui::SetCursorScreenPos(r0);
+        const bool can = tv.pending < 0 && !tv.busy;
+        const bool clicked = ImGui::InvisibleButton(id, ImVec2(r1.x - r0.x, r1.y - r0.y)) && can;
+        if (ImGui::IsItemHovered()) { hovered = i; if (can) g.hovering_button = true; }
+        if (clicked) treasure_take(i);
+        if (tv.pending == (int)i) {   // asked for, waiting for the host's answer
+            const char* tag = tr(Tx::TP_WAIT);
+            const float fs = 24 * k;
+            const ImVec2 ts = text_size(fs, tag);
+            const ImVec2 c = P(v, tv.cx[i], tv.cy[i] + h + 26);
+            const ImVec2 t0(c.x - ts.x * 0.5f - 12 * k, c.y - ts.y * 0.5f - 6 * k), t1(c.x + ts.x * 0.5f + 12 * k, c.y + ts.y * 0.5f + 6 * k);
+            rough_rect(dl, t0, t1, IM_COL32(236, 236, 228, 235), kInk, 1.8f, 950 + i, 1.0f);
+            text_at(dl, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), fs, kInk, tag);
+        }
+    }
+    treasure_hover(hovered);
+    if (tv.mismatch) { const ImVec2 m = P(v, (x0 + x1) * 0.5f, y1 + h + 70); text_c(dl, m.x, m.y, 20 * k, kAmber, tr(Tx::TP_MISMATCH)); }
+    ImGui::End();
+    // 0.1.87: what the hovered item does, under it (below its "waiting" tag when it has one)
+    if (hovered >= 0) draw_item_desc(v, tv.cx[hovered], tv.cy[hovered] + h + (tv.pending == hovered ? 56.0f : 14.0f), tv.desc[hovered], (uint32_t)hovered);
+}
+
+// EXPERIMENTAL: the shared treasure chest (mgmp_treasure) -- the panel, when the room's own row could not be made. The items every player sees,
+// who took which, and a button to take one or nothing. On the right of the treasure room, clear of its chest.
+void draw_treasure_pick(const View& v) {
+    TreasureView tv;
+    if (!treasure_view(tv) || tv.building) return;
+    if (tv.native) { draw_treasure_row(v, tv); return; }
+    const float k = v.k;
+    const float W = 640;
+    const float H = 130 + tv.n * 78.0f + (tv.mismatch ? 40.0f : 0.0f) + 30;
+    const ImVec2 a = P(v, kStageW - W - 60, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!overlay_window_begin("##mgmp_treasure", a, sz)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+
+    text_c(dl, X(W / 2), Y(30), 42 * k, kInk, tr(Tx::TP_TITLE));
+    float y = 100;
+    int hover_row = -1;
+    float hover_y = 0;
+    if (tv.mismatch) { text_c(dl, X(W / 2), Y(y), 20 * k, kAmber, tr(Tx::TP_MISMATCH)); y += 40; }
+    for (uint8_t i = 0; i < tv.n; ++i) {
+        const bool open_slot = !tv.taker[i][0];
+        rough_rect(dl, ImVec2(X(40), Y(y)), ImVec2(X(W - 40), Y(y + 64)), open_slot ? IM_COL32(250, 248, 238, 200) : IM_COL32(210, 208, 200, 160),
+                   IM_COL32(30, 30, 30, 120), 1.6f, 900 + i, 1.0f);
+        // the name, set smaller when it would run into the button
+        float fs = 28 * k;
+        const float room = (W - 40 - 200 - 60) * k;
+        const float tw = text_size(fs, tv.name[i]).x;
+        if (tw > room && tw > 0) fs *= room / tw;
+        text_at(dl, ImVec2(X(60), Y(y + 32) - fs * 0.6f), fs, open_slot ? kInk : kGrey, tv.name[i]);
+        char id[16];
+        _snprintf_s(id, sizeof(id), _TRUNCATE, "tp_take%u", (unsigned)i);
+        if (open_slot) {
+            const bool waiting = tv.pending == (int)i;
+            const bool can = tv.pending < 0 && !tv.busy;
+            if (paper_button(id, ImVec2(X(W - 240), Y(y + 8)), ImVec2(X(W - 56), Y(y + 56)), waiting ? tr(Tx::TP_WAIT) : tr(Tx::TP_TAKE), 26 * k, can, Tone::Good))
+                treasure_take(i);
+        } else {
+            char who[96];
+            if (tv.mine[i]) _snprintf_s(who, sizeof(who), _TRUNCATE, "%s", tr(Tx::TP_MINE));
+            else            _snprintf_s(who, sizeof(who), _TRUNCATE, tr(Tx::TP_TAKEN), tv.taker[i]);
+            float ws = 22 * k;
+            const float ww = text_size(ws, who).x, wroom = 200 * k;
+            if (ww > wroom && ww > 0) ws *= wroom / ww;
+            text_r(dl, X(W - 60), Y(y + 32) - ws * 0.6f, ws, tv.mine[i] ? kGreen : kGrey, who);
+        }
+        if (ImGui::IsMouseHoveringRect(ImVec2(X(40), Y(y)), ImVec2(X(W - 40), Y(y + 64)), false)) hover_row = i, hover_y = y;
+        y += 78;
+    }
+    ImGui::End();
+    // 0.1.87: what the item under the mouse does, left of the panel at its row
+    const float panel_x = kStageW - W - 60, panel_y = (kStageH - H) * 0.5f;
+    if (hover_row >= 0) draw_item_desc(v, panel_x - 20 - 280, panel_y + hover_y, tv.desc[hover_row], (uint32_t)hover_row);
 }
 
 void draw_beta_notice(const View& v) {
@@ -2958,6 +3592,116 @@ int collect_log_files(wchar_t files[kLogUploadMaxFiles][MAX_PATH]) {
     return n;
 }
 
+// The last upload's result as one line (both F2 pages).
+void log_status_line(const LogUploadStatus& st, char* msg, size_t cap, ImU32& col) {
+    msg[0] = 0; col = kInkSoft;
+    if (st.state == LogUploadState::Working) { _snprintf_s(msg, cap, _TRUNCATE, tr(Tx::LOG_BUSY), (unsigned)st.percent); return; }
+    if (st.state == LogUploadState::Done) { _snprintf_s(msg, cap, _TRUNCATE, tr(Tx::LOG_DONE), st.detail); col = kGreen; return; }
+    if (st.state != LogUploadState::Failed) return;
+    col = kRed;
+    switch (st.error) {
+        case LogUploadError::NoFile:    _snprintf_s(msg, cap, _TRUNCATE, "%s", tr(Tx::LOG_FAIL_NOFILE)); break;
+        case LogUploadError::Connect:   _snprintf_s(msg, cap, _TRUNCATE, "%s", tr(Tx::LOG_FAIL_CONNECT)); break;
+        case LogUploadError::ServerOld: _snprintf_s(msg, cap, _TRUNCATE, "%s", tr(Tx::LOG_FAIL_OLD)); break;
+        case LogUploadError::Refused:   _snprintf_s(msg, cap, _TRUNCATE, tr(Tx::LOG_FAIL_REFUSED), st.detail); break;
+        default:                        _snprintf_s(msg, cap, _TRUNCATE, "%s", tr(Tx::LOG_FAIL_LOST)); break;
+    }
+}
+
+// A request addressed like F2's own upload: the server in the window, this player's name, the description typed on the first page.
+void log_fill_request(LogUploadRequest& req) {
+    char host[64]; uint16_t port = config().signal_port;
+    split_addr(g.log_addr, host, sizeof(host), port);
+    strncpy_s(req.addr, sizeof(req.addr), host, _TRUNCATE);
+    req.port = port;
+    const char* who = g.pname[0] ? g.pname : (signal_name()[0] ? signal_name() : "player");
+    strncpy_s(req.player, sizeof(req.player), who, _TRUNCATE);
+}
+
+// "10-24 19:36:41" (the date only when `with_date`)
+void fmt_stamp(char* out, size_t cap, const LogTimeStamp& t, bool with_date) {
+    if (with_date) _snprintf_s(out, cap, _TRUNCATE, "%04d-%02d-%02d %02d:%02d:%02d", t.year, t.month, t.day, t.hour, t.minute, t.second);
+    else           _snprintf_s(out, cap, _TRUNCATE, "%02d:%02d:%02d", t.hour, t.minute, t.second);
+}
+long long stamp_seconds(const LogTimeStamp& t) {   // for a difference only (days since a fixed origin, by the civil-from-days rule)
+    int y = t.year, m = t.month;
+    y -= m <= 2;
+    const long long era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + t.day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const long long days = era * 146097 + (long long)doe;
+    return days * 86400 + t.hour * 3600 + t.minute * 60 + t.second;
+}
+
+// 0.1.93: F2's second page -- the logs of the earlier runs (the folder keeps 5 besides this run's), each with when that game started and stopped, how it
+// ended, and a button that uploads it (and its crash dump) with the description typed on the first page.
+void draw_log_history(const View& v) {
+    const ULONGLONG now_ms = GetTickCount64();
+    if (!g.hist_at || now_ms - g.hist_at > 2000) { log_flush(); g.hist_n = log_history(g.hist, kLogHistoryKeep); g.hist_at = now_ms; }
+    const float k = v.k;
+    const float W = 980, rowh = 104;
+    const float H = 250 + (g.hist_n ? g.hist_n : 1) * rowh + 170;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!overlay_window_begin("##mgmp_loghist", a, sz)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 44 * k, kInk, tr(Tx::LOG_HIST_TITLE));
+    wrap_text(dl, X(60), Y(100), (W - 120) * k, 23 * k, 32 * k, kInkSoft, tr(Tx::LOG_HIST_HINT));
+
+    const LogUploadStatus st = logupload_status();
+    const bool working = st.state == LogUploadState::Working;
+    float y = 200;
+    if (!g.hist_n) { text_at(dl, ImVec2(X(60), Y(y + 30)), 26 * k, kGrey, tr(Tx::LOG_HIST_NONE)); y += rowh; }
+    for (int i = 0; i < g.hist_n; ++i) {
+        const LogHistoryEntry& e = g.hist[i];
+        rough_rect(dl, ImVec2(X(40), Y(y)), ImVec2(X(W - 40), Y(y + rowh - 12)), IM_COL32(250, 248, 238, 200), IM_COL32(30, 30, 30, 120), 1.6f, 1200 + i, 1.0f);
+        // when: the start (with its date), the end (with its date when it is another day), and how long
+        char s0[32] = "?", s1[32] = "?", dur[48] = "", line[200];
+        if (e.have_start) fmt_stamp(s0, sizeof(s0), e.start, true);
+        if (e.have_end) fmt_stamp(s1, sizeof(s1), e.end, !e.have_start || e.end.year != e.start.year || e.end.month != e.start.month || e.end.day != e.start.day);
+        if (e.have_start && e.have_end) {
+            const long long secs = stamp_seconds(e.end) - stamp_seconds(e.start);
+            if (secs < 60) _snprintf_s(dur, sizeof(dur), _TRUNCATE, "%s", tr(Tx::LOG_HIST_LT1));
+            else if (secs < 3600) _snprintf_s(dur, sizeof(dur), _TRUNCATE, tr(Tx::LOG_HIST_MIN), (int)(secs / 60));
+            else _snprintf_s(dur, sizeof(dur), _TRUNCATE, tr(Tx::LOG_HIST_HM), (int)(secs / 3600), (int)(secs % 3600 / 60));
+        }
+        _snprintf_s(line, sizeof(line), _TRUNCATE, dur[0] ? "%s  ->  %s  (%s)" : "%s  ->  %s", s0, s1, dur);
+        text_at(dl, ImVec2(X(64), Y(y + 12)), 26 * k, kInk, line);
+        // how it ended, its size, a crash dump
+        char size[32]; format_size(size, sizeof(size), (uint32_t)(e.size > 0xFFFFFFFFull ? 0xFFFFFFFFull : e.size));
+        const char* how = e.ended == 1 ? tr(Tx::LOG_HIST_CLEAN) : e.ended == 0 ? tr(Tx::LOG_HIST_BAD) : tr(Tx::LOG_HIST_UNKNOWN);
+        char info[256];
+        _snprintf_s(info, sizeof(info), _TRUNCATE, e.dump[0] ? "%s  \xC2\xB7  %s  \xC2\xB7  %s" : "%s  \xC2\xB7  %s", how, size, tr(Tx::LOG_HIST_DUMP));
+        text_at(dl, ImVec2(X(64), Y(y + 52)), 21 * k, e.ended == 0 ? kRed : e.ended == 1 ? kGreen : kGrey, info);
+        char id[16]; _snprintf_s(id, sizeof(id), _TRUNCATE, "lh_go%d", i);
+        if (paper_button(id, ImVec2(X(W - 230), Y(y + 18)), ImVec2(X(W - 60), Y(y + rowh - 30)), tr(Tx::LOG_HIST_SEND), 26 * k, !working, Tone::Good)) {
+            LogUploadRequest req;
+            log_fill_request(req);
+            wcsncpy_s(req.files[0], MAX_PATH, e.path, _TRUNCATE);
+            req.nfiles = 1;
+            if (e.dump[0]) { wcsncpy_s(req.files[1], MAX_PATH, e.dump, _TRUNCATE); req.nfiles = 2; }
+            _snprintf_s(req.desc, sizeof(req.desc), _TRUNCATE, "[older log: %s -> %s, %s] %s", s0, s1, e.ended == 1 ? "clean exit" : e.ended == 0 ? "did NOT end cleanly" : "end unknown", g.log_desc);
+            _snprintf_s(req.info, sizeof(req.info), _TRUNCATE, "proto %u, an older log (%s), role %s, room %s", (unsigned)kProtoVersion, s0,
+                        signal_role()[0] ? signal_role() : "-", signal_room()[0] ? signal_room() : "-");
+            log_line("MENU", "older log upload to %s:%u: %ls (%llu bytes%s, %s)", req.addr, (unsigned)req.port, e.path, (unsigned long long)e.size, e.dump[0] ? ", with its crash dump" : "",
+                     e.ended == 1 ? "clean exit" : e.ended == 0 ? "did not end cleanly" : "end unknown");
+            g.hist_sent = i;
+            logupload_start(req);
+        }
+        y += rowh;
+    }
+    // the result of the last upload
+    char msg[320]; ImU32 mcol;
+    log_status_line(st, msg, sizeof(msg), mcol);
+    if (msg[0]) wrap_text(dl, X(60), Y(y + 10), (W - 120) * k, 25 * k, 32 * k, mcol, msg);
+    if (paper_button("lh_back", ImVec2(X(W / 2 - 160), Y(H - 96)), ImVec2(X(W / 2 + 160), Y(H - 36)), tr(Tx::BACK), 30 * k)) { g.log_hist = false; }
+    ImGui::End();
+}
+
 // F2: upload this run's game log to a server that collects them, with a note about what went wrong.
 void draw_log_window(const View& v) {
     ensure_inited();
@@ -2965,6 +3709,7 @@ void draw_log_window(const View& v) {
         g.log_inited = true;
         strncpy_s(g.log_addr, sizeof(g.log_addr), g.addr[0] ? g.addr : "localhost", _TRUNCATE);
     }
+    if (g.log_hist) { draw_log_history(v); return; }      // 0.1.93
     const float k = v.k;
     const float o = g.log_halt ? 300.0f : 0.0f;   // the halt notice (the advice and the auto-finish note) takes this much above the upload part
     const float W = 860, H = 760 + o;
@@ -3036,7 +3781,12 @@ void draw_log_window(const View& v) {
     }
     if (msg[0]) wrap_text(dl, X(60), Y((working ? 624 : 596) + o), (W - 120) * k, 26 * k, 34 * k, mcol, msg);
 
-    if (paper_button("log_go", ImVec2(X(60), Y(H - 100)), ImVec2(X(W / 2 - 10), Y(H - 36)), tr(Tx::LOG_UPLOAD), 30 * k, !working && nfiles > 0, Tone::Good)) {
+    const float bw = (W - 120 - 2 * 16) / 3.0f;            // 0.1.93: three buttons -- upload, an older log, close
+    if (paper_button("log_hist", ImVec2(X(60 + bw + 16), Y(H - 100)), ImVec2(X(60 + 2 * bw + 16), Y(H - 36)), tr(Tx::LOG_HIST_BTN), 28 * k, !working)) {
+        g.log_hist = true; g.hist_at = 0; g.hist_sent = -1;
+        logupload_reset();
+    }
+    if (paper_button("log_go", ImVec2(X(60), Y(H - 100)), ImVec2(X(60 + bw), Y(H - 36)), tr(Tx::LOG_UPLOAD), 30 * k, !working && nfiles > 0, Tone::Good)) {
         LogUploadRequest req;
         char host[64]; uint16_t port = config().signal_port;
         split_addr(g.log_addr, host, sizeof(host), port);
@@ -3055,10 +3805,12 @@ void draw_log_window(const View& v) {
             if (prevrun_request(pr)) { for (int i = 0; i < pr.ndelete; ++i) wcsncpy_s(req.on_ok_delete[i], MAX_PATH, pr.on_ok_delete[i], _TRUNCATE); req.ndelete = pr.ndelete; }
         }
         log_line("MENU", "log upload to %s:%u (%d file(s), description %u bytes)", host, (unsigned)port, nfiles, (unsigned)strlen(g.log_desc));
+        log_flush();             // 0.1.50: the log is buffered -- what it holds goes into the file before the file is read
         logupload_start(req);
     }
-    if (paper_button("log_close", ImVec2(X(W / 2 + 10), Y(H - 100)), ImVec2(X(W - 60), Y(H - 36)), tr(Tx::LOG_CLOSE), 30 * k)) {
+    if (paper_button("log_close", ImVec2(X(60 + 2 * bw + 32), Y(H - 100)), ImVec2(X(W - 60), Y(H - 36)), tr(Tx::LOG_CLOSE), 30 * k)) {
         g.log_open = false;
+        g.log_hist = false;
         g.log_desync = false;
         g.log_halt = false;
         if (g.log_prev) { prevrun_dismiss(); g.log_prev = false; }      // closing the previous run's window forgets it: it is not offered again at every start
@@ -3178,7 +3930,7 @@ void menu_draw() {
             if (g.win == Win::Backup) refresh_backup_view();
         }
         if (g.win == Win::Multi)  draw_multi_window(v);
-        if (g.win == Win::Backup) { draw_backup_window(v); draw_backup_confirm(v); draw_sync_confirm(v); }
+        if (g.win == Win::Backup) { draw_backup_window(v); draw_backup_confirm(v); draw_sync_confirm(v); if (g.acct_warn) draw_acct_warn(v); if (g.acct_list) draw_acct_list(v, false); }
         if (g.win == Win::Settings) draw_settings_window(v);
     } else {
         g.win = Win::None;
@@ -3217,12 +3969,20 @@ void menu_draw() {
 
     // The first-run notice, once the title screen is up.
     if (title && g.title_a > 0.001f && config().beta_notice && !g.beta_closed) draw_beta_notice(v);
+    // WHICH ACCOUNT'S SAVES (2026-10-15): several account folders and neither Steam nor the player has named one -- ask, on the title screen, after a few
+    // seconds (Steam's id usually arrives by then and settles it without a question).
+    if (title) { if (g.title_since <= 0) g.title_since = now(); } else g.title_since = 0;
+    if (title && g.title_since > 0 && now() - g.title_since > 4.0 && !g.acct_list && !in_room() && savefile_dir_needs_choice()) draw_acct_list(v, true);
 
     draw_board(v);      // first: its canvas sits behind every other window of the mod
+    draw_mapvote(v);    // 0.1.95: the players' picks of the next map node
     draw_mp_tag(v);
     draw_save_sync(v);
     draw_abandon(v);
     abandon_toasts();
+    draw_treasure_pick(v);   // EXPERIMENTAL shared treasure chest
+    draw_housecoop(v);       // EXPERIMENTAL house boss co-op
+    draw_area_gate(v);       // the host: entering an area another player has not unlocked
     draw_room_notice(v);
     if (g.log_open) draw_log_window(v);
     room_toasts();
@@ -3262,6 +4022,38 @@ void menu_draw() {
 
     draw_toast(v);
     draw_cursor(v);
+}
+
+// 0.1.91: THE GAME'S CURSOR STEPS ASIDE FOR THE DRAWING TOOL. glaiel::TempHideMouseCursor (C_TempHideCursor) is what the game's own screens call
+// from their update, every frame they want no cursor; the Cursor shows it again the first frame nobody does. Its fatal error path (no custom cursor)
+// is never taken: the singleton and its type cookie are read off the function's own first instructions and checked exactly as it checks them --
+//   40 53 / 48 81 EC 80 00 00 00 / 48 8B 0D [cursor] / 48 85 C9 / 74 1E / 48 8B 05 [cookie] / 48 39 41 F8 / 75 11 / C6 41 39 01
+// Called from the map's and the combat menu's update hooks, i.e. where the game's own callers are.
+namespace {
+typedef void (__fastcall* fn_temphide)();
+bool call_temphide(uintptr_t fn) { __try { ((fn_temphide)fn)(); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+}
+void menu_board_cursor_tick() {
+    if (!g.board_cursor || GetTickCount64() - g.board_cursor_at > 200) return;     // a tool over the board, seen by the last frames
+    static uintptr_t fn = 0, cursor_slot = 0, cookie_slot = 0;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const uintptr_t f = addr_of_call(C_TempHideCursor);
+        uint8_t b[38] = {};
+        if (f && mem_read((const void*)f, b, sizeof(b)) && b[0] == 0x40 && b[1] == 0x53 && b[9] == 0x48 && b[10] == 0x8B && b[11] == 0x0D &&
+            b[21] == 0x48 && b[22] == 0x8B && b[23] == 0x05 && b[34] == 0xC6 && b[35] == 0x41 && b[36] == 0x39 && b[37] == 0x01) {
+            int32_t d1 = 0, d2 = 0;
+            memcpy(&d1, b + 12, 4); memcpy(&d2, b + 24, 4);
+            fn = f; cursor_slot = f + 16 + (intptr_t)d1; cookie_slot = f + 28 + (intptr_t)d2;
+            log_line("MENU", "drawing board: the game's cursor is hidden while a tool is over the board (TempHideMouseCursor found)");
+        } else log_line_lvl(LogLevel::Warn, "MENU", "!! drawing board: TempHideMouseCursor is not where this build has it -- the game's cursor stays beside the tool");
+    }
+    if (!fn) return;
+    uintptr_t cur = 0, cookie = 0, have = 0;
+    if (!mem_read((const void*)cursor_slot, &cur, sizeof(cur)) || !cur || !mem_read((const void*)cookie_slot, &cookie, sizeof(cookie)) ||
+        !mem_read((const void*)(cur - 8), &have, sizeof(have)) || have != cookie) return;      // no custom cursor: the call would be a fatal error
+    call_temphide(fn);
 }
 
 } // namespace mgmp

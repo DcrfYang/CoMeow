@@ -275,6 +275,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         mgmp::session_shutdown();
         mgmp::replay_shutdown();
         mgmp::record_shutdown();
+        mgmp::log_mark_clean_exit();   // 0.1.93: the "logend" line -- this run ended cleanly (the crash path closes the log without it)
         mgmp::log_shutdown();
         mgmp::prevrun_shutdown();      // a clean exit: this run's "ended badly" marker goes away
         break;

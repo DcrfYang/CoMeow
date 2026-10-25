@@ -20,6 +20,11 @@ void setup_on_chapter_page();
 // taken over -- a client's means READY, the host's is the chapter-1 choice (it waits for every READY, commits, then goes) -- and the
 // game is let through later by setup_tick through `go(director)`. True: taken over, the caller must NOT run the closure.
 bool setup_on_equip_done(void* director, void (*go)(void*));
+// THE HOUSE BOSS CO-OP (experimental, mgmp_housecoop): the house boss gear screen's done is taken over the same way -- the cats are exchanged, every
+// player READY, the host commits the stream (and its unlock answers) and every peer then runs `go` at once. Nothing of a chapter is left behind
+// (no map flags override, no armed map seed). True: taken over, the caller must NOT start the fight.
+bool setup_on_house_gear_done(void* director, void (*go)(void*));
+bool setup_house_pending();   // a house boss gear lock is waiting for the others
 // Every frame: drives a taken-over lock (the export, the host's commit, the client's wait for the host's command).
 void setup_tick();
 // A taken-over lock is waiting: the player is, for the room, on the chapter page.

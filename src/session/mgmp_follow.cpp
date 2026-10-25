@@ -2,12 +2,14 @@
 
 #include "mgmp_catsync.h"
 #include "mgmp_choice.h"
+#include "mgmp_indepevt.h"
 #include "mgmp_invsync.h"
 #include "mgmp_nodehash.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_nodesnapshot.h"
 #include "mgmp_runhist.h"
 #include "mgmp_follow.h"
+#include "mgmp_treasure.h"   // treasure_publish_luck
 #include "mgmp_unlocks.h"
 #include "mgmp_room.h"
 #include "mgmp_page.h"       // page_of / page_age_ms -- is another player on the gear screen
@@ -17,6 +19,7 @@
 #include "mgmp_setup.h"
 #endif
 #include "mgmp_net.h"
+#include "mgmp_session.h"   // session_exp_treasure: the shared treasure chest
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_mem.h"
@@ -640,7 +643,10 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
                            " adopt it", index);
     memcpy(m.seed, words, sizeof(m.seed));
     m.seed[0] = seed;
-    if (type >= 5 && type <= 11) unlocks_publish();   // battles and events: the clients answer from the host's unlock answers and event properties (shops and chests stay personal)
+    // battles and events: the clients answer from the host's unlock answers and event properties (shops and chests stay personal) -- and, with the
+    // experimental features on, a treasure node: the shared chest's items are rolled on every peer from the host's answers (mgmp_treasure)
+    if ((type >= 5 && type <= 11) || (type == 13 && session_exp_treasure())) unlocks_publish();
+    if (type == 13) treasure_publish_luck(seed);   // proto 101: the host's party luck, before the node message (no-op unless the shared chest is on)
     if (!net_send_enter_node(m)) {
         g.faulted = true;
         log_line_lvl(LogLevel::Error, "FOLLOW", "!! node %u could not be sent -- NOT entered", index);
@@ -675,6 +681,26 @@ bool follow_on_map() {
     return !g.faulted && (GetTickCount64() - g.map_tick) < 250 && map_ready(g.map);
 }
 
+bool  follow_active() { return g.on && net_active(); }
+void* follow_map_screen() { return g.map; }
+bool  follow_map_ready(void* map) { return map && map_ready(map); }
+void* follow_node_by_index(void* map, uint32_t index) { return node_at(map, index); }
+bool  follow_index_of(void* map, void* node, uint32_t& index) { return index_of_node(map, node, index); }
+uint64_t follow_node_seed(void* node) { return node_seed0(node); }
+uint32_t follow_node_type(void* node) { return node_type(node); }
+bool  follow_node_consumed(void* node) {
+    uint8_t c = 0;
+    return node && mem_read((const uint8_t*)node + kNode_Consumed, &c, sizeof(c)) && c != 0;
+}
+bool  follow_marker(void* map, void*& marker, void*& at, void*& moving, void*& selected) {
+    marker = at = moving = selected = nullptr;
+    if (!map || !mem_read((const uint8_t*)map + 0xA0, &marker, sizeof(marker)) || !marker) return false;
+    mem_read((const uint8_t*)marker + 0x50, &at, sizeof(at));
+    mem_read((const uint8_t*)marker + 0x58, &moving, sizeof(moving));
+    mem_read((const uint8_t*)marker + 0x60, &selected, sizeof(selected));
+    return true;
+}
+
 uint32_t follow_node_count() {
     if (!g.map) return 0;
     uint32_t count = 0; void* data = nullptr;
@@ -704,6 +730,7 @@ bool follow_current_node(uint32_t& index) {
 // CHOICE, so the lock would only buy a lock-ordering hazard against the module
 // that wants the value. See remember_node for the other half of that argument.
 uint64_t follow_here_seed() { return g.have_here ? g.here_seed : 0; }
+uint32_t follow_here_type() { return g.have_here ? g.here_type : 0; }
 
 // --- where the run is standing, read from the GAME rather than remembered ----
 //
@@ -1668,6 +1695,9 @@ void* follow_map_update(void* map_screen) {
             g.host_retry_map = nullptr;
         } else {
             bool sent = false;
+            // EXPERIMENTAL own random events (mgmp_indepevt): this retry is how the host usually gets into the next node when it clicked while the event screen was
+            // closing (the click was held in h_EnterNode, the party icon already stands on the node) -- it waits for the clients' events here too (0.1.65).
+            if (indepevt_hold_node()) return nullptr;
             if (follow_on_enter_node(map_screen, retry, &sent)) {
                 g.host_retry_pending = false;
                 g.host_retry_map = nullptr;

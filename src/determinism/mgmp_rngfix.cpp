@@ -9,6 +9,8 @@
 #include "mgmp_log.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_mem.h"
+#include "mgmp_addresses.h"
+#include "mgmp_resolve.h"
 #include "mgmp_net.h"
 #include "mgmp_rng.h"
 #include "mgmp_unlocks.h"
@@ -76,6 +78,58 @@ void* rngfix_pick_index(void* out, void* vec, void* stream, fn_rngfix_3 orig) {
 }
 
 // R027. The vector is {u32, u32 count, Item** data}; an Item's name is the std::string at +8 (the build looks its GON up by it).
+// ---- R013: the AOE landing's per-tile damage delay ----------------------------------------------------------------------------------------------------
+// In sub_140096C20 the ability's graphics key visual_delay_but_simultaneous_damage is read into [rbp-4], -1 when absent:
+//   83 B8 A8 00 00 00 02   cmp dword ptr [rax+0xA8], 2      (an integer node?)
+//   74 05                  je   +5                           -> the value
+//   89 7D FC               mov  [rbp-4], edi                 (edi = -1: absent)
+//   EB 06                  jmp  +6
+//   8B 48 50               mov  ecx, [rax+0x50]
+//   89 4D FC               mov  [rbp-4], ecx
+// -1 lets every tile apply its damage when its own (random) delay runs out; 0 applies every tile's damage at once, in tile order (0x140098A6E), while the particles still
+// fall with their delays. The patch makes `absent` mean 0: je +4; xor ecx,ecx; jmp +3; mov ecx,[rax+0x50]; mov [rbp-4],ecx; nop -- same length, nothing else moves.
+namespace {
+const uint8_t kR013Find[20] = { 0x83, 0xB8, 0xA8, 0x00, 0x00, 0x00, 0x02, 0x74, 0x05, 0x89, 0x7D, 0xFC, 0xEB, 0x06, 0x8B, 0x48, 0x50, 0x89, 0x4D, 0xFC };
+const uint8_t kR013Old[13]  = { 0x74, 0x05, 0x89, 0x7D, 0xFC, 0xEB, 0x06, 0x8B, 0x48, 0x50, 0x89, 0x4D, 0xFC };
+const uint8_t kR013New[13]  = { 0x74, 0x04, 0x31, 0xC9, 0xEB, 0x03, 0x8B, 0x48, 0x50, 0x89, 0x4D, 0xFC, 0x90 };
+struct R013 { bool looked = false; uint8_t* site = nullptr; bool on = false; } g_r013;
+bool code_write(uint8_t* at, const uint8_t* bytes, size_t n) {
+    DWORD old = 0;
+    if (!VirtualProtect(at, n, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(at, bytes, n);
+    DWORD tmp = 0;
+    VirtualProtect(at, n, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), at, n);
+    return memcmp(at, bytes, n) == 0;
+}
+}
+
+void rngfix_simultaneous_aoe_tick() {
+    if (!g_r013.looked) {
+        g_r013.looked = true;
+        const uintptr_t fn = addr_of_call(C_AoeLand);
+        uint8_t code[0x900] = {};
+        if (fn && mem_read((const void*)fn, code, sizeof(code))) {
+            for (size_t i = 0; i + sizeof(kR013Find) <= sizeof(code) && !g_r013.site; ++i)
+                if (memcmp(code + i, kR013Find, sizeof(kR013Find)) == 0) g_r013.site = (uint8_t*)(fn + i + 7);
+        }
+        log_line("RNGFIX", "R013: the AOE landing's damage-delay branch %s", g_r013.site ? "found -- in a room every AOE applies its damage at once, in tile order" : "NOT found -- AOEs keep their per-tile damage delays");
+    }
+    if (!g_r013.site) return;
+    const bool want = net_active() && net_peer_count() >= 2;
+    if (want == g_r013.on) return;
+    uint8_t now[13] = {};
+    if (!mem_read(g_r013.site, now, sizeof(now)) || memcmp(now, want ? kR013Old : kR013New, sizeof(now)) != 0) {
+        log_line_lvl(LogLevel::Warn, "RNGFIX", "!! R013: the damage-delay branch does not hold the expected bytes -- left alone");
+        g_r013.site = nullptr;
+        return;
+    }
+    if (code_write(g_r013.site, want ? kR013New : kR013Old, 13)) {
+        g_r013.on = want;
+        log_line("RNGFIX", "R013: %s", want ? "in a room: every AOE applies its damage at once, in tile order (the particles still fall with their delays)" : "out of a room: the game's own per-tile damage delays are back");
+    }
+}
+
 void rngfix_battle_backpack(void* vec) {
     if (!vec || !in_room()) return;
     uint32_t n = 0;
@@ -152,12 +206,12 @@ void* rngfix_clay(void* self, void* a, void* b, void* c, fn_rngfix_4 orig) {
     if (mem_read((const uint8_t*)self + 0x38, &chr, sizeof(chr)) && chr && mem_read((const uint8_t*)chr + 0x88, &cat, sizeof(cat)) && cat)
         mem_read((const uint8_t*)cat + 0xC48, &cat_id, sizeof(cat_id));
     static uint64_t s_battle = 0;
-    static uint64_t s_id[16] = {};
-    static uint32_t s_n[16] = {};
+    static uint64_t s_id[100] = {};
+    static uint32_t s_n[100] = {};
     if (s_battle != battle) { s_battle = battle; memset(s_id, 0, sizeof(s_id)); memset(s_n, 0, sizeof(s_n)); }
     uint32_t k = 0;
-    while (k < 16 && s_id[k] && s_id[k] != cat_id) ++k;
-    if (k == 16) k = 15;
+    while (k < 100 && s_id[k] && s_id[k] != cat_id) ++k;
+    if (k == 100) k = 99;
     s_id[k] = cat_id;
     const uint32_t n = ++s_n[k];
     uint64_t saved[4];

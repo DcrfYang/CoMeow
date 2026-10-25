@@ -89,6 +89,32 @@ bool read_flag(void* props, fn_prop_int get, fn_alloc alloc, const char* name, b
 
 } // namespace
 
+// The same reading as unlocks_mapflags, but saying when it could not be made (no save loaded, a getter that did not resolve) instead of
+// answering "everything" -- for a report another player acts on (mgmp_areagate). A debug-unlocked save still reads as every flag set.
+bool unlocks_mapflags_try(uint32_t& out) {
+    out = 0;
+    const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+    void* dir = nullptr;
+    auto get   = (fn_prop_int)addr_of_call(C_PropGetInt);
+    auto alloc = (fn_alloc)addr_of_call(C_GameStrAlloc);
+    if (!at || !get || !alloc || !mem_read((const void*)at, &dir, sizeof(dir)) || !dir) return false;
+    uint8_t debug = 0;
+    if (mem_read((const uint8_t*)dir + kDir_DebugUnlock, &debug, 1) && debug) { out = 0xFFFFFFFFu; return true; }
+    void* props = (uint8_t*)dir + kDir_SaveProps;
+    for (int i = 0; i < kFlagCount; ++i) {
+        bool on = false;
+        if (!read_flag(props, get, alloc, kFlagNames[i], on)) return false;
+        if (on) out |= 1u << i;
+    }
+    return true;
+}
+
+int unlocks_flag_bit(const char* name) {
+    if (!name) return -1;
+    for (int i = 0; i < kFlagCount; ++i) if (strcmp(kFlagNames[i], name) == 0) return i;
+    return -1;
+}
+
 uint32_t unlocks_mapflags() {
     constexpr uint32_t kAll = 0xFFFFFFFFu;
     const uintptr_t at = addr_of_data(D_MewDirectorPtr);
@@ -162,6 +188,9 @@ struct Window {
     int64_t  dyn_last[kDyn] = {};
     int32_t  dyn_virt[kDyn] = {};
     unsigned dyn_n = 0, dyn_differing = 0;
+    // the per-player properties read in this window (logged once each, 0.1.55)
+    uint32_t own_seen[32] = {};
+    unsigned own_n = 0, own_reads = 0;
 } win;
 
 // THE HOST'S WHOLE PROPERTY TABLE (proto 79), as (hash, value): assembled from MSG_PROPS chunks.
@@ -452,7 +481,7 @@ using fn_cat_stats = int* (__fastcall*)(void* cat, int* out, const void* filter,
 using fn_cat_by_id = void* (__fastcall*)(void* registry, uint64_t id);
 using fn_is_kitten = bool (__fastcall*)(void* cat);
 constexpr int kSortStat = 4;                     // STR DEX CON INT SPD CHA LCK: the sort compares SPEED
-constexpr uint32_t kMaxSpawn = 8;
+constexpr uint32_t kMaxSpawn = kSpawnMax;   // 100 (8 until 2026-10-18: four players bring sixteen cats, and a party past eight kept the game's own order)
 
 struct Predicted { uint32_t n = 0; uint64_t ids[kMaxSpawn] = {}; int32_t keys[kMaxSpawn] = {}; } predicted;   // the order the host last sent
 
@@ -624,6 +653,7 @@ constexpr QueueDesc kQueues[kTableQueues] = {
     { "carried units",     0x628, 0x630, 0x58, 0x00, -1,   0x20, 0x24 },
 };
 struct PendingLocal { uintptr_t at = 0; char name[24] = {}; PendingEnemy e; };
+constexpr uint32_t kLocalQueueMax = 128;   // entries of one director queue read on this peer (above the message's kPendingMax, so a longer local queue still shows its surplus)
 uint32_t pending_ident(const char* name) {
     uint64_t h = 1469598103934665603ull;
     for (const char* c = name; *c; ++c) { h ^= (uint8_t)*c; h *= 1099511628211ull; }
@@ -664,8 +694,8 @@ void pending_log(const char* who, const QueueDesc& q, const PendingLocal* l, uin
         off += _snprintf_s(line + off, sizeof(line) - off, _TRUNCATE, " %s x%d (hp %d, %d)%s", l[i].name, l[i].e.remaining, l[i].e.hp, l[i].e.mode, l[i].e.remaining > 0 ? "" : " [used up]");
     log_line("SPAWN", "%s: the director's queue of %s holds %u entr%s:%s", who, q.label, n, n == 1 ? "y" : "ies", n ? line : " none");
 }
-// Queue C is hidden by moving its end pointer back; this remembers how to put it back.
-struct HiddenQueue { bool on = false; uintptr_t end_at = 0, begin = 0, end = 0; } g_hidden;
+// Queue C (no counter) is narrowed for a build by moving its end pointer back over the entries the host does not have; this remembers how to put it back.
+struct HiddenQueue { bool on = false; uintptr_t end_at = 0, begin = 0, end = 0, shown_end = 0; } g_hidden;
 } // namespace
 
 
@@ -683,6 +713,7 @@ bool weather_read(WeatherNames& out) {
     if (!mem_read(dir + kDir_Weather, &b, sizeof(b)) || !mem_read(dir + kDir_Weather + 8, &e, sizeof(e)) || e < b) return false;
     if (!b) return true;                                    // an empty vector: no weather
     const uintptr_t count = (e - b) / kStrSize;
+    if (count > kWeatherNames) log_line_lvl(LogLevel::Warn, "SPAWN", "!! the director's weather list holds %u names, only %u are carried", (unsigned)count, (unsigned)kWeatherNames);
     for (uintptr_t i = 0; i < count && out.n < kWeatherNames; ++i)
         if (mem_read_std_string((const void*)(b + i * kStrSize), out.name[out.n], kWeatherLen)) ++out.n;
     return true;
@@ -773,27 +804,36 @@ static void weather_align(const WeatherNames& host) {
         log_line_lvl(LogLevel::Warn, "SPAWN", "!! this peer's weather list differed from the host's -- it now holds the host's %u weather(s) and stays that way", (unsigned)host.n);
         return;
     }
-    g_wswap = WeatherSwap{};
-    g_wswap.at = (uintptr_t)dir + kDir_Weather;
-    if (!mem_read((const void*)g_wswap.at, &g_wswap.orig_first, 8) || !mem_read((const void*)(g_wswap.at + 8), &g_wswap.orig_last, 8) || !mem_read((const void*)(g_wswap.at + 16), &g_wswap.orig_end, 8)) return;
-    for (uint32_t i = 0; i < host.n; ++i) {
-        uint8_t* s = g_wswap.strings + i * kStrSize;
-        const size_t len = strnlen(host.name[i], kWeatherLen - 1);
-        uint64_t size = len, cap = 15;
-        if (len <= 15) memcpy(s, host.name[i], len + 1);
-        else { memcpy(g_wswap.pool[i], host.name[i], len + 1); const uint64_t p = (uint64_t)(uintptr_t)g_wswap.pool[i]; memcpy(s, &p, 8); cap = len; }
-        memcpy(s + 0x10, &size, 8);
-        memcpy(s + 0x18, &cap, 8);
+    // THE HOST'S LIST IN THE GAME'S OWN MEMORY (2026-10-20, the crash on "quit to the main menu" mid-battle). This used to point the director's vector
+    // at a buffer of the mod's for the battle and put the client's own back when the map was ready again; quitting mid-battle destroyed the director
+    // first, its destructor freed the mod's buffer as if it were the game's, and the heap was corrupt (C0000374 in MewDirector's destructor, +0x668).
+    // Now a new buffer and its strings come from the game's own allocator (C_GameStrAlloc, what the vector and the strings are freed with), the
+    // director owns them from here on like any list of its own, and nothing has to be put back. The client's old buffer is left alone (a few bytes).
+    const auto alloc = (fn_alloc)addr_of_call(C_GameStrAlloc);
+    if (!alloc) { log_line_lvl(LogLevel::Warn, "SPAWN", "!! the host's weather cannot be taken: the game's allocator is not resolved -- this peer builds with its own"); return; }
+    const uintptr_t at = (uintptr_t)dir + kDir_Weather;
+    uintptr_t first = 0, last = 0;
+    if (host.n) {
+        first = (uintptr_t)call_alloc(alloc, (size_t)host.n * kStrSize);
+        if (!first) { log_line_lvl(LogLevel::Warn, "SPAWN", "!! the host's weather cannot be taken: no memory -- this peer builds with its own"); return; }
+        for (uint32_t i = 0; i < host.n; ++i) {
+            GameStr s;
+            if (!make_key(s, host.name[i], alloc)) {
+                log_line_lvl(LogLevel::Warn, "SPAWN", "!! the host's weather '%s' could not be built -- the list ends before it", host.name[i]);
+                break;
+            }
+            memcpy((void*)(first + (uintptr_t)i * kStrSize), &s, sizeof(s));
+            last = first + (uintptr_t)(i + 1) * kStrSize;
+        }
+        if (!last) last = first;
     }
-    g_wswap.ours = (uintptr_t)g_wswap.strings;
-    const uintptr_t last = g_wswap.ours + (uintptr_t)host.n * kStrSize;
-    mem_write((void*)g_wswap.at, &g_wswap.ours, 8);
-    mem_write((void*)(g_wswap.at + 8), &last, 8);
-    mem_write((void*)(g_wswap.at + 16), &last, 8);
-    g_wswap.on = true;
-    g_wswap.at_ms = GetTickCount64();
-    weather_log("client, this peer's own weather (set aside for this battle)", mine);
-    log_line_lvl(LogLevel::Warn, "SPAWN", "!! this peer's weather list differs from the host's -- the host's %u weather(s) are used for this battle", (unsigned)host.n);
+    const uintptr_t endcap = first ? first + (uintptr_t)host.n * kStrSize : 0;
+    if (!mem_write((void*)at, &first, 8) || !mem_write((void*)(at + 8), &last, 8) || !mem_write((void*)(at + 16), &endcap, 8)) {
+        log_line_lvl(LogLevel::Error, "SPAWN", "!! the director's weather list could not be written");
+        return;
+    }
+    weather_log("client, this peer's own weather (replaced for good)", mine);
+    log_line_lvl(LogLevel::Warn, "SPAWN", "!! this peer's weather list differed from the host's -- it now holds the host's %u weather(s), in the game's own memory", (unsigned)host.n);
 }
 
 // HOST: its queues, for the message that carries the level (live entries only).
@@ -805,10 +845,14 @@ static void pending_fill(UnlocksMsg& m) {
         memcpy(m.weather, w.name, sizeof(m.weather));
     }
     for (uint32_t q = 0; q < kTableQueues; ++q) {
-        PendingLocal l[16];
-        const uint32_t n = pending_read(kQueues[q], l, 16);
+        PendingLocal l[kLocalQueueMax];
+        const uint32_t n = pending_read(kQueues[q], l, kLocalQueueMax);
         m.n_pending[q] = 0;
-        for (uint32_t i = 0; i < n && m.n_pending[q] < kPendingMax; ++i) if (l[i].e.remaining > 0) m.pending[q][m.n_pending[q]++] = l[i].e;
+        uint32_t live = 0;
+        for (uint32_t i = 0; i < n; ++i) if (l[i].e.remaining > 0) { ++live; if (m.n_pending[q] < kPendingMax) m.pending[q][m.n_pending[q]++] = l[i].e; }
+        m.pending_total[q] = live;
+        if (live > m.n_pending[q])
+            log_line_lvl(LogLevel::Warn, "SPAWN", "!! the director's queue of %s holds %u live entries, only %u fit the message -- the clients match those and leave the rest of theirs as it is", kQueues[q].label, live, (unsigned)m.n_pending[q]);
     }
 }
 
@@ -817,7 +861,7 @@ static void pending_unhide() {
     g_hidden.on = false;
     const uint8_t* dir = pending_director();
     uintptr_t b = 0, e = 0;
-    if (!dir || !mem_read(dir + kQueues[2].begin, &b, sizeof(b)) || !mem_read(dir + kQueues[2].end, &e, sizeof(e)) || b != g_hidden.begin || e != g_hidden.begin) {
+    if (!dir || !mem_read(dir + kQueues[2].begin, &b, sizeof(b)) || !mem_read(dir + kQueues[2].end, &e, sizeof(e)) || b != g_hidden.begin || e != g_hidden.shown_end) {
         log_line_lvl(LogLevel::Warn, "SPAWN", "!! the hidden queue of carried units changed during the build -- it is left as the game has it");
         return;
     }
@@ -893,12 +937,12 @@ bool unlocks_bounty_target(void* vec, void* pick, bool faction1, void** out) {
     const uint64_t battle = lockstep_battle_id();
     uint32_t n = 0;
     void** data = nullptr;
-    if (!battle || !mem_read((uint8_t*)vec + 4, &n, sizeof(n)) || !n || n > 64 || !mem_read((uint8_t*)vec + 8, &data, sizeof(data)) || !data) return false;
-    void* units[64] = {};
+    if (!battle || !mem_read((uint8_t*)vec + 4, &n, sizeof(n)) || !n || n > 256 || !mem_read((uint8_t*)vec + 8, &data, sizeof(data)) || !data) return false;   // 256 (64 until 2026-10-18: a battle has 60-70 units)
+    static void* units[256];
     if (!mem_read(data, units, n * sizeof(void*))) return false;
     struct Key { int32_t y, x; char def[48]; };
-    Key key[64] = {};
-    uint32_t order[64] = {};
+    static Key key[256];
+    static uint32_t order[256];
     for (uint32_t i = 0; i < n; ++i) {
         const void* tobj = nullptr;
         int32_t tile[2] = {};
@@ -916,7 +960,7 @@ bool unlocks_bounty_target(void* vec, void* pick, bool faction1, void** out) {
     uint64_t x = battle ^ 0x626F756E74790000ull ^ (faction1 ? 0x31ull : 0x32ull);
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = splitmix64(x);
-    void* idx[64] = {};
+    static void* idx[256];
     for (uint32_t i = 0; i < n; ++i) idx[i] = (void*)(uintptr_t)i;
     uint8_t fake[24] = {};
     void* fp = idx;
@@ -940,10 +984,10 @@ bool unlocks_bounty_target(void* vec, void* pick, bool faction1, void** out) {
 void unlocks_build_enemies_begin() {
     if (!g_in_build || !net_active() || net_peer_count() < 2) return;
     const bool client = net_role() == NetRole::Client;
-    PendingLocal l[kTableQueues][16];
+    PendingLocal l[kTableQueues][kLocalQueueMax];
     uint32_t n[kTableQueues];
     for (uint32_t q = 0; q < kTableQueues; ++q) {
-        n[q] = pending_read(kQueues[q], l[q], 16);
+        n[q] = pending_read(kQueues[q], l[q], kLocalQueueMax);
         pending_log(client ? "client, enemy stage" : "host, enemy stage", kQueues[q], l[q], n[q]);
     }
     {
@@ -973,16 +1017,21 @@ void unlocks_build_enemies_begin() {
             room_sync_trouble("the host's weather and queues");
         }
     }
-    PendingEnemy host[kPendingQueues][kPendingMax];
+    static PendingEnemy host[kPendingQueues][kPendingMax];   // static: 100 entries per queue is too much for this frame's stack next to the local copies
     uint8_t hn[kPendingQueues] = {};
+    uint32_t htot[kPendingQueues] = {};
     const uint64_t id = lockstep_battle_id();
-    if (!net_host_pending(id, host, hn)) {
+    if (!net_host_pending(id, host, hn, htot)) {
         log_line_lvl(LogLevel::Warn, "SPAWN", "!! the host's queues did not come with its level for battle %016llx -- this peer spawns its own", (unsigned long long)id);
         return;
     }
     for (uint32_t q = 0; q < kTableQueues; ++q) {
         const QueueDesc& qd = kQueues[q];
         bool used[kPendingMax] = {};
+        const bool truncated = htot[q] > hn[q];             // the host's queue was longer than the message: what did not come cannot be judged
+        if (truncated) log_line_lvl(LogLevel::Warn, "SPAWN", "!! the host's %s hold %u entries, %u came -- the rest of this peer's are left as they are", qd.label, htot[q], (unsigned)hn[q]);
+        int  match_of[kLocalQueueMax];                     // the host entry each local entry was matched to, -1 = none
+        for (int& v : match_of) v = -1;
         uint32_t off_n = 0, set_n = 0, unmatched = 0;
         for (uint32_t i = 0; i < n[q]; ++i) {
             if (l[q][i].e.remaining <= 0) continue;
@@ -990,7 +1039,7 @@ void unlocks_build_enemies_begin() {
             for (uint32_t k = 0; k < hn[q] && match < 0; ++k) if (!used[k] && host[q][k].ident == l[q][i].e.ident) match = (int)k;
             if (match < 0) {   // the host has no such entry: this one must not spawn
                 ++unmatched;
-                if (qd.count >= 0) {
+                if (qd.count >= 0 && !truncated) {
                     const int32_t zero = 0;
                     mem_write((void*)(l[q][i].at + qd.count), &zero, 4);
                     ++off_n;
@@ -999,18 +1048,42 @@ void unlocks_build_enemies_begin() {
                 continue;
             }
             used[match] = true;
+            match_of[i] = match;
             const PendingEnemy& h = host[q][match];
             if (qd.count >= 0 && h.remaining != l[q][i].e.remaining) { mem_write((void*)(l[q][i].at + qd.count), &h.remaining, 4); ++set_n; }
             if (qd.hp >= 0 && h.hp != l[q][i].e.hp)                  { mem_write((void*)(l[q][i].at + qd.hp), &h.hp, 4); ++set_n; }
             if (qd.mode >= 0 && h.mode != l[q][i].e.mode)            { mem_write((void*)(l[q][i].at + qd.mode), &h.mode, 4); ++set_n; }
         }
-        if (qd.count < 0 && unmatched && n[q]) {   // no counter to clear: hide the whole queue for this build
+        if (qd.count < 0 && n[q]) {
+            // NO COUNTER TO CLEAR (the carried units: every entry spawns). Until 2026-10-18 one entry the host lacked hid the WHOLE queue for the build -- and the host's
+            // queue was cut to six in the message, so seven carried rot flies made the client build its battle with none of them (room RZ2P: 40 units against the host's
+            // 47, the players' crow at another index, a halt at turn 0). Now the entries the host has are moved to the front IN THE HOST'S ORDER (the build spawns them
+            // in queue order, and the order is the roster's), and the end pointer is moved back over the rest for this build only.
             const uint8_t* dir = pending_director();
             uintptr_t b = 0, e = 0;
-            if (dir && mem_read(dir + qd.begin, &b, sizeof(b)) && mem_read(dir + qd.end, &e, sizeof(e)) && b && e > b) {
-                g_hidden = HiddenQueue{ true, (uintptr_t)(dir + qd.end), b, e };
-                mem_write((void*)g_hidden.end_at, &b, sizeof(b));
-                log_line_lvl(LogLevel::Warn, "SPAWN", "!! %u of this peer's %s are not on the host -- the whole queue is hidden for this build", unmatched, qd.label);
+            const uint32_t total = n[q] < kLocalQueueMax ? n[q] : kLocalQueueMax;
+            if (dir && mem_read(dir + qd.begin, &b, sizeof(b)) && mem_read(dir + qd.end, &e, sizeof(e)) && b && e > b && (e - b) / qd.stride == total) {
+                uint32_t perm[kLocalQueueMax], np = 0;
+                for (uint32_t k = 0; k < hn[q]; ++k) for (uint32_t i = 0; i < total; ++i) if (match_of[i] == (int)k) perm[np++] = i;   // the matched ones, in the host's order
+                const uint32_t shown = truncated ? total : np;    // a truncated host list hides nothing: the unmatched may be among what did not come
+                for (uint32_t i = 0; i < total; ++i) if (match_of[i] < 0) perm[np++] = i;                                              // then the rest, kept behind the end
+                bool identity = true;
+                for (uint32_t i = 0; i < np; ++i) identity = identity && perm[i] == i;
+                if (!identity || shown < total) {
+                    static uint8_t buf[kLocalQueueMax * 0x58];
+                    const size_t sz = (size_t)total * qd.stride;
+                    bool ok = qd.stride <= 0x58 && mem_read((const void*)b, buf, sz);
+                    for (uint32_t i = 0; ok && i < np; ++i) ok = mem_write((void*)(b + (uintptr_t)i * qd.stride), buf + (size_t)perm[i] * qd.stride, qd.stride);   // relocated whole: no entry points into itself
+                    if (ok && shown < total) {
+                        const uintptr_t shown_end = b + (uintptr_t)shown * qd.stride;
+                        g_hidden = HiddenQueue{ true, (uintptr_t)(dir + qd.end), b, e, shown_end };
+                        mem_write((void*)g_hidden.end_at, &shown_end, sizeof(shown_end));
+                    }
+                    log_line_lvl(ok ? LogLevel::Warn : LogLevel::Error, "SPAWN", "!! this peer's %s put in the host's order for this build: %u of %u spawn, %u the host does not have are held back%s",
+                                 qd.label, shown, total, total - shown, ok ? "" : " -- !! the queue could not be rewritten");
+                }
+            } else if (unmatched) {
+                log_line_lvl(LogLevel::Warn, "SPAWN", "!! %u of this peer's %s are not on the host and the queue could not be read whole -- left as it is", unmatched, qd.label);
             }
         }
         uint32_t missing = 0;
@@ -1256,12 +1329,12 @@ void unlocks_level_pick(void* kind, void* node, void* out, bool picked) {
 }
 
 void unlocks_spawn_sort(void** first, void** last, bool sorted) {
-    if (!net_active() || net_peer_count() < 2 || !first || last <= first || last - first > 16) return;
+    if (!net_active() || net_peer_count() < 2 || !first || last <= first || last - first > (ptrdiff_t)kMaxSpawn) return;
     const uint32_t n = (uint32_t)(last - first);
-    void* cats[16] = {};
+    void* cats[kMaxSpawn] = {};
     if (!mem_read(first, cats, n * sizeof(void*))) return;
-    uint64_t ids[16] = {};
-    int keys[16] = {};
+    uint64_t ids[kMaxSpawn] = {};
+    int keys[kMaxSpawn] = {};
     char line[400] = {};
     int off = 0;
     for (uint32_t i = 0; i < n; ++i) {
@@ -1299,8 +1372,8 @@ void unlocks_spawn_sort(void** first, void** last, bool sorted) {
         log_line_lvl(LogLevel::Warn, "SPAWN", "!! the party list could not be read (or holds another number of cats than the battle sorted: %u) -- the game's order is kept", n);
         return;
     }
-    void* want[16] = {};
-    bool used[16] = {};
+    void* want[kMaxSpawn] = {};
+    bool used[kMaxSpawn] = {};
     char want_line[400] = {};
     off = 0;
     for (uint32_t i = 0; i < n; ++i) {
@@ -1331,7 +1404,15 @@ void unlocks_spawn_sort(void** first, void** last, bool sorted) {
     log_line_lvl(LogLevel::Warn, "SPAWN", "!! spawn order set to the canonical one (speed, then the party list):%s -- the game's shuffle gave%s", want_line, line);
 }
 
+static bool g_force_lists = false;   // unlocks_force_host_lists
+void unlocks_force_host_lists(bool on) {
+    g_force_lists = on && net_role() == NetRole::Client && host_lists.have;
+    if (on && net_role() == NetRole::Client && !host_lists.have)
+        log_line_lvl(LogLevel::Warn, "UNLOCK", "a shared roll, but the host's unlock answers have not arrived -- this save's own lists are used");
+}
+
 bool unlocks_window_active() {
+    if (g_force_lists && !g_own_read) return true;
     if (!win.on || g_own_read) return false;
     if (GetTickCount64() - win.at > kWindowMaxMs) { unlocks_window_close("timed out"); return false; }
     return true;
@@ -1425,9 +1506,12 @@ void unlocks_window_open(const char* why, bool event) {
              event ? "event" : "battle and its rewards");
 }
 
+const char* unlocks_window_why() { return win.on ? win.why : nullptr; }
+
 void unlocks_window_close(const char* why) {
     if (!win.on) return;
     win.on = false;
+    if (win.own_reads) log_line("HOUSE", "window closing (%s): %u read(s) of this player's own House/stash numbers inside it, all answered from this save", why ? why : "", win.own_reads);
     log_line("UNLOCK", "window CLOSED (%s) after %llu ms: checks ability %u, passive %u, item %u, level group %u, boss %u; answered differently from this save: %u, %u, %u, %u, %u; event properties read %u, differing %u",
              why ? why : "", (unsigned long long)(GetTickCount64() - win.at),
              win.checks[0], win.checks[1], win.checks[2], win.checks[3], win.checks[4], win.differing[0], win.differing[1], win.differing[2], win.differing[3], win.differing[4], win.props, win.props_differing);
@@ -1468,9 +1552,44 @@ void note_uncovered(const char* key, int64_t local) {
              key, win.event ? "event" : "battle", (long long)local);
 }
 
+bool unlocks_per_player_property(const char* key) {
+    if (!key) return false;
+    // 0.1.83 (the 2026-10-24 health check): every number that is this player's OWN progress, not only the House. Found in the logs: the House
+    // engine (0x1401D2550 -> 0x1401D5680) reads save_file_next_cat_mutation at every map-ready and writes it back (a client's 90 became the host's
+    // 40-based value), and a Bonus Bird's TrackAmountKilledByPlayer wrote BonusBirdsKilled as the host's count + 1. The story, area and weather state
+    // (mapflag_*, *Unlocked, AntennaQuest_* ...) still follows the host: what a node or a battle IS is decided from it.
+    static const char* const kPrefix[] = { "house_", "adventure_", "save_file_", "savefile_", "savescum", "sfunlockcounter_", "GameStat_", "NPCRSTRACKER_",
+                                           "catinfo_unlock_", "Legacy_" };
+    for (const char* p : kPrefix) if (strncmp(key, p, strlen(p)) == 0) return true;
+    static const char* const kExact[] = { "BonusBirdsKilled", "blank_collars", "current_day", "game_began", "given_junk_furniture", "generated_mercy_strays_today",
+                                          "min_strays_tomorrow", "organname_set", "version_compatability_index", "butch_box_unlocked" };
+    for (const char* e : kExact) if (strcmp(key, e) == 0) return true;
+    return false;
+}
+
 // The property getter's answer for one of the properties the events read: the HOST's value, with every difference from this save's own on the record.
 bool event_property_answer(const char* key, int64_t local, int64_t fallback, int64_t& value) {
     if (!event_window_on()) return false;
+    if (unlocks_per_player_property(key)) {
+        // 0.1.55: the House and the stash are this player's own -- the read answers from this save. Logged once per key and window, with the host's
+        // number next to it: a load inside the window used to copy it into the House (MewDirector's load 0x1403AEFD0 -> 0x1402062C0 reads house_gold
+        // into House+0xB4, house_storage_upgrades ... through this very getter).
+        ++win.own_reads;
+        const uint32_t h = prop_key_hash(key);
+        bool seen = false;
+        for (unsigned i = 0; i < win.own_n; ++i) if (win.own_seen[i] == h) seen = true;
+        if (!seen && win.own_n < 32) {
+            win.own_seen[win.own_n++] = h;
+            int32_t host = 0;
+            const bool known = hprops.have && hprops.lookup(h, host);
+            char hv[24] = "unknown";
+            if (known) _snprintf_s(hv, sizeof(hv), _TRUNCATE, "%d", (int)host);
+            log_line_lvl(known && (int64_t)host != local ? LogLevel::Warn : LogLevel::Info, "HOUSE",
+                         "'%s' read inside the window (%s): this player's own number -- this save's %lld is used (the host has %s)%s",
+                         key, win.why, (long long)local, hv, known && (int64_t)host != local ? " -- before 0.1.55 the host's would have been answered" : "");
+        }
+        return false;
+    }
     for (int i = 0; i < event_keys::kCount; ++i) {
         if (strcmp(event_keys::kKeys[i], key) != 0) continue;
         const int32_t host = host_lists.msg.events[i];
@@ -1583,6 +1702,9 @@ float g_sent_speed = 0.0f;           // host: what was last sent
 uint8_t g_sent_peers = 0;            // host: how many players there were then (a player who joined must be told again)
 bool g_speed_said = false;
 float g_own_speed = 0.0f;            // what this game's own setting answered last (any peer; 0 = never read)
+// host: every accepted HELLO counts one (settings_peer_joined). The player COUNT alone missed a player who left and came back while somebody else
+// joined in between (2026-10-20: three players before and after -- the one who came back never got the speed and showed "unknown" all game).
+uint32_t g_join_gen = 0, g_sent_gen = 0;
 }
 bool settings_room_speed(float& out) {
     const float v = net_role() == NetRole::Host ? g_own_speed : g_host_speed;
@@ -1597,10 +1719,10 @@ bool settings_override(const char* key, float own, float& out) {
     if (!net_active() || net_peer_count() < 2) { g_host_speed = 0.0f; g_sent_speed = 0.0f; g_sent_peers = 0; g_speed_said = false; return false; }
     if (net_role() == NetRole::Host) {
         const uint8_t peers = net_peer_count();
-        if (own != g_sent_speed || peers != g_sent_peers) {
+        if (own != g_sent_speed || peers != g_sent_peers || g_join_gen != g_sent_gen) {
             SettingMsg m; m.id = kSettingCombatSpeed; m.value = own;
             if (net_send_setting(m)) {
-                g_sent_speed = own; g_sent_peers = peers;
+                g_sent_speed = own; g_sent_peers = peers; g_sent_gen = g_join_gen;
                 log_line("SETTING", "the host's combat speed %.2f is sent to the other players (their game uses it, so every animation takes the same time)", (double)own);
             }
         }
@@ -1613,6 +1735,19 @@ bool settings_override(const char* key, float own, float& out) {
     }
     out = g_host_speed;
     return true;
+}
+
+// HOST: a player was accepted. It is told the speed now if this game has read its own already (the game reads it in a fight, so before the first
+// fight it is told at the next read -- the generation makes that read send again).
+void settings_peer_joined() {
+    if (net_role() != NetRole::Host) return;
+    ++g_join_gen;
+    if (g_own_speed <= 0.0f) return;
+    SettingMsg m; m.id = kSettingCombatSpeed; m.value = g_own_speed;
+    if (net_send_setting(m)) {
+        g_sent_speed = g_own_speed; g_sent_peers = net_peer_count(); g_sent_gen = g_join_gen;
+        log_line("SETTING", "a player was accepted: the host's combat speed %.2f is sent again", (double)g_own_speed);
+    }
 }
 
 void settings_on_message(uint8_t from, const SettingMsg& m) {
@@ -1930,7 +2065,7 @@ bool unlocks_window_answer(UnlockList list, const char* name, bool local) {
 
 static bool unlocks_window_answer_impl(UnlockList list, const char* name, bool local) {
     const int li = (int)list;
-    if (unlocks_fight_released()) { unlockq_query(list, name, local, local); return local; }     // the fight is over: this save answers for itself
+    if (!g_force_lists && unlocks_fight_released()) { unlockq_query(list, name, local, local); return local; }     // the fight is over: this save answers for itself
     ++win.checks[li];
     if (!host_lists.have) { unlockq_query(list, name, local, local); return local; }
     const int idx = find_name(list, name);

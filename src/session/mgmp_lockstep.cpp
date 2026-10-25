@@ -2,6 +2,8 @@
 
 #include "mgmp_lockstep.h"
 #include "mgmp_spawntest.h"   // unit_definition_name / unit_transform_to: the board sync repairs a unit of another kind
+#include "mgmp_souljar.h"     // MSG_SOULCAT
+#include "mgmp_mapvote.h"     // MSG_NODEVOTE
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_barrier.h"
@@ -25,6 +27,8 @@
 #include "mgmp_diag.h"
 #include "mgmp_chat.h"
 #include "mgmp_draw.h"
+#include "mgmp_treasure.h"
+#include "mgmp_housecoop.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_checkpoint.h"
@@ -152,6 +156,76 @@ constexpr uintptr_t kChar_Carried  = 0xC4;    // int32: the slot in the director
 static bool board_call_capture(uintptr_t fn, void* chr) {
     __try { ((void(__fastcall*)(void*))fn)(chr); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+
+// THE DIRECTOR'S QUEUE OF CARRIED UNITS (MewDirector+0x628/+0x630, 0x58 per entry, the unit's definition name at +0x00): does entry `slot` name `def`? The board's follower repair asks
+// it before calling CaptureFamiliar: a unit the board MADE from the host's carried follower is already in this peer's queue (it was only held back from the build), and a capture would
+// append a second entry for it -- room RZ2P (2026-10-18) grew the client's queue from 7 rot flies to 12 that way, against the host's 7.
+static bool carried_slot_names(int32_t slot, const char* def) {
+    if (slot < 0 || !def || !def[0]) return false;
+    const uint8_t* dir = nullptr;
+    const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+    uintptr_t b = 0, e = 0;
+    if (!at || !mem_read((const void*)at, &dir, sizeof(dir)) || !dir || !mem_read(dir + 0x628, &b, 8) || !mem_read(dir + 0x630, &e, 8) || !b || e < b) return false;
+    if ((uintptr_t)slot >= (e - b) / 0x58) return false;
+    char name[64] = {};
+    return mem_read_std_string((const void*)(b + (uintptr_t)slot * 0x58), name, sizeof(name)) && strcmp(name, def) == 0;
+}
+
+// THE CURRENT ROUND'S ORDER, AFTER THE BOARD TOOK A UNIT'S TURN-ORDER KEYS (2026-10-18, room SXPY, battle 2509bb44): a unit made at the end of turn 4 was inserted into this round's
+// queue with its OWN keys on one client (9/3110046) and with 6/299957 on the host. The board wrote the host's keys over it -- but the queue had been ordered at the insertion and the
+// write moved nothing, so on turn 10 that client gave the unit its turn while the host and the other client gave it to a player's cat, and the stream hash halted the battle.
+// TurnControl+0x118 is a std::list of turn entries (0x30: next, prev, +0x10 kind (0 = a character), +0x18 Character*), +0x128 the node of the actor whose turn it is. A unit joining
+// mid-round (sub_1408E5520, modes 3/4) goes in front of the first remaining entry whose keys are lower: +0x954 first, then +0x958, highest first. The same rule, applied again here
+// to the unit's node if it is still to act this round, puts it where the host's keys put it on the host.
+typedef void* (__fastcall* fn_char_tc)(void* chr);
+static void turn_queue_reposition(void* chr, uint32_t index) {
+    const uintptr_t ctc = addr_of_call(C_CharTurnControl);
+    if (!ctc || !chr) return;
+    void* tc = nullptr;
+    __try { tc = ((fn_char_tc)ctc)(chr); } __except (EXCEPTION_EXECUTE_HANDLER) { tc = nullptr; }
+    if (!tc) return;
+    uint8_t* head = nullptr; uint8_t* cur = nullptr; uint64_t size = 0;
+    if (!mem_read((uint8_t*)tc + 0x118, &head, 8) || !head || !mem_read((uint8_t*)tc + 0x120, &size, 8) || !mem_read((uint8_t*)tc + 0x128, &cur, 8) || !cur || size > 4096) return;
+    // the unit's node among those still to come (after the current one)
+    uint8_t* node = nullptr;
+    uint8_t* p = nullptr;
+    if (!mem_read(cur, &p, 8)) return;
+    for (uint64_t guard = 0; p && p != head && guard <= size; ++guard) {
+        uint32_t kind = 0; void* c = nullptr;
+        if (!mem_read(p + 0x10, &kind, 4) || !mem_read(p + 0x18, &c, 8)) return;
+        if (kind == 0 && c == chr) { node = p; break; }
+        if (!mem_read(p, &p, 8)) return;
+    }
+    if (!node) return;                                       // acting now, already acted, or not in the queue: nothing to move
+    int32_t ka = 0, kb = 0;
+    mem_read((uint8_t*)chr + 0x954, &ka, 4); mem_read((uint8_t*)chr + 0x958, &kb, 4);
+    uint8_t* next = nullptr; uint8_t* prev = nullptr;
+    if (!mem_read(node, &next, 8) || !mem_read(node + 8, &prev, 8) || !next || !prev) return;
+    // where the rule puts it, the node itself left out
+    uint8_t* before = head;
+    if (!mem_read(cur, &p, 8)) return;
+    for (uint64_t guard = 0; p && p != head && guard <= size; ++guard) {
+        if (p != node) {
+            uint32_t kind = 0; void* c = nullptr;
+            if (!mem_read(p + 0x10, &kind, 4) || !mem_read(p + 0x18, &c, 8)) return;
+            if (kind == 0 && c) {
+                int32_t ea = 0, eb = 0;
+                if (!mem_read((uint8_t*)c + 0x954, &ea, 4) || !mem_read((uint8_t*)c + 0x958, &eb, 4)) return;
+                if (ea != ka ? ea < ka : (eb != kb && eb < kb)) { before = p; break; }
+            }
+        }
+        if (!mem_read(p, &p, 8)) return;
+    }
+    if (before == next) return;                              // already there
+    // unlink, then link in front of `before`
+    uint8_t* bprev = nullptr;
+    if (!mem_read(before + 8, &bprev, 8) || !bprev) return;
+    if (!mem_write(prev, &next, 8) || !mem_write(next + 8, &prev, 8)) return;
+    if (!mem_read(before + 8, &bprev, 8)) return;            // (may have been `node`'s neighbour)
+    mem_write(node, &before, 8); mem_write(node + 8, &bprev, 8);
+    mem_write(bprev, &node, 8); mem_write(before + 8, &node, 8);
+    log_line_lvl(LogLevel::Warn, "BOARD", "!! unit %u moved in this round's turn queue to where the host's keys %d/%d put it (it had joined the round with this peer's own keys)", index, ka, kb);
+}
 // The game's own equip of a named item on a cat (SEH: a function of its own, no C++ objects). 1 = equipped, 0 = the game declined (the slot is not free), -1 = faulted.
 // THE OWNER'S ITEM STATE (proto 89, 2026-10-12 review). Item::make runs the item's init (0x1402E01D0), which reads `durability` into +0x48 (a ranged one
 // is DRAWN, 0x14094F270 on the shared stream: ViperBottle, Mushrooms), `aux` into +0x4C and `str_aux` into the std::string at +0x28 (its random_* forms
@@ -245,7 +319,7 @@ struct State {
     // turn 4; the client's hash of the boundary it was made in had cat 24 in_battle 0 where the host's had 1, a halt). Such an entry counts as present until the list shows it (or kFreshTurns pass).
     static constexpr uint8_t kFreshTurns = 3;
     uint8_t     fresh_left[kMaxCats] = {};
-    static constexpr uint32_t kMaxRetired = 16;
+    static constexpr uint32_t kMaxRetired = 100;   // 16 until 2026-10-18: more transforms at one boundary pushed out entries still in the live list
     const void* retired[kMaxRetired] = {};
     uint32_t    retired_key[kMaxRetired] = {};
     uint32_t    retired_n      = 0;
@@ -433,6 +507,10 @@ struct State {
         uint32_t audit_cats = 0, audit_differ = 0; bool audit_done = false;     // the pre-battle audit of the player cats
         bool audit_sent = false;
         ULONGLONG t0 = 0;                                                       // GetTickCount64 when the battle was first seen: the ELAPSED time in the records
+        // 0.1.50 / proto 98: how long this client's game stood still at the boundaries waiting for the host's board, and how the digests went
+        uint64_t board_wait_ms = 0; uint32_t board_wait_max = 0, board_waits_slow = 0;   // summed / longest / over 100 ms
+        uint32_t board_sum_agreed = 0, board_asked = 0, board_skipped = 0;            // digests that agreed / full boards asked for / boundaries the host was already past
+        uint32_t board_req_run = 0; bool board_stream_asked = false;                  // boundaries in a row that needed the full board; whether the host was asked to stream it
     } bs;
     // The last turns, newest last: what was hashed and how it turned out. Printed whenever a hash disagrees, so even a log with no peer beside it shows the lead-up.
     struct Trail { uint32_t turn = 0; int32_t actor = -1; uint64_t rng = 0, state = 0; uint8_t verdict = 0; uint8_t board = 0; uint32_t ms = 0; };   // verdict 0 pending 1 agreed 2 MISMATCH
@@ -2151,6 +2229,37 @@ uint32_t pend_purge_retired() {
 
 // Pops the oldest pending action for `cat`, if any. Actions for different cats
 // can legitimately be in flight at once, so this is not a plain FIFO pop.
+// THE CHAIN POSITION (proto 97, 2026-10-20, the Creator's last phase: battle 46e1db2c halted at turn 45). The Destroyer's primed form answers
+// every hit it takes with a pulse (ImmediateAbilityReaction, even for 0 damage), and something on the board hit it back each time: the pulses
+// ran on, one per animation, until the acting player's next decision was applied. The owner ended its turn after 11 pulses; the host, which was
+// handed the decision at once, applied it after 11 too; a client that was handed it only after 17 had six more pulses -- more damage, more
+// deaths, a corpse the host still had: a halt. So every decision carries how many actions (DoAction, reactions included) the owner's turn had
+// run when it decided, and the others hand it to their game only when their own count is there (or after a wait, if theirs stops short).
+static uint64_t g_chain_battle = 0;
+static uint32_t g_chain_turn = ~0u, g_chain_n = 0;
+static void chain_note_doaction() {
+    if (g_chain_battle != g.battles.current || g_chain_turn != g.turn) { g_chain_battle = g.battles.current; g_chain_turn = g.turn; g_chain_n = 0; }
+    ++g_chain_n;
+}
+static uint32_t chain_now() {
+    return (g_chain_battle == g.battles.current && g_chain_turn == g.turn) ? g_chain_n : 0;
+}
+// The remote decision held for its chain position: which one, since when (a local chain that stops short of it must not hold the battle forever).
+static uint8_t   g_chain_hold_cat = 0xFF;
+static uint32_t  g_chain_hold_turn = ~0u, g_chain_hold_want = 0;
+static ULONGLONG g_chain_hold_since = 0;
+constexpr ULONGLONG kChainHoldMaxMs = 15000;
+
+bool pend_peek(uint8_t cat, ActionMsg& out) {
+    for (uint32_t i = 0; i < g.pend_count; ++i) {
+        uint32_t slot = (g.pend_head + i) % kMaxPending;
+        if (g.pending[slot].actor != cat || g.pending[slot].battle_id != g.battles.current) continue;
+        out = g.pending[slot];
+        return true;
+    }
+    return false;
+}
+
 bool pend_take(uint8_t cat, ActionMsg& out) {
     for (uint32_t i = 0; i < g.pend_count; ++i) {
         uint32_t slot = (g.pend_head + i) % kMaxPending;
@@ -3422,12 +3531,30 @@ void lockstep_pump() {
                 draw_on_message(m.from, m.draw);
                 break;
 
+            case MSG_TREASURE:
+                treasure_on_message(m.from, m.treasure);
+                break;
+
+            case MSG_HOUSECOOP:
+                housecoop_on_message(m.from, m.housecoop);
+                break;
+
             case MSG_SETTING:
                 settings_on_message(m.from, m.setting);
                 break;
 
             case MSG_EQUIP:
                 lockstep_autoequip_on_message(m.from, m.equip);
+                break;
+
+            // Run state, not battle-gated: the cat a jar holds is the same whichever battle it is opened in (mgmp_souljar).
+            case MSG_SOULCAT:
+                souljar_on_message(m.from, m.soulcat);
+                break;
+
+            // 0.1.95 (proto 106): a player's pick of the next map node (mgmp_mapvote). Not battle-gated: a click on the map is true whatever this peer is doing.
+            case MSG_NODEVOTE:
+                mapvote_on_message(m.from, m.nodevote);
                 break;
 
             case MSG_DEEP:
@@ -3640,6 +3767,18 @@ bool lockstep_roll_resolve(uint8_t site, double chance, double luck, bool local)
     return theirs;
 }
 
+// A BRAIN A PERSON DRIVES (0.1.72, room D547: the Engineer's mech). The cats' PlayerBrain, and the MountBrain of a vehicle a cat climbed into -- MechSuit2 hides the
+// caster off the board (-4000,-4000) and spawns a 'MechSuit' unit with a MountBrain that takes the player's input (it shares PlayerBrain's update, see mgmp_aim).
+// Matched by "PlayerBrain" alone, the mech was an AI summon: nobody's, both peers' players could drive it, the host's moves were never sent, and the client sat on its own
+// copy until its player ended the turn and the host's board was copied over.
+static bool lockstep_fill_choice_peer(void* brain, void* out, uint8_t cat, const void* actor);
+static void send_own_decision(uint8_t cat, const void* actor, const TurnAction& a);
+
+bool player_brain_class(const char* cls) {
+    return cls && (strstr(cls, tune::kReplayBrains) != nullptr || strstr(cls, "MountBrain") != nullptr);
+}
+void adopt_new_cats(bool even_if_halted);
+
 bool lockstep_fill_choice(void* brain, void* out) {
     if (!g.active || !brain || !out) return false;
     if (g.halted) {
@@ -3658,6 +3797,19 @@ bool lockstep_fill_choice(void* brain, void* out) {
         return false;
 
     uint8_t cat = cat_index_of(actor);
+    // A VEHICLE TAKES ITS FIRST TURN AT ONCE, inside the turn of the cat that summoned it -- before the turn boundary that adopts new units. A player brain with no index
+    // is adopted here, at its first decision: both peers reach this decision at the same point of the simulation, so the roster index agrees, and the owner is the cat
+    // whose action spawned it (g.actor: the last applied action -- the MechSuit2 cast), the same on both.
+    if (cat == kNoCat && g.snapped && !g.halted) {
+        char cls[96] = {};
+        if (rtti_class_name(brain, cls, sizeof(cls)) && player_brain_class(cls)) {
+            adopt_new_cats(false);
+            cat = cat_index_of(actor);
+            if (cat != kNoCat)
+                log_line("LOCKSTEP", "a %s unit took its first decision before the turn boundary: adopted now as roster index %u (%s)", cls, (unsigned)cat,
+                         !g.human_cat[cat] ? "no owner found -- both peers drive it" : g.local_cat[cat] ? "THIS peer drives it" : "the peer drives it, its moves come over the wire");
+        }
+    }
     // Recorded before the AI and barrier branches below, so it tracks every
     // turn rather than only the ones this function goes on to act upon. A
     // summon (kNoCat) is nobody's, same as an AI cat.
@@ -3747,6 +3899,20 @@ bool lockstep_fill_choice(void* brain, void* out) {
         if (!mem_read(out, &a, sizeof(a))) return false;
         if (a.type != TA_Ability && a.type != TA_EndTurn) return false;
 
+        // A DECISION THE GAME CANCELS STILL GOES OUT (0.1.82, rooms EQA4/LJP2: "his priest ends the turn and here it is still his turn ... then it freezes").
+        // An enemy Galien's Counterspell (passive slot 52, 0x1407FFD00) turns the next spell an enemy of it decides into nothing -- TurnAction type 0 -- spends
+        // one of its stacks and has the caster pay. The decision is sent as before: the peer applies it, its own Counterspell cancels it the same way, and both
+        // games spend the stack. What was wrong was AFTER it: the outstanding guard stayed up because the cancelled decision is never applied, so the next decision
+        // -- the one that really ran -- was never sent (lockstep_on_queued now drops the guard when the game queues a cancelled decision).
+        send_own_decision(cat, actor, a);
+        return false;    // the local brain's own decision proceeds unchanged
+    }
+    return lockstep_fill_choice_peer(brain, out, cat, actor);
+}
+
+// Builds the wire message for this peer's own cat `cat` from the decision its brain made, and sends it.
+static void send_own_decision(uint8_t cat, const void* actor, const TurnAction& a) {
+    {
         ActionMsg msg{};
         msg.battle_id = g.battles.current;
         msg.turn  = g.turn;
@@ -3764,6 +3930,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
         }
         msg.b30 = a.tail[0x30 - 0x28];
         msg.b31 = a.tail[0x31 - 0x28];
+        msg.chain = chain_now();   // where this turn's chain of actions stands on the owner's game (see the chain position above pend_peek)
 
         if (a.type == TA_Ability) {
             AbilitySlot slot = ability_slot_of(actor, a.ability);
@@ -3796,20 +3963,60 @@ bool lockstep_fill_choice(void* brain, void* out) {
                      msg.slot_kind, msg.slot_index, msg.tx, msg.ty,
                      msg.gon[0] ? msg.gon : "-");
         }
-        return false;    // the local brain's own decision proceeds unchanged
     }
+}
 
+void lockstep_on_queued(const void* ta) {
+    if (!g.active || !ta || !g.outstanding) return;
+    uint32_t type = 0;
+    if (!mem_read(ta, &type, sizeof(type)) || type != 0) return;     // 0: a decision a slot-52 passive cancelled (1 is the brain's "nothing yet" poll, every frame)
+    Guard guard;
+    g.outstanding = false;
+    log_line_lvl(LogLevel::Warn, "LOCKSTEP", "this player's decision was cancelled by the game before it ran (an enemy's Counterspell or the like) -- sent as it was "
+                 "(the other players' games cancel it the same way); the next decision goes out too");
+}
+
+static bool lockstep_fill_choice_peer(void* brain, void* out, uint8_t cat, const void* actor) {
+    (void)brain;
+    Guard guard;
     // --- the peer's cat: overwrite unconditionally --------------------------
     //
     // Unconditionally, because this is also what suppresses local input on a
     // cat we do not own: a stray click produces a decision that we replace
     // here, so it can never reach QueueDecision.
     ActionMsg msg{};
-    if (!pend_take(cat, msg)) {
+    if (!pend_peek(cat, msg)) {
         uint32_t none = TA_None;
         mem_write(out, &none, sizeof(none));
         return true;                       // nothing yet -- keep waiting, free
     }
+    // THE CHAIN POSITION: not before this peer's turn has run as many actions as the owner's had when it decided (a reaction chain still running
+    // here goes on until then, exactly as it did there).
+    if (msg.chain != 0xFFFFFFFFu && msg.turn == g.turn) {
+        const uint32_t here = chain_now();
+        if (here < msg.chain) {
+            const ULONGLONG now = GetTickCount64();
+            if (g_chain_hold_cat != cat || g_chain_hold_turn != g.turn || g_chain_hold_want != msg.chain) {
+                g_chain_hold_cat = cat; g_chain_hold_turn = g.turn; g_chain_hold_want = msg.chain; g_chain_hold_since = now;
+                log_line("LOCKSTEP", "cat %u's decision ('%s') waits: the owner decided after %u action(s) of this turn, this peer has run %u -- handed over when it is there",
+                         (unsigned)cat, msg.gon[0] ? msg.gon : (msg.type == TA_EndTurn ? "end turn" : "-"), msg.chain, here);
+            }
+            if (now - g_chain_hold_since < kChainHoldMaxMs) {
+                uint32_t none = TA_None;
+                mem_write(out, &none, sizeof(none));
+                return true;
+            }
+            log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! cat %u's decision waited %llu ms for action %u of this turn and this peer stopped at %u -- handed over now (the chains differ)",
+                         (unsigned)cat, (unsigned long long)(now - g_chain_hold_since), msg.chain, here);
+        } else if (here > msg.chain) {
+            log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! cat %u's decision arrived after this peer's turn had run %u action(s); the owner decided after %u -- the chain here has gone further",
+                         (unsigned)cat, here, msg.chain);
+        } else if (g_chain_hold_cat == cat && g_chain_hold_turn == g.turn) {
+            log_line("LOCKSTEP", "cat %u's decision handed over at action %u of this turn, where the owner made it", (unsigned)cat, here);
+        }
+        g_chain_hold_cat = 0xFF;
+    }
+    pend_take(cat, msg);
     apply_remote(msg, actor, out);
     return true;
 }
@@ -3869,6 +4076,10 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     if (msg.type == TA_Ability) {
         AbilitySlot slot{ msg.slot_kind, msg.slot_index };
         a.ability = ability_from_slot(actor, slot);
+        if (!a.ability && slot.kind == SLOT_UNKNOWN && msg.gon[0]) {
+            a.ability = ability_by_gon_name(actor, msg.gon);          // an ability in no slot (a disorder's): by its GON name, among all of the cat's abilities
+            log_line("LOCKSTEP", "cat %u's '%s' is in no slot -- %s by its name", (unsigned)cat, msg.gon, a.ability ? "found" : "NOT found");
+        }
         if (!a.ability) {
             char why[192];
             _snprintf_s(why, sizeof(why), _TRUNCATE,
@@ -3917,8 +4128,8 @@ constexpr uintptr_t kAE_Pending = 0xC8;    // byte: the passive has something to
 constexpr uintptr_t kAE_Char    = 0x38;    // Character*
 struct AeHeld { bool on = false; EquipMsg msg; };          // the owner's message, item state and all (proto 89)
 struct AeWait { bool on = false; uint64_t battle = 0; uint8_t cat = 0; void* passive = nullptr; void* chr = nullptr; };
-AeHeld g_ae_held[16];
-AeWait g_ae_wait[8];
+AeHeld g_ae_held[100];   // 16 / 8 until 2026-10-18: a full room's cats could fill them and the next message was dropped
+AeWait g_ae_wait[100];
 
 bool ae_slot_name(const uint8_t* cd, unsigned k, char (&out)[48], uint64_t& id) {
     out[0] = 0; id = 0;
@@ -4164,7 +4375,7 @@ void adopt_new_cats(bool even_if_halted = false) {
         char bcls[96] = "?";
         if (mem_read((const uint8_t*)ch + kChar_Brain, &brain, sizeof(brain)) && brain)
             rtti_class_name(brain, bcls, sizeof(bcls));
-        g.human_cat[i] = (strstr(bcls, tune::kReplayBrains) != nullptr);
+        g.human_cat[i] = player_brain_class(bcls);      // a mech's MountBrain too (0.1.72)
         if (g.human_cat[i]) ++g.summon_humans;   // NOT g.humans -- see the field note:
                                                  // CONTROL's count is the snapshot's
 
@@ -4267,7 +4478,7 @@ uint32_t build_live_roster(const void* list, const void* out[], bool human[], ui
         if (mem_read((const uint8_t*)chr + kChar_Brain, &brain, sizeof(brain)) && brain) {
             char cls[96] = {};
             if (rtti_class_name(brain, cls, sizeof(cls)))
-                is_human = strstr(cls, tune::kReplayBrains) != nullptr;
+                is_human = player_brain_class(cls);
         }
         out[n]   = chr;
         human[n] = is_human;
@@ -4356,7 +4567,7 @@ bool debug_is_enemy(const void* chr) {
     char cls[96] = {};
     return mem_read((const uint8_t*)chr + kChar_Brain, &brain, sizeof(brain)) && brain &&
            rtti_class_name(brain, cls, sizeof(cls)) &&
-           !strstr(cls, tune::kReplayBrains);
+           !player_brain_class(cls);           // a player's mech is no enemy (0.1.72: the fight-over count called it one)
 }
 
 bool debug_apply_hit(const void* chr, int32_t amount, int32_t tx, int32_t ty) {
@@ -4400,11 +4611,12 @@ void log_battle_stats(const char* why, bool halted) {
     uint32_t rlc = 0, rlm = 0, rll = 0, dpc = 0, dpm = 0;
     rngl_stats(rlc, rlm, rll); deep_stats(dpc, dpm);
     log_line("BATTLE", "SUMMARY-SYNC (%s) battle %016llx role=%s sim=%u proto=%u: turns %u in %llu s | hashes agreed %u, mismatched %u, debounced %u, %s | board: applied %u, with repairs %u, late %u, "
-                       "units rewritten %u moved %u replaced %u spawned %u trimmed %u, stuck %u, unmatched %u, the build itself differed in %u unit(s) | audit: %s%u cat(s) compared, %u differ | unlock queries: %u action(s) compared, %u differ | rng ledger: %u action(s) compared, %u differ (%u between actions) | derived values: %u turn(s) compared, %u differ",
+                       "units rewritten %u moved %u replaced %u spawned %u trimmed %u, stuck %u, unmatched %u, the build itself differed in %u unit(s) | audit: %s%u cat(s) compared, %u differ | unlock queries: %u action(s) compared, %u differ | rng ledger: %u action(s) compared, %u differ (%u between actions) | derived values: %u turn(s) compared, %u differ | board waits: %llu ms in all, longest %u ms, %u over 100 ms | board digests: %u agreed, %u full board(s) asked for%s, %u boundary(ies) the host was already past",
              why, (unsigned long long)g.battles.current, net_role() == NetRole::Host ? "host" : "client", (unsigned)tune::kSimRevision, (unsigned)kProtoVersion,
              (unsigned)g.turn, (unsigned long long)(g.bs.t0 ? (GetTickCount64() - g.bs.t0) / 1000 : 0), g.bs.agreed, g.bs.mismatched, g.debounced, halted || g.halted || g.halted_in_battle ? "HALTED" : "completed",
              g.bs.board_applied, g.bs.board_differed, g.bs.board_late, g.bs.rewritten, g.bs.moved, g.bs.replaced, g.bs.spawned, g.bs.trimmed, g.bs.stuck, g.bs.bad, g.bs.turn0_differed,
-             g.bs.audit_done ? "" : "(not completed) ", g.bs.audit_cats, g.bs.audit_differ, uqc, uqm, rlc, rlm, rll, dpc, dpm);
+             g.bs.audit_done ? "" : "(not completed) ", g.bs.audit_cats, g.bs.audit_differ, uqc, uqm, rlc, rlm, rll, dpc, dpm,
+             (unsigned long long)g.bs.board_wait_ms, g.bs.board_wait_max, g.bs.board_waits_slow, g.bs.board_sum_agreed, g.bs.board_asked, g.bs.board_stream_asked ? " (then streamed)" : "", g.bs.board_skipped);
 }
 } // namespace
 
@@ -5091,6 +5303,29 @@ bool board_move_unit(const void* chr, int32_t x, int32_t y) {
 }
 
 // HOST: capture and send. The chunks are kept for a peer that joins this battle later (lockstep_catchup).
+// ONE UNIT'S ROW OF THE BOARD, as the host sends it -- and, since proto 98, as a client reads its own board at the same boundary to take the digest the host's is compared with
+// (board_local_matches). One function for both, so the two sides can only ever describe a unit the same way.
+void board_fill(uint32_t i, bool have_memb, const bool* still_n, BoardUnit& u) {
+    u = BoardUnit{};
+    u.index = (uint8_t)i;
+    if ((have_memb && !still_n[i]) || !g.cats[i]) { u.flags = kBoardGone; return; }
+    CatState st{};
+    read_cat_state(g.cats[i], st, false);       // plain reads: the elements the call would add are not part of the board
+    u.ident = board_ident(g.cats[i]);
+    u.hp = st.hp; u.shield = st.shield; u.maxhp = st.maxhp;
+    u.flags = (uint8_t)((st.dead ? kBoardDead : 0) | (st.linked ? kBoardLinked : 0) | (g.human_cat[i] ? kBoardHuman : 0) | (unit_is_champion(g.cats[i]) ? kBoardChampion : 0)
+                           | (!st.dead && unit_is_removed(g.cats[i]) ? kBoardRemoved : 0));       // taken off the board, not dead: a client holding it alive takes it off too
+    if (g.human_cat[i]) {                          // proto 77: a player's stats ride along (the experiment, and the record)
+        for (int k = 0; k < 7; ++k) mem_read((const uint8_t*)g.cats[i] + 0x5BC + k * 4, &u.stat[k], 4);
+        mem_read((const uint8_t*)g.cats[i] + 0x5E8, &u.stat_bonus, 4);
+    }
+    if (!g.human_cat[i]) unit_definition_name(g.cats[i], u.def, kBoardDefLen);   // proto 75: what a peer holding another kind here replaces its unit with
+    u.tx = st.tx; u.ty = st.ty; u.fx = st.fx; u.fy = st.fy;
+    mem_read((const uint8_t*)g.cats[i] + kChar_Faction, &u.faction, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Carried, &u.carried, 4);   // proto 83
+    mem_read((const uint8_t*)g.cats[i] + kChar_Mana, &u.mana, 4);                                                                         // proto 84
+    mem_read((const uint8_t*)g.cats[i] + kChar_InitA, &u.key_a, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitB, &u.key_b, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Speed, &u.speed, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitBase, &u.init_base, 4);
+}
+
 void board_publish() {
     if (g.cat_count == 0 || g.battles.current == kNoBattle) return;
     uint32_t idx[kMaxCats];
@@ -5114,39 +5349,70 @@ void board_publish() {
         m.battle = g.battles.current; m.turn = g.turn; m.cats = g.cat_count; m.total = total; m.first = first;
         memcpy(m.rng, rng, sizeof(rng));
         m.count = (uint8_t)((total - first) < kBoardChunk ? (total - first) : kBoardChunk);
-        for (uint32_t k = 0; k < m.count; ++k) {
-            const uint32_t i = idx[first + k];
-            BoardUnit& u = m.units[k];
-            if (have_memb && !still_n[i]) {
-                u = BoardUnit{};
-                u.index = (uint8_t)i; u.flags = kBoardGone;
-                continue;
-            }
-            CatState st{};
-            read_cat_state(g.cats[i], st, false);       // plain reads: the elements the call would add are not part of the board
-            u.index = (uint8_t)i; u.ident = board_ident(g.cats[i]);
-            u.hp = st.hp; u.shield = st.shield; u.maxhp = st.maxhp;
-            u.flags = (uint8_t)((st.dead ? kBoardDead : 0) | (st.linked ? kBoardLinked : 0) | (g.human_cat[i] ? kBoardHuman : 0) | (unit_is_champion(g.cats[i]) ? kBoardChampion : 0)
-                                   | (!st.dead && unit_is_removed(g.cats[i]) ? kBoardRemoved : 0));       // taken off the board, not dead: a client holding it alive takes it off too
-            if (g.human_cat[i]) {                          // proto 77: a player's stats ride along (the experiment, and the record)
-                for (int k = 0; k < 7; ++k) mem_read((const uint8_t*)g.cats[i] + 0x5BC + k * 4, &u.stat[k], 4);
-                mem_read((const uint8_t*)g.cats[i] + 0x5E8, &u.stat_bonus, 4);
-            }
-            if (!g.human_cat[i]) unit_definition_name(g.cats[i], u.def, kBoardDefLen);   // proto 75: what a peer holding another kind here replaces its unit with
-            u.tx = st.tx; u.ty = st.ty; u.fx = st.fx; u.fy = st.fy;
-            mem_read((const uint8_t*)g.cats[i] + kChar_Faction, &u.faction, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Carried, &u.carried, 4);   // proto 83
-            mem_read((const uint8_t*)g.cats[i] + kChar_Mana, &u.mana, 4);                                                                         // proto 84
-            mem_read((const uint8_t*)g.cats[i] + kChar_InitA, &u.key_a, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitB, &u.key_b, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Speed, &u.speed, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitBase, &u.init_base, 4);
-        }
+        for (uint32_t k = 0; k < m.count; ++k) board_fill(idx[first + k], have_memb, still_n, m.units[k]);
         first += m.count;
         ++g.board_sent_n;
     } while (first < total && g.board_sent_n < sizeof(g.board_sent) / sizeof(g.board_sent[0]));
     g.board_sent_for = g.battles.current;
 
-    uint32_t sent = 0;
-    for (uint32_t c = 0; c < g.board_sent_n; ++c) if (net_send_board(g.board_sent[c])) ++sent;
-    if (g.turn == 0) log_line("BOARD", "-> the host's board for battle %016llx: %u unit(s) (players' cats carry only their turn-order keys) of %u in %u chunk(s) (%u sent), stream %016llx -- the clients take it over at their first turn boundary",
-             (unsigned long long)g.battles.current, total, g.cat_count, g.board_sent_n, sent, (unsigned long long)rng[0]);
+    // PROTO 98: turn 0 goes out whole (the build itself differs often enough); every later boundary as one digest per unit, the chunks kept by the transport for a client
+    // whose own board's digest differs (it asks; the answer comes from the receive thread) or that asked to be streamed.
+    if (g.turn == 0) {
+        const uint32_t sent = net_board_publish(g.board_sent, g.board_sent_n, nullptr);
+        log_line("BOARD", "-> the host's board for battle %016llx: %u unit(s) (players' cats carry only their turn-order keys) of %u in %u chunk(s) (to %u client(s)), stream %016llx -- the clients take it over at their first turn boundary",
+                 (unsigned long long)g.battles.current, total, g.cat_count, g.board_sent_n, sent, (unsigned long long)rng[0]);
+        return;
+    }
+    static BoardSumMsg sum;      // 1 KB: not on the game thread's stack
+    sum = BoardSumMsg{};
+    sum.battle = g.battles.current; sum.turn = g.turn; sum.cats = g.cat_count < kBoardMax ? g.cat_count : kBoardMax;
+    memcpy(sum.rng, rng, sizeof(rng));
+    for (uint32_t c = 0; c < g.board_sent_n; ++c)
+        for (uint32_t k = 0; k < g.board_sent[c].count; ++k) {
+            const BoardUnit& u = g.board_sent[c].units[k];
+            if (u.index < sum.cats) sum.digest[u.index] = board_unit_digest(u);
+        }
+    net_board_publish(g.board_sent, g.board_sent_n, &sum);
+}
+
+// CLIENT, proto 98: does this peer's own board at this boundary have the host's digest? `why` says what differs when it does not.
+bool board_local_matches(const BoardSumMsg& s, char* why, size_t cap) {
+    why[0] = 0;
+    size_t w = 0;
+    auto put = [&](const char* fmt, ...) {
+        if (w + 8 >= cap) return;
+        va_list ap; va_start(ap, fmt);
+        const int n = _vsnprintf_s(why + w, cap - w, _TRUNCATE, fmt, ap);
+        va_end(ap);
+        if (n > 0) w += (size_t)n;
+    };
+    bool same = true;
+    if (g.cat_count != s.cats) { same = false; put("roster %u here, %u on the host; ", g.cat_count, s.cats); }
+    uint64_t rng[4] = {};
+    if (const uint64_t* p = rng_global_stream()) mem_read(p, rng, sizeof(rng));
+    if (memcmp(rng, s.rng, sizeof(rng)) != 0) { same = false; put("stream %016llx here, %016llx on the host; ", (unsigned long long)rng[0], (unsigned long long)s.rng[0]); }
+    uint32_t live_n = 0, appeared_n = 0;
+    bool still_n[kMaxCats];
+    const bool have_memb = snapshot_membership(g.snapped_list, live_n, still_n, appeared_n);
+    const uint32_t n = g.cat_count < s.cats ? g.cat_count : s.cats;
+    uint32_t differ = 0;
+    for (uint32_t i = 0; i < n && i < kMaxCats; ++i) {
+        BoardUnit u;
+        board_fill(i, have_memb, still_n, u);
+        if (board_unit_digest(u) == s.digest[i]) continue;
+        same = false;
+        if (differ < 12) put("%sunit %u", differ ? ", " : "units differing: ", i);
+        ++differ;
+    }
+    if (differ > 12) put(" ... (%u in all)", differ);
+    return same;
+}
+
+// The time this client's game stood still at a boundary for the host's board (SUMMARY-SYNC).
+void board_wait_note(ULONGLONG ms) {
+    g.bs.board_wait_ms += ms;
+    if (ms > g.bs.board_wait_max) g.bs.board_wait_max = (uint32_t)ms;
+    if (ms > 100) ++g.bs.board_waits_slow;
 }
 
 // THE DERIVED VALUES OF EVERY UNIT, as one digest each (mgmp_diag: deep_publish), taken at the boundary before the board repairs anything: the stats, speed, turn-order keys and max hp the state hash does not cover.
@@ -5353,6 +5619,7 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                     // the base first: +0x954 is derived from it, and the game recomputes it from it whenever the unit's stats are touched
                     mem_write(c + kChar_InitBase, &u.init_base, 4); mem_write(c + kChar_InitA, &u.key_a, 4); mem_write(c + kChar_InitB, &u.key_b, 4);
                     if (g.cat_key_ok[i]) g.cat_key[i] = (uint32_t)u.key_b;      // the entry's identity is its creation key: it follows the host's value
+                    turn_queue_reposition(c, i);                                    // and its place in this round's queue follows the keys (it joined the round with this peer's own)
                 } else if (sp != u.speed) say("unit %u speed here %d, the host's %d (keys equal)", i, sp, u.speed);
             }
             if (host_human) {
@@ -5458,7 +5725,12 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                 // host's faction/carried values are still synchronized below, so the
                 // summon remains an ally for this fight without being saved as one.
                 const bool temporary = (i < kMaxCats && g.summon[i]) || host_human || g.human_cat[i];
-                if (u.carried >= 0 && car < 0 && !temporary) {
+                char cdef[kBoardDefLen] = {};
+                if (u.carried >= 0 && car < 0 && !temporary && unit_definition_name(c, cdef, sizeof(cdef)) && carried_slot_names(u.carried, cdef)) {
+                    mem_write(c + kChar_Carried, &u.carried, 4);                    // already in this peer's queue at that slot: linked, not captured a second time
+                    car = u.carried;
+                    log_line_lvl(LogLevel::Warn, "BOARD", "!! unit %u is the host's carried follower %d ('%s'), which this peer's queue already holds at that slot -- linked to it, not captured again", i, u.carried, cdef);
+                } else if (u.carried >= 0 && car < 0 && !temporary) {
                     const uintptr_t cap = addr_of_call(C_CaptureFamiliar);
                     const bool ok = cap && board_call_capture(cap, c);
                     mem_read(c + kChar_Carried, &car, 4);
@@ -5628,21 +5900,73 @@ void board_sync() {
     // EVERY TURN BOUNDARY (proto 71), not only the first: the host publishes its board here, and a client that finds its own different (a unit on another tile, other hit points, a
     // unit the host already lost) puts it right BEFORE the turn is hashed -- so what the hash compares is the repaired board, and a drift costs one line in the log instead of a halt.
     // Applying is a no-op where the boards agree. A later turn waits only briefly: the host's board is normally already here, and a turn played without it is repaired at the next one.
+    //
+    // PROTO 98: from turn 1 on the host sends a DIGEST of its board (one value per unit and its stream). This peer takes the same digest of its own board; where they agree
+    // (~99% of the boundaries) nothing is applied and nothing more travels; where they differ it asks for that boundary's full board and applies it as before. A full board that is
+    // already here (streamed, or a re-send) is taken directly. And a host already PAST this boundary -- anything of a later one has arrived -- is not waited for: what this peer
+    // wants is not coming (0.1.50: a client more than four boundaries behind waited out 3 s at every boundary for boards that had been overwritten).
     const bool first = g.turn == 0;
     const ULONGLONG limit = first ? kBoardWaitMs : (ULONGLONG)tune::kBoardTurnWaitMs;
-    static BoardAssembled box;     // 12 KB: not on the game thread's stack
+    static BoardAssembled box;     // 30 KB: not on the game thread's stack
+    static BoardSumMsg sum;
+    const uint64_t battle = g.battles.current;
     const ULONGLONG t0 = GetTickCount64();
-    while (!net_host_board(g.battles.current, g.turn, box) && GetTickCount64() - t0 < limit) Sleep(5);
-    if (!net_host_board(g.battles.current, g.turn, box)) {
+    bool full = false, have_sum = false, past = false;
+    for (;;) {
+        if (net_host_board(battle, g.turn, box)) { full = true; break; }
+        if (!first) {
+            if (net_host_boardsum(battle, g.turn, sum)) { have_sum = true; break; }
+            if (net_board_seen_past(battle, g.turn)) { past = true; break; }
+        }
+        if (GetTickCount64() - t0 >= limit) break;
+        Sleep(2);
+    }
+    if (full) {
+        board_wait_note(GetTickCount64() - t0);
+        if (first) log_line("BOARD", "the host's board arrived (waited %llu ms)", (unsigned long long)(GetTickCount64() - t0));
+        board_apply(box, !first);
+        return;
+    }
+    if (past) {
+        board_wait_note(GetTickCount64() - t0);
+        ++g.bs.board_skipped;
+        log_line_lvl(LogLevel::Warn, "BOARD", "!! the host is already past turn %u of battle %016llx and neither its board nor its digest of that boundary is here -- not waited for, this peer plays the board it has",
+                     (unsigned)g.turn, (unsigned long long)battle);
+        return;
+    }
+    if (!have_sum) {
+        board_wait_note(GetTickCount64() - t0);
         ++g.bs.board_late;
         log_line_lvl(LogLevel::Warn, "BOARD", "!! (%llu ms into the battle) the host's board for battle", (unsigned long long)(g.bs.t0 ? GetTickCount64() - g.bs.t0 : 0));
         log_line_lvl(LogLevel::Warn, "BOARD", "!! the host's board for battle %016llx, turn %u did not arrive within %llu ms -- this peer plays the board it has",
-                     (unsigned long long)g.battles.current, (unsigned)g.turn, (unsigned long long)limit);
+                     (unsigned long long)battle, (unsigned)g.turn, (unsigned long long)limit);
         if (first) room_sync_trouble("the host's battle board");
         return;
     }
-    if (first) log_line("BOARD", "the host's board arrived (waited %llu ms)", (unsigned long long)(GetTickCount64() - t0));
-    board_apply(box, !first);
+    char why[400];
+    if (board_local_matches(sum, why, sizeof(why))) {
+        board_wait_note(GetTickCount64() - t0);
+        ++g.bs.board_sum_agreed;
+        g.bs.board_req_run = 0;
+        return;
+    }
+    // The boards differ: this boundary's full board, from the host's kept chunks.
+    ++g.bs.board_req_run; ++g.bs.board_asked;
+    BoardReqMsg q{};
+    q.battle = battle; q.turn = g.turn;
+    if (g.bs.board_req_run >= tune::kBoardStreamAfter && !g.bs.board_stream_asked) { q.flags = kBoardReqStream; g.bs.board_stream_asked = true; }
+    net_send_boardreq(q);
+    log_line_lvl(LogLevel::Warn, "BOARD", "!! the host's board digest of turn %u differs from this board (%s) -- its full board is asked for%s", (unsigned)g.turn, why,
+                 q.flags ? "; this is the third boundary in a row, so the host is asked to send the whole board at every boundary of this battle" : "");
+    const ULONGLONG t1 = GetTickCount64();
+    while (!net_host_board(battle, g.turn, box) && GetTickCount64() - t1 < tune::kBoardTurnWaitMs) Sleep(2);
+    board_wait_note(GetTickCount64() - t0);
+    if (!net_host_board(battle, g.turn, box)) {
+        ++g.bs.board_late;
+        log_line_lvl(LogLevel::Warn, "BOARD", "!! the host's full board of turn %u did not come within %u ms of asking -- this peer plays the board it has", (unsigned)g.turn, (unsigned)tune::kBoardTurnWaitMs);
+        return;
+    }
+    board_apply(box, true);
 }
 
 } // namespace
@@ -5858,7 +6182,10 @@ uint64_t reseed_mix(uint64_t& x) {
 }
 uint64_t g_rs_battle = 0;
 uint32_t g_rs_turn = ~0u, g_rs_idx = ~0u, g_rs_repeat = 0, g_rs_logged = 0, g_rs_action = 0, g_rs_action_logged = 0;
+uint64_t g_rs_key = 0;          // the first word of the last reseed (actor-turn or action): the same number on every peer at the same point
 } // namespace
+
+uint64_t lockstep_reseed_key() { return g_rs_key; }
 
 void lockstep_reseed(const void* actor, int arg) {
     if (!tune::kReseedPerTurn || !g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
@@ -5878,6 +6205,7 @@ void lockstep_reseed(const void* actor, int arg) {
     uint64_t before = 0;
     mem_read(s, &before, sizeof(before));
     if (!mem_write(s, st, sizeof(st))) return;
+    g_rs_key = st[0];
     unlockq_flush(g.turn, g_rs_action);                       // what the last action's unlock checks and property reads were (a line only when there were some)
     rngl_flush(g.turn, g_rs_action);                          // ... and the draws it made on the shared stream, by call site (compared with the other peer's)
     g_rs_action = 0;                                          // a new actor-turn: its actions are numbered from 0
@@ -5911,10 +6239,29 @@ void lockstep_reseed_action(const void* actor) {
     uint64_t before = 0;
     mem_read(s, &before, sizeof(before));
     if (!mem_write(s, st, sizeof(st))) return;
+    g_rs_key = st[0];
     if (g_rs_action_logged < 400) {
         ++g_rs_action_logged;
         log_line("RESEED", "turn %u action %u of actor %u: the stream was %016llx, now %016llx", (unsigned)g.turn, (unsigned)n, idx == 0xFFFFu ? 0xFFFFu : (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
     }
+}
+
+bool lockstep_stream_for_pick(uint64_t salt, uint64_t* seed_out) {
+    if (!g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return false;
+    if (!lockstep_fight_up()) return false;          // g.snapped outlives the fight (it stays on the map): a shop's or a reward's pick is the player's own
+    uint64_t* s = rng_global_stream();
+    if (!s) return false;
+    static uint64_t battle = 0;
+    static uint32_t turn = ~0u, action = ~0u, actor = ~0u, nth = 0;
+    if (battle != g.battles.current || turn != g.turn || action != g_rs_action || actor != g_rs_idx) { battle = g.battles.current; turn = g.turn; action = g_rs_action; actor = g_rs_idx; nth = 0; }
+    ++nth;
+    uint64_t x = g.battles.current ^ 0x5049434B53414C54ull ^ (salt * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)g.turn * 0xC2B2AE3D27D4EB4Full) ^
+                 ((uint64_t)g_rs_action * 0x165667B19E3779F9ull) ^ ((uint64_t)nth * 0xD6E8FEB86659FD93ull) ^ ((uint64_t)g_rs_idx * 0x27D4EB2F165667C5ull) ^ ((uint64_t)g_rs_repeat * 0x94D049BB133111EBull);
+    uint64_t st[4];
+    for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
+    if (!mem_write(s, st, sizeof(st))) return false;
+    if (seed_out) *seed_out = st[0];
+    return true;
 }
 
 // THE DECISION-TIME WINDOW (RNG research 2026-10-11, R373/R386/R388 -- P0). TurnControl, once UpdateDecision returns a decision, first
@@ -6004,6 +6351,7 @@ void lockstep_action_trace_flush(const char* why) {
 
 void lockstep_action_trace(const void* actor, const void* turn_action) {
     if (!g.active || !g.snapped || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2 || !turn_action) return;
+    chain_note_doaction();
     if (g.battles.current != g_tr_battle) { g_tr_battle = g.battles.current; g_tr_have = false; g_tr_logged = 0; }
     lockstep_action_trace_flush("effects of the previous action");
     TurnAction a{};

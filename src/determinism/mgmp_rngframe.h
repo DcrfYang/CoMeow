@@ -21,5 +21,7 @@ namespace mgmp {
 
 // After MinHook is initialised (hooks_install): verifies each table entry's first bytes and installs the wrappers. Returns how many went in.
 int rngframe_install(uintptr_t base);
+// The `this` of the wrapped passive handler running right now (nullptr outside one; the innermost while they nest).
+const void* rngframe_current_passive();
 
 } // namespace mgmp

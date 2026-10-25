@@ -1,4 +1,6 @@
 #include "mgmp_setup.h"
+#include "mgmp_areagate.h"
+#include "mgmp_indepevt.h"
 #include "mgmp_catsync.h"
 #include "mgmp_checkpoint.h"
 #include "mgmp_config.h"
@@ -17,7 +19,7 @@
 namespace mgmp {
 namespace {
 // A gear-screen lock taken over for a player without chapter 2 (setup_on_equip_done): the game's closure waits here until the room lets it go.
-struct Hold{bool on=false;void* director=nullptr;void(*go)(void*)=nullptr;};
+struct Hold{bool on=false;bool house=false;bool unlocks_sent=false;void* director=nullptr;void(*go)(void*)=nullptr;};
 struct State {
     Hold hold;
     bool on=false,is_client=false,client_lock=false,chapter_seen=false,resume=false,resume_error=false;
@@ -210,13 +212,25 @@ bool setup_on_equip_done(void* director,void(*go)(void*)){
     if(g.is_client)room_say_no_chapter_ready();else room_say_no_chapter_wait();
     return true;
 }
+bool setup_on_house_gear_done(void* director,void(*go)(void*)){
+    refresh();
+    if(!g.on||g.resume||g.committed||g.hold.on||!director||!go)return false;
+    g.hold.on=true;g.hold.house=true;g.hold.unlocks_sent=false;g.hold.director=director;g.hold.go=go;
+    g.have_difficulty[0]=true;g.difficulty[0]=0;
+    log_line("SETUP","house boss co-op: the gear screen's done is the %s -- the fight starts on every screen together",g.is_client?"READY":"start command");
+    setup_on_chapter_page();
+    return true;
+}
+bool setup_house_pending(){return g.hold.on&&g.hold.house;}
+// After a house fight's `go`: what a chapter commit leaves for the map that is never generated.
+static void house_go_done(){unlocks_override_clear();map_seed_armed=false;}
 void setup_tick(){
     if(!g.hold.on)return;
     refresh();
-    void* director=g.hold.director;auto go=g.hold.go;
+    void* director=g.hold.director;auto go=g.hold.go;const bool house=g.hold.house;
     if(!g.on||g.resume||!net_active()){   // the room is gone: the player pressed lock, let the game do what it would have done
-        log_line("SETUP","the session ended while the chapter-1 start was held -- starting it on its own");
-        g.hold=Hold{};go(director);return;}
+        log_line("SETUP","the session ended while the %s start was held -- starting it on its own",house?"house boss":"chapter-1");
+        g.hold=Hold{};go(director);if(house)house_go_done();return;}
     setup_on_chapter_page();   // progress(): the export / the shared roster, retried on its own cadence as the chapter page's buttons do
     if(g.is_client){
         if(!g.have_command||g.committed||!g.have_seed||!freeze()||!rng_global_stream())return;
@@ -227,10 +241,14 @@ void setup_tick(){
 #endif
         unlocks_override_set(g.command.mapflags);
         arm_map_seed(g.seed.rng);
-        log_line("SETUP","the host's command arrived -- starting chapter 1");
-        g.hold=Hold{};go(director);return;
+        log_line("SETUP","the host's command arrived -- starting %s",house?"the house boss fight":"chapter 1");
+        g.hold=Hold{};go(director);if(house)house_go_done();return;
     }
-    if(setup_on_select_act(1)){g.hold=Hold{};go(director);}   // the host: the chapter-1 choice, once every player is READY
+    if(house){   // the host of a house fight: quietly until every player is READY (the co-op panel says what is awaited), then the unlock answers before the command
+        if(!all_ready())return;
+        if(!g.hold.unlocks_sent){unlocks_publish();g.hold.unlocks_sent=true;}
+    }
+    if(setup_on_select_act(1)){g.hold=Hold{};go(director);if(house)house_go_done();}   // the host: the chapter-1 choice, once every player is READY
 }
 bool setup_no_chapter_pending(){return g.hold.on;}
 void setup_on_chapter_control(void* screen,int act,int32_t* difficulty,void(*select_act)(void*,int)){
@@ -248,6 +266,12 @@ void setup_on_chapter_control(void* screen,int act,int32_t* difficulty,void(*sel
     select_act(screen,act);
 }
 void setup_on_chapter_message(const ChapterMsg& m,uint8_t from){
+    // proto 99: a client's own map flags, whenever they change -- for the area gate, outside any preparation round
+    if(m.kind==kChapterFlags){areagate_on_flags(from,m.mapflags,"its report");return;}
+    // proto 102: a client is done with its own random event (mgmp_indepevt)
+    if(m.kind==kChapterEventDone){indepevt_on_done(from,((uint64_t)m.mapflags<<32)|m.generation);return;}
+    if(m.kind==kChapterEventName){indepevt_on_host_event(from,m.generation,m.mapflags);return;}
+    if(m.kind==kChapterReady)areagate_on_flags(from,m.mapflags,"its READY");
     refresh();if(!g.on||!valid_chapter(m)||!freeze()||m.generation!=g.round)return;
     const int p=pos(from);
     if(!g.is_client&&m.kind==kChapterReady&&g.reply_sent&&p>0){g.ready[p]=true;g.mapflags[p]=m.mapflags;return;}

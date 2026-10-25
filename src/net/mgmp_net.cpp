@@ -2,6 +2,7 @@
 
 #include "mgmp_net.h"
 #include "mgmp_log.h"
+#include "mgmp_perf.h"
 #include "mgmp_steambridge.h"
 
 #include <winsock2.h>
@@ -38,7 +39,20 @@ struct Link {
     HANDLE        thread = nullptr;
     uint8_t       id     = kNoPeer;
     volatile LONG live   = 0;
+
+    // THE OUTGOING QUEUE (0.1.50). A send used to be a blocking send() on the CALLER's thread under one lock shared by every link: the game thread stalled whenever a
+    // socket's buffer was full (a slow carrier, the 32 KB/s server relay), and the host's relay of one client's frames held up its sends to everyone else. Now a frame is
+    // appended here (whole, so frames never interleave) and this link's writer thread puts it on the wire; only a queue past kSendQueueCap makes the caller wait.
+    CRITICAL_SECTION qcs;
+    bool          qcs_ready = false;
+    HANDLE        qev     = nullptr;   // auto-reset: something was queued, or the writer is told to stop
+    HANDLE        writer  = nullptr;
+    uint8_t*      qbuf    = nullptr;
+    size_t        qcap = 0, qhead = 0, qlen = 0;
+    volatile LONG wstop   = 0;
+    volatile LONG wdead   = 0;         // a send failed: nothing more is written to this link
 };
+constexpr size_t kSendQueueCap = 16u << 20;   // bytes waiting on one link before a sender is made to wait for the writer
 
 struct State {
     NetRole  role  = NetRole::None;
@@ -92,15 +106,45 @@ bool wsa_init() {
     return true;
 }
 
-struct LevelBox { uint64_t node = 0; char name[64] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {}; } g_level_box;
-constexpr uint32_t kBoardRing = 4;
-BoardAssembled g_board_ring[kBoardRing];   // the last few turns' boards, guarded by g.cs like the level box
+struct LevelBox { uint64_t node = 0; char name[64] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint32_t pending_total[kPendingQueues] = {}; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {}; } g_level_box;
+// The last few FULL boards (since proto 98 a later turn's board only comes when asked for, or streamed). Guarded by g.cs like the level box.
+// 4 until 0.1.50, when a client that fell more than four boundaries behind the host found its turn's board already overwritten and waited out the whole 3 s for it, at every
+// boundary, until the host stopped for a player (2026-10-20: nine boundaries in a row).
+constexpr uint32_t kBoardRing = 8;
+BoardAssembled g_board_ring[kBoardRing];
 uint32_t g_board_next = 0;
+// CLIENT: the host's board digests (proto 98), small enough to keep a long run of them; and the latest boundary anything of the board came for (net_board_seen_past).
+constexpr uint32_t kSumRing = 128;
+BoardSumMsg g_sum_ring[kSumRing];
+uint32_t g_sum_next = 0;
+uint64_t g_board_latest_battle = 0;
+uint32_t g_board_latest_turn = 0;
+void board_note_latest(uint64_t battle, uint32_t turn) {
+    if (g_board_latest_battle != battle) { g_board_latest_battle = battle; g_board_latest_turn = turn; }
+    else if (turn > g_board_latest_turn) g_board_latest_turn = turn;
+}
+// HOST: the encoded chunks of the last kBoardKeep boundaries (each a run of [u32 length][payload]), for a client that asks (MSG_BOARDREQ, answered on its receive thread);
+// and which clients asked to be sent every boundary's chunks for the rest of a battle (kBoardReqStream). Guarded by g.cs.
+constexpr uint32_t kBoardKeep = 64;
+struct KeptBoard { uint64_t battle = 0; uint32_t turn = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+KeptBoard g_kept[kBoardKeep];
+uint32_t g_kept_next = 0;
+uint64_t g_board_stream[kMaxPeers] = {};
 constexpr uint32_t kRollRing = 64;
 RollMsg g_roll_ring[kRollRing];            // the host's last rolls, guarded by g.cs
 uint32_t g_roll_next = 0;
 
 void queue_push(const NetMsg& m) {
+    // A PING never reaches the game thread's queue: the receive thread takes its statistics and answers a request AT ONCE, so the round trip is the link's alone (mgmp_perf).
+    if (m.type == MSG_PING) {
+        perf_on_ping(m.from, m.ping);
+        if (m.ping.kind == 0) {
+            uint8_t p[96];
+            const uint32_t n = perf_make_reply(p, sizeof(p), m.ping);
+            if (n) net_send_peer(m.from, p, n);
+        }
+        return;
+    }
     EnterCriticalSection(&g.cs);
     if (m.type == MSG_UNLOCKS && m.unlocks.n_level_name) {          // the level of a battle (picked by the level picker)
         g_level_box.node = m.unlocks.level_node;
@@ -110,6 +154,7 @@ void queue_push(const NetMsg& m) {
         g_level_box.bnode = m.unlocks.level_node;
         memcpy(g_level_box.n_pending, m.unlocks.n_pending, sizeof(g_level_box.n_pending));
         memcpy(g_level_box.pending, m.unlocks.pending, sizeof(g_level_box.pending));
+        memcpy(g_level_box.pending_total, m.unlocks.pending_total, sizeof(g_level_box.pending_total));
         g_level_box.n_weather = m.unlocks.n_weather;
         memcpy(g_level_box.weather, m.unlocks.weather, sizeof(g_level_box.weather));
     }
@@ -132,6 +177,22 @@ void queue_push(const NetMsg& m) {
             box->unit[at] = b.units[i];
         }
         box->complete = box->got >= box->total;
+        board_note_latest(b.battle, b.turn);
+    }
+    if (m.type == MSG_BOARDSUM) {
+        const BoardSumMsg& s = m.boardsum;
+        BoardSumMsg* slot = nullptr;
+        for (uint32_t k = 0; k < kSumRing && !slot; ++k) if (g_sum_ring[k].battle == s.battle && g_sum_ring[k].turn == s.turn) slot = &g_sum_ring[k];
+        if (!slot) slot = &g_sum_ring[g_sum_next++ % kSumRing];
+        *slot = s;
+        board_note_latest(s.battle, s.turn);
+    }
+    // The board's frames live in their mailboxes only (the game thread waits on those inside the turn boundary): queuing them as well cost five slots of the 256 per boundary
+    // and nothing ever read them.
+    if (m.type == MSG_BOARD || m.type == MSG_BOARDSUM) {
+        ++g.stats.received;
+        LeaveCriticalSection(&g.cs);
+        return;
     }
     if (g.count >= kQueueCap) {
         // Drop the newest rather than the oldest. Losing the oldest would
@@ -224,6 +285,8 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_DRAW:      return dec_draw(r, m.draw);
         case MSG_SETTING:   return dec_setting(r, m.setting);
         case MSG_EQUIP:     return dec_equip(r, m.equip);
+        case MSG_TREASURE:  return dec_treasure(r, m.treasure);
+        case MSG_HOUSECOOP: return dec_housecoop(r, m.housecoop);
         case MSG_DEEP:      return dec_deep(r, m.deep);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
@@ -235,11 +298,15 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_MAPSEEDS:  return dec_mapseeds(r, m.mapseeds);
         case MSG_UNLOCKS:   return dec_unlocks(r, m.unlocks);
         case MSG_BOARD:     return dec_board(r, m.board);
+        case MSG_BOARDSUM:  return dec_boardsum(r, m.boardsum);
+        case MSG_BOARDREQ:  return dec_boardreq(r, m.boardreq);
+        case MSG_SOULCAT:   return dec_soulcat(r, m.soulcat);
+        case MSG_NODEVOTE:  return dec_nodevote(r, m.nodevote);
         case MSG_ROLL:      return dec_roll(r, m.roll);
         case MSG_PEERS:   return dec_peers(r, m.peers);
         case MSG_HALT:    return dec_halt(r, m.halt);
         case MSG_REFUSE:  r.str(m.refuse, sizeof(m.refuse)); return r.ok;
-        case MSG_PING:    return true;
+        case MSG_PING:    return dec_ping(r, m.ping);
         default:          return false;
     }
 }
@@ -266,6 +333,136 @@ bool send_framed(SOCKET s, uint8_t from, const uint8_t* payload, uint32_t len) {
     if (ok) { ++g.stats.sent; g.stats.bytes_sent += n + 4; }
     LeaveCriticalSection(&g.send_cs);
     return ok;
+}
+
+// Queue one framed message on a link (see Link: the outgoing queue). Any thread. False when the link is down or its writer has failed.
+bool link_send(Link& l, uint8_t from, const uint8_t* payload, uint32_t len) {
+    if (len == 0 || !l.qcs_ready) return false;
+    if (!InterlockedCompareExchange(&l.live, 0, 0) || InterlockedCompareExchange(&l.wdead, 0, 0)) return false;
+    const uint32_t n = len + kEnvelopeBytes;
+    const size_t total = 4 + (size_t)n;
+    for (;;) {
+        EnterCriticalSection(&l.qcs);
+        if (l.qlen == 0 || l.qlen + total <= kSendQueueCap) break;
+        LeaveCriticalSection(&l.qcs);
+        // backpressure: only a link this far behind makes its sender wait, as every send used to
+        if (!InterlockedCompareExchange(&l.live, 0, 0) || InterlockedCompareExchange(&l.wdead, 0, 0)) return false;
+        Sleep(1);
+    }
+    if (l.qhead + l.qlen + total > l.qcap) {
+        if (l.qhead) { memmove(l.qbuf, l.qbuf + l.qhead, l.qlen); l.qhead = 0; }
+        if (l.qlen + total > l.qcap) {
+            size_t cap = l.qcap ? l.qcap : 64 * 1024;
+            while (cap < l.qlen + total) cap *= 2;
+            uint8_t* grown = (uint8_t*)realloc(l.qbuf, cap);
+            if (!grown) { LeaveCriticalSection(&l.qcs); log_line("NET", "!! out of memory queuing %u bytes for peer %u", n, (unsigned)l.id); return false; }
+            l.qbuf = grown; l.qcap = cap;
+        }
+    }
+    uint8_t* at = l.qbuf + l.qhead + l.qlen;
+    memcpy(at, &n, 4); memcpy(at + 4, &from, kEnvelopeBytes); memcpy(at + 4 + kEnvelopeBytes, payload, len);
+    l.qlen += total;
+    LeaveCriticalSection(&l.qcs);
+    SetEvent(l.qev);
+    EnterCriticalSection(&g.send_cs);
+    ++g.stats.sent; g.stats.bytes_sent += total;
+    LeaveCriticalSection(&g.send_cs);
+    return true;
+}
+
+// The writer of one link: takes what is queued, a block at a time, and puts it on the wire. Stops when told to (after draining), or at the first failed send -- then it shuts
+// the socket down so the receive thread sees the link go, as it would have from the other side.
+DWORD WINAPI link_writer(LPVOID param) {
+    Link& l = *(Link*)param;
+    static constexpr size_t kBlock = 64 * 1024;
+    uint8_t* block = (uint8_t*)malloc(kBlock);
+    if (!block) { InterlockedExchange(&l.wdead, 1); return 0; }
+    for (;;) {
+        EnterCriticalSection(&l.qcs);
+        const size_t take = l.qlen < kBlock ? l.qlen : kBlock;
+        if (take) { memcpy(block, l.qbuf + l.qhead, take); l.qhead += take; l.qlen -= take; if (!l.qlen) l.qhead = 0; }
+        LeaveCriticalSection(&l.qcs);
+        if (!take) {
+            if (InterlockedCompareExchange(&l.wstop, 0, 0)) break;
+            WaitForSingleObject(l.qev, 200);
+            continue;
+        }
+        size_t off = 0;
+        while (off < take) {
+            const int r = send(l.sock, (const char*)block + off, (int)(take - off), 0);
+            if (r <= 0) {
+                const int e = WSAGetLastError();
+                InterlockedExchange(&l.wdead, 1);
+                if (!InterlockedCompareExchange(&g.stop, 0, 0) && !InterlockedCompareExchange(&l.wstop, 0, 0))
+                    log_line("NET", "!! send to peer %u failed (WSA %d) -- nothing more is written to it", (unsigned)l.id, e);
+                shutdown(l.sock, SD_BOTH);
+                EnterCriticalSection(&l.qcs); l.qhead = l.qlen = 0; LeaveCriticalSection(&l.qcs);
+                free(block);
+                return 0;
+            }
+            off += (size_t)r;
+        }
+    }
+    free(block);
+    return 0;
+}
+
+// Wait (bounded) until every live link's queue is on the wire: before a deliberate close, so the last frames (HOSTLEFT, a refusal) are not lost with the socket.
+void links_drain(DWORD max_ms) {
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;) {
+        bool busy = false;
+        for (int i = 0; i < kMaxPeers; ++i) {
+            Link& l = g.links[i];
+            if (!l.qcs_ready || !InterlockedCompareExchange(&l.live, 0, 0) || InterlockedCompareExchange(&l.wdead, 0, 0)) continue;
+            EnterCriticalSection(&l.qcs); if (l.qlen) busy = true; LeaveCriticalSection(&l.qcs);
+        }
+        if (!busy || GetTickCount64() - t0 >= max_ms) return;
+        Sleep(5);
+    }
+}
+
+// HOST, receive thread of the asking client (proto 98): the kept chunks of that boundary, to that client only; with kBoardReqStream it is sent every later boundary's chunks
+// of this battle as well (net_board_publish).
+void host_answer_boardreq(Link& l, const BoardReqMsg& q) {
+    if (!g.cs_ready || l.id >= kMaxPeers) return;
+    uint8_t* copy = nullptr; uint32_t len = 0;
+    EnterCriticalSection(&g.cs);
+    if (q.flags & kBoardReqStream) g_board_stream[l.id] = q.battle;
+    for (uint32_t k = 0; k < kBoardKeep; ++k) {
+        const KeptBoard& kb = g_kept[k];
+        if (kb.data && kb.battle == q.battle && kb.turn == q.turn) {
+            copy = (uint8_t*)malloc(kb.len);
+            if (copy) { memcpy(copy, kb.data, kb.len); len = kb.len; }
+            break;
+        }
+    }
+    LeaveCriticalSection(&g.cs);
+    if (!copy) {
+        log_line("BOARD", "!! peer %u asked for the board of battle %016llx turn %u, which is no longer kept here%s", (unsigned)l.id, (unsigned long long)q.battle, (unsigned)q.turn,
+                 (q.flags & kBoardReqStream) ? " (it is streamed every later boundary's board from now on)" : "");
+        return;
+    }
+    uint32_t chunks = 0;
+    for (uint32_t at = 0; at + 4 <= len; ) {
+        uint32_t n = 0; memcpy(&n, copy + at, 4); at += 4;
+        if (!n || at + n > len) break;
+        if (link_send(l, kHostPeer, copy + at, n)) ++chunks;
+        at += n;
+    }
+    free(copy);
+    log_line("BOARD", "-> peer %u asked for the board of turn %u (its digest differed): %u chunk(s) sent%s", (unsigned)l.id, (unsigned)q.turn, chunks,
+             (q.flags & kBoardReqStream) ? " -- and it asked to be sent the whole board at every boundary of this battle from now on" : "");
+}
+
+// Stop a link's writer (it drains first) and wait for it. Called before the socket is closed.
+void link_writer_stop(Link& l, DWORD max_ms) {
+    if (!l.writer) return;
+    InterlockedExchange(&l.wstop, 1);
+    if (l.qev) SetEvent(l.qev);
+    if (WaitForSingleObject(l.writer, max_ms) == WAIT_TIMEOUT) log_line("NET", "!! the writer for peer %u did not stop in %lu ms", (unsigned)l.id, (unsigned long)max_ms);
+    CloseHandle(l.writer);
+    l.writer = nullptr;
 }
 
 // Which messages the host passes on to the other clients.
@@ -300,6 +497,10 @@ bool relayed(uint8_t type) {
         // EQUIP: authored by the cat's OWNER, which may be a client -- in a room of three or four the other clients equip the same item or their copy
         // of the cat waits for it forever (2026-10-12 review: it reached the host only, and the next turn hash halted)
         case MSG_EQUIP:
+        // SOULCAT (proto 100): authored by the Soul Jar's owner, which may be a client -- every other peer summons from it
+        case MSG_SOULCAT:
+        // NODEVOTE (proto 106): every player's pick of the next map node, for every other screen
+        case MSG_NODEVOTE:
         // NODEHASH is symmetric -- every peer authors its own -- so with more
         // than two players a client's has to reach the other clients, exactly
         // like the per-turn HASH above it.
@@ -327,7 +528,7 @@ void host_relay(uint8_t from, const uint8_t* payload, uint32_t len) {
         Link& l = g.links[i];
         if (!InterlockedCompareExchange(&l.live, 0, 0)) continue;
         if (l.id == from) continue;              // not back to its author
-        send_framed(l.sock, from, payload, len);
+        link_send(l, from, payload, len);
     }
 }
 
@@ -363,7 +564,7 @@ void host_publish_roster() {
         mine.you = l.id;
         uint8_t p[64];
         uint32_t n = enc_peers(p, sizeof(p), mine);
-        if (n) send_framed(l.sock, kHostPeer, p, n);
+        if (n) link_send(l, kHostPeer, p, n);
     }
 
     NetMsg self{};
@@ -412,18 +613,34 @@ void recv_loop(Link& link) {
 
         NetMsg m{};
         if (!decode_into(payload, plen, m)) {
+            // A PREVIEW IS NOT WORTH A CONNECTION (2026-10-20, a client's cat swallowed by the Spewer: its aim carried a direction outside the
+            // bounds, and the host closed the link -- the client "dropped out" every time it chose to struggle). The aim and the pointer only
+            // draw something; one that cannot be read is dropped. Everything else still closes: a broken game message is a broken session.
+            if (payload[0] == MSG_AIM || payload[0] == MSG_CURSOR) {
+                static ULONGLONG said = 0;
+                if (GetTickCount64() - said > 10000) { said = GetTickCount64(); log_line("NET", "!! undecodable %s frame from peer %u, %u bytes -- dropped (a preview only)", msg_name(payload[0]), (unsigned)from, plen); }
+                continue;
+            }
             log_line("NET", "!! undecodable %s frame from peer %u, %u bytes -- closing",
                      msg_name(payload[0]), (unsigned)from, plen);
             break;
         }
         m.from = from;
         g.stats.bytes_received += len + 4;
+        // proto 98: a client asking for a boundary's full board is answered HERE, from the kept chunks -- not through the game thread, which may be busy or parked.
+        if (m.type == MSG_BOARDREQ) {
+            if (g.role == NetRole::Host) host_answer_boardreq(link, m.boardreq);
+            continue;
+        }
         queue_push(m);
     }
 
     free(buf);
 
     InterlockedExchange(&link.live, 0);
+    // the writer first: shut the socket down (a writer blocked in send() returns), let it go, and only then close the handle it uses
+    if (link.sock != INVALID_SOCKET) shutdown(link.sock, SD_BOTH);
+    link_writer_stop(link, 2000);
     if (link.sock != INVALID_SOCKET) { closesocket(link.sock); link.sock = INVALID_SOCKET; }
 
     if (!InterlockedCompareExchange(&g.stop, 0, 0)) {
@@ -457,11 +674,27 @@ bool start_link(int slot, SOCKET s, uint8_t id) {
     Link& l = g.links[slot];
     l.sock = s;
     l.id   = id;
+    // the outgoing queue of a fresh link: empty, with its own writer (a slot reused after a peer left starts clean; the old writer was stopped by its receive thread)
+    if (!l.qcs_ready) { InitializeCriticalSection(&l.qcs); l.qcs_ready = true; }
+    if (!l.qev) l.qev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (l.writer) link_writer_stop(l, 2000);
+    EnterCriticalSection(&l.qcs); l.qhead = l.qlen = 0; LeaveCriticalSection(&l.qcs);
+    InterlockedExchange(&l.wstop, 0);
+    InterlockedExchange(&l.wdead, 0);
+    l.writer = l.qev ? CreateThread(nullptr, 0, link_writer, &l, 0, nullptr) : nullptr;
+    if (!l.writer) {
+        closesocket(s);
+        l.sock = INVALID_SOCKET;
+        fail("CreateThread (writer)", (int)GetLastError());
+        return false;
+    }
     InterlockedExchange(&l.live, 1);
     nodelay_on(s);
     l.thread = CreateThread(nullptr, 0, link_thread, &l, 0, nullptr);
     if (!l.thread) {
         InterlockedExchange(&l.live, 0);
+        shutdown(s, SD_BOTH);
+        link_writer_stop(l, 2000);
         closesocket(s);
         l.sock = INVALID_SOCKET;
         fail("CreateThread", (int)GetLastError());
@@ -948,15 +1181,18 @@ void net_set_seat_order(const uint8_t* ids, uint8_t n) {
 
 void net_shutdown() {
     if (g.role == NetRole::None) return;
+    // What is still queued goes out first (the last frames before a deliberate close -- HOSTLEFT, a refusal -- used to be on the wire by the time send() returned).
+    links_drain(1500);
     InterlockedExchange(&g.stop, 1);
 
     // Shut the sockets down before waiting: every receive thread is parked in
     // recv() and will not notice a flag until the call returns. Closing the
-    // listener is what releases the accept thread.
+    // listener is what releases the accept thread. A link's socket is CLOSED by its
+    // receive thread once its writer has stopped (or below, for one that did not exit).
     if (g.listener != INVALID_SOCKET) { closesocket(g.listener); g.listener = INVALID_SOCKET; }
     for (int i = 0; i < kMaxPeers; ++i) {
         Link& l = g.links[i];
-        if (l.sock != INVALID_SOCKET) { shutdown(l.sock, SD_BOTH); closesocket(l.sock); l.sock = INVALID_SOCKET; }
+        if (l.sock != INVALID_SOCKET) shutdown(l.sock, SD_BOTH);
     }
 
     if (g_dial_thread) {
@@ -980,6 +1216,12 @@ void net_shutdown() {
         CloseHandle(l.thread);
         l.thread = nullptr;
         InterlockedExchange(&l.live, 0);
+    }
+    for (int i = 0; i < kMaxPeers; ++i) {
+        Link& l = g.links[i];
+        link_writer_stop(l, 1000);
+        if (l.sock != INVALID_SOCKET) { closesocket(l.sock); l.sock = INVALID_SOCKET; }
+        if (l.qcs_ready) { EnterCriticalSection(&l.qcs); l.qhead = l.qlen = 0; LeaveCriticalSection(&l.qcs); }
     }
 
     NetStats s = net_stats();
@@ -1035,17 +1277,20 @@ bool net_send(const uint8_t* payload, uint32_t len) {
     for (int i = 0; i < kMaxPeers; ++i) {
         Link& l = g.links[i];
         if (!InterlockedCompareExchange(&l.live, 0, 0)) continue;
-        if (send_framed(l.sock, g.self, payload, len)) any = true;
+        if (link_send(l, g.self, payload, len)) any = true;
         else failed = true;
     }
-    if (failed) log_line("NET", "!! send failed (WSA %d)", WSAGetLastError());
+    if (failed) {
+        static ULONGLONG said = 0;
+        if (GetTickCount64() - said > 10000) { said = GetTickCount64(); log_line("NET", "!! a %s frame could not be queued for every peer (a link is closing)", msg_name(payload[0])); }
+    }
     return any;
 }
 
 bool net_send_peer(uint8_t peer, const uint8_t* payload, uint32_t len) {
     int slot = link_slot_of(peer);
     if (slot < 0) return false;
-    return send_framed(g.links[slot].sock, g.self, payload, len);
+    return link_send(g.links[slot], g.self, payload, len);
 }
 
 // Every encoder writes into a stack buffer and hands the result to net_send.
@@ -1104,6 +1349,7 @@ bool net_send_catdigest(const CatDigestMsg& m) {
 // client and a relay would deliver it twice.
 bool net_send_hostleft(const HostLeftMsg& m) { MGMP_SEND_WITH(enc_hostleft, m); }
 bool net_send_page    (const PageMsg& m)     { MGMP_SEND_WITH(enc_page,     m); }
+bool net_send_nodevote(const NodeVoteMsg& m) { MGMP_SEND_WITH(enc_nodevote, m); }
 bool net_send_cats    (const CatsMsg& m)     { MGMP_SEND_WITH(enc_cats,     m); }
 // Host-authored, so it is NOT in relayed(): net_send already reaches every client.
 bool net_send_savewait(const SaveWaitMsg& m) { MGMP_SEND_WITH(enc_savewait, m); }
@@ -1113,7 +1359,7 @@ bool net_send_roomctl(const RoomCtlMsg& m) { MGMP_SEND_WITH(enc_roomctl, m); }
 // Host-authored, so it is NOT in relayed(): net_send already reaches every client.
 bool net_send_mapseeds(const MapSeedsMsg& m) { MGMP_SEND_WITH(enc_mapseeds, m); }
 // Host-authored, so it is NOT in relayed() either.
-bool net_send_unlocks(const UnlocksMsg& m) { uint8_t p[2048]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // 2048 since proto 78 (the class names)   // bigger than the 512-byte default since proto 62
+bool net_send_unlocks(const UnlocksMsg& m) { static thread_local uint8_t p[16384]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // 2048 since proto 78 (the class names)   // bigger than the 512-byte default since proto 62
 
 // Host-authored, so it is NOT in relayed() either. Bigger than the 512-byte default: a chunk is up to 16 units.
 bool net_send_board(const BoardMsg& m) { uint8_t p[1024]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send(p, n); }
@@ -1145,6 +1391,12 @@ void net_clear_battle_caches() {
     for (uint32_t k = 0; k < kRollRing; ++k) g_roll_ring[k] = RollMsg{};
     g_roll_next = 0;
     g_level_box = LevelBox{};
+    for (uint32_t k = 0; k < kSumRing; ++k) g_sum_ring[k] = BoardSumMsg{};
+    g_sum_next = 0;
+    g_board_latest_battle = 0; g_board_latest_turn = 0;
+    for (uint32_t k = 0; k < kBoardKeep; ++k) { free(g_kept[k].data); g_kept[k] = KeptBoard{}; }
+    g_kept_next = 0;
+    for (uint32_t p = 0; p < kMaxPeers; ++p) g_board_stream[p] = 0;
     LeaveCriticalSection(&g.cs);
 }
 bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
@@ -1157,12 +1409,85 @@ bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
     return ok;
 }
 
-bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n) {
-    for (uint32_t q = 0; q < kPendingQueues; ++q) n[q] = 0;
+uint32_t net_board_publish(const BoardMsg* chunks, uint32_t n, const BoardSumMsg* sum) {
+    if (!g.cs_ready || !chunks || !n || g.role != NetRole::Host) return 0;
+    // the chunks, encoded once: [u32 length][payload] each
+    uint8_t* data = (uint8_t*)malloc((size_t)n * (4 + 1024));
+    if (!data) return 0;
+    uint32_t len = 0;
+    for (uint32_t c = 0; c < n; ++c) {
+        const uint32_t k = enc_board(data + len + 4, 1024, chunks[c]);
+        if (!k) continue;
+        memcpy(data + len, &k, 4);
+        len += 4 + k;
+    }
+    const uint64_t battle = chunks[0].battle;
+    const uint32_t turn = chunks[0].turn;
+    bool stream[kMaxPeers] = {};
+    EnterCriticalSection(&g.cs);
+    KeptBoard* slot = nullptr;
+    for (uint32_t k = 0; k < kBoardKeep && !slot; ++k) if (g_kept[k].data && g_kept[k].battle == battle && g_kept[k].turn == turn) slot = &g_kept[k];
+    if (!slot) slot = &g_kept[g_kept_next++ % kBoardKeep];
+    free(slot->data);
+    slot->battle = battle; slot->turn = turn; slot->data = data; slot->len = len;
+    for (uint32_t p = 0; p < kMaxPeers; ++p) stream[p] = g_board_stream[p] == battle;
+    // the copy sent below is taken under the lock: a request answered on a receive thread may replace the slot meanwhile
+    uint8_t* mine = (uint8_t*)malloc(len ? len : 1);
+    if (mine) memcpy(mine, data, len);
+    LeaveCriticalSection(&g.cs);
+    if (!mine) return 0;
+
+    uint8_t sb[16 + 4 + 4 + 32 + 4 * kBoardMax];
+    const uint32_t sn = sum ? enc_boardsum(sb, sizeof(sb), *sum) : 0;
+    uint32_t reached = 0;
+    for (int i = 0; i < kMaxPeers; ++i) {
+        Link& l = g.links[i];
+        if (!InterlockedCompareExchange(&l.live, 0, 0)) continue;
+        bool any = false;
+        if (sn && link_send(l, g.self, sb, sn)) any = true;
+        if (!sum || (l.id < kMaxPeers && stream[l.id])) {
+            for (uint32_t at = 0; at + 4 <= len; ) {
+                uint32_t k = 0; memcpy(&k, mine + at, 4); at += 4;
+                if (link_send(l, g.self, mine + at, k)) any = true;
+                at += k;
+            }
+        }
+        if (any) ++reached;
+    }
+    free(mine);
+    return reached;
+}
+
+bool net_host_boardsum(uint64_t battle, uint32_t turn, BoardSumMsg& out) {
+    if (!g.cs_ready || !battle) return false;
+    EnterCriticalSection(&g.cs);
+    bool ok = false;
+    for (uint32_t k = 0; k < kSumRing && !ok; ++k)
+        if (g_sum_ring[k].battle == battle && g_sum_ring[k].turn == turn) { out = g_sum_ring[k]; ok = true; }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
+
+bool net_board_seen_past(uint64_t battle, uint32_t turn) {
+    if (!g.cs_ready || !battle) return false;
+    EnterCriticalSection(&g.cs);
+    const bool past = g_board_latest_battle == battle && g_board_latest_turn > turn;
+    LeaveCriticalSection(&g.cs);
+    return past;
+}
+
+bool net_send_boardreq(const BoardReqMsg& m) { uint8_t p[32]; const uint32_t n = enc_boardreq(p, sizeof(p), m); return n && net_send(p, n); }
+
+bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n, uint32_t* total) {
+    for (uint32_t q = 0; q < kPendingQueues; ++q) { n[q] = 0; if (total) total[q] = 0; }
     if (!g.cs_ready || !out || !node_id) return false;
     EnterCriticalSection(&g.cs);
     const bool ok = g_level_box.bnode == node_id;
-    if (ok) for (uint32_t q = 0; q < kPendingQueues; ++q) { n[q] = g_level_box.n_pending[q]; for (uint8_t i = 0; i < n[q] && i < kPendingMax; ++i) out[q][i] = g_level_box.pending[q][i]; }
+    if (ok) for (uint32_t q = 0; q < kPendingQueues; ++q) {
+        n[q] = g_level_box.n_pending[q];
+        for (uint8_t i = 0; i < n[q] && i < kPendingMax; ++i) out[q][i] = g_level_box.pending[q][i];
+        if (total) total[q] = g_level_box.pending_total[q] > n[q] ? g_level_box.pending_total[q] : n[q];
+    }
     LeaveCriticalSection(&g.cs);
     return ok;
 }
@@ -1358,17 +1683,30 @@ bool net_send_statedump(const StateDumpMsg& m) {
 }
 
 bool net_send_uqd(const UqdMsg& m) { uint8_t p[128]; const uint32_t n = enc_uqd(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_ping(const PingMsg& m) { uint8_t p[96]; const uint32_t n = enc_ping(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_setting(const SettingMsg& m) { uint8_t p[16]; const uint32_t n = enc_setting(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_equip(const EquipMsg& m) { uint8_t p[160]; const uint32_t n = enc_equip(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_soulcat(const SoulCatMsg& m) {
+    const uint32_t need = soulcat_frame_size(m);
+    if (need > kMaxFrame) { log_line("NET", "!! a soul jar's cat is %u bytes, over the %u-byte frame cap", m.size, kMaxFrame); return false; }
+    uint8_t* p = (uint8_t*)malloc(need);
+    if (!p) return false;
+    const uint32_t n = enc_soulcat(p, need, m);
+    const bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
 bool net_send_chat(const ChatMsg& m) { uint8_t p[320]; const uint32_t n = enc_chat(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_draw(const DrawMsg& m) { uint8_t p[320]; const uint32_t n = enc_draw(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_treasure(const TreasureMsg& m) { uint8_t p[160]; const uint32_t n = enc_treasure(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_housecoop(const HouseCoopMsg& m) { uint8_t p[96]; const uint32_t n = enc_housecoop(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_rngl(const RnglMsg& m) { uint8_t p[512]; const uint32_t n = enc_rngl(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_deep(const DeepMsg& m) { uint8_t p[384]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_deep(const DeepMsg& m) { uint8_t p[2048]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_props(const PropsMsg& m) { uint8_t p[1024]; const uint32_t n = enc_props(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_audit(const AuditMsg& m) {
-    uint8_t* p = (uint8_t*)malloc(4096);
+    uint8_t* p = (uint8_t*)malloc(8192);
     if (!p) return false;
-    const uint32_t n = enc_audit(p, 4096, m);
+    const uint32_t n = enc_audit(p, 8192, m);
     const bool ok = n && net_send(p, n);
     free(p);
     return ok;
@@ -1409,6 +1747,7 @@ void net_msg_release(NetMsg& m) {
     if (m.runhist.data)  { free(m.runhist.data);  m.runhist.data  = nullptr; }
     if (m.statedump.data){ free(m.statedump.data);m.statedump.data= nullptr; }
     if (m.peerlog.data)  { free(m.peerlog.data);  m.peerlog.data  = nullptr; }
+    if (m.soulcat.data)  { free(m.soulcat.data);  m.soulcat.data  = nullptr; }
     for (uint32_t i = 0; i < kInvBuckets; ++i)
         if (m.inventory.data[i]) { free(m.inventory.data[i]); m.inventory.data[i] = nullptr; }
 }
@@ -1429,6 +1768,7 @@ bool net_poll(NetMsg& out) {
         g.queue[g.head].runhist.data  = nullptr;
         g.queue[g.head].statedump.data = nullptr;
         g.queue[g.head].peerlog.data   = nullptr;
+        g.queue[g.head].soulcat.data   = nullptr;
         for (uint32_t i = 0; i < kInvBuckets; ++i)
             g.queue[g.head].inventory.data[i] = nullptr;
         g.head = (g.head + 1) % kQueueCap;
@@ -1445,6 +1785,16 @@ bool net_poll(NetMsg& out) {
         g.roster_valid = true;
     }
     return got;
+}
+
+size_t net_queued_bytes(uint8_t peer) {
+    size_t n = 0;
+    for (int i = 0; i < kMaxPeers; ++i) {
+        Link& l = g.links[i];
+        if (!l.qcs_ready || l.id != peer || !InterlockedCompareExchange(&l.live, 0, 0)) continue;
+        EnterCriticalSection(&l.qcs); n += l.qlen; LeaveCriticalSection(&l.qcs);
+    }
+    return n;
 }
 
 NetStats net_stats() {

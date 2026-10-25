@@ -393,8 +393,13 @@ DWORD WINAPI worker(LPVOID) {
     buf.reserve(4096);
     char tmp[2048];
     bool closed_by_peer = false;
+    // HEARTBEAT (0.1.57): the server drops a connection that went silent only after TCP gives up on it, which can take a quarter of an hour behind some
+    // routers -- and a host's room stayed in the list for all of it. A ping every 20 s lets the server tell a dead peer from a quiet one (it answers with
+    // "pong", which is ignored below; a server that does not know "ping" answers with an error line, which is too).
+    ULONGLONG last_beat = GetTickCount64();
 
     while (!InterlockedCompareExchange(&g.stop, 0, 0)) {
+        if (GetTickCount64() - last_beat >= 20000) { last_beat = GetTickCount64(); send_cmd("ping"); }
         const int n = recv(s, tmp, (int)sizeof(tmp), 0);
         if (n == 0) { closed_by_peer = true; break; }
         if (n < 0) {
@@ -503,6 +508,8 @@ void close_direct_listener() {
 }
 
 void finish_direct_check(DirectCheck result, const char* why) {
+    // 0.1.86: no answer from the server, but the router said it sits behind another NAT -- the port cannot be reached from outside, whatever the server says
+    if (result == DirectCheck::NoAnswer && upnp_double_nat()) { result = DirectCheck::Closed; why = "no answer from the server, and the router sits behind another NAT"; }
     close_direct_listener();
     g.dcheck = result;
     g.dcheck_sent = false;
@@ -830,9 +837,12 @@ void handle_line(const char* line) {
     if (t == "reach") {
         auto ok = j.find("ok");
         const bool open = ok != j.end() && ok->is_boolean() && ok->get<bool>();
-        if (!g.room[0] && g.dcheck == DirectCheck::Checking) {        // the pre-check, not a room's probe
+        // The pre-check's answer. 0.1.86 (room AEZS, 2026-10-24): a room created while the pre-check was still under way took this answer as the room's
+        // probe only, the pre-check then ran out at 12 s as "no answer", and the carrier picker let "direct" be chosen for a port behind a double NAT -- a
+        // joiner dialled it twice and left. The answer is about the same port either way: it finishes the pre-check too.
+        if (g.dcheck == DirectCheck::Checking) {
             finish_direct_check(open ? DirectCheck::Open : DirectCheck::Closed, open ? "the server reached it" : "the server could not reach it");
-            return;
+            if (!g.room[0]) return;
         }
         g.reach = open ? 1 : 2;
         log_line_lvl(open ? LogLevel::Info : LogLevel::Warn, "SIGNAL", "%sthe server %s our game port %s:%d from outside",
@@ -1013,7 +1023,9 @@ void signal_init() {
     strncpy_s(g.addr, sizeof(g.addr), cfg.signal_addr, _TRUNCATE);
     g.port = cfg.signal_port;
 
-    if (cfg.signal_name[0]) {
+    if (cfg.ui_player_name[0]) {                      // 0.1.89: the name this player last connected with
+        strncpy_s(g.name, sizeof(g.name), cfg.ui_player_name, _TRUNCATE);
+    } else if (cfg.signal_name[0]) {
         strncpy_s(g.name, sizeof(g.name), cfg.signal_name, _TRUNCATE);
     } else {
         // A default that is useful rather than blank: two instances on one

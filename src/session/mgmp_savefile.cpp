@@ -143,9 +143,117 @@ uint64_t newest_save_time(const wchar_t* dir) {
     return best;
 }
 
-bool resolve_save_dir(wchar_t* out, size_t out_len, bool* unsure = nullptr) {
+// THE PLAYER'S OWN CHOICE (2026-10-15, the user: "if the mod cannot tell the player's save by the Steam id, ask, and remember the answer"). The account folder's name, one line
+// in <the DLL's folder>\save_account.txt, written by savefile_choose_account (the title screen's question, or the backup page's "switch the save folder"). It wins over
+// every rule below: the player looked at the folders and said which one is theirs. A remembered folder that no longer exists is said and passed over.
+constexpr const wchar_t* kAccountFile = L"save_account.txt";
+bool account_file_path(wchar_t* out, size_t cap) {
+    const wchar_t* d = config_dll_dir();
+    if (!d || !d[0]) return false;
+    _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%s", d, kAccountFile);
+    return true;
+}
+bool plain_account_name(const wchar_t* n) {
+    if (!n || !n[0] || wcslen(n) >= 64) return false;
+    for (const wchar_t* c = n; *c; ++c) if (*c == L'\\' || *c == L'/' || *c == L':' || *c < 32) return false;
+    return wcscmp(n, L".") != 0 && wcscmp(n, L"..") != 0;
+}
+bool read_chosen_account(wchar_t* name, size_t cap) {
+    name[0] = 0;
+    wchar_t path[MAX_PATH];
+    if (!account_file_path(path, MAX_PATH)) return false;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[256] = {}; DWORD got = 0;
+    const BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(h);
+    if (!ok || !got) return false;
+    buf[got] = 0;
+    char* p = buf; if ((uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) p += 3;   // a BOM, if a hand edit left one
+    char* e = p; while (*e && *e != '\r' && *e != '\n') ++e;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t')) --e;
+    *e = 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, p, -1, name, (int)cap)) { name[0] = 0; return false; }
+    if (!plain_account_name(name)) { name[0] = 0; return false; }
+    return true;
+}
+bool write_chosen_account(const wchar_t* name) {
+    wchar_t path[MAX_PATH], tmp[MAX_PATH];
+    if (!plain_account_name(name) || !account_file_path(path, MAX_PATH)) return false;
+    _snwprintf_s(tmp, _TRUNCATE, L"%s.tmp", path);
+    char u8[256] = {};
+    if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, u8, sizeof(u8) - 2, nullptr, nullptr)) return false;
+    strcat_s(u8, "\n");
+    HANDLE h = CreateFileW(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    const bool ok = WriteFile(h, u8, (DWORD)strlen(u8), &put, nullptr) && put == strlen(u8);
+    CloseHandle(h);
+    if (!ok || !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileW(tmp); return false; }
+    return true;
+}
+
+// <roaming appdata>\Glaiel Games\Mewgenics -- the folder that holds one folder per account.
+bool save_root(wchar_t* root, size_t cap) {
+    wchar_t appdata[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appdata)) || !appdata[0])
+        if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) return false;
+    _snwprintf_s(root, cap, _TRUNCATE, L"%s\\Glaiel Games\\Mewgenics", appdata);
+    return true;
+}
+
+// The Steam account names of the players who signed in on this PC, from the Steam client's own config\loginusers.vdf (SteamID64 -> "PersonaName"), so the
+// question can say whose folder is whose. Read-only; a missing file or entry just leaves the name empty.
+bool steam_persona(const wchar_t* account, char* out, size_t cap) {
+    out[0] = 0;
+    wchar_t steam[MAX_PATH] = {}; DWORD cb = sizeof(steam), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, &type, steam, &cb) != ERROR_SUCCESS || !steam[0]) return false;
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%s\\config\\loginusers.vdf", steam);
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    static char text[64 * 1024];
+    DWORD got = 0;
+    const BOOL ok = ReadFile(h, text, sizeof(text) - 1, &got, nullptr);
+    CloseHandle(h);
+    if (!ok) return false;
+    text[got] = 0;
+    char id[64] = {};
+    if (!WideCharToMultiByte(CP_UTF8, 0, account, -1, id, sizeof(id), nullptr, nullptr)) return false;
+    char key[80];
+    _snprintf_s(key, _TRUNCATE, "\"%s\"", id);
+    const char* at = strstr(text, key);
+    if (!at) return false;
+    const char* end = strchr(at, '}');                            // this account's block
+    const char* pn = strstr(at, "\"PersonaName\"");
+    if (!pn || (end && pn > end)) return false;
+    const char* q1 = strchr(pn + 13, '"');
+    if (!q1) return false;
+    const char* q2 = strchr(q1 + 1, '"');
+    if (!q2 || q2 - q1 - 1 <= 0) return false;
+    const size_t n = (size_t)(q2 - q1 - 1) < cap - 1 ? (size_t)(q2 - q1 - 1) : cap - 1;
+    memcpy(out, q1 + 1, n); out[n] = 0;
+    return true;
+}
+
+// How many .sav files a folder holds.
+int count_saves(const wchar_t* dir) {
+    wchar_t glob[MAX_PATH];
+    _snwprintf_s(glob, _TRUNCATE, L"%s\\*.sav", dir);
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) ++n; } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+// how: "chosen" (the player's remembered choice), "steam" (named like the logged-in Steam account), "only" (the one folder there is), "guess" (several, newest save file -- unsure)
+bool resolve_save_dir(wchar_t* out, size_t out_len, bool* unsure = nullptr, const char** how_out = nullptr) {
     out[0] = 0;
     if (unsure) *unsure = false;
+    if (how_out) *how_out = "";
     wchar_t appdata[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr,
                                 SHGFP_TYPE_CURRENT, appdata)) || !appdata[0]) {
@@ -179,7 +287,9 @@ bool resolve_save_dir(wchar_t* out, size_t out_len, bool* unsure = nullptr) {
     wchar_t  live_name[24] = {};
     if (live) _snwprintf_s(live_name, _TRUNCATE, L"%llu", (unsigned long long)live);
 
-    wchar_t  best[MAX_PATH] = {}, matched[MAX_PATH] = {};
+    wchar_t  chosen[64] = {};
+    const bool have_chosen = read_chosen_account(chosen, 64);
+    wchar_t  best[MAX_PATH] = {}, matched[MAX_PATH] = {}, picked[MAX_PATH] = {};
     uint64_t best_time = 0;
     int      found = 0;
     wchar_t  cand_text[6][200] = {}; int cand_n = 0;
@@ -193,6 +303,7 @@ bool resolve_save_dir(wchar_t* out, size_t out_len, bool* unsure = nullptr) {
         if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
 
         ++found;
+        if (have_chosen && _wcsicmp(fd.cFileName, chosen) == 0) wcscpy_s(picked, cand);
         if (live && wcscmp(fd.cFileName, live_name) == 0) wcscpy_s(matched, cand);
         const uint64_t t = newest_save_time(cand);
         {   // every candidate, so a wrong pick on a two-account PC can be read off the log (printed below when there is more than one)
@@ -215,16 +326,26 @@ bool resolve_save_dir(wchar_t* out, size_t out_len, bool* unsure = nullptr) {
         log_line("SAVEFILE", "%d account folders under %ls; the logged-in Steam account is %llu (from %s)", found, root, (unsigned long long)live, live ? how : "nothing -- no id known");
         for (int i = 0; i < cand_n; ++i) log_line("SAVEFILE", "  candidate: %ls", cand_text[i]);
     }
+    if (picked[0]) {
+        log_line("SAVEFILE", "the save directory is the one the player chose: %ls (remembered in %ls)%s", picked, kAccountFile,
+                 matched[0] && wcscmp(matched, picked) != 0 ? " -- NOT the logged-in Steam account's folder; the player's choice is kept" : "");
+        wcscpy_s(out, out_len, picked);
+        if (how_out) *how_out = "chosen";
+        return true;
+    }
+    if (have_chosen) log_line_lvl(LogLevel::Warn, "SAVEFILE", "!! the remembered save folder '%ls' (%ls) is not under %ls any more -- found the usual way", chosen, kAccountFile, root);
     if (matched[0]) {
         if (found > 1) log_line("SAVEFILE", "%d account directories under %ls -- using the one of the logged-in Steam account %llu (from %s)", found, root, (unsigned long long)live, how);
         wcscpy_s(out, out_len, matched);
+        if (how_out) *how_out = "steam";
         return true;
     }
     if (found > 1) {
-        log_line("SAVEFILE", "!! %d account directories under %ls and none is named like the Steam account (%s) -- using the one whose save file was written last; it is checked again when Steam's id is known",
+        log_line("SAVEFILE", "!! %d account directories under %ls and none is named like the Steam account (%s) -- using the one whose save file was written last; it is checked again when Steam's id is known, and the player is asked",
                  found, root, live ? how : "no Steam account id is known yet");
         if (unsure) *unsure = true;
-    }
+        if (how_out) *how_out = "guess";
+    } else if (how_out) *how_out = "only";
     wcscpy_s(out, out_len, best);
     return true;
 }
@@ -330,6 +451,8 @@ struct State {
     bool    dir_tried = false;
     bool    dir_unsure = false;       // several account folders and none matched a Steam id: the newest-file guess
     bool    dir_rechecked = false;    // the unsure choice was looked at again once the Steam id was known
+    const char* dir_how = "";         // chosen / steam / only / guess (resolve_save_dir)
+    bool    choice_dismissed = false; // the player closed the question without choosing: not asked again this session
 
     // --- host ---
     bool     have_slot   = false;
@@ -412,15 +535,17 @@ void ensure_dir() {
         g.dir_rechecked = true;
         wchar_t again[MAX_PATH] = {};
         bool unsure = false;
-        if (resolve_save_dir(again, MAX_PATH, &unsure) && wcscmp(again, g.dir) != 0) {
+        const char* how = "";
+        if (resolve_save_dir(again, MAX_PATH, &unsure, &how) && wcscmp(again, g.dir) != 0) {
             log_line("SAVEFILE", "!! the save directory is %ls, not %ls as first guessed", again, g.dir);
             wcscpy_s(g.dir, again);
         }
         g.dir_unsure = unsure;
+        if (how[0]) g.dir_how = how;
         return;
     }
     g.dir_tried = true;                 // one attempt, one log line, whatever happens
-    g.have_dir = resolve_save_dir(g.dir, MAX_PATH, &g.dir_unsure);
+    g.have_dir = resolve_save_dir(g.dir, MAX_PATH, &g.dir_unsure, &g.dir_how);
     if (g.have_dir) log_line("SAVEFILE", "save directory: %ls", g.dir);
 }
 
@@ -662,6 +787,64 @@ bool savefile_save_dir(wchar_t* out, size_t out_len) {
     ensure_dir();
     if (!g.have_dir || !g.dir[0]) return false;
     wcsncpy_s(out, out_len, g.dir, _TRUNCATE);
+    return true;
+}
+
+// --- WHICH ACCOUNT'S SAVES (2026-10-15): the question and the switch, see the header ---
+int savefile_accounts(SaveAccount* out, int cap) {
+    ensure_dir();
+    wchar_t root[MAX_PATH];
+    if (!out || cap <= 0 || !save_root(root, MAX_PATH)) return 0;
+    wchar_t glob[MAX_PATH];
+    _snwprintf_s(glob, _TRUNCATE, L"%s\\*", root);
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.' || !plain_account_name(fd.cFileName)) continue;
+        wchar_t cand[MAX_PATH];
+        _snwprintf_s(cand, _TRUNCATE, L"%s\\%s\\saves", root, fd.cFileName);
+        const DWORD attr = GetFileAttributesW(cand);
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) || n >= cap) continue;
+        SaveAccount& a = out[n++];
+        a = SaveAccount{};
+        wcsncpy_s(a.name, fd.cFileName, _TRUNCATE);
+        steam_persona(fd.cFileName, a.persona, sizeof(a.persona));
+        a.newest = newest_save_time(cand);
+        a.saves = count_saves(cand);
+        a.current = g.have_dir && _wcsicmp(cand, g.dir) == 0;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+bool savefile_dir_needs_choice() {
+    ensure_dir();
+    return g.have_dir && g.dir_unsure && !g.choice_dismissed;
+}
+
+void savefile_dir_dismiss_choice() {
+    if (!g.choice_dismissed) log_line("SAVEFILE", "the player closed the save-folder question without choosing -- the guess %ls stays for this session; asked again at the next start", g.dir);
+    g.choice_dismissed = true;
+}
+
+const char* savefile_dir_how() { ensure_dir(); return g.dir_how ? g.dir_how : ""; }
+
+bool savefile_choose_account(const wchar_t* name) {
+    ensure_dir();
+    if (net_active()) { log_line_lvl(LogLevel::Warn, "SAVEFILE", "!! the save folder is not switched while in a room"); return false; }
+    wchar_t root[MAX_PATH], cand[MAX_PATH];
+    if (!plain_account_name(name) || !save_root(root, MAX_PATH)) return false;
+    _snwprintf_s(cand, _TRUNCATE, L"%s\\%s\\saves", root, name);
+    const DWORD attr = GetFileAttributesW(cand);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) { log_line_lvl(LogLevel::Warn, "SAVEFILE", "!! no save folder %ls -- nothing switched", cand); return false; }
+    if (!write_chosen_account(name)) { log_line_lvl(LogLevel::Error, "SAVEFILE", "!! the choice of save folder could not be written to %ls -- nothing switched", kAccountFile); return false; }
+    const bool changed = !g.have_dir || _wcsicmp(cand, g.dir) != 0;
+    log_line_lvl(LogLevel::Warn, "SAVEFILE", "the player chose the save folder %ls%s (was %ls, %s) -- remembered in %ls", cand, changed ? "" : " (the one in use)",
+                 g.have_dir ? g.dir : L"none", g.dir_how && g.dir_how[0] ? g.dir_how : "?", kAccountFile);
+    wcscpy_s(g.dir, cand);
+    g.have_dir = true; g.dir_tried = true; g.dir_unsure = false; g.dir_rechecked = true; g.dir_how = "chosen";
     return true;
 }
 

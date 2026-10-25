@@ -153,6 +153,42 @@ enum Target : int {
     T_ClayChange,         // ModelingClayPassive's after-cast (vtable 0x14102A8F0 slot 57 -> 0x140906F50, this only): the clay turns into a random weapon of the
                           // combat_reward_hard pool -- drawn inline from the shared stream at the moment the throw lands. Halted a room 2026-10-11 (host MeatCleaver,
                           // client BentSpoon); now drawn from a stream of (battle, cat, n-th change) (mgmp_rngfix)
+    T_ButterflyEffect,    // the event result `trigger_butterfly_effect` (0x1401C1450, no argument read): picks a random time-travel frame for THIS save (a draw from the shared stream) --
+                          // skipped on a client replaying a story event, fenced in a room (2026-10-16 quest review)
+    T_ShopStock,          // Shop::initShop's stock half (0x140796070, Shop* in rcx): fills Shop+0x60 (vector<ShopItem>, 0xC0 each) from the definition's item_groups
+                          // when it is empty and Shop+0x7C is clear, then -- in a treasure room (Shop+0x79) -- takes every item at once (Shop::ObtainItem). A treasure
+                          // room calls it from its chest animation's "initShop" event. The experimental shared chest (mgmp_treasure) holds it back until the player picked
+    // THE HOUSE BOSS CO-OP (experimental, mgmp_housecoop, 2026-10-18). The end of a day in the House (EndDayTransition's closure 0x1401EF4D0) runs, in this
+    // order: the house boss countdown, the overnight, a new House screen, the strays of the new day, the progression cutscenes, SaveGame. A helper's
+    // INSERTED day skips the countdown, the overnight and the strays, and the overnight's place is where the helped player's boss is put in.
+    T_HouseCountdown,     // GlobalProgressionData house boss countdown (0x1401C47A0, gpd in rcx): --countdown (rematch below 0), or the bosses' initial cooldowns
+    T_HouseOvernight,     // the House overnight (0x1401E8B40, House* in rcx, out vector* in rdx -- zeroed first, returned): food, breeding, the day counter MewDirector+0x580
+    T_HouseStrays,        // the strays of a new day (0x1401EE8E0, House* in rcx; the second caller is the house test map)
+    T_HouseFight,         // the house boss fight starts (0x1403B1830, the gear screen's done closure + 8 = {MewDirector*, std::string boss}): SaveGame, the boss's level, Battle
+    T_BeatHouseBoss,      // GlobalProgressionData::BeatHouseBoss (0x1401C69D0, gpd in rcx): the story of a won house boss -- only the helped player's settlement runs it
+    // THE SCRAMBLED STATUS (glaiel::Scrambled, vtable 0x140F42B78; the chaos tile -- GlitchTile 0x1401C0BB0 -- puts it on a player's cat, 2026-10-20).
+    // Logged only (the report: a client's cat got its own abilities back a turn later while still Scrambled).
+    T_ScrambleRoll,       // slot 33 (0x1400A1AB0, status in rcx): shuffles the AnyUnlocked ability pool on the shared stream, keeps the first four at +0xF0
+    T_ScrambleTick,       // slot 35 (0x1400A21F0, status in rcx): one stack off (+0x5C); at 0 the status goes (unless an ability is mid-cast)
+    T_ScrambleNames,      // slot 86 (0x1400A1EF0, status in rcx, vector<string>* spell names in rdx): the cat's spells become the four kept names
+    // WHERE AN ITEM CAME FROM (0.1.52, the user: "is this Clown Makeup the host's?" -- nothing in the log said where any item had come from).
+    T_InvInsert,          // glaiel::Inventory::insert_item(Equipment&, Loc, __int64) (0x1402E13F0; rcx Inventory*, rdx Equipment&, r8d Loc, r9 a cat id for Loc 3): every item put into an inventory, 36 callers
+    // THE SOUL JAR (0.1.54, mgmp_souljar: "the client crashed after the host's Soul Jar went off"). Both act on ONE call site each (by return address).
+    T_CatById,            // CatDatabase::get(registry, u64 id) (0x1400D7220, the C_CatDataById function): the summon's lookup of the jar's cat (return 0x1407A3C92)
+    T_AbilityItem,        // the item an ability comes from (0x1400475C0, ability in rcx): the summon's jar (return 0x1407A3C51)
+    // EACH PLAYER'S OWN RANDOM EVENTS (0.1.58, experimental ui.exp_indep_events, mgmp_indepevt). Acts on ONE call site (by return address).
+    T_EvPick,             // the event pool draw (0x1403968E0: rcx the map screen, rdx std::string* out, r8 the pool kind std::string by value, r9 MapNode*): the WorldEvent constructor's call returns to kRet_EvPickCtor
+    T_EvNextEvent,        // event result `next_event_from_set` (0x1409321F0: rcx WorldEvent, rdx GON node): queues an event for the next draw (MewDirector+0x698) -- skipped inside an own random event (0.1.61)
+    // THE COIN COST OF ANOTHER PLAYER'S CAT (0.1.69, room D547: a halt on a quest antenna's scrambled spell). Ability vtable slots 2 and 3, shared by every spell class.
+    T_AbilityCanCast,     // Ability slot 2 (0x140031800: rcx Ability, dl flag): can it be cast now -- a player cat's COIN cost (Ability+0x58) is checked against the LOCAL inventory's coins
+    T_AbilityPay,         // Ability slot 3 (0x140031CE0: rcx Ability): calls slot 2 and returns if it says no; else pays mana/coins (the coins from the LOCAL inventory) and runs the after-cast passives
+    // THE QUEST ANTENNA'S SCRAMBLE (0.1.74, room QQA9: "cat 16 slot 4:1 holds 'RemoteDetonator', peer sent 'Anoint'").
+    T_AlliesScramble,     // AlliesScrambleSpellAfterCast slot 154 (0x140166BC0: rcx passive, rdx, r8): an ally cast -> the spell is replaced by a random one of the AnyUnlocked pool, one draw from the shared stream
+    // THE MAP NODE'S CLICK (0.1.95, proto 106: every player picks the next node before the party moves). The std::function call (0x140228700, `_Do_call`: rcx = the closure,
+    // [rcx+8] = the MapNode) every node's button runs when it is clicked. It is the ONLY writer of the marker's selected-node slot (MapMarker+0x60, at its end,
+    // 0x14022886A), after the "return home early" confirmation for a home node (type 4). The marker's own update then walks the party there and, on arrival, calls
+    // EnterNode -- so holding this call holds the animation too. mgmp_mapvote swallows it and runs it later, for the host's pick, once every player has picked.
+    T_NodeClick,
     T_COUNT
 };
 
@@ -698,6 +734,25 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x002E1660, "ITEMCOLLECT", "ItemMgr collect (R027, the battle build's backpack read)" },
     { 0x0004A110, "PICKINDEX", "random element helper (R102, Character late_update's call fenced)" },
     { 0x00906F50, "CLAYCHANGE", "ModelingClayPassive after-cast: the clay becomes a random weapon" },
+    { 0x001C1450, "BUTTERFLY", "event result trigger_butterfly_effect (a save-level time-travel frame, draws the shared stream)" },
+    { 0x00796070, "SHOPSTOCK", "Shop::initShop stock (fill and, in a treasure room, take every item)" },
+    { 0x001C47A0, "HOUSECOUNTDOWN", "GlobalProgressionData: house boss countdown (end of day)" },
+    { 0x001E8B40, "HOUSEOVERNIGHT", "House overnight (food, breeding, day counter)" },
+    { 0x001EE8E0, "HOUSESTRAYS", "House: the strays of a new day" },
+    { 0x003B1830, "HOUSEFIGHT", "house boss fight start (after the gear screen)" },
+    { 0x001C69D0, "BEATHOUSEBOSS", "GlobalProgressionData::BeatHouseBoss" },
+    { 0x000A1AB0, "SCRAMBLEROLL", "Scrambled: roll the four abilities" },
+    { 0x000A21F0, "SCRAMBLETICK", "Scrambled: a stack off" },
+    { 0x000A1EF0, "SCRAMBLENAMES", "Scrambled: the spells take the rolled names" },
+    { 0x002E13F0, "INVINSERT", "Inventory::insert_item" },
+    { 0x000D7220, "CATBYID", "CatDatabase::get (the Soul Jar summon's lookup)" },
+    { 0x000475C0, "ABILITYITEM", "an ability's source item (the Soul Jar summon's jar)" },
+    { 0x003968E0, "EVPICK", "the event pool draw (the WorldEvent constructor's call: each player's own random event)" },
+    { 0x009321F0, "EVNEXTEVENT", "event result next_event_from_set (skipped inside an own random event)" },
+    { 0x00031800, "ABILITYCANCAST", "Ability: can it be cast (a player cat's coin cost checked against the local coins)" },
+    { 0x00031CE0, "ABILITYPAY", "Ability: pay its cost and cast (a player cat's coins come from the local inventory)" },
+    { 0x00166BC0, "ANTENNASCRAMBLE", "AlliesScrambleSpellAfterCast: an ally's cast spell replaced by a random one (the pick on a stream both peers derive)" },
+    { 0x00228700, "NODECLICK", "MapNode click callback (the only writer of the marker's selected node)" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -812,6 +867,35 @@ enum Call : int {
     C_CharItemsChanged,      // void(Character*) -- sub_1400FE980: what AutoEquipConsumables calls on the cat after the equip (its abilities follow its items)
     C_StrFromCStr,           // std::string*(std::string* out, const char*) -- sub_140052AF0
     C_CatCanLevel,           // bool(CatData*) -- sub_1400D22F0: may this cat be offered a level-up (the level-up pick 0x1403B7530 counts the others as level 999999)
+    // --- the shop's stock (mgmp_treasure: the experimental shared chest) ---
+    C_ShopItemsGen,          // vector<ShopItem>*(vector* out, GonObject* def, double luck [xmm2], const vector* initial, std::string* breakdown_key [stack]) -- sub_140795BB0:
+                             // out = a copy of `initial` plus the items the definition's item_groups roll for the `breakdown` counts (draws from the shared stream)
+    C_ShopItemsMove,         // vector<ShopItem>*(vector* dst, vector* src) -- sub_1401D75E0: move-assign (dst's items destroyed, src left empty)
+    C_ShopItemsFree,         // void(vector<ShopItem>*) -- sub_1401D7880: destroys the items, frees the buffer, leaves it empty
+    // --- the game's Flash display list (mgmp_treasure: the shared chest's items side by side in the treasure room itself) ---
+    C_SwfFind,               // DisplayObject*(renderer*, std::string path BY VALUE) -- sub_14005A100: the renderer's (+0x80) root clip, then the named child, searched by path
+    C_SwfPoolAlloc,          // void*(pool*) -- sub_1409694C0: the fixed-size pool the display objects come from
+    C_MovieClipCtor,         // MovieClip*(void* mem, void* timeline) -- sub_1409A7C00 (a clip's timeline is its +0xD0)
+    C_SwfSpriteMake,         // DefineSprite's instantiate (vtable slot 3) -- sub_140A583D0: not called; its `lea rcx, [rip+X]` at +0x11 names the clip pool
+    C_SwfAddChildAt,         // void(container*, child*, int depth) -- sub_140999E40: the child at that depth (one already there is removed), child+0x38 = container
+    C_ShopSlotUi,            // void(Shop*, ShopItem*, bool) -- sub_1407988E0: fills the clip "i<ShopItem+4>" with the item (icon, label, price ...)
+    C_WStrCopy,              // std::wstring*(std::wstring* out, const std::wstring*) -- sub_14005B060
+    C_SwfSetText,            // void(TextField*, std::wstring BY VALUE, bool, bool) -- sub_14098E8A0 ("[KEY]" text is localized)
+    C_FindAbility,           // Ability*(Character*, const std::string& name, bool quiet) -- sub_140118DF0, Character::FindAbility: none|move|attack|bonus|weapon|trinket|spellN|<GON name>;
+                             // a GON name is looked up among ALL the character's abilities (sub_140118C40), the disorder abilities too
+    C_AoeLand,               // the AOE landing (sub_140096C20, R013): spawns each tile's particle and applies the damage -- per tile after its own delay unless the ability's
+                             // graphics set visual_delay_but_simultaneous_damage. Not called: located for the R013 patch (mgmp_rngfix)
+    C_StrAssign,             // std::string& std::string::assign(std::string*, const char*, size_t) -- sub_1400520D0 (mgmp_housecoop: the House's next_house_boss)
+    C_PartyLuck,             // double(MewDirector*) -- sub_1403BA770: 0.1 x sum over the party list (+0x5C0, the cats' effective stats 0x1400C1820 +0x18) of (LCK - 5);
+                             // Shop::initShop adds it to the difficulty's bonus_itemroll_luck (0x1407952A1). mgmp_treasure: the chest's luck is the HOST's party's
+    C_ItemPoolsBuild,        // void(ItemRegistry*) -- sub_1407AB3D0: clears the registry's item pools (+0x13D8) and builds them again from data/item_pools, each item kept
+                             // only if the save says it is unlocked (0x1407AB5B0 -> MewSaveFile item unlocked?, 0x1402329E0). Run by MewDirector::init at every load,
+                             // so the pools are this save's unlocks AS OF THE LOAD. mgmp_treasure (0.1.75): rebuilt around a shared chest's roll
+    C_TempHideCursor,        // void() -- glaiel::TempHideMouseCursor (sub_1409BE4E0): the Cursor singleton's "hidden this frame" (+0x39) and SDL's hide; the game's own
+                             // screens call it from their update every frame they want no cursor (the Cursor's next frame shows it again). FATAL ERROR when no custom
+                             // cursor exists -- mgmp_menu checks the singleton exactly as the function does before calling it (0.1.91: the drawing board's tools)
+    C_MapNodeBlocked,        // bool(MapMarker*, MapNode*) -- sub_1402223C0: TRUE = the party cannot walk there (no path, or an area that is not open); the marker's update clears a
+                             // click's selection on it. mgmp_mapvote asks it before it takes a click as a vote, so a click the game would drop is not a pick (0.1.95)
     C_COUNT
 };
 
@@ -1092,6 +1176,24 @@ static const CallDesc kCalls[C_COUNT] = {
     { 0x000FE980, "Character::items_changed" },
     { 0x00052AF0, "std::string(const char*)" },
     { 0x000D22F0, "CatData::can_level_up" },
+    { 0x00795BB0, "Shop: roll the item_groups" },
+    { 0x001D75E0, "vector<ShopItem> move-assign" },
+    { 0x001D7880, "vector<ShopItem> free" },
+    { 0x0005A100, "swf: find a child by path" },
+    { 0x009694C0, "swf: pool alloc" },
+    { 0x009A7C00, "swf::MovieClip ctor" },
+    { 0x00A583D0, "swf::DefineSprite instantiate" },
+    { 0x00999E40, "swf: addChildAt" },
+    { 0x007988E0, "Shop: fill an item slot" },
+    { 0x0005B060, "std::wstring copy" },
+    { 0x0098E8A0, "swf: TextField set text" },
+    { 0x00118DF0, "Character::FindAbility" },
+    { 0x00096C20, "AOE landing (particles and damage)" },
+    { 0x000520D0, "std::string::assign(ptr, len)" },
+    { 0x003BA770, "MewDirector: the party's luck" },
+    { 0x007AB3D0, "ItemRegistry: build the item pools (unlocked items only)" },
+    { 0x009BE4E0, "glaiel::TempHideMouseCursor" },
+    { 0x002223C0, "MapMarker: can the party NOT walk to this node" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -1225,6 +1327,14 @@ constexpr uintptr_t kCatData_Killed  = 0x7AC;   // u8
 constexpr uint64_t  kCatFlag_Perished = 0x40000;
 // The instruction after the call that picks a WorldEvent's subject cat (sub_140913A90, `call sub_1400AB770` at 0x1409150F3): T_PickRandom only acts when it returns here.
 constexpr uintptr_t kRet_EventSubject = 0x009150F8;
+// The instruction after the WorldEvent constructor's call of the event pool draw (sub_1403968E0 at 0x140913C0F, made when the event name is
+// "random"): T_EvPick acts only when it returns here. The other two callers (EnterNode's trigger_extra_event, do_additional_random_event)
+// are left alone -- their events follow the host as before.
+constexpr uintptr_t kRet_EvPickCtor = 0x00913C14;
+// THE DRAW OF AN ORDINARY EVENT NODE IS NOT THAT ONE (0.1.59, the first live test: no event was ever the player's own). MapScreen::EnterNode's
+// lambda_5 (0x14039D9B0, the event node's) draws the event itself -- `call sub_1403968E0` at 0x14039DA89, pool kind "normal" -- and hands the
+// NAME to the event scene (sub_1403B7300); the constructor then gets "OldCan", not "random", and draws nothing. T_EvPick acts on this return too.
+constexpr uintptr_t kRet_EvPickNode = 0x0039DA8E;
 // THE BOUNTY HUNTER'S TARGET (weather BountyHunting -> EventBountyHunter, passive EventBounterHunterPassive). Its vtable slot +0x108 (sub_1407E99F0) walks the board's units, sorts them into two
 // lists -- faction 1 and every other faction -- and puts EventBounty 5 on one picked with T_PickRandom from the shared stream: the second list first (the call returns to kRet_BountyOthers), the
 // first if that one was empty (kRet_BountyFaction1). It runs while the hunter is being loaded at the battle's start, and that load draws a different number of times on each peer (2026-10-06:
@@ -1436,6 +1546,16 @@ constexpr const char kBtnName_CatSelectorLeft [] = "CatSelector_Left";
 //
 // select_option's RVA is 0x3835D0; the old "no UPDATE" claim had no probe in the update path.
 constexpr const char kBtnName_LevelupBoon[] = "Levelup_Boon";
+// The option buttons of a world event (WorldEvent setupActionChoice, sub_14091A7E0, assigns the name at Button+0x1F8 = kBtn_Name).
+constexpr const char kBtnName_EventChoice[] = "Event_ChoiceButton";
+// A swf display object's own colour transform (the layout the renderer composes with its parent's, 0x1409B0CBA / 0x1409B11B4, and the "_alpha" setter 0x14099B590 writes +0x84):
+// multipliers R G B A at +0x78 / +0x7C / +0x80 / +0x84, additions R G B A at +0x88 / +0x8C / +0x90 / +0x94. Button+0x48 is the button's root clip (the one the event
+// screen looks its "stat" icon child up in).
+constexpr uintptr_t kBtn_RootClip     = 0x48;
+constexpr uintptr_t kClip_MulR        = 0x78;
+constexpr uintptr_t kClip_MulG        = 0x7C;
+constexpr uintptr_t kClip_MulB        = 0x80;
+constexpr uintptr_t kClip_MulA        = 0x84;
 
 // THE CHAPTER PAGE'S TWO BUTTONS, and the handle the barrier is built on.
 //

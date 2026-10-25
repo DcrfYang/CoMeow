@@ -107,6 +107,11 @@ AbilitySlot ability_slot_of(const void* character, const void* ability);
 // empty or out of range -- never faults, never guesses.
 void* ability_from_slot(const void* character, AbilitySlot slot);
 
+// THE ABILITIES IN NO SLOT (2026-10-18, room SXPY): a disorder's ability ('EatShit') is neither move, attack, bonus nor a spell slot, so the owner sent slot 255 and every other
+// peer halted ("slot 255:0 is empty on this peer"). Its GON name travels with every action; the game's own Character::FindAbility (sub_140118DF0) looks a GON name up among
+// ALL of the character's abilities. nullptr when the name is not the character's.
+void* ability_by_gon_name(const void* character, const char* gon);
+
 // The ability's authored GON name ("Spit", "Roll"), read through
 // Ability+0x28 -> +0x88. Writes "" and returns false if anything is unreadable.
 // This is the second, independent identity: the replayer resolves by slot and

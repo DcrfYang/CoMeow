@@ -17,6 +17,7 @@ struct Peer { State st; uint16_t nonce = 0; AbandonNotice notice; bool notice_se
 Peer peers[kMaxPeers];
 unsigned current = 0, live = 3;
 bool active = true, native_ok = true;
+PageState pages[kMaxPeers];                       // every peer's page; a run unless a test says otherwise
 struct Packet { unsigned from, to; AbandonMsg msg; };
 std::deque<Packet> packets;
 
@@ -40,6 +41,7 @@ void drain() {
 }
 void reset(unsigned n) {
     live = n; active = true; native_ok = true; packets.clear();
+    for (auto& pg : pages) pg = PageState::InGame;
     for (auto& p : peers) p = Peer{};
 }
 bool press(unsigned who) { bool r = false; at(who, [&] { r = abandon_on_try(); }); return r; }
@@ -58,6 +60,9 @@ bool net_send_abandon(const AbandonMsg& m) {
 bool abandon_native_ready() { return native_ok; }
 bool abandon_run_native() { ++peers[current].ran; return true; }
 void log_line(const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
+void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
+PageState page_self() { return pages[current]; }
+const char* page_name(PageState) { return "page"; }
 }
 
 int main() {
@@ -92,6 +97,14 @@ int main() {
     at(2, [&] { abandon_vote(true); }); drain();
     CHECK(peers[0].ran == 1 && peers[1].ran == 1 && peers[2].ran == 1);
     CHECK(phase(0) == AbandonPhase::None && phase(1) == AbandonPhase::None && phase(2) == AbandonPhase::None);
+
+    printf("-- a peer that is not in a run agrees and ends nothing (0.1.80: the host was in the House, and the game crashed) --\n");
+    reset(2);
+    pages[0] = PageState::House;
+    CHECK(press(1)); drain();
+    at(0, [&] { abandon_vote(true); }); drain();
+    CHECK(peers[0].ran == 0 && peers[1].ran == 1);
+    CHECK(phase(0) == AbandonPhase::None && phase(1) == AbandonPhase::None);
 
     printf("-- one refusal ends it everywhere --\n");
     reset(3);

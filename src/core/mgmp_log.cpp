@@ -4,9 +4,36 @@
 #include <cstdio>
 #include <cstring>
 #include <share.h>
+#include <locale.h>
 
 namespace mgmp {
 namespace {
+
+// FORMATTING THAT NEVER WRITES GARBAGE (0.1.79, room EQA4: the host's log held raw memory after a line). A `%ls` path with non-ASCII characters (a mod folder
+// named in Chinese) cannot be converted in the C runtime's default "C" locale: _vsnprintf_s then fails with -1 and leaves the buffer's old bytes behind, and the
+// caller took -1 for "truncated" and wrote the whole buffer out. Wide strings are now converted to UTF-8 (a private locale object -- the game's own locale is not
+// touched), and the length is what was really written; a line that still cannot be formatted says so.
+_locale_t utf8_locale() {
+    static _locale_t loc = nullptr;
+    static bool tried = false;
+    if (!tried) { tried = true; loc = _create_locale(LC_ALL, ".UTF8"); }
+    return loc;
+}
+int format_v(char* buf, size_t cap, const char* fmt, va_list ap) {
+    if (!buf || cap < 2) return 0;
+    buf[0] = 0;
+    const _locale_t loc = utf8_locale();
+    const int m = loc ? _vsnprintf_s_l(buf, cap, _TRUNCATE, fmt, loc, ap) : _vsnprintf_s(buf, cap, _TRUNCATE, fmt, ap);
+    if (m >= 0) return m;
+    size_t len = strnlen(buf, cap);
+    if (len >= cap) { len = cap - 1; buf[len] = 0; }
+    if (len + 1 < cap / 2) {                                  // not a truncation: the format failed part-way
+        const int extra = _snprintf_s(buf + len, cap - len, _TRUNCATE, "%s[this log line could not be formatted: %s]", len ? " " : "", fmt);
+        if (extra > 0) len += (size_t)extra;
+        else len = strnlen(buf, cap);
+    }
+    return (int)len;
+}
 
 CRITICAL_SECTION g_cs;
 bool             g_cs_ready = false;
@@ -15,6 +42,13 @@ wchar_t          g_path[MAX_PATH] = {};   // the stamped file name, for log_curr
 bool             g_console  = false;
 LONG volatile    g_seq      = 0;
 LONG volatile    g_turn     = 0;
+// BUFFERED SINCE 0.1.50. Every line used to be fflush'ed -- a WriteFile per line on whatever thread logged, the game thread above all (~70 lines per turn boundary, more per action).
+// Now a line is flushed at once only when it matters if the process dies right after it (a warning or worse, a crash line, a stage change); the rest is flushed by a small
+// thread every kFlushMs, and by log_flush() before anything reads the file.
+bool             g_dirty    = false;
+HANDLE           g_flusher  = nullptr;
+LONG volatile    g_flusher_stop = 0;
+constexpr DWORD  kFlushMs   = 100;   // 0.1.93: 250 -> 100 ("as close to real time as possible": a crash or a kill loses at most this much)
 
 // --- the ring ---------------------------------------------------------------
 //
@@ -45,7 +79,7 @@ void stage_push_text(const char* text) {
 
 void stage_push(const char* fmt, va_list ap) {
     char text[160];
-    _vsnprintf_s(text, sizeof(text), _TRUNCATE, fmt, ap);
+    format_v(text, sizeof(text), fmt, ap);
     stage_push_text(text);
 }
 
@@ -124,10 +158,11 @@ void ring_push_locked(uint32_t seq, uint32_t turn, const char* tag,
     ++g_ring_written;
 }
 
-void emit_locked(const char* s, size_t n) {
+void emit_locked(const char* s, size_t n, bool urgent) {
     if (g_file) {
         fwrite(s, 1, n, g_file);
-        fflush(g_file);
+        if (urgent) { fflush(g_file); g_dirty = false; }
+        else g_dirty = true;
     }
     if (g_console) {
         DWORD written = 0;
@@ -137,13 +172,29 @@ void emit_locked(const char* s, size_t n) {
     }
 }
 
+DWORD WINAPI flusher_thread(LPVOID) {
+    while (!InterlockedCompareExchange(&g_flusher_stop, 0, 0)) {
+        Sleep(kFlushMs);
+        EnterCriticalSection(&g_cs);
+        if (g_file && g_dirty) { fflush(g_file); g_dirty = false; }
+        LeaveCriticalSection(&g_cs);
+    }
+    return 0;
+}
+
 } // namespace
+
+void log_flush() {
+    if (!g_cs_ready) return;
+    EnterCriticalSection(&g_cs);
+    if (g_file) { fflush(g_file); g_dirty = false; }
+    LeaveCriticalSection(&g_cs);
+}
 
 // A log per session is the right default for debugging and a slow leak for a player: keep the newest few dozen of this
 // process's logs (same stem and extension, stamped names sort by time) and delete the rest. Never touches the file
 // just opened, and a failure to delete is silent -- housekeeping must not be able to stop the game starting.
-static void prune_old_logs(const wchar_t* path) {
-    constexpr size_t kKeep = 30;
+static void prune_old_logs(const wchar_t* path, size_t kKeep = 30) {
     wchar_t dir[MAX_PATH] = {}, pattern[MAX_PATH] = {};
     const wchar_t* slash = wcsrchr(path, L'\\');
     const wchar_t* dot = wcsrchr(path, L'.');
@@ -215,6 +266,8 @@ void log_init(const wchar_t* path, bool console) {
         // file is that another process tails it while the game is running.
         g_file = _wfsopen(stamped, L"w", _SH_DENYWR);
         if (g_file) wcsncpy_s(g_path, stamped, _TRUNCATE);
+        if (g_file) setvbuf(g_file, nullptr, _IOFBF, 64 * 1024);
+        if (g_file && !g_flusher) g_flusher = CreateThread(nullptr, 0, flusher_thread, nullptr, 0, nullptr);
         // Into the file, not stdout: with no console there is nowhere else for
         // it to go, and a log whose first line names itself is what tells you
         // which of the stamped files you are looking at.
@@ -222,13 +275,15 @@ void log_init(const wchar_t* path, bool console) {
         // orientation and every other write here is byte-oriented fwrite, which
         // a wide-oriented stream would then refuse.
         if (g_file) fprintf(g_file, "log    : %ls\n", stamped);
-        prune_old_logs(path);
+        // 0.1.93: a log that names its format here and has no "logend" line at its end is a run that died (log_history)
+        if (g_file) { fprintf(g_file, "logver : 2 (a clean exit ends this file with a logend line)\n"); fflush(g_file); }
+        prune_old_logs(path, 1 + kLogHistoryKeep);      // 0.1.93: this run's and the 5 before it (was 30)
         {   // the crash dumps and the cat dumps that sit beside the logs are kept to the same count
             wchar_t other[MAX_PATH] = {};
             wcsncpy_s(other, path, _TRUNCATE);
             wchar_t* d = wcsrchr(other, L'.');
             const wchar_t* sl = wcsrchr(other, L'\\');
-            if (d && (!sl || d > sl)) { wcscpy_s(d, (size_t)(other + MAX_PATH - d), L".dmp"); prune_old_logs(other); }
+            if (d && (!sl || d > sl)) { wcscpy_s(d, (size_t)(other + MAX_PATH - d), L".dmp"); prune_old_logs(other, 1 + kLogHistoryKeep); }
             wcsncpy_s(other, path, _TRUNCATE);
             if (wchar_t* s2 = wcsrchr(other, L'\\')) { wcscpy_s(s2 + 1, (size_t)(other + MAX_PATH - (s2 + 1)), L"mgmp_catdump.bin"); prune_old_logs(other); }
         }
@@ -237,6 +292,12 @@ void log_init(const wchar_t* path, bool console) {
 
 void log_shutdown() {
     if (!g_cs_ready) return;
+    if (g_flusher) {
+        InterlockedExchange(&g_flusher_stop, 1);
+        WaitForSingleObject(g_flusher, 1000);
+        CloseHandle(g_flusher);
+        g_flusher = nullptr;
+    }
     EnterCriticalSection(&g_cs);
     if (g_file) { fflush(g_file); fclose(g_file); g_file = nullptr; }
     LeaveCriticalSection(&g_cs);
@@ -259,8 +320,7 @@ void emit_line_v(const LogLevel* level, const char* tag, const char* fmt, va_lis
 
     const int body = n;   // where the message starts, for the ring
 
-    int m = _vsnprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, fmt, ap);
-    if (m < 0) m = (int)(sizeof(buf) - n - 1);   // truncated; emit what we have
+    const int m = format_v(buf + n, sizeof(buf) - n, fmt, ap);   // the length really written, never the buffer's size
     n += m;
 
     LogLevel lv = level ? *level : classify(tag, buf + body);
@@ -269,7 +329,9 @@ void emit_line_v(const LogLevel* level, const char* tag, const char* fmt, va_lis
     // one -- ImGui renders a trailing newline as a blank line per entry.
     buf[n] = 0;
 
-    if (stage_tag(tag)) {                      // a phase change: remembered for the crash report (the ring is lock-free)
+    const bool stage = stage_tag(tag);
+    const bool urgent = stage || lv >= LogLevel::Warn || strcmp(tag, "CRASH") == 0;
+    if (stage) {                               // a phase change: remembered for the crash report (the ring is lock-free)
         char mark[160];
         _snprintf_s(mark, sizeof(mark), _TRUNCATE, "%s %s", tag, buf + body);
         stage_push_text(mark);
@@ -277,7 +339,7 @@ void emit_line_v(const LogLevel* level, const char* tag, const char* fmt, va_lis
     EnterCriticalSection(&g_cs);
     ring_push_locked((uint32_t)seq, (uint32_t)turn, tag, buf + body, lv);
     if (n < (int)sizeof(buf) - 2) { buf[n++] = '\n'; buf[n] = 0; }
-    emit_locked(buf, (size_t)n);
+    emit_locked(buf, (size_t)n, urgent);
     LeaveCriticalSection(&g_cs);
 }
 
@@ -358,9 +420,8 @@ void log_raw(const char* fmt, ...) {
     char    buf[4096];
     va_list ap;
     va_start(ap, fmt);
-    int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    int n = format_v(buf, sizeof(buf) - 1, fmt, ap);
     va_end(ap);
-    if (n < 0) n = (int)sizeof(buf) - 2;
     buf[n] = 0;
 
     // The banner goes in the ring too -- it is the single most useful thing to
@@ -377,7 +438,7 @@ void log_raw(const char* fmt, ...) {
     // anyway; seq here is only ever displayed.
     ring_push_locked((uint32_t)g_seq, (uint32_t)g_turn, "", buf, lv);
     if (n < (int)sizeof(buf) - 2) { buf[n++] = '\n'; buf[n] = 0; }
-    emit_locked(buf, (size_t)n);
+    emit_locked(buf, (size_t)n, lv >= LogLevel::Warn);
     LeaveCriticalSection(&g_cs);
 }
 
@@ -385,6 +446,98 @@ void     log_set_turn(uint32_t t) { InterlockedExchange(&g_turn, (LONG)t); }
 uint32_t log_turn()               { return (uint32_t)g_turn; }
 uint32_t log_bump_turn()          { return (uint32_t)InterlockedIncrement(&g_turn); }
 
+
+// --- 0.1.93: the history of logs (see the header) -------------------------------------------------------------------------------------------
+void log_mark_clean_exit() {
+    if (!g_cs_ready) return;
+    EnterCriticalSection(&g_cs);
+    if (g_file) {
+        SYSTEMTIME t{};
+        GetLocalTime(&t);
+        fprintf(g_file, "logend : clean exit at %04d-%02d-%02d %02d:%02d:%02d\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        fflush(g_file);
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
+static bool parse_stamp(const wchar_t* name, LogTimeStamp& s) {     // "<stem>_YYYYMMDD-HHMMSS<ext>": the last '_' of the name
+    const wchar_t* us = wcsrchr(name, L'_');
+    if (!us || wcslen(us) < 16) return false;
+    int v[14];
+    for (int i = 0; i < 15; ++i) {
+        const wchar_t c = us[1 + i];
+        if (i == 8) { if (c != L'-') return false; continue; }
+        if (c < L'0' || c > L'9') return false;
+        v[i < 8 ? i : i - 1] = c - L'0';
+    }
+    s.year = v[0] * 1000 + v[1] * 100 + v[2] * 10 + v[3]; s.month = v[4] * 10 + v[5]; s.day = v[6] * 10 + v[7];
+    s.hour = v[8] * 10 + v[9]; s.minute = v[10] * 10 + v[11]; s.second = v[12] * 10 + v[13];
+    return s.month >= 1 && s.month <= 12 && s.day >= 1 && s.day <= 31;
+}
+
+int log_history(LogHistoryEntry* out, int cap) {
+    if (!out || cap <= 0 || !g_path[0]) return 0;
+    // this run's name without its stamp: <dir>\<stem>_*<ext>
+    wchar_t dir[MAX_PATH] = {}, pattern[MAX_PATH] = {};
+    const wchar_t* slash = wcsrchr(g_path, L'\\');
+    const wchar_t* dot = wcsrchr(g_path, L'.');
+    const wchar_t* us = wcsrchr(g_path, L'_');
+    if (!slash || !us || us < slash) return 0;
+    wcsncpy_s(dir, g_path, (size_t)(slash - g_path + 1));
+    _snwprintf_s(pattern, _TRUNCATE, L"%.*s_*%s", (int)(us - g_path), g_path, (dot && dot > us) ? dot : L"");
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    static wchar_t names[64][96];
+    int n = 0;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || wcslen(fd.cFileName) >= 96 || n >= 64) continue;
+        if (_wcsicmp(fd.cFileName, slash + 1) == 0) continue;                 // this run's own
+        wcscpy_s(names[n++], fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    for (int i = 0; i < n; ++i)                                                // newest first (the stamp is in the name)
+        for (int j = i + 1; j < n; ++j)
+            if (wcscmp(names[j], names[i]) > 0) { wchar_t t[96]; wcscpy_s(t, names[i]); wcscpy_s(names[i], names[j]); wcscpy_s(names[j], t); }
+    int m = 0;
+    for (int i = 0; i < n && m < cap; ++i) {
+        LogHistoryEntry& e = out[m];
+        e = LogHistoryEntry{};
+        _snwprintf_s(e.path, _TRUNCATE, L"%s%s", dir, names[i]);
+        e.have_start = parse_stamp(names[i], e.start);
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (!GetFileAttributesExW(e.path, GetFileExInfoStandard, &fa)) continue;
+        e.size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        FILETIME lt{}; SYSTEMTIME st{};
+        if (FileTimeToLocalFileTime(&fa.ftLastWriteTime, &lt) && FileTimeToSystemTime(&lt, &st)) {
+            e.end.year = st.wYear; e.end.month = st.wMonth; e.end.day = st.wDay; e.end.hour = st.wHour; e.end.minute = st.wMinute; e.end.second = st.wSecond;
+            e.have_end = true;
+        }
+        // how it ended: the "logend" line in its last bytes; the "logver" line at its top says the format knows that line
+        HANDLE f = CreateFileW(e.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            char head[512] = {}, tail[1024] = {};
+            DWORD got = 0;
+            ReadFile(f, head, sizeof(head) - 1, &got, nullptr);
+            const bool versioned = strstr(head, "logver :") != nullptr;
+            LARGE_INTEGER pos; pos.QuadPart = e.size > sizeof(tail) - 1 ? (LONGLONG)(e.size - (sizeof(tail) - 1)) : 0;
+            got = 0;
+            if (SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) ReadFile(f, tail, sizeof(tail) - 1, &got, nullptr);
+            for (DWORD k = 0; k < got; ++k) if (!tail[k]) tail[k] = ' ';
+            tail[got] = 0;
+            CloseHandle(f);
+            e.ended = strstr(tail, "logend :") ? 1 : versioned ? 0 : -1;
+        }
+        wchar_t dmp[MAX_PATH] = {};
+        wcsncpy_s(dmp, e.path, _TRUNCATE);
+        if (wchar_t* d = wcsrchr(dmp, L'.')) {
+            wcscpy_s(d, (size_t)(dmp + MAX_PATH - d), L".dmp");
+            if (GetFileAttributesW(dmp) != INVALID_FILE_ATTRIBUTES) wcsncpy_s(e.dump, dmp, _TRUNCATE);
+        }
+        ++m;
+    }
+    return m;
+}
 
 bool log_current_path(wchar_t* out, size_t cap) {
     if (!g_path[0] || !cap) return false;

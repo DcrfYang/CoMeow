@@ -19,9 +19,31 @@ namespace mgmp {
 
 void log_init(const wchar_t* path, bool console);
 void log_shutdown();
+// Puts what is buffered into the file now (0.1.50: lines are buffered). Call before anything reads the log file.
+void log_flush();
 
 // The full path of the file this run is writing (the stamped name). False if there is none (no log opened).
 bool log_current_path(wchar_t* out, size_t cap);
+
+// 0.1.93 THE HISTORY OF LOGS (F2's "upload an older log"). The folder keeps this run's log and the 5 before it (a queue: the oldest goes when a new run
+// starts). A log opens with a "logver" line and a clean exit closes it with a "logend" line (log_mark_clean_exit, from DLL_PROCESS_DETACH only -- the crash
+// path never writes it), so a log that has the first and not the second is a run that died. The lines are on disk within kFlushMs (100 ms) of being written,
+// by a thread of their own, so a frozen or killed game leaves its log all but complete.
+constexpr int kLogHistoryKeep = 5;
+struct LogTimeStamp { int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0; };
+struct LogHistoryEntry {
+    wchar_t      path[260] = {};
+    wchar_t      dump[260] = {};       // the crash dump beside it ("" when there is none)
+    LogTimeStamp start;                // from the stamp in the name (when the game started)
+    LogTimeStamp end;                  // the file's last write (when the game stopped writing: its end, or its crash)
+    bool         have_start = false, have_end = false;
+    uint64_t     size = 0;
+    int          ended = -1;           // 1 a clean exit, 0 it did not end cleanly, -1 unknown (a log from before 0.1.93)
+};
+// The earlier runs' logs beside this run's (same name, another stamp), newest first; at most `cap`. This run's log is not among them.
+int  log_history(LogHistoryEntry* out, int cap);
+// A clean exit: the "logend" line, on disk at once. Only from DLL_PROCESS_DETACH.
+void log_mark_clean_exit();
 
 // Emits one complete line (newline appended, flushed).
 void log_line(const char* tag, const char* fmt, ...);

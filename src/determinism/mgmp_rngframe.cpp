@@ -70,7 +70,16 @@ uint64_t mix(uint64_t& x) {
     return z ^ (z >> 31);
 }
 
+// The passive a wrapped handler is running for (its `this`), while it runs: mgmp_gains reads the carrier of the item a passive drops (RockyArmor).
+const void* g_cur_passive = nullptr;
+struct CurPassive {
+    const void* prev;
+    explicit CurPassive(const void* p) : prev(g_cur_passive) { g_cur_passive = p; }
+    ~CurPassive() { g_cur_passive = prev; }
+};
+
 void* fenced_call(int i, void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    CurPassive cur(a);
     if (!tune::kRngFrame || !in_play()) return g_orig[i](a, b, c, d, e, f, g, h);
     uint64_t* s = rng_global_stream();
     if (!s) return g_orig[i](a, b, c, d, e, f, g, h);
@@ -118,6 +127,8 @@ constexpr std::array<void*, sizeof...(I)> make_detours(std::integer_sequence<int
 const std::array<void*, kN> kDetours = make_detours(std::make_integer_sequence<int, kN>{});
 
 } // namespace
+
+const void* rngframe_current_passive() { return g_cur_passive; }
 
 int rngframe_install(uintptr_t base) {
     if (!tune::kRngFrame || !base) return 0;

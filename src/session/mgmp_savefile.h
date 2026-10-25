@@ -129,6 +129,22 @@ bool savefile_adventure_is_loaded();
 // False if it cannot be resolved; the reason is logged by the resolver.
 bool savefile_save_dir(wchar_t* out, size_t out_len);
 
+// WHICH ACCOUNT'S SAVES (2026-10-15). With several account folders under <appdata>\Glaiel Games\Mewgenics and no Steam id to match one, the
+// folder was a guess (the newest save file). Now the player is asked (the title screen's question) and the answer is remembered in
+// <the DLL's folder>\save_account.txt; the backup page can switch it too. A remembered choice wins over the Steam id.
+struct SaveAccount {
+    wchar_t  name[64] = {};      // the account folder (the SteamID64 on a Steam install)
+    char     persona[64] = {};   // the Steam account name, from Steam's loginusers.vdf (UTF-8; empty when not known)
+    uint64_t newest = 0;         // the newest .sav write time (FILETIME), 0 = no save file
+    int      saves = 0;          // .sav files in it
+    bool     current = false;    // the folder in use now
+};
+int  savefile_accounts(SaveAccount* out, int cap);   // every account folder that has a saves folder
+bool savefile_dir_needs_choice();                    // several folders, none confirmed by Steam or by the player, not dismissed this session
+void savefile_dir_dismiss_choice();                  // "not now": the guess stays for this session
+const char* savefile_dir_how();                      // "chosen", "steam", "only", "guess" ("" before it is resolved)
+bool savefile_choose_account(const wchar_t* name);   // remember and use this folder (refused in a room); false when it does not exist or cannot be written
+
 // Flush and capture this player's local SQLite database at a safe map boundary.
 // The returned buffer is malloc-owned by the caller.
 bool savefile_read_checkpoint(uint8_t** data, uint32_t* size, uint64_t* hash);

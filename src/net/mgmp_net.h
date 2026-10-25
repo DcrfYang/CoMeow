@@ -80,7 +80,10 @@ struct NetMsg {
     ChatMsg      chat;        // a line of text one player typed (proto 81): flat
     DrawMsg      draw;        // a piece of a player's drawing over the map or the battle (proto 87): flat
     SettingMsg   setting;     // the host's combat speed (proto 82): flat
+    PingMsg      ping;        // a request / reply with the sender's frame statistics (proto 104, mgmp_perf): flat, answered on the receive thread
     EquipMsg     equip;       // the consumable a backpack auto-equipped on its owner's peer (proto 85): flat
+    TreasureMsg  treasure;    // a claim on / the ledger of a shared treasure chest (proto 90, experimental): flat
+    HouseCoopMsg housecoop;   // the house boss co-op: statuses, the vote, the go (proto 94, experimental): flat
     DeepMsg      deep;        // one turn's per-unit digest of derived values (proto 80): flat
     NodeHashMsg  nodehash;
     CatDigestMsg catdigest;  // per-cat hash digest, see MSG_CATDIGEST
@@ -93,7 +96,11 @@ struct NetMsg {
     MapSeedsMsg  mapseeds;  // the chapter map's node seeds, host -> clients, see MSG_MAPSEEDS
     UnlocksMsg   unlocks;   // the host's unlock answers, host -> clients, see MSG_UNLOCKS
     BoardMsg     board;     // the host's battle board and stream, host -> clients, see MSG_BOARD
+    BoardSumMsg  boardsum;  // the host's board as one digest per unit (proto 98), host -> clients, see MSG_BOARDSUM
+    BoardReqMsg  boardreq;  // a client asking for the full board of a boundary (proto 98), client -> host, see MSG_BOARDREQ
     RollMsg      roll;      // a host-decided chance roll, host -> clients, see MSG_ROLL
+    NodeVoteMsg  nodevote;  // a player's pick of the next map node (proto 106): flat
+    SoulCatMsg   soulcat;   // the cat a Soul Jar holds, from the jar's owner (proto 100); owns its buffer, same contract as catdata
     HaltMsg   halt;
     char      refuse[192] = {};
 };
@@ -240,7 +247,7 @@ bool net_send_unlocks(const UnlocksMsg& m);
 // The newest level name the host sent (filled by the receive thread, not the frame queue): true when it is for `node_id`.
 bool net_host_level(uint64_t node_id, char* out, size_t cap);
 // The host's queue of returning enemies that came with that level (same mailbox): true when the level message for `node_id` has arrived.
-bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n);   // out[kPendingQueues][kPendingMax], n[kPendingQueues]
+bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n, uint32_t* total = nullptr);   // out[kPendingQueues][kPendingMax], n[kPendingQueues]
 // The host's battle board (MSG_BOARD): host-authored, net_send reaches every client; _to is the replay for a peer that joins late.
 bool net_send_board(const BoardMsg& m);
 // A roll the host decided (MSG_ROLL): sent to every client; a client looks it up by (battle, seq, site).
@@ -251,6 +258,14 @@ bool net_send_board_to(uint8_t peer, const BoardMsg& m);
 // come through the frame queue): true once every chunk is in.
 // The host's board for one TURN boundary of a battle (the last few are kept): true once every chunk of it is in.
 bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out);
+// HOST, proto 98: publish one boundary's board. The chunks are kept (the last kBoardKeep boundaries) for a client that asks for them (MSG_BOARDREQ, answered on the receive
+// thread); `sum` null = turn 0: the chunks go to every client; otherwise every client gets the digest and only the ones that asked to be streamed get the chunks too.
+// Returns the number of clients reached.
+uint32_t net_board_publish(const BoardMsg* chunks, uint32_t n, const BoardSumMsg* sum);
+// CLIENT, proto 98: the host's digest of one boundary (the last many are kept); whether anything of a LATER boundary of that battle has arrived (the host is past it); the request.
+bool net_host_boardsum(uint64_t battle, uint32_t turn, BoardSumMsg& out);
+bool net_board_seen_past(uint64_t battle, uint32_t turn);
+bool net_send_boardreq(const BoardReqMsg& m);
 // Forgets what the host sent for battles that are over -- the boards, the rolls and the level box. Called when a save is loaded: a node entered again keeps its battle id, and a stale board of turn 0 would
 // otherwise be applied before the host's new one arrives.
 void net_clear_battle_caches();
@@ -268,8 +283,14 @@ bool net_send_props(const PropsMsg& m);
 bool net_send_rngl(const RnglMsg& m);
 bool net_send_chat(const ChatMsg& m);
 bool net_send_draw(const DrawMsg& m);
+bool net_send_treasure(const TreasureMsg& m);
+bool net_send_housecoop(const HouseCoopMsg& m);
 bool net_send_setting(const SettingMsg& m);
+bool net_send_ping(const PingMsg& m);
 bool net_send_equip(const EquipMsg& m);
+// proto 100: the cat a Soul Jar of this player's holds (mgmp_souljar), to every other peer. `data` is borrowed for the duration.
+bool net_send_soulcat(const SoulCatMsg& m);
+bool net_send_nodevote(const NodeVoteMsg& m);
 bool net_send_deep(const DeepMsg& m);
 bool net_send_halt(const HaltMsg& h);
 bool net_send_refuse(const char* reason);
@@ -293,5 +314,7 @@ struct NetStats {
     uint64_t bytes_sent = 0, bytes_received = 0;
 };
 NetStats net_stats();
+// Bytes this peer has queued for that peer and not yet handed to the socket (the link's outgoing queue, 0.1.50). For the PERF line (0.1.84).
+size_t net_queued_bytes(uint8_t peer);
 
 } // namespace mgmp

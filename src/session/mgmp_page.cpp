@@ -153,7 +153,7 @@ void page_on_button(void* button) {
     if (!starts(name, "InventoryButton_") && !starts(name, "EquippedButton_") &&
         !starts(name, "CatSelector_") && !starts(name, "Button_LowerDifficulty") &&
         !starts(name, "Map_") && !starts(name, "MapNode_") && !starts(name, "Event_") && !starts(name, "Shop_") &&
-        !starts(name, "Combat_") && !starts(name, "Button_PauseMenu_"))
+        !starts(name, "Combat_") && !starts(name, "Button_PauseMenu_") && !starts(name, "Levelup_"))
         return;
     note(name, GetTickCount64());
 }

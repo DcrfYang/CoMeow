@@ -21,7 +21,10 @@
 //                    R268 dice. Fix shape: give each sequence its own stream seeded from (battle, turn, action, unit, n-th closure) and put the shared
 //                    stream back around it. mgmp_rng's kIsolated (SpawnThingOnDamage only) is the one point done so far.
 //   TODO(RNG-R268)   Dicer's dice redraw their pips on the `roll` animation event; DicerBrain (slot 31, 0x140160AEC) picks its D6 ability from them.
-//   TODO(RNG-R013)   AOE landing particle delays draw through an inline helper (0x14094F1F0, return 0x140097EFD): invisible to the ledger.
+//   R013 (DONE 2026-10-18, rngfix_simultaneous_aoe_tick): an AOE whose tiles land after their own random delays (MeteorStorm: random_delay [0,120]) applied each tile's damage --
+//                    and its chance effects (Stun, SpawnFlames, BounceRock) -- when that tile's delay ran out, so two tiles landing close together came in either order
+//                    depending on the frame timing: the same draws went to other units (room GAAX, battle 50a0452c: three floaters burning here and stunned there).
+//                    In a room every such AOE applies its damage at once, in tile order, as the game does for visual_delay_but_simultaneous_damage; the particles still fall late.
 //   TODO(RNG-R438)   scramble_basic_attack builds its candidates from THIS peer's unlocked classes (outside a battle the save answers).
 //   TODO(RNG-R027)   the backpack's global passives are ignored in a room; the faithful version is the host sending the item names with the build.
 //   TODO(RNG-R440)   spawn_unit_next_fight is reset at entry now; the robust version is the host sending MewDirector+0x610 with the level.
@@ -54,6 +57,10 @@ void* rngfix_wave(void* level, int32_t wave, fn_rngfix_wave orig);
 // weapon it turns into is drawn from a stream of (battle, the cat, how many times this cat's clay changed in this battle), the shared one put back.
 typedef void* (__fastcall* fn_rngfix_4)(void*, void*, void*, void*);
 void* rngfix_clay(void* self, void* a, void* b, void* c, fn_rngfix_4 orig);
+
+// R013: every frame. In a room of two or more the AOE landing (sub_140096C20) treats an ability without visual_delay_but_simultaneous_damage as if it had it with 0 (the
+// damage of every tile at once, in tile order); out of one the game's own code is put back. A 13-byte patch of the one branch that reads the setting.
+void rngfix_simultaneous_aoe_tick();
 
 // "R001/P1" for a draw site (return RVA, as the ledger keys it) that the research flagged; nullptr otherwise.
 const char* rngfix_site_tag(uint32_t rva);

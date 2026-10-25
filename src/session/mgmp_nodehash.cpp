@@ -9,6 +9,7 @@
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_follow.h"     // follow_here_seed
+#include "mgmp_indepevt.h"   // indepevt_own_node: an own random event puts each player's own cats in the party
 #include "mgmp_hashring.h"
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
@@ -256,7 +257,10 @@ void report(uint8_t from, const NodeHashMsg& a, const NodeHashMsg& b) {
     const bool rng_compared = (a.point == kNodePointEnter);
     const bool rng_same  = memcmp(a.rng, b.rng, sizeof(a.rng)) == 0;
     const bool hist_same = a.hist_hash == b.hist_hash;
-    const bool cats_same = a.cats_hash == b.cats_hash && a.cat_count == b.cat_count;
+    // EXPERIMENTAL (mgmp_indepevt): on a node whose random event is each player's own, each party holds that player's own cats -- the
+    // rosters differ by design there, and only the stream is a verdict.
+    const bool own_event = indepevt_own_node(a.node_seed);
+    const bool cats_same = own_event || (a.cats_hash == b.cats_hash && a.cat_count == b.cat_count);
     const bool inv_same  = a.inv_hash  == b.inv_hash;
     const bool evt_same  = strcmp(a.event, b.event) == 0;
 

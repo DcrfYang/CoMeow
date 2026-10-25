@@ -21,6 +21,10 @@ constexpr uint32_t kMapFlag_Lab    = 1u << 18;   // mapflag_LabUnlocked    -- th
 // THIS player's flags, read live from the running game. All bits when the game's debug unlock-everything byte is set, and all bits when
 // nothing can be read: an unreadable state must never lock anybody out (and is neutral in the AND).
 uint32_t unlocks_mapflags();
+// The same set, false when it could not be read (no save loaded): what a client reports to the host (mgmp_areagate).
+bool unlocks_mapflags_try(uint32_t& out);
+// The bit of `name` ("SewersUnlocked" ...) in that set, -1 for a flag the set does not carry.
+int unlocks_flag_bit(const char* name);
 
 // Whether a flag set lets its player choose chapter `act` (1..3). Chapter 3 needs chapter 2 as well.
 inline bool unlocks_allow(uint32_t flags, int act) {
@@ -59,7 +63,16 @@ void unlocks_window_open(const char* why, bool event = false);
 // battle that was built, counts as having left).
 void unlocks_on_map(bool ready);
 void unlocks_window_close(const char* why);
+// What opened the window that is open now (for the log), or nullptr when none is.
+const char* unlocks_window_why();
+// THIS PLAYER'S OWN NUMBERS (0.1.55, "my warehouse money went from ~3000 to ~300, about what the other player has"): the House (house_gold,
+// house_food, house_storage_upgrades ... every house_*) and the stash the run carries (adventure_coins / _food / _furniture_boxes). Never answered
+// with the host's value, whatever window is open: a save loaded inside one took the host's warehouse money into this player's House.
+bool unlocks_per_player_property(const char* key);
 bool unlocks_window_active();
+// CLIENT, for the duration of one roll outside any window (the experimental shared treasure chest, mgmp_treasure): every unlock check answers with
+// the host's lists, as in a window. A no-op on the host and before the host's lists arrived. Always paired: on, the roll, off.
+void unlocks_force_host_lists(bool on);
 // The class-list function ran (both peers, from its hook): record this peer's list and, on a client in a battle's window, replace it by the host's. See mgmp_unlocks.cpp.
 void unlocks_classes_after(void* out_vector, bool with_colorless);
 // A level-up screen is about to be built (its constructor builds the option pool, the unlock queries of which come BEFORE any log line of ours): if this is the reward of a fight, the fight is over -- both the
@@ -71,6 +84,7 @@ void unlocks_level_screen_opens();
 // room that has been told one); the HOST'S call also publishes its value when it changed. False for any other key.
 bool settings_override(const char* key, float own, float& out);
 void settings_on_message(uint8_t from, const SettingMsg& m);
+void settings_peer_joined();   // host: a player was accepted (the combat speed goes to it)
 // The combat speed this game runs a room's battles at, for the panel: the host's own setting as its game last read it, or on a client the
 // host's value it was told. False while it is not known yet (the game reads it only in a battle). settings_room_left forgets the host's.
 bool settings_room_speed(float& out);

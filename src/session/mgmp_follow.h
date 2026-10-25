@@ -146,6 +146,18 @@ bool follow_on_map();
 // Number of nodes on the live map, or 0 if there is no map screen yet.
 uint32_t follow_node_count();
 
+// 0.1.95 (mgmp_mapvote): the map as this module reads it, read-only. `map` is the MapScreen* of the tick that called (or follow_map_screen()).
+bool     follow_active();                                  // following is armed (a room's run)
+void*    follow_map_screen();                              // the latest MapScreen* the update saw, nullptr before the first
+bool     follow_map_ready(void* map);                      // the map is not initialising or entering a node
+void*    follow_node_by_index(void* map, uint32_t index);  // nullptr when out of range
+bool     follow_index_of(void* map, void* node, uint32_t& index);
+uint64_t follow_node_seed(void* node);                     // MapNode+0x118, word 0
+uint32_t follow_node_type(void* node);
+bool     follow_node_consumed(void* node);                 // the node's own "consumed" byte (+0x168) is set
+// The marker (the party's icon): the node it stands on, the node it is walking to (non-null = moving), and the node a click selected.
+bool     follow_marker(void* map, void*& marker, void*& at, void*& moving, void*& selected);
+
 // Type, seed and name of one node. False if the index is out of range or the
 // map is not up.
 bool follow_node_info(uint32_t index, uint32_t& type, uint64_t& seed0,
@@ -163,6 +175,8 @@ bool follow_current_node(uint32_t& index);
 // This is the same 64 bits battle_id uses, and for the same reason: it is the
 // only name for a node that two processes can independently arrive at.
 uint64_t follow_here_seed();
+// The type of that node (MapNode::str_to_type order: 13 = treasure), or 0 if it has not entered one this session.
+uint32_t follow_here_type();
 
 // Where the map MARKER is, and what is SELECTED, read live out of the game
 // (MapScreen+0xA0 -> +0x50 / +0x60, the slot MapNode::Click writes).

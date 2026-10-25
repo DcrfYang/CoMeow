@@ -148,6 +148,10 @@ bool catsync_cat_perished(uint64_t id);
 
 // Is there a cat with this id in the game's registry? (A cat gained during the run -- the gain_cat_familiar event -- is one.)
 bool catsync_cat_exists(uint64_t id);
+// A cat an event brought into the run (gain_cat_familiar, after the game's own call): moved to the shared session_gained_id on every peer.
+// `counter_before` is catsync_id_counter() from just before the game's call. True when the cat was moved.
+bool catsync_on_gained_cat(uint64_t counter_before, const char* why);
+uint64_t catsync_id_counter();
 
 // FNV-1a of a cat's serialized image -- the hash CATDATA carries; 0 when it cannot be serialized. For logs.
 uint64_t catsync_image_hash(void* cat);
@@ -159,6 +163,11 @@ bool catsync_export_resume(SetupMsg& out, uint8_t owner);
 void catsync_setup_sent(const SetupMsg& snapshot);
 // Transactionally isolate owned cats immediately before native home settlement.
 bool catsync_prepare_settlement(void* director);
+// THE LAST LINE BEFORE AN UNFILTERED SETTLEMENT (0.1.79): when catsync_prepare_settlement refuses, this only takes the OTHER players' session cats out of the
+// run's three lists (party, mirror, familiars) -- by their owner note, or by their id when there is none (a clone slot 1..4 or a gained-cat slot of another
+// position) -- and leaves everything else as it is. The native settlement then cannot make another player's cat a cat of this House. False when this peer's
+// position is not known or a list cannot be read; nothing is written then.
+bool catsync_strip_peer_copies_for_settlement(void* director);
 // RETURN A RUN'S CLONES TO THE CATS THEY WERE MADE FROM (2026-10-01, review finding F1).
 // A player's selected cats are cloned into session cats for the run (0x70000000 + owner<<24 + n); the game flags
 // the ORIGINALS "on adventure" at departure and settles only the clones. This finds this peer's SETTLED clones
@@ -168,7 +177,11 @@ bool catsync_prepare_settlement(void* director);
 // not on adventure, a seed that is not unique, or a write that fails leaves everything as it was. Called right
 // after the native settlement and, as a safety net for saves the old behaviour left behind, before a new run's
 // clones are made. Returns how many clones were merged.
-unsigned catsync_merge_session_cats(const char* why);
+// `after_native_settlement`: the run has just been settled by the game (run_settled). Only then is a clone of this run that is STILL out on adventure -- the settlement walks the party
+// and clears the mark on every cat in it -- a cat that was not in the party at the end: it left during the run (leave_party_temporarily, came back as an enemy, ...). Its original
+// then comes home as LEFT (0x10) -- or dead (0x20) when the clone died -- exactly as the game marks a cat that is not in the party. Never before a setup: a crashed run's clones
+// are still out on adventure there too.
+unsigned catsync_merge_session_cats(const char* why, bool after_native_settlement = false);
 
 // A cat's BODY PARTS AND MUTATIONS, as one log line (PARTS): the game's own mutation lister (0x1400CB690, the one the cat card uses) walks 14 slots of 0x54 bytes in the cat data, each with a part
 // id at +0x8C, a mutation value at +0x90 and a "has a mutation" byte at +0xA4 (slot k: add 0x54*k). Written as `id` or `id*mutation`, with the count in front and a hash of the whole table behind it.
@@ -211,6 +224,8 @@ void catsync_house_save(void* house);
 // The cat census (see mgmp_catsync.cpp): taken when the House's box sets off (`box` = the ids in it), checked after a shared run is settled.
 void catsync_census_take(const uint64_t* box, uint32_t nbox);
 void catsync_census_check(const char* stage);
+// A save was loaded: an earlier census is dropped; a save already on an adventure is counted again as loaded (0.1.51).
+void catsync_census_on_save_loaded();
 
 // THE SAVE THE NATIVE SETTLEMENT WRITES IS NOT THE ONE THAT COUNTS (2026-10-03). MewDirector::SaveGame is the settlement's own last step, and it runs BEFORE the clone merge: the file on disk then
 // holds the settled CLONES under their session ids, the originals still "on adventure", and a house_state naming the clones. A player who reloads before anything saves again got the
@@ -327,5 +342,16 @@ void catsync_map_tick();
 // the authority only logs the difference; the first time a cat differs, each peer
 // writes its own copy's bytes next to the log (mgmp_catdump_*.bin) for diffing.
 void catsync_on_digest(uint8_t from, const CatDigestMsg& m);
+
+// --- for mgmp_souljar (2026-10-22) ---
+// This peer's seat (the position a session cat id names), the one catsync itself uses.
+uint8_t catsync_my_seat();
+// The run's cat ids, party then familiars; 0 when the lists cannot be read.
+uint32_t catsync_run_cat_list(uint64_t* out, uint32_t cap);
+// The CatData the registry holds for `id` (the game's own lookup, guarded); nullptr when there is none or nothing could be read.
+void* catsync_registry_cat(uint64_t id);
+// A NEW CatData read from a cat image the way setup builds a session cat (allocate + construct + read + post-load), its CatData+0xC48 set to
+// `save_id`. Not registered anywhere: the caller keeps it. nullptr when the image does not read.
+void* catsync_cat_from_image(const uint8_t* image, uint32_t len, uint64_t save_id);
 
 } // namespace mgmp

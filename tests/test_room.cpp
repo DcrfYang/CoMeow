@@ -85,6 +85,19 @@ void menu_request_slot(int s) { requested_slot = s; }
 bool checkpoint_abort_round() { ++aborts; round_open = false; return true; }
 bool checkpoint_round_open() { return round_open; }
 void checkpoint_stage_tick(uint8_t) {}
+int drop_uploads = 0;
+void prevrun_drop_upload(const char*, const char*) { ++drop_uploads; }   // 0.1.76: the log sent on a drop-out
+bool session_exp_house_coop() { return false; }   // the house boss co-op (mgmp_housecoop): off here
+void housecoop_tick() {}
+bool housecoop_holds_solo() { return false; }
+void housecoop_hold_reason(char* out, size_t cap) { if (out && cap) out[0] = 0; }   // 0.1.86+: the links this test never has
+NetRole net_role() { return NetRole::None; }
+uint32_t perf_link_slow_ms(uint8_t*) { return 0; }
+const char* signal_room_transport() { return ""; }
+int signal_reach() { return 0; }
+bool upnp_double_nat() { return false; }
+bool session_ready() { return true; }
+bool session_version_problem(char*, size_t) { return false; }
 uintptr_t addr_of_data(DataSym d) { return d == D_MewDirectorPtr ? (uintptr_t)&director_ptr : 0; }
 bool mem_read(const void* src, void* dst, size_t n) { memcpy(dst, src, n); return true; }
 const Config& config() { static Config c; return c; }

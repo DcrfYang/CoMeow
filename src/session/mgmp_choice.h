@@ -125,6 +125,11 @@ bool choice_on_level_select(void* screen, void* opt);
 
 // Diagnostic cross-check: Levelup_Boon captures must name one screen and distinct option indices.
 void choice_on_button(void* button);
+// A CLIENT'S OPTION BUTTONS OF A FOLLOW EVENT ARE GREY (0.1.63, tinted instead of disabled in 0.1.64): called for every button before and after Button::update. While a
+// world event is up on a client, each "Event_ChoiceButton"'s root clip gets its RGB colour multipliers pulled down (about 0.6): the whole option goes a dull grey, the icon and
+// the text stay readable. (The game's own disabled state hides the icon and fades the text almost out, which is why it is not used.) The click is swallowed by the commit hook.
+// Not for an event that is this player's own (mgmp_indepevt). Without the independent-events setting every event follows the host, so all of a client's options are grey.
+void choice_grey_event_button(void* button);
 
 // THE TRUTH ABOUT A LEVEL-UP SCREEN, FOR THE DEBUG PANEL TO SAY OUT LOUD (2026-09-23).
 //
@@ -147,6 +152,9 @@ void choice_on_event_update(void* world_event);
 bool choice_story_event_block_active();
 // A blocked change, for the log (once per kind per node).
 void choice_story_event_blocked(const char* what);
+// Every frame: on a client replaying the host's story event, a House surviving-kaiju name the result cleared (`clear_surviving_kaiju`, inline in the
+// interpreter) is put back (2026-10-16).
+void choice_story_guard_tick();
 void choice_on_level_update(void* level_screen);
 
 void choice_on_message(uint8_t from, const ChoiceMsg& m);

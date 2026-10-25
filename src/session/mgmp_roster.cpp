@@ -1292,6 +1292,10 @@ static bool g_swap_post = false;
 static bool g_swap_list_seen = false;
 static bool g_swap_battle_node = false;
 static bool g_swap_node_entered = false;
+// EXPERIMENTAL (ui.exp_indep_events, mgmp_indepevt): this node's random event is this player's own, so the local roster was put in place
+// in the middle of the event's constructor (after the shared draw, before the subject cat is picked). The node-entry rule below must not
+// take it back to the shared layout.
+static bool g_swap_event_local = false;
 static uint64_t g_swap_turn_serial = 0;
 static uint64_t g_swap_run_turn_serial = 0;
 static bool swap_capture();
@@ -1313,6 +1317,7 @@ bool roster_party_swap_release() {
     g_swap_list_seen = false;
     g_swap_battle_node = false;
     g_swap_node_entered = false;
+    g_swap_event_local = false;
     g_swap_turn_serial = g.turn_serial;
     if (!g_swap.captured) {
         uintptr_t pd = 0, fd = 0;
@@ -1519,11 +1524,26 @@ void roster_party_swap_after_node(uint32_t type) {
     if (!g_setup_ready || !tune::kPartySwapWhileEditing || !net_active() || net_peer_pos() == 0) return;
     g_swap_node_entered = true;
     g_swap_battle_node = type >= 5 && type <= 8;
-    const bool shared_event = type >= 9 && type <= 11 && !tune::kPerPlayerNodes;
+    const bool shared_event = type >= 9 && type <= 11 && !tune::kPerPlayerNodes && !g_swap_event_local;
     g_swap_blocked = g_swap_battle_node || shared_event;
     g_swap_post = !g_swap_blocked;
     g_swap_list_seen = false;
     if (g_swap_post) swap_apply_now();
+}
+
+bool roster_party_swap_for_own_event() {
+    if (!g_setup_ready || !tune::kPartySwapWhileEditing || !net_active() || net_peer_pos() == 0) return false;
+    if (!swap_capture()) {
+        log_line_lvl(LogLevel::Warn, "ROSTER", "!! own random event: the local roster could not be captured -- the event keeps the shared party");
+        return false;
+    }
+    g_swap.active = true;
+    g_swap_holds = true;
+    if (!swap_set_lists(true, "own random event: this peer's cats take the event")) return false;
+    g_swap_event_local = true;
+    g_swap_blocked = false;
+    g_swap_post = true;
+    return true;
 }
 
 void roster_party_swap_on_map() {
@@ -1574,6 +1594,7 @@ void roster_party_swap_reset() {
     g_swap_list_seen = false;
     g_swap_battle_node = false;
     g_swap_node_entered = false;
+    g_swap_event_local = false;
 }
 
 // POST-BATTLE PROMOTION, UNDONE BY OWNERSHIP (2026-09-29). Measured Host3/Client2: the
@@ -1683,7 +1704,7 @@ static uint8_t shared_owner(uint32_t id) {
     if (!lockstep_owner_pos(id, owner)) {
         const int encoded = session_cat_owner(id);
         if (encoded >= 0) owner = (uint8_t)encoded;
-        else if (id < 0x70000000u) owner = 0;      // an ordinary id in the run: a cat the game brought in (an event) -- the host's
+        else if (id < 0x70000000u || session_is_gained(id)) owner = 0;      // a cat the game brought in (an event) -- the host's
     }
     return owner;
 }
@@ -1699,7 +1720,7 @@ bool roster_adopt_host_shared(const uint64_t* cats, uint32_t cn, const uint64_t*
         const uint8_t owner = shared_owner((uint32_t)fam[i]);
         // A familiar is normally a client's cat. A HOST cat the game filed there because the party was already full (a gained cat)
         // is fine too -- only a host cat with a session id has no business in the familiars.
-        if (owner >= net_peer_count() || (owner == 0 && fam[i] >= 0x70000000ull)) refuse = "a familiar not owned by a client";
+        if (owner >= net_peer_count() || (owner == 0 && fam[i] >= 0x70000000ull && !session_is_gained(fam[i]))) refuse = "a familiar not owned by a client";
         else fams[nfn++] = (uint32_t)fam[i];
     }
     for (uint32_t i = 0; i < cn && !refuse; ++i) {
