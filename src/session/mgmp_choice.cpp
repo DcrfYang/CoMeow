@@ -431,6 +431,11 @@ struct State {
     uint32_t event_count = 0;
     uint32_t event_step = 0;
     bool event_faulted = false;
+    // 0.1.178: this node's events are this player's own to choose (the host's choice could not be followed here); the evidence that started
+    // counting toward that, and when.
+    uint64_t event_free_seed = 0;
+    uint64_t event_mism_since = 0;
+    char     event_mism_why[200] = {};
 
     struct HeldLevel {
         ChoiceMsg message;
@@ -869,7 +874,75 @@ void remove_event(uint32_t i) {
     for (uint32_t j = i + 1; j < g.event_count; ++j) g.event_queue[j - 1] = g.event_queue[j];
     --g.event_count;
 }
+// THE EVENT THIS PEER CANNOT FOLLOW IS RELEASED (0.1.178; room DJVE 11-03: the host carried a quest item that changed the extra events, the client's
+// extra event asked for a choice the host never made, and the client sat on the event node for good -- the user's rule since: options that differ from
+// the host's and cannot be followed are this player's own to pick, never a dead screen). For the rest of this node a client's own clicks go through,
+// the buttons are not grey and the host's later choices of this node are dropped; the next node follows the host again.
+bool event_free_here() { return g.event_free_seed != 0 && g.event_free_seed == g.here_seed; }
+void event_release(void* screen, const char* why) {
+    if (event_free_here()) return;
+    g.event_free_seed = g.here_seed;
+    g.event_faulted = false;
+    g.event_mism_since = 0;
+    g.event_local_have = false;
+    for (uint32_t i = 0; i < g.event_count;) { if (g.event_queue[i].node_seed == g.here_seed) remove_event(i); else ++i; }
+    char page[64] = {};
+    read_game_string((const uint8_t*)screen + kEvt_EventName, page, sizeof(page));
+    log_line_lvl(LogLevel::Warn, "CHOICE", "!! EVENT RELEASED: this peer's event '%s' (step %u) cannot follow the host's -- %s. This player chooses on their own for the rest of this node "
+                 "(the options are not grey, nothing is published, the host's later choices of this node are dropped)", page[0] ? page : "?", g.event_step, why ? why : "?");
+    room_toast(tr(Tx::EV_FREE_CHOICE));
+}
+// The host's option, found here by its name when the index does not fit (an option the host has and this peer lacks, or the other way round, shifts
+// the indices). Only a name this peer's page holds exactly once, and never "none" (the key of every plain option: it names no option in particular).
+bool event_index_by_name(uint8_t* begin, uint32_t count, const char* name, uint32_t& index) {
+    if (!name || !name[0] || strcmp(name, "none") == 0 || strcmp(name, "?") == 0) return false;
+    uint32_t hits = 0;
+    for (uint32_t k = 0; k < count; ++k) {
+        char key[48] = {};
+        option_name(kChoiceEvent, begin + (uintptr_t)k * kOptStride, key, sizeof(key));
+        if (strcmp(key, name) == 0) { index = k; ++hits; }
+    }
+    return hits == 1;
+}
+// EVIDENCE THAT THE HOST'S CHOICES CANNOT REACH THIS PAGE, checked while this peer's page waits for a click (a choice that fits is applied before
+// this runs): the host's choice for this step is for another page, the host's choices of this node are all for other steps, or the host has left the
+// node without one. Released when it holds for kEventMismatchMs (a page in transition can read the previous page's name for a frame or two).
+constexpr uint64_t kEventMismatchMs = 2000;
+void event_check_mismatch(void* screen) {
+    char page[64] = {};
+    if (!read_game_string((const uint8_t*)screen + kEvt_EventName, page, sizeof(page)) || !page[0]) return;
+    char why[200] = {};
+    bool same_step = false, other_step = false;
+    uint32_t other = 0;
+    for (uint32_t i = 0; i < g.event_count; ++i) {
+        const ChoiceMsg& m = g.event_queue[i];
+        if (m.node_seed != g.here_seed) continue;
+        if (m.level_step == g.event_step) {
+            same_step = true;
+            if (strcmp(page, m.event_name) != 0)
+                _snprintf_s(why, sizeof(why), _TRUNCATE, "the host's choice for step %u is on its page '%s', this page is '%s'", m.level_step, m.event_name, page);
+        } else { other_step = true; other = m.level_step; }
+    }
+    if (!same_step && other_step)
+        _snprintf_s(why, sizeof(why), _TRUNCATE, "the host's choices of this node are for other steps (e.g. %u), this page is step %u -- the host's event had other pages", other, g.event_step);
+    if (!same_step && !why[0] && follow_host_ahead())
+        _snprintf_s(why, sizeof(why), _TRUNCATE, "the host has left this node and made no choice for this page");
+    const uint64_t now = GetTickCount64();
+    if (!why[0]) { g.event_mism_since = 0; return; }
+    if (!g.event_mism_since || strcmp(why, g.event_mism_why) != 0) {
+        g.event_mism_since = now;
+        strncpy_s(g.event_mism_why, sizeof(g.event_mism_why), why, _TRUNCATE);
+        log_line_lvl(LogLevel::Warn, "CHOICE", "!! event '%s' step %u: %s -- released to this player if it lasts %llu ms", page, g.event_step, why, (unsigned long long)kEventMismatchMs);
+        return;
+    }
+    if (now - g.event_mism_since >= kEventMismatchMs) event_release(screen, why);
+}
+
 void apply_event_pending(void* screen) {
+    if (event_free_here()) {                      // released: the host's choices of this node no longer apply here
+        for (uint32_t i = 0; i < g.event_count;) { if (g.event_queue[i].node_seed == g.here_seed) remove_event(i); else ++i; }
+        return;
+    }
     if (g.event_faulted || !event_ready(screen)) return;
     for (uint32_t i = 0; i < g.event_count; ++i) {
         const ChoiceMsg m = g.event_queue[i];
@@ -879,17 +952,25 @@ void apply_event_pending(void* screen) {
             strcmp(page, m.event_name) != 0) return; // may still be on the previous page
         uint8_t* begin = nullptr; uint32_t count = 0;
         if (!read_options(screen, kEvt_OptBegin, kEvt_OptEnd, begin, count)) return;
-        if (m.index >= count || count != m.count) {
-            g.event_faulted = true;
-            log_line_lvl(LogLevel::Error, "CHOICE", "!! event page '%s' step=%u option count/index differ; choice not applied", page, m.level_step);
-            return;
-        }
-        char key[48]{};
-        option_name(kChoiceEvent, begin + m.index * kOptStride, key, sizeof(key));
-        if (strcmp(key, m.name) != 0) {
-            g.event_faulted = true;
-            log_line_lvl(LogLevel::Error, "CHOICE", "!! event page '%s' step=%u options differ; choice not applied", page, m.level_step);
-            return;
+        // 0.1.178: options that differ from the host's (a quest item adds or removes one) -- the host's option by its name when this page holds it once,
+        // otherwise this page is released to this player (event_release) instead of the old dead end (event_faulted, every later event stuck too).
+        uint32_t use = m.index;
+        {
+            char key[48]{};
+            if (m.index < count) option_name(kChoiceEvent, begin + m.index * kOptStride, key, sizeof(key));
+            if (m.index >= count || count != m.count || strcmp(key, m.name) != 0) {
+                uint32_t by_name = 0;
+                if (event_index_by_name(begin, count, m.name, by_name)) {
+                    log_line_lvl(LogLevel::Warn, "CHOICE", "!! event page '%s' step=%u: the options differ from the host's (%u here, %u there; option %u is '%s' here, '%s' there) -- the host's option '%s' is option %u here, that one is taken",
+                                 page, m.level_step, count, m.count, m.index, key[0] ? key : "-", m.name, m.name, by_name);
+                    use = by_name;
+                } else {
+                    char why[200];
+                    _snprintf_s(why, sizeof(why), _TRUNCATE, "its options differ from the host's (%u here, %u there) and the host's option '%s' is not one this page holds once", count, m.count, m.name);
+                    event_release(screen, why);
+                    return;
+                }
+            }
         }
         // A STORY EVENT, AND ONLY THAT (2026-10-04): the "?" events are shared too now (kPerPlayerNodes is off), so the client replays the host's click on every event -- but a random event is as much the client's own as
         // the host's (its tokens, counters and unlocks are progress this save earns), while a story event is the host's: one of its options is a quest or home option, or the host chose one. For the rest of a story
@@ -904,21 +985,22 @@ void apply_event_pending(void* screen) {
         } else {
             log_line("CHOICE", "event '%s' (option '%s') replayed from the host is a RANDOM one: its result is applied to this peer's save as it always was", page, m.name);
         }
-        if (!inject_event(m.index)) return;
+        if (!inject_event(use)) return;
         // The native commit must close the choice phase. Do not count a mere
         // callback invocation as success, nor retry an ambiguous partial commit.
         const void* selected = nullptr;
         if (event_ready(screen) ||
             !mem_read((const uint8_t*)screen + 0x100, &selected, sizeof(selected)) ||
-            selected != begin + m.index * kOptStride) {
-            g.event_faulted = true;
+            selected != begin + use * kOptStride) {
             log_line_lvl(LogLevel::Error, "CHOICE", "!! event '%s' commit not acknowledged by native state", page);
+            if (event_ready(screen)) event_release(screen, "the host's option could not be committed here");   // 0.1.178: a page still waiting is this player's, not a dead screen
+            else g.event_faulted = true;                                                                         // the page moved on: nothing to retry on it
             return;
         }
         remove_event(i);
         ++g.event_step; ++g.applied;
         g.event_local_have = false;
-        log_line("CHOICE", "applied host event '%s' step=%u option=%u/%u", page, m.level_step, m.index, count);
+        log_line("CHOICE", "applied host event '%s' step=%u option=%u/%u", page, m.level_step, use, count);
         return; // at most one page per native update
     }
 }
@@ -1097,6 +1179,7 @@ void choice_reset_run() {
     g.pending[0] = g.pending[1] = false;
     g.event_count = g.event_step = 0; g.event_faulted = false;
     g.event_local_have = false;
+    g.event_free_seed = 0; g.event_mism_since = 0;
     g.pending_warned[0] = g.pending_warned[1] = false;
     memset(g.skipped, 0, sizeof(g.skipped));
     g.skipped_next = 0;
@@ -1183,6 +1266,17 @@ bool choice_on_event_commit(void* cap) {
                      ours, count);
     }
 
+    if (g.is_client && event_free_here()) {
+        // 0.1.178: released (event_release) -- this player's own click on this node's events, nothing published
+        if (!event_ready(we)) return false;
+        char key[48] = {};
+        if (have && (uint8_t*)entry >= begin && (uint8_t*)entry < begin + (uintptr_t)count * kOptStride) option_name(kChoiceEvent, (const uint8_t*)entry, key, sizeof(key));
+        char page[64] = {};
+        read_game_string((const uint8_t*)we + kEvt_EventName, page, sizeof(page));
+        log_line("CHOICE", "released event '%s' step %u: this player's own option '%s' is taken", page[0] ? page : "?", g.event_step, key[0] ? key : "?");
+        ++g.event_step;
+        return true;
+    }
     if (g.is_client) {
         // THE OPTIONS OF A FOLLOW EVENT ARE GREY ON A CLIENT (0.1.64): a click on one is not kept (nothing could use it: the host chooses), only answered.
         {
@@ -1298,6 +1392,9 @@ void choice_on_event_update(void* world_event) {
     g.event_tick_ms = GetTickCount64();
     // an own random event (experimental, mgmp_indepevt) takes no choice from the host
     if (g.is_client && !indepevt_is_own(world_event)) apply_event_pending(world_event);
+    // 0.1.178: a page still waiting after that -- is there evidence the host's choice can never reach it?
+    if (g.is_client && !indepevt_is_own(world_event) && !event_free_here() && !g.event_faulted && event_ready(world_event)) event_check_mismatch(world_event);
+    else if (!g.is_client || !event_ready(world_event)) g.event_mism_since = 0;
     // HOST: the option confirmed in the area question, committed through the game's own commit -- NOT as an injection, so it goes through
     // choice_on_event_commit like the host's click (published to the room), and mgmp_areagate lets this one option through.
     uint32_t confirmed = 0;
@@ -1373,6 +1470,7 @@ void choice_grey_event_button(void* button) {
     if (!button || !g.on || !g.is_client || !g.event_tick_ms || !net_active()) return;
     if (GetTickCount64() - g.event_tick_ms > 1500) return;                       // no world event updated lately: none is up
     if (indepevt_is_own(g.world_event)) return;                                  // this player's own event: its options are its own to pick
+    if (event_free_here()) return;                                               // 0.1.178: released -- this player picks
     char name[40];
     if (!mem_read_std_string((const uint8_t*)button + kBtn_Name, name, sizeof(name)) || strcmp(name, kBtnName_EventChoice) != 0) return;
     // The root clip's colour transform: multipliers in a sane range (an unread or wild value is left alone), the RGB ones pulled to kEventGreyMul.
@@ -2942,6 +3040,7 @@ void choice_on_node_entered(uint64_t node_seed) {
             if (g.event_queue[i].node_seed == g.here_seed) remove_event(i); else ++i;
         }
         g.event_step = 0; g.event_local_have = false;
+        g.event_faulted = false; g.event_mism_since = 0;   // 0.1.178: a fault ends with its node (it used to grey every later event of the run)
         reset_level_caches(false);
         remember_skipped(g.here_seed);
         for (uint32_t i = 0; i < g.level_pending_count;) {

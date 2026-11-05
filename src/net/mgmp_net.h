@@ -98,8 +98,10 @@ struct NetMsg {
     BoardMsg     board;     // the host's battle board and stream, host -> clients, see MSG_BOARD
     BoardSumMsg  boardsum;  // the host's board as one digest per unit (proto 98), host -> clients, see MSG_BOARDSUM
     BoardReqMsg  boardreq;  // a client asking for the full board of a boundary (proto 98), client -> host, see MSG_BOARDREQ
+    TurnQueueMsg turnqueue; // the host's turn queue of the round at a boundary (proto 111), host -> clients, see MSG_TURNQUEUE
     RollMsg      roll;      // a host-decided chance roll, host -> clients, see MSG_ROLL
     NodeVoteMsg  nodevote;  // a player's pick of the next map node (proto 106): flat
+    VoiceMsg     voice;     // a frame of a player's microphone (proto 107): flat
     SoulCatMsg   soulcat;   // the cat a Soul Jar holds, from the jar's owner (proto 100); owns its buffer, same contract as catdata
     HaltMsg   halt;
     char      refuse[192] = {};
@@ -163,6 +165,10 @@ uint8_t net_peer_count();
 // anyone has disconnected, and it is the index -- never the id -- that the
 // control split is computed from.
 uint8_t net_peer_pos();
+uint8_t net_peer_rank();    // the place among the players present (0..count-1); net_peer_pos is the SEAT and does not move when somebody leaves
+uint8_t net_seat_span();    // seats of the session (or the players present when there is no seat order)
+bool    net_seat_peer(uint8_t pos, uint8_t& id);   // the peer id holding seat `pos`; false when there is no such seat or its player is not in the room
+uint32_t net_absent_seats();                       // bit s: seat s belongs to the session's seat order and its player is no longer in the room (0 without a seat order)
 
 // Copy the member ids out, in that same order. False before the first PEERS.
 bool net_peer_ids(uint8_t* out, uint8_t cap);
@@ -266,11 +272,29 @@ uint32_t net_board_publish(const BoardMsg* chunks, uint32_t n, const BoardSumMsg
 bool net_host_boardsum(uint64_t battle, uint32_t turn, BoardSumMsg& out);
 bool net_board_seen_past(uint64_t battle, uint32_t turn);
 bool net_send_boardreq(const BoardReqMsg& m);
+// proto 113 (mgmp_unitstate). HOST: this boundary's unit records (encoded MSG_USTATE payloads, malloc'd -- ownership passes to the transport; blob i = roster index i).
+void net_ustate_publish(uint64_t battle, uint32_t turn, uint8_t* const* blobs, const uint32_t* lens, uint32_t n);
+// CLIENT: ask for units' records; read one that arrived (its length, 0 = not here).
+bool net_send_ustatereq(const UstateReqMsg& m);
+// proto 115 (0.1.190): units made from cat data. HOST: keep this unit's cat image of the battle (replaces the index's earlier one); a client's MSG_UCATREQ is answered from these
+// on the receive thread. CLIENT: ask; read the frame that arrived (an encoded MSG_UCAT, its length -- 0 = not here).
+bool net_ucat_keep(uint64_t battle, uint8_t index, int32_t key, uint64_t save_id, const uint8_t* image, uint32_t size, uint64_t hash);
+bool net_send_ucatreq(const UcatReqMsg& m);
+uint32_t net_host_ucat(uint64_t battle, uint8_t index, int32_t key, uint8_t* out, uint32_t cap);
+uint32_t net_host_ustate(uint64_t battle, uint32_t turn, uint8_t index, uint8_t* out, uint32_t cap);
+// proto 111: the host's turn queue of one boundary -- HOST: to every client (before that boundary's board); CLIENT: the one the receive thread kept (the last many are).
+bool net_send_turnqueue(const TurnQueueMsg& m);
+bool net_host_turnqueue(uint64_t battle, uint32_t turn, TurnQueueMsg& out);
 // Forgets what the host sent for battles that are over -- the boards, the rolls and the level box. Called when a save is loaded: a node entered again keeps its battle id, and a stale board of turn 0 would
 // otherwise be applied before the host's new one arrives.
 void net_clear_battle_caches();
 // The host's weather names that came with that level (same mailbox): true when the level message for `node_id` has arrived.
 bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n);
+// proto 110: the host's difficulty index -- with `node_id`, the one sent with that battle's build information (-1 until it came); with 0, the latest
+// the host sent with any UNLOCKS (-1 = none yet).
+int net_host_difficulty(uint64_t node_id);
+// proto 112: the host's latest count of `trigger_extra_event` (true) or `increase_event_difficulty` (false) items; -1 until one came.
+int net_host_tag_count(bool extra_events);
 
 // The desync dump. Sent at most once per divergence, so it has no throughput
 // budget to respect and no dedupe to do -- by the time it goes out the run is
@@ -291,6 +315,7 @@ bool net_send_equip(const EquipMsg& m);
 // proto 100: the cat a Soul Jar of this player's holds (mgmp_souljar), to every other peer. `data` is borrowed for the duration.
 bool net_send_soulcat(const SoulCatMsg& m);
 bool net_send_nodevote(const NodeVoteMsg& m);
+bool net_send_voice(const VoiceMsg& m);
 bool net_send_deep(const DeepMsg& m);
 bool net_send_halt(const HaltMsg& h);
 bool net_send_refuse(const char* reason);

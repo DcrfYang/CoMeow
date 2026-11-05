@@ -614,6 +614,8 @@ void vis_release() {
 
 } // namespace
 
+bool treasure_rebuild_item_pools(const char* how) { return rebuild_item_pools(how); }
+
 bool treasure_on_stock(void* shop, void (*original)(void*)) {
     Lock lock;
     g.original = original;

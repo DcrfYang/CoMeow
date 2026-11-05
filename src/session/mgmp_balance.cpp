@@ -37,7 +37,7 @@ bool balance_scale_enemy(void* chr, int32_t hp_before, uint32_t scale_half) {
     // A sane character only: a wild value here means the layout is not what this was written against.
     if (con < 0 || con > 1000 || bonus < -100000 || bonus > 100000 || base < -100000 || base > 100000) return false;
 
-    const int64_t h = scale_half < 4 ? 4 : scale_half > 16 ? 16 : scale_half;   // the multiplier is h / 2
+    const int64_t h = scale_half < 2 ? 2 : scale_half > 16 ? 16 : scale_half;   // the multiplier is h / 2 (x1 since 0.1.179: every number stays the game's own)
     // x * h / 2, rounded to the nearest whole number (a .5 upward; floor division, so a negative x rounds the same way)
     const auto mul = [h](int64_t x) -> int64_t { const int64_t t = x * h + 1; return t >= 0 ? t / 2 : -((-t + 1) / 2); };
     // maximum = 4*con + bonus  ->  scaled  =>  bonus' = scaled maximum - 4*con

@@ -46,6 +46,8 @@ const char* session_status();   // one line for the banner / diagnostics
 // game's, or the mod's rules). False when there is no such problem -- "wait a few seconds" is then the honest answer to a save click. Cleared with
 // the session. (Before: a client on another protocol was refused in silence and every click said "completing the handshake, please wait".)
 bool        session_version_problem(char* out, size_t cap);
+// The host refused this peer's HELLO within the last seconds (another mod version, game build or resources): the room panel says so beside its name.
+bool        session_peer_refused(uint8_t peer);
 
 // --- starting and stopping a session at RUNTIME ------------------------------
 //
@@ -70,9 +72,10 @@ bool        session_version_problem(char* out, size_t cap);
 // Do "a new cat joins" event effects do nothing? The host's setting (ui.block_new_cats), whichever peer is asking.
 bool session_block_new_cats();
 // Is an experimental feature on? The host's setting, whichever peer is asking; false on a client until the host's HELLO.
-// The room's enemy health and armor multiplier in halves (4 = x2 .. 16 = x8): the host's ui.enemy_scale, whichever peer is asking.
+// The room's enemy health and armor multiplier in halves (2 = x1 .. 16 = x8): the host's ui.enemy_scale, whichever peer is asking.
 uint8_t session_enemy_scale_half();
 bool session_exp_treasure();      // ui.exp_treasure: the shared treasure chest (mgmp_treasure)
+bool session_exp_voice();           // ui.exp_voice, the HOST's setting: the room panel gets a microphone and a sound button (mgmp_voice)
 bool session_exp_indep_events();  // ui.exp_indep_events: the random "?" events are each player's own (mgmp_indepevt)
 bool session_exp_house_coop();    // ui.exp_house_coop: helping the one player whose house boss is today (mgmp_housecoop)
 

@@ -18,6 +18,13 @@
 #include "mgmp_rng.h"
 #if defined(MGMP_WITH_SETUP)
 #include "mgmp_setup.h"
+#include "mgmp_i18n.h"       // the seat guard's notices
+#include "mgmp_indepevt.h"   // indepevt_in_own_event: whose a gained cat is (0.1.146)
+#include "mgmp_completion_rule.h"   // the room's rule for the solo-cat / same-class marks (0.1.147)
+#include "mgmp_gametext.h"          // the game's words for a class (0.1.149: the marks notice)
+#include "mgmp_catbrief.h"          // brief_class_from_key
+#include <cstdarg>
+#include <vector>
 #endif
 
 #include <windows.h>
@@ -58,7 +65,7 @@ struct State {
     void (__fastcall* status_range_dtor)(void*, void*) = nullptr;
     uint64_t* id_counter = nullptr;
     bool import_ready = false;
-    uint32_t gained_n = 0;        // cats an event brought into this run (catsync_on_gained_cat): the next one takes session_gained_id(gained_n)
+    uint32_t gained_n[kMaxPeers] = {};   // per seat, the cats events brought into this run (catsync_on_gained_cat): the next one takes session_gained_id_of(seat, gained_n[seat])
 
     bool settling = false;
     bool on        = false;
@@ -338,7 +345,7 @@ bool run_cats(RunCats& out) {
 bool cat_is_mine(uint64_t id, bool& mine) {
     if(lockstep_cat_is_mine(id,mine))return true;
     uint8_t owner=kNoPeer;
-    if(!lockstep_owner_pos(id,owner)||owner>=net_peer_count())return false;
+    if(!lockstep_owner_pos(id,owner)||owner>=net_seat_span())return false;      // a SEAT: it can be above the count of the players present once a lower seat has left
     mine=owner==net_peer_pos();return true;
 }
 
@@ -457,9 +464,22 @@ void seed_client_baseline(const RunCats& rc) {
 uint8_t s_run_pos = 0;
 bool    s_run_pos_known = false;
 
-uint8_t my_session_pos() {
-    if (net_peer_count() >= 2) { s_run_pos = net_peer_pos(); s_run_pos_known = true; return s_run_pos; }
+// THE CATS' OWN WORD ON WHOSE THEY ARE (0.1.129; the user asked for it after rooms 3KGX and others: "a player dropped, the cats went to the wrong owner / the wrong cats were removed"). Everything that
+// ends a run -- the settlement's ownership filter, the merge home, the removal of the other players' cats when a room is left or a player drops -- trusted ONE number, the seat this peer computes from the
+// room. When that number was wrong (3KGX: a middle seat dropped and the others' seats shifted) the result went straight into the save: this player's own cats removed, another player's merged as new cats.
+// The cats carry an independent answer: this player's clones are the ones whose ORIGINAL (an ordinary cat with the same seed -- a byte copy at cloning) is in THIS save; another player's have none here.
+// seat_evidence_check() reads it before each of those operations; when exactly one seat's clones have originals here and it is not the computed seat, that seat is used (s_seat_override) and it is said
+// loudly. No answer (no clones, or several seats -- a save that already holds a foreign cat) leaves the computed seat alone. The override belongs to the run it was read in: a new run's setup clears it.
+int s_seat_override = -1;
+void seat_evidence_check(const char* why, bool force);
+uint8_t computed_session_pos() {
+    if (net_peer_count() >= 2) return net_peer_pos();
     return s_run_pos_known ? s_run_pos : net_peer_pos();
+}
+uint8_t my_session_pos() {
+    if (net_peer_count() >= 2) { s_run_pos = net_peer_pos(); s_run_pos_known = true; }
+    const uint8_t computed = computed_session_pos();
+    return s_seat_override >= 0 ? (uint8_t)s_seat_override : computed;
 }
 
 void ensure_state() {
@@ -871,15 +891,36 @@ bool catsync_export_resume(SetupMsg& out, uint8_t owner) {
     ensure_state();
     out = SetupMsg{};
     RunCats rc{};
-    if (!g.on || owner >= net_peer_count() || !run_cats(rc) || rc.count > kSetupMaxCats) return false;
+    if (!g.on || owner >= net_seat_span() || !run_cats(rc) || rc.count > kSetupMaxCats) return false;
     unsigned masks[kMaxPeers]{};
     for (uint32_t i=0;i<rc.count;++i) {
         const auto id=rc.ids[i]; const int p=session_cat_owner(id);
         void* cat=nullptr;
-        if(p<0 || p>=net_peer_count() || !safe_by_id((void*)rc.registry,id,&cat) || !cat) return false;
+        // 0.1.145 (room KD8E): a cat an event brought in (0x70000019+, the host's) is no clone slot -- session_cat_owner says -1, and every resume of such a run
+        // was refused here ("resume held: invalid saved player roster", nodes never entered). It is not exported (each peer's save holds it, and the install keeps
+        // it in the lists); it only has to be there.
+        if (session_is_gained(id)) {
+            if (safe_by_id((void*)rc.registry,id,&cat) && cat) continue;
+            log_line_lvl(LogLevel::Error, "CATSYNC", "!! resume: the gained cat %016llx is in the run's lists but not in this save", (unsigned long long)id);
+            return false;
+        }
+        if(p<0 || p>=net_seat_span() || !safe_by_id((void*)rc.registry,id,&cat) || !cat) {
+            // 0.1.163: the map asks again and again while the save stays on it (up to 15 557 such lines in one log): once per cat and reason, then a count a minute
+            static uint64_t said_id = 0; static int said_why = -1; static unsigned quiet = 0; static ULONGLONG said_at = 0;
+            const int why = p<0 || p>=net_seat_span() ? 0 : 1;
+            const ULONGLONG now = GetTickCount64();
+            if (said_id == id && said_why == why && now - said_at < 60000) ++quiet;
+            else {
+                log_line_lvl(LogLevel::Error, "CATSYNC", "!! resume: cat %016llx in the run's lists %s%s", (unsigned long long)id,
+                             why == 0 ? "belongs to no player's session slots (the run in this save was not started in this room -- a solo run?)" : "is not in this save",
+                             quiet ? (" (" + std::to_string(quiet) + " more time(s) since the last line)").c_str() : "");
+                said_id = id; said_why = why; said_at = now; quiet = 0;
+            }
+            return false;
+        }
         masks[p] |= 1u << unsigned((id & 0xFFFFFF)-1);
     }
-    for(unsigned p=0;p<net_peer_count();++p) if(!masks[p]) return false;
+    { unsigned seats_with_cats = 0; for (unsigned p = 0; p < kMaxPeers; ++p) if (masks[p]) ++seats_with_cats; if (seats_with_cats < net_peer_count()) return false; }   // every player present has cats (a seat that has left may hold none)
     for (uint8_t i = 0; i < kPartyMaxCats; ++i) {
         if(!(masks[owner] & (1u<<i))) continue;
         const uint64_t id = 0x70000001ull + ((uint64_t)owner << 24) + i;
@@ -959,6 +1000,7 @@ bool catsync_prepare_settlement(void* director) {
     ensure_state();
     if (!g.on) { settle_refuse("catsync is off (role or game functions)"); return false; }
     if (g.settling) { settle_refuse("a settlement is already in progress (g.settling set, no forget since)"); return false; }
+    seat_evidence_check("before the settlement", true);
     const uint8_t owner = my_session_pos();
     if (owner >= kMaxPeers) { settle_refuse("this peer's session position %u is out of range", (unsigned)owner); return false; }
     const void* live = nullptr;
@@ -985,6 +1027,21 @@ bool catsync_prepare_settlement(void* director) {
         // (slot 5 and up of the session range; the host of 2026-10-03 had three). That used to fail the whole check and hold the home door shut for ever. Such a cat is the HOST's (events and
         // loot are the host's call): the host settles it with its own party -- it is a real cat of the host's house, not a clone -- and a client leaves it out like any other copy of somebody
         // else's cat.
+        // 0.1.146: A GAINED CAT is the seat's whose event brought it in (the host's when every player's event did): its owner settles it with its own party, everybody
+        // else leaves its copy out.
+        if (const int gseat = session_gained_owner(id); gseat >= 0) {
+            void* gained = nullptr;
+            if (gseat == (int)owner && own_n < 8 && safe_by_id((void*)rc.registry, id, &gained) && gained) {
+                own[own_n++] = id;
+                log_line("SETTLE", "cat %016llx was gained during the run by this player (seat %d): settled with its own party", (unsigned long long)id, gseat);
+            } else if (gseat == (int)owner) {
+                log_line_lvl(LogLevel::Warn, "SETTLE", "cat %016llx, gained during the run by this player, is not registered -- not settled with the party", (unsigned long long)id);
+            } else {
+                ++peer_copies;
+                log_line("SETTLE", "cat %016llx was gained during the run by seat %d -- left out of this peer's settlement", (unsigned long long)id, gseat);
+            }
+            continue;
+        }
         if (pos < 0 && (id < 0x70000000ull || is_session_range(id))) {
             void* gained = nullptr;
             if (owner == 0 && own_n < 8 && safe_by_id((void*)rc.registry, id, &gained) && gained) {
@@ -1015,7 +1072,9 @@ bool catsync_prepare_settlement(void* director) {
         masks[pos] |= 1u << slot;
         if ((uint8_t)pos == owner) { if (own_n >= 8) { settle_refuse("more than eight own cats"); return false; } own[own_n++] = id; } else ++peer_copies;
     }
-    if (!own_n) { settle_refuse("none of this peer's own cats is in the run's lists (peer copies seen: %u)", peer_copies); return false; }
+    // 0.1.152: EVERY CAT OF THIS PLAYER DIED and the others won the run: nothing of its own goes home, the other players' copies must still leave its lists (refusing
+    // held the door shut for as long as the others were connected). Its dead clones are not in the lists; the merge brings their deaths home by their origins.
+    if (!own_n) log_line_lvl(LogLevel::Warn, "SETTLE", "none of this player's own cats is in the run's lists (all dead, or gone) -- the lists are emptied of the %u other players' cat(s); the dead come home by the merge", peer_copies);
     const uint32_t party_own = own_n < 4 ? own_n : 4, fam_own = own_n - party_own;
     // A peer that is connected but has no cat in the run is odd; a peer that is GONE is normal (it left or crashed mid-run) and must not keep the survivor out of its own home.
     for (unsigned p = 0; p < net_peer_count() && p < kMaxPeers; ++p)
@@ -1042,10 +1101,32 @@ bool catsync_prepare_settlement(void* director) {
             settle_refuse("the list at director+%u is unreadable or inconsistent (cap %u, count %u)", (unsigned)offset, cap, count);
             return false;
         }
-        uint64_t mirror_ids[kPartyMaxCats]{};
-        if (offset == kDir_MirrorCap && (count > kPartyMaxCats || count != party_n || !mem_read(data, mirror_ids, count * 8) || memcmp(mirror_ids, rc.ids, count * 8))) {
-            settle_refuse("the mirror list (%u) does not match the party list (%u)", count, party_n);
-            return false;
+        if (offset == kDir_MirrorCap) {
+            // 0.1.152: THE MIRROR IS NOT THE PARTY AFTER A BATTLE, AND THAT IS THE GAME'S OWN DOING. After every battle (0x1403B3D60) the game takes the dead out of
+            // the PARTY list and fills it up to four from the familiars -- the mirror is never touched; gain_cat_familiar appends to the party only too. On the map
+            // the mod's roster writes put the mirror back, but after the FINAL battle the settlement comes with no map tick in between: a host with fewer than four
+            // cats (a client's cat promoted into its party) or a death in that battle failed this check, and with the other players connected the door stayed shut
+            // (room 2026-10-28, the nuclear ending: a white screen). Both lists are rewritten with this player's own cats below, so a difference is only logged.
+            uint64_t mirror_ids[16]{};
+            const uint32_t mn = count < 16 ? count : 16;
+            if (mn && !mem_read(data, mirror_ids, mn * 8)) { settle_refuse("the mirror list (%u) cannot be read", count); return false; }
+            const bool match = count == party_n && (!count || !memcmp(mirror_ids, rc.ids, count * 8));
+            if (!match) {
+                char gone[160] = {}, came[160] = {}; int go = 0, co = 0;
+                for (uint32_t i = 0; i < mn; ++i) {
+                    bool in_party = false;
+                    for (uint32_t j = 0; j < party_n && j < rc.count; ++j) if (rc.ids[j] == mirror_ids[i]) in_party = true;
+                    if (!in_party && go >= 0 && go < (int)sizeof(gone) - 20) go += _snprintf_s(gone + go, sizeof(gone) - go, _TRUNCATE, " %llx", (unsigned long long)mirror_ids[i]);
+                }
+                for (uint32_t j = 0; j < party_n && j < rc.count; ++j) {
+                    bool in_mirror = false;
+                    for (uint32_t i = 0; i < mn; ++i) if (mirror_ids[i] == rc.ids[j]) in_mirror = true;
+                    if (!in_mirror && co >= 0 && co < (int)sizeof(came) - 20) co += _snprintf_s(came + co, sizeof(came) - co, _TRUNCATE, " %llx", (unsigned long long)rc.ids[j]);
+                }
+                log_line_lvl(LogLevel::Warn, "SETTLE", "the mirror list (%u) differs from the party list (%u) -- not in the party any more:%s | in the party, not in the mirror:%s "
+                             "(the game's post-battle death removal / promotion, or a cat an event brought in; both lists are rewritten with this player's own cats)",
+                             count, party_n, gone[0] ? gone : " none", came[0] ? came : " none");
+            }
         }
         if (offset == kDir_CatFamiliars) {
             // the peers' copies leave it; this peer's own cats beyond the party's four stay in it
@@ -1053,7 +1134,7 @@ bool catsync_prepare_settlement(void* director) {
             if (!add(d + offset + 4, &fam_own, 4)) { settle_refuse("the familiar list cannot be emptied"); return false; }
         } else {
             // Setup reserves room for four in both party vectors even for one-cat teams.
-            if (cap < party_own || !data || !add(data, own, party_own * 8) || !add(d + offset + 4, &party_own, 4)) { settle_refuse("the list at director+%u has room for %u, %u cats needed", (unsigned)offset, cap, party_own); return false; }
+            if (cap < party_own || (party_own && (!data || !add(data, own, party_own * 8))) || !add(d + offset + 4, &party_own, 4)) { settle_refuse("the list at director+%u has room for %u, %u cats needed", (unsigned)offset, cap, party_own); return false; }
         }
     }
     // Peer registry objects are intentionally left untouched. Their CatData
@@ -1257,6 +1338,65 @@ bool find_origin_by_seed(const void* registry, uint64_t seed, const uint64_t* bu
     if (oa) { if (oa != 1) return false; out = o_ord; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; out.home_cat = hc; return true; }
     if (la != 1) return false;
     out = o_leg; out.ordinary_away = oa; out.ordinary_home = oh; out.legacy_away = la; out.home_cat = hc; return true;
+}
+
+// Bit p: a LIVE session clone of seat p (slots 1..kCloneSlots, flags not 0) has an ordinary cat with its seed in this registry. ok = false when the registry could not be walked.
+unsigned seats_with_originals(const void* registry, bool& ok, unsigned& clones) {
+    ok = false; clones = 0;
+    if (!registry) return 0;
+    static uint64_t seeds[4096];
+    uint32_t n = 0;
+    if (!registry_walk(registry, [&](uint64_t key, void* cat) {
+            if (is_session_range(key) || n >= 4096) return;
+            uint64_t sd = 0;
+            if (mem_read(cat, &sd, sizeof(sd)) && sd) seeds[n++] = sd;
+        })) return 0;
+    ok = true;
+    unsigned mask = 0;
+    for (uint32_t p = 0; p < 8; ++p)
+        for (uint32_t slot = 1; slot <= kCloneSlots; ++slot) {
+            void* c = nullptr; uint64_t sd = 0, fl = 0;
+            if (!safe_by_id((void*)registry, 0x70000000ull + ((uint64_t)p << 24) + slot, &c) || !c || !mem_read(c, &sd, sizeof(sd)) || !sd) continue;
+            if (!mem_read((uint8_t*)c + kCatData_Flags, &fl, sizeof(fl)) || !fl) continue;      // a retired copy (flags 0) may be left from an earlier run on another seat
+            ++clones;
+            for (uint32_t i = 0; i < n; ++i) if (seeds[i] == sd) { mask |= 1u << p; break; }
+        }
+    return mask;
+}
+
+void seat_evidence_check(const char* why, bool force) {
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!force && now - s_last < 2000) return;                    // a level check that runs at every map update: once in 2 s is enough
+    s_last = now;
+    if (!g.resolved || !g.director_slot) return;
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return;
+    bool ok = false; unsigned clones = 0;
+    const unsigned mine = seats_with_originals(registry, ok, clones);
+    if (!ok || __popcnt(mine) != 1) {
+        static unsigned s_said = ~0u;
+        if (ok && clones && __popcnt(mine) > 1 && s_said != mine) {
+            s_said = mine;
+            log_line_lvl(LogLevel::Warn, "SEATGUARD", "%s: the clones of several seats (%#x) have an original in this save (a foreign cat was kept here before?) -- the computed seat %u is used",
+                         why ? why : "?", mine, (unsigned)computed_session_pos());
+        }
+        return;
+    }
+    unsigned e = 0; while (!((mine >> e) & 1u)) ++e;
+    const uint8_t computed = computed_session_pos();
+    if (e == computed) {
+        if (s_seat_override >= 0) log_line("SEATGUARD", "%s: the computed seat %u agrees with the cats again -- the override ends", why ? why : "?", (unsigned)computed);
+        s_seat_override = -1;
+        return;
+    }
+    if (s_seat_override != (int)e) {
+        log_line_lvl(LogLevel::Error, "SEATGUARD", "!! %s: this peer computed seat %u, but the cats that come from THIS save are those of seat %u (%u clone(s) looked at) -- seat %u is used for removing, "
+                     "settling and merging cats, so neither this player's own cats are removed nor another player's kept", why ? why : "?", (unsigned)computed, e, clones, e);
+        room_toast(tr(Tx::CS_SEAT_FIXED));
+        s_seat_override = (int)e;
+        catsync_log_audit("the seat guard corrected the seat");
+    }
 }
 
 // THE FAMILY TABLE (registry+0x38; 2026-10-11 review). The game keeps a flat hash map id -> {parent a, parent b, kinship} next to the cat registry
@@ -1880,9 +2020,35 @@ void catsync_house_save(void* house) {
     }
 }
 
+// THE HOUSE AS THE GAME FINDS IT (MewDirector::SaveGame, 0x1403BDFCE -> 0x1409D4AF0): the scene named "House" in the list at director+0x28 (a vector of scene
+// pointers; the name is the std::string at +0x4B8, a scene with +0x4DB set is skipped), then element 0 of the vector at (scene+0x20)->+0x4460. Read only; null
+// when no House scene is up.
+static const void* current_house(const uint8_t* dir) {
+    const uint8_t* list = nullptr; const uint8_t* const* b = nullptr; const uint8_t* const* e = nullptr;
+    if (!dir || !mem_read(dir + 0x28, &list, sizeof(list)) || !list || !mem_read(list, &b, sizeof(b)) || !mem_read(list + 8, &e, sizeof(e)) || !b || e < b || e - b > 256) return nullptr;
+    for (const uint8_t* const* p = b; p < e; ++p) {
+        const uint8_t* scene = nullptr; char name[32] = {}; uint8_t dying = 1;
+        if (!mem_read(p, &scene, sizeof(scene)) || !scene || !mem_read_std_string(scene + 0x4B8, name, sizeof(name)) || strcmp(name, "House") != 0) continue;
+        if (!mem_read(scene + 0x4DB, &dying, 1) || dying) continue;
+        const uint8_t* a = nullptr; const uint8_t* v = nullptr; uint32_t count = 0; const void* const* data = nullptr; const void* house = nullptr;
+        if (mem_read(scene + 0x20, &a, sizeof(a)) && a && mem_read(a + 0x4460, &v, sizeof(v)) && v && mem_read(v + 0xC, &count, 4) && count &&
+            mem_read(v + 0x10, &data, sizeof(data)) && data && mem_read(data, &house, sizeof(house)) && house) return house;
+        return nullptr;
+    }
+    return nullptr;
+}
+
+void catsync_drop_swap_notes(const char* why) {
+    if (!g_swaps_n && !g_house_due_n) return;
+    log_line_lvl(LogLevel::Warn, "CATSYNC", "%u pending swap note(s) and %u due cat(s) dropped: %s -- they described the save as it was before", g_swaps_n, g_house_due_n, why ? why : "?");
+    memset(g_swaps, 0, sizeof(g_swaps)); g_swaps_n = 0;
+    memset(g_house_due, 0, sizeof(g_house_due)); g_house_due_n = 0;
+}
+
 unsigned catsync_merge_session_cats(const char* why, bool after_native_settlement) {
     ensure_state();
     log_stage_quiet("merge (%s): clones go back to their originals", why ? why : "?");
+    if (g.on && g.import_ready && g.director_slot) seat_evidence_check("before the merge", true);
     if (!g.on || !g.import_ready || !g.director_slot || my_session_pos() >= kMaxPeers) return 0;
     const uint8_t* dir = nullptr;
     const void* registry = nullptr;
@@ -1994,6 +2160,21 @@ unsigned catsync_merge_session_cats(const char* why, bool after_native_settlemen
             origin_forget(id);
             log_line_lvl(LogLevel::Warn, "CATSYNC", "!! merge (%s): session cat %016llx (flags %llx) is a live duplicate of %u cat(s) already at home -- retired again, NOT kept as a new cat",
                          why, (unsigned long long)id, (unsigned long long)flags, o.ordinary_home);
+            continue;
+        }
+
+        // NOT FROM THIS SAVE (0.1.129): a cat the run just SETTLED (it was in the party at the end) with no recorded origin and no cat anywhere in this save -- at home or away -- with its seed.
+        // This player's own clone always has one of the two (its original was cloned from here); a cat with neither was cloned from ANOTHER save, and keeping it "as a new cat" is how another
+        // player's cat entered this one (3KGX: "2 kept as new cats"). Only at the run's end and only for a cat of the run: a real cat of this save that sits on a reserved id (a squatter, never in a
+        // party) is not touched here -- it is moved, not retired.
+        if (after_native_settlement && in_run && !have_origin && !catsync_origin_of(id) && !o.ordinary_away && !o.ordinary_home && !o.legacy_away) {
+            const uint64_t zero = 0;
+            mem_write((uint8_t*)clone + kCatData_Flags, &zero, sizeof(zero));
+            origin_forget(id);
+            log_line_lvl(LogLevel::Error, "SEATGUARD", "!! merge (%s): session cat %016llx (seed %llx) has no original in this save and no cat here carries its seed -- it was cloned from another "
+                         "player's save: retired, NOT kept as a new cat (seat used %u)", why, (unsigned long long)id, (unsigned long long)seed, (unsigned)my_session_pos());
+            static ULONGLONG s_toast = 0;
+            if (GetTickCount64() - s_toast > 10000) { s_toast = GetTickCount64(); room_toast(tr(Tx::CS_FOREIGN_CAT)); }
             continue;
         }
 
@@ -2140,6 +2321,17 @@ unsigned catsync_merge_session_cats(const char* why, bool after_native_settlemen
     if (merged || as_new)
         log_line("CATSYNC", "merge (%s): summary -- %u clone(s) returned (%u by the recorded origin, %u by seed, %u of them dead, %u not in the party at the end), %u kept as new cats",
                  why, merged - as_new, by_record, by_seed, dead_n, lost_n, as_new);
+    // THE HOUSE IS RENAMED NOW, NOT AT ITS NEXT SAVE (0.1.170, 2026-11-03): before a setup the slot of a clone just swapped away is given to the NEW run's clone, and
+    // the House entity still carrying the old id waited for a House save that only came after the run -- one entity for two cats: it was written as the old cat
+    // (the stale note), and the three cats that came home were in no entity (the House showed a copy from before the run: level 1, the gear still on).
+    if (!after_native_settlement && g_swaps_n) {
+        if (const void* house = current_house(dir)) {
+            log_line("CATSYNC", "merge (%s): %u swap note(s) applied to the House at once (its entities are renamed before the ids are given out again) -- House %p, the last House save's %p", why, g_swaps_n, house, g_last_house);
+            catsync_house_save(const_cast<void*>(house));
+        } else {
+            log_line_lvl(LogLevel::Warn, "CATSYNC", "merge (%s): no House scene is up -- %u swap note(s) wait for the next House save", why, g_swaps_n);
+        }
+    }
     settle_audit(registry, dir, why);
     return merged;
 }
@@ -2254,7 +2446,38 @@ unsigned catsync_relocate_squatters(const char* why) {
         const bool wrote = roster_setup_replace_party(ids, n, "real cats moved off reserved ids");
         log_line_lvl(wrote ? LogLevel::Info : LogLevel::Error, "CATSYNC", "squatters (%s): the run's party list re-pointed at the moved cats -- %s", why, wrote ? "written" : "NOT written");
     }
+    // SAVED AT ONCE (0.1.192; BF-202108081243, 11-05: the party list and the House named the moved cats 0x65/0x66, the save the game wrote next held the party list but not
+    // the cats, and every later load of that save crashed on the backpack screen). The moved cats, the House's renamed entities and the party list go into the file together.
+    catsync_save_game("real cats moved off reserved ids");
     return moved;
+}
+
+unsigned catsync_purge_missing_party(const char* why, uint64_t* gone, unsigned cap) {
+    ensure_state();
+    if (!g.director_slot) return 0;
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return 0;
+    uint32_t count = 0; const uint64_t* data = nullptr;
+    uint64_t ids[16] = {};
+    if (!mem_read(dir + kDir_CatIdCount, &count, 4) || !count || count > 16 || !mem_read(dir + kDir_CatIdData, &data, sizeof(data)) || !data || !mem_read(data, ids, count * sizeof(uint64_t))) return 0;
+    uint64_t keep[16] = {}; uint32_t k = 0; unsigned out = 0;
+    char list[200] = {}; int lw = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        void* cat = nullptr;
+        const bool readable = safe_by_id((void*)registry, ids[i], &cat);
+        if (readable && !cat) {                                                   // the save answers: no such cat
+            if (gone && out < cap) gone[out] = ids[i];
+            ++out;
+            if (lw >= 0 && (size_t)lw < sizeof(list) - 24) lw += _snprintf_s(list + lw, sizeof(list) - lw, _TRUNCATE, " %llx", (unsigned long long)ids[i]);
+            continue;
+        }
+        keep[k++] = ids[i];
+    }
+    if (!out) return 0;
+    const bool wrote = roster_setup_replace_party(keep, k, "party ids the save does not hold");
+    log_line_lvl(LogLevel::Error, "CATSYNC", "!! party list (%s): %u id(s) the save cannot load:%s -- %s (%u remain); the game reads them without a null check (the backpack's cat selector crashed on them)",
+                 why, out, list, wrote ? "taken out of the party and its mirror" : "could NOT be taken out", k);
+    return wrote ? out : 0;
 }
 
 // A PICTURE OF EVERYTHING THE SESSION'S CAT BOOKKEEPING DEPENDS ON, in the log, at the moments that matter (2026-10-03): the run's lists, the save's day, the id counter, and for every
@@ -2380,13 +2603,19 @@ unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions) {
     for (uint32_t p = 0; p < kMaxPeers; ++p) {
         if (p == me || !((only_positions >> p) & 1u)) continue;
         for (uint32_t slot = 1; slot < kGainedSlot0 + kGainedSlots; ++slot) {
-            if (slot > kCloneSlots && (p != 0 || slot < kGainedSlot0)) continue;   // the clone slots, and the host's gained cats
+            if (slot > kCloneSlots && slot < kGainedSlot0) continue;   // the clone slots, and every seat's gained cats (0.1.146)
             const uint64_t id = 0x70000000ull + ((uint64_t)p << 24) + slot;
             bool in_lists = false;
             for (uint32_t b = 0; b < nbusy; ++b) if (busy[b] == id) in_lists = true;
             void* cat = nullptr; uint64_t fl = 0;
             if (in_lists || !safe_by_id((void*)registry, id, &cat) || !cat || !mem_read((uint8_t*)cat + kCatData_Flags, &fl, sizeof(fl)) || !(fl & kCatFlag_OnAdventure)) continue;
             if (adopted_has(id)) continue;
+            // 0.1.185: a copy the House names is a cat of this House now -- retired (flags 0) it could no longer be loaded and the House scene crashed on it
+            // at the return home (11-04 18:27, two players). Kept as it is; the line says so.
+            if (house_names_id(id) == 1) {
+                log_line_lvl(LogLevel::Warn, "CATSYNC", "retire (%s): %016llx is named by a House cat entity -- kept as it is (flags %llx), not retired", why, (unsigned long long)id, (unsigned long long)fl);
+                continue;
+            }
             const uint64_t zero = 0;
             if (!mem_write((uint8_t*)cat + kCatData_Flags, &zero, sizeof(zero))) continue;
             ++retired;
@@ -2406,6 +2635,9 @@ unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions) {
 // So, on every peer alike, right after the game made it: the cat moves to session_gained_id(k) (k = the cats gained so far in this run, the
 // same count everywhere), its owner noted as the host, and the list entry follows (the party and its mirror, or the familiars). What is left
 // on the counter's id:
+// 0.1.146: IN A PLAYER'S OWN RANDOM EVENT (ui.exp_indep_events; CatOrgy, ExtraLife) only that peer runs the event. The cat is then that player's:
+// it moves to its seat's slot session_gained_id_of(seat, k), its original stays home on the game's id exactly like the host's below, and the other
+// peers create it from the owner's cat push (catsync_apply_snapshot: another seat's gained cat may be created) and list it with that owner.
 //   - on the HOST, a copy that stays home "away on the adventure" -- exactly an original of a clone. The settlement merge (recorded origin)
 //     swaps the two back, and the cat comes home as a real cat of the host's House, under the id the game gave it;
 //   - on a CLIENT, a retired copy (flags 0): it was never the client's cat. Its run copy is retired with the other copies after the run.
@@ -2430,16 +2662,33 @@ bool catsync_on_gained_cat(uint64_t counter_before, const char* why) {
         for (uint32_t i = 0; i < cnt; ++i) { uint64_t v = 0; if (mem_read(data + i, &v, 8) && v == n_id) in_list[l] = (int)i; }
     }
     if (in_list[0] < 0 && in_list[2] < 0) { log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): %llx is in neither the party nor the familiars -- left as the game made it", why, (unsigned long long)n_id); return false; }
-    if (g.gained_n >= kGainedSlots) { log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): more than %u cats gained in one run -- %llx left as the game made it", why, kGainedSlots, (unsigned long long)n_id); return false; }
-    const uint64_t s_id = session_gained_id(g.gained_n);
+    const bool own = indepevt_in_own_event();
+    const uint8_t seat = own ? my_session_pos() : 0;
+    if (seat >= kMaxPeers) { log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): this player's seat is not known -- %llx left as the game made it", why, (unsigned long long)n_id); return false; }
+    if (g.gained_n[seat] >= kGainedSlots) { log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): more than %u cats gained by seat %u in one run -- %llx left as the game made it", why, kGainedSlots, (unsigned)seat, (unsigned long long)n_id); return false; }
+    const uint64_t s_id = session_gained_id_of(seat, g.gained_n[seat]);
     // the session id: free, or a retired slot of an earlier run (reused)
     void* slot_cat = nullptr;
     if (!safe_by_id((void*)registry, s_id, &slot_cat)) return false;
     uint64_t slot_flags = 0;
     if (slot_cat && mem_read((uint8_t*)slot_cat + kCatData_Flags, &slot_flags, sizeof(slot_flags)) && slot_flags) {
-        log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): the shared id %llx holds a live cat (flags %llx) on this peer -- %llx left as the game made it",
-                     why, (unsigned long long)s_id, (unsigned long long)slot_flags, (unsigned long long)n_id);
-        return false;
+        // 0.1.151: ON A CLIENT, A HOST SLOT IS NEVER ITS OWN CAT. Every peer runs a shared event alike and moves the cat to the same slot of the host's namespace;
+        // a live object there on a client is a copy of a host's gained cat a run before left behind (no retire reached it). Leaving the game's cat as it was put
+        // a free cat into the client's House and parted the two peers' ids for the rest of the run: the copy is reused -- unless this run's lists name it.
+        bool in_run = false;
+        for (int l = 0; l < 3 && !in_run; ++l) {
+            uint32_t cnt = 0; uint64_t* data = nullptr;
+            if (!mem_read(dir + lists[l].at + 4, &cnt, 4) || !mem_read(dir + lists[l].at + 8, &data, 8) || !data || cnt > 64) continue;
+            for (uint32_t i = 0; i < cnt && !in_run; ++i) { uint64_t v = 0; if (mem_read(data + i, &v, 8) && v == s_id) in_run = true; }
+        }
+        if (g.is_client && seat == 0 && !in_run) {
+            log_line_lvl(LogLevel::Warn, "CATSYNC", "gained cat (%s): the host's slot %llx holds a stale copy here (flags %llx, in no list of this run) -- reused for the cat this event made",
+                         why, (unsigned long long)s_id, (unsigned long long)slot_flags);
+        } else {
+            log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): the shared id %llx holds a live cat (flags %llx%s) on this peer -- %llx left as the game made it",
+                         why, (unsigned long long)s_id, (unsigned long long)slot_flags, in_run ? ", named by this run's lists" : "", (unsigned long long)n_id);
+            return false;
+        }
     }
     uint8_t* image = nullptr;
     const uint32_t size = serialize_cat(cat, &image);
@@ -2462,21 +2711,24 @@ bool catsync_on_gained_cat(uint64_t counter_before, const char* why) {
     // the game appends to the party only; its mirror must name the same cats (the settlement checks it)
     if (in_list[0] >= 0 && in_list[1] < 0) {
         uint32_t cnt = 0; uint64_t* data = nullptr; uint64_t ids[4] = {};
-        if (mem_read(dir + kDir_CatIdCount, &cnt, 4) && cnt && cnt <= 4 && mem_read(dir + kDir_CatIdData, &data, 8) && data && mem_read(data, ids, cnt * 8))
-            roster_setup_replace_party(ids, cnt, "a cat an event brought in");
+        if (mem_read(dir + kDir_CatIdCount, &cnt, 4) && cnt && cnt <= 4 && mem_read(dir + kDir_CatIdData, &data, 8) && data && mem_read(data, ids, cnt * 8) &&
+            !roster_setup_replace_party(ids, cnt, "a cat an event brought in"))
+            log_line("CATSYNC", "gained cat (%s): the party's mirror was not written now (a local roster is held, e.g. this player's own event) -- the next roster write puts it in; the settlement accepts it meanwhile", why);
     }
     uint64_t f_run = 0, f_home = 0;
     mem_read((uint8_t*)cat + kCatData_Flags, &f_run, sizeof(f_run));
     f_run |= kCatFlag_OnAdventure;
     mem_write((uint8_t*)cat + kCatData_Flags, &f_run, sizeof(f_run));
-    const bool host = my_session_pos() == 0;
-    if (host) { f_home = f_run; catsync_note_origin(s_id, n_id); }
+    const bool mine = my_session_pos() == seat;
+    if (mine) { f_home = f_run; catsync_note_origin(s_id, n_id); }
     mem_write((uint8_t*)copy + kCatData_Flags, &f_home, sizeof(f_home));
-    lockstep_note_owner(s_id, 0);
-    ++g.gained_n;
-    log_line("CATSYNC", "gained cat (%s): the game made %llx (%s, slot %d); it is now the shared %llx, the host's cat -- %s", why, (unsigned long long)n_id,
+    lockstep_note_owner(s_id, seat);
+    if (mine) if (uint64_t* b = baseline(s_id)) *b = 1;   // its owner publishes it (a client publishes only a cat with a baseline; 1 is no image's hash)
+    ++g.gained_n[seat];
+    log_line("CATSYNC", "gained cat (%s): the game made %llx (%s, slot %d); it is now %llx, %s -- %s", why, (unsigned long long)n_id,
              in_list[0] >= 0 ? "party" : "familiars", in_list[0] >= 0 ? in_list[0] : in_list[2], (unsigned long long)s_id,
-             host ? "its original stays home on the game's id and the settlement brings it back there" : "the copy on this save's id is retired (it is the host's cat)");
+             own ? "THIS player's cat (its own random event)" : "the host's cat (every player's event)",
+             mine ? "its original stays home on the game's id and the settlement brings it back there" : "the copy on this save's id is retired (it is the host's cat)");
     return true;
 }
 
@@ -2530,13 +2782,395 @@ unsigned catsync_release_stuck_cats(const char* why) {
 // party and familiars).  Give every selected slot a session-local identity
 // before it crosses the wire.  The high range is outside IDs observed in the
 // save and still fits the game's 32-bit run-list elements.
+// THE CLASS COMPLETION CHECK (0.1.131) -- see catsync_completion_begin in the header and T_ClassCompletion. Lists: {u32 cap, u32 count, u64* data}.
+namespace {
+struct CompletionSwap { bool on = false; uint32_t pn = 0, mn = 0; uint64_t party[16] = {}, mirror[16] = {}; };
+CompletionSwap s_cc;
+bool cc_read(const uint8_t* dir, uintptr_t at, uint32_t& cap, uint32_t& n, uint64_t*& data, uint64_t* ids) {
+    cap = n = 0; data = nullptr;
+    if (!mem_read(dir + at, &cap, 4) || !mem_read(dir + at + 4, &n, 4) || !mem_read(dir + at + 8, &data, 8) || n > cap || n > 16) return false;
+    return !n || (data && mem_read(data, ids, n * 8));
+}
+void cc_describe(const void* registry, const uint64_t* ids, uint32_t n, char* out, size_t cap) {
+    int w = 0; out[0] = 0;
+    for (uint32_t i = 0; i < n && w >= 0 && (size_t)w < cap - 48; ++i) {
+        void* cat = nullptr; char cls[32] = "?";
+        if (registry && safe_by_id((void*)registry, ids[i], &cat) && cat) mem_read_std_string((const uint8_t*)cat + 0xC10, cls, sizeof(cls));
+        w += _snprintf_s(out + w, cap - w, _TRUNCATE, " %llx:%s", (unsigned long long)ids[i], cls);
+    }
+}
+}
+
+// 0.1.147: WHO BROUGHT WHAT, remembered when the room's shared roster is installed (roster_setup_install_shared): the session cats of every player, by id. The marks'
+// rule (mgmp_completion_rule.h) counts these -- not the lists, which lose the cats that die and gain the ones an event brings.
+namespace { struct Departure { uint32_t n = 0; uint64_t ids[16] = {}; } s_dep; }
+namespace {
+// ---- 0.1.149: everything the solo-cat / same-class marks do is written to the log (grep COMPLETION): who brought what, the rule's reasoning, the lists the game's check
+// saw, the records it changed (and whether that is what the rule promised), a ledger of the checks of the run printed when the run is settled, and the notice the
+// players read at the chapter page.
+void cc_app(char* buf, size_t cap, const char* fmt, ...) {
+    const size_t at = strlen(buf);
+    if (at + 1 >= cap) return;
+    va_list ap; va_start(ap, fmt);
+    _vsnprintf_s(buf + at, cap - at, _TRUNCATE, fmt, ap);
+    va_end(ap);
+}
+const char* const kMarkName[] = { "solo-cat", "same-class", "none" };
+// a class key ("Fighter") in the game's own words, or the key itself when the game cannot say
+const char* cc_class_name(const char* cls) {
+    const uint8_t k = brief_class_from_key(cls);
+    const char* name = k < kClassCount ? gametext_class_name(k) : nullptr;
+    return name && name[0] ? name : cls;
+}
+// the cat's `alive and on the adventure` test the game's check applies (CatData +0x7AC, +0x7AE both 0; flag 0x80000 in +0xBF8), as a log token
+void cc_flags_token(const void* registry, uint64_t id, char* out, size_t cap) {
+    void* cat = nullptr; char cls[32] = "?";
+    out[0] = 0;
+    if (!registry || !safe_by_id((void*)registry, id, &cat) || !cat) { _snprintf_s(out, cap, _TRUNCATE, "%llx:not in this registry", (unsigned long long)id); return; }
+    mem_read_std_string((const uint8_t*)cat + 0xC10, cls, sizeof(cls));
+    uint8_t d1 = 0xFF, d2 = 0xFF; uint64_t fl = 0;
+    mem_read((const uint8_t*)cat + 0x7AC, &d1, 1); mem_read((const uint8_t*)cat + 0x7AE, &d2, 1); mem_read((const uint8_t*)cat + kCatData_Flags, &fl, sizeof(fl));
+    const bool counted = d1 == 0 && d2 == 0 && (fl & 0x80000);
+    _snprintf_s(out, cap, _TRUNCATE, "%llx:%s[+7AC=%u +7AE=%u flags=%llx -> %s]", (unsigned long long)id, cls, (unsigned)d1, (unsigned)d2, (unsigned long long)fl,
+                counted ? "COUNTED" : (d1 || d2) ? "not counted (dead/left)" : "not counted (not on the adventure)");
+}
+
+// What the departure record says, read against the registry and the room.
+struct CcRule {
+    bool ok = false; const char* why_not = "";
+    CompletionMark mark = CompletionMark::None;
+    uint64_t out[2] = {}; uint32_t outn = 0;
+    uint32_t recorded = 0, counted = 0;
+    unsigned per[kMaxPeers] = {};
+    char classes[160] = {};      // the distinct classes, as the game keys them
+    char names[160] = {};        // ... in the game's words, joined with "/"
+    char detail[480] = {};       // per seat and who was left out
+    char reason[160] = {};       // why the mark came out so
+};
+void cc_collect(const void* registry, uint8_t me, CcRule& r) {
+    r = CcRule{};
+    if (!s_dep.n) { r.why_not = "no record of who brought what (the shared roster was not installed in this process, or the run is settled)"; return; }
+    if (!net_active()) { r.why_not = "no room"; return; }
+    if (!registry) { r.why_not = "the cat registry is not readable"; return; }
+    r.recorded = s_dep.n;
+    CompletionCat cats[16]; uint64_t ids[16]; uint32_t k = 0;
+    char seat_cls[kMaxPeers][96] = {};
+    for (uint32_t i = 0; i < s_dep.n; ++i) {
+        const uint64_t id = s_dep.ids[i];
+        const int seat = session_cat_owner(id);
+        uint8_t holder = 0;
+        if (seat < 0 || seat >= (int)kMaxPeers) continue;
+        if (!net_seat_peer((uint8_t)seat, holder)) { cc_app(r.detail, sizeof(r.detail), " left:%llx(seat %d)", (unsigned long long)id, seat); continue; }   // a player who has left no longer counts
+        void* cat = nullptr; char cls[32] = {};
+        if (!safe_by_id((void*)registry, id, &cat) || !cat || !mem_read_std_string((const uint8_t*)cat + 0xC10, cls, sizeof(cls)) || !cls[0]) {
+            log_line_lvl(LogLevel::Warn, "COMPLETION", "!! cat %llx (seat %d) of the departure could not be read%s", (unsigned long long)id, seat, cat ? " (no class)" : " (not in this registry)");
+            r.why_not = "a cat of the departure could not be read";
+            return;
+        }
+        cats[k].seat = (uint8_t)seat; strcpy_s(cats[k].cls, sizeof(cats[k].cls), cls); ids[k] = id; ++k;
+        ++r.per[seat];
+        cc_app(seat_cls[seat], sizeof(seat_cls[seat]), "%s%s", seat_cls[seat][0] ? "," : "", cls);
+        bool seen = false;
+        for (uint32_t j = 0; j + 1 < k; ++j) if (strcmp(cats[j].cls, cls) == 0) seen = true;
+        if (!seen) {
+            cc_app(r.classes, sizeof(r.classes), "%s%s", r.classes[0] ? "," : "", cls);
+            cc_app(r.names, sizeof(r.names), "%s%s", r.names[0] ? "/" : "", cc_class_name(cls));
+        }
+    }
+    r.counted = k;
+    if (!k) { r.why_not = "every player of the record has left the room"; return; }
+    uint32_t a = 0, b = 0;
+    r.mark = completion_rule(cats, k, me, a, b);
+    r.out[0] = ids[a]; r.out[1] = ids[b]; r.outn = r.mark == CompletionMark::Solo ? 1 : 2;
+    char seats[200] = {};
+    unsigned nseats = 0, biggest = 0; int biggest_seat = -1;
+    for (unsigned p = 0; p < kMaxPeers; ++p) if (r.per[p]) {
+        ++nseats;
+        cc_app(seats, sizeof(seats), " seat%u=%u[%s]", p, r.per[p], seat_cls[p]);
+        if (r.per[p] > biggest) { biggest = r.per[p]; biggest_seat = (int)p; }
+    }
+    const char* head = r.detail[0] ? " |" : "";
+    char tmp[480]; _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s%s%s", seats, head, r.detail);
+    strcpy_s(r.detail, sizeof(r.detail), tmp);
+    const bool one_class = strchr(r.classes, ',') == nullptr;
+    if (r.mark == CompletionMark::Solo)      _snprintf_s(r.reason, sizeof(r.reason), _TRUNCATE, "%u player(s) brought one cat each and all are %s", nseats, r.classes);
+    else if (r.mark == CompletionMark::Mono) _snprintf_s(r.reason, sizeof(r.reason), _TRUNCATE, "all %u cat(s) are %s, but seat %d brought %u", k, r.classes, biggest_seat, biggest);
+    else                                     _snprintf_s(r.reason, sizeof(r.reason), _TRUNCATE, "%s: %s", one_class ? "?" : "the cats are of different classes", r.classes);
+    r.ok = true;
+}
+
+// ---- the records of the game's progression (GlobalProgressionData +0x768, 0x58 each): chapter string +0x00, class string +0x20, ints +0x40 best difficulty
+// (normal path), +0x44 (hard path), +0x48 clears, +0x4C same-class clears, +0x50 solo-cat clears. (0x1401C96B0 writes them; 0x1400E7EB0 draws the marks.)
+struct MarkRec { char chapter[24]; char cls[24]; int32_t v[5]; };
+struct MarkSnap { bool ok = false; std::vector<MarkRec> r; };
+constexpr uintptr_t kProg_Records = 0x768, kProg_RecordsEnd = 0x770;
+constexpr uint32_t kRecSize = 0x58, kRecMax = 4096;
+bool mark_snapshot(const void* prog, MarkSnap& s) {
+    s = MarkSnap{};
+    uint64_t b = 0, e = 0;
+    if (!prog || !mem_read((const uint8_t*)prog + kProg_Records, &b, 8) || !mem_read((const uint8_t*)prog + kProg_RecordsEnd, &e, 8) || !b || e < b) return false;
+    const uint64_t bytes = e - b;
+    if (bytes % kRecSize || bytes / kRecSize > kRecMax) return false;
+    const uint32_t n = (uint32_t)(bytes / kRecSize);
+    s.r.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* rec = (const uint8_t*)b + (uintptr_t)i * kRecSize;
+        MarkRec m{};
+        if (!mem_read_std_string(rec, m.chapter, sizeof(m.chapter))) strcpy_s(m.chapter, sizeof(m.chapter), "?");
+        if (!mem_read_std_string(rec + 0x20, m.cls, sizeof(m.cls))) strcpy_s(m.cls, sizeof(m.cls), "?");
+        if (!mem_read(rec + 0x40, m.v, sizeof(m.v))) return false;
+        s.r.push_back(m);
+    }
+    s.ok = true;
+    return true;
+}
+MarkSnap s_snap; const void* s_prog = nullptr;
+int s_expect = -1;                       // the mark the room's rule promised for the check in flight: 0 solo-cat, 1 same-class, 2 none, -1 the rule was not applied
+char s_run_classes[160] = {};            // the classes this run's cats are of, as the last check saw them (for the settlement summary)
+struct Ledger { char chapter[24]; bool hard; int expect; bool swapped; uint32_t created, changed, clears, mono, solo; bool read; };
+Ledger s_ledger[32]; uint32_t s_ledger_n = 0;
+} // namespace
+
+void catsync_note_departure(const uint64_t* ids, uint32_t n) {
+    s_dep = Departure{};
+    if (!ids || n > 16) return;
+    for (uint32_t i = 0; i < n; ++i) if (session_cat_owner(ids[i]) >= 0) s_dep.ids[s_dep.n++] = ids[i];
+    // what was recorded, with the classes the registry gives the ids right now
+    char text[480] = {};
+    ensure_state();
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (g.director_slot && mem_read(g.director_slot, &dir, sizeof(dir)) && dir) mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry));
+    for (uint32_t i = 0; i < s_dep.n; ++i) {
+        void* cat = nullptr; char cls[32] = "?";
+        if (registry && safe_by_id((void*)registry, s_dep.ids[i], &cat) && cat) mem_read_std_string((const uint8_t*)cat + 0xC10, cls, sizeof(cls));
+        cc_app(text, sizeof(text), " %llx(seat %d,%s)", (unsigned long long)s_dep.ids[i], session_cat_owner(s_dep.ids[i]), cls);
+    }
+    log_line("COMPLETION", "departure recorded: %u of %u id(s) are session cats --%s", s_dep.n, n, text);
+}
+void catsync_departure_clear() {
+    if (s_dep.n) log_line("COMPLETION", "departure record cleared (%u cat(s))", s_dep.n);
+    s_dep = Departure{};
+}
+
+// THE NOTICE AT THE CHAPTER PAGE (0.1.149): every player is on it and the shared roster is installed -- say, to this player, whether this run can earn a special mark.
+void catsync_announce_marks() {
+    ensure_state();
+    if (!g.resolved || !g.director_slot || !net_active()) return;
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir) return;
+    mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry));
+    CcRule r; cc_collect(registry, my_session_pos(), r);
+    if (!r.ok) {
+        log_line_lvl(LogLevel::Warn, "COMPLETION", "marks notice NOT given: %s", r.why_not);
+        return;
+    }
+    char msg[420] = {};
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE, tr(r.mark == CompletionMark::Solo ? Tx::R_MARK_SOLO : r.mark == CompletionMark::Mono ? Tx::R_MARK_MONO : Tx::R_MARK_NONE), r.names);
+    log_line("COMPLETION", "marks notice (everybody is on the chapter page): %s mark | %s | counted %u of %u recorded | seats:%s | classes: %s", kMarkName[(int)r.mark], r.reason, r.counted, r.recorded, r.detail, r.classes);
+    room_say_marks(msg);
+}
+
+bool catsync_completion_begin(const char* why) {
+    s_cc = CompletionSwap{};
+    s_expect = -1;
+    ensure_state();
+    if (!g.resolved || !g.director_slot) return false;
+    const uint8_t* dir = nullptr; const void* registry = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir) return false;
+    mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry));
+    uint64_t party[16] = {}, mirror[16] = {}, fam[16] = {};
+    uint32_t pcap = 0, pn = 0, mcap = 0, mn = 0, fcap = 0, fn = 0;
+    uint64_t *pd = nullptr, *md = nullptr, *fd = nullptr;
+    if (!cc_read(dir, kDir_CatIdCap, pcap, pn, pd, party) || !cc_read(dir, kDir_MirrorCap, mcap, mn, md, mirror) || !cc_read(dir, kDir_CatFamiliars, fcap, fn, fd, fam)) {
+        log_line_lvl(LogLevel::Warn, "COMPLETION", "event '%s': the run's lists could not be read -- the game's own check runs as it is", why ? why : "?");
+        return false;
+    }
+    char before[400]; cc_describe(registry, party, pn, before, sizeof(before));
+    {
+        char dep[400], fm[400];
+        cc_describe(registry, mirror, mn, dep, sizeof(dep)); cc_describe(registry, fam, fn, fm, sizeof(fm));
+        log_line("COMPLETION", "check begins: event '%s', this player is seat %u | lists as the game has them: party %u (cap %u)%s | departed %u (cap %u)%s | familiars %u%s",
+                 why ? why : "?", (unsigned)my_session_pos(), pn, pcap, before, mn, mcap, dep, fn, fm);
+    }
+    const uint8_t me = my_session_pos();
+    // 0.1.151: A CAT AN EVENT BROUGHT IN IS NOT COUNTED. gain_cat_familiar (0x140929B80) builds it and files it without the on-adventure flag (0x80000 at +0xBF8),
+    // and nothing in the game ever sets that flag on it -- only the departure does (0x1403B13F0) -- so in a game alone the check (which wants that flag) never
+    // counts it. The mod flags its moved copy on the adventure (the clone model), which made the room mark its class: it is left out of the check's party.
+    auto own = [&](uint64_t id) { return is_session_range(id) && !session_is_gained(id) && ((id >> 24) & 0xF) == me; };
+    bool foreign = false;
+    unsigned session = 0;
+    char gained_out[120] = {};
+    for (uint32_t i = 0; i < pn; ++i) {
+        if (is_session_range(party[i])) ++session;
+        if (is_session_range(party[i]) && !own(party[i])) foreign = true;
+        if (session_is_gained(party[i])) cc_app(gained_out, sizeof(gained_out), " %llx", (unsigned long long)party[i]);
+    }
+    if (gained_out[0]) log_line("COMPLETION", "gained cat(s) in the party list:%s -- left out of the check (a cat an event brought in is never counted in a game alone: it has no on-adventure flag)", gained_out);
+    uint64_t mine[16] = {}; uint32_t n = 0;
+    for (uint32_t i = 0; i < pn && n < 16; ++i) if (own(party[i])) mine[n++] = party[i];
+    for (uint32_t i = 0; i < fn && n < 16; ++i) if (own(fam[i])) mine[n++] = fam[i];
+    if (!session) {                                                // not a run the mod made: the game's own check
+        log_line("COMPLETION", "event '%s': the party (no session cats) is the game's own -- nothing is changed, the game decides the marks", why ? why : "?");
+        return false;
+    }
+    const bool party_own = !foreign && n == pn;
+    if (!party_own && (!n || n > pcap)) {
+        log_line_lvl(LogLevel::Warn, "COMPLETION", "!! event '%s' (seat %u): %u own cat(s) in the run's lists, the party list holds %u (cap %u) -- the game's own check runs with the party as it is:%s",
+                     why ? why : "?", (unsigned)me, n, pn, pcap, before);
+        return false;
+    }
+    // 0.1.147: THE ROOM'S RULE for the solo-cat and same-class marks (mgmp_completion_rule.h). The departed list is what the game counts them from.
+    CcRule cr; cc_collect(registry, me, cr);
+    const bool rule = cr.ok && md && mcap >= cr.outn;
+    if (cr.ok) {
+        log_line("COMPLETION", "rule: %s mark | %s | counted %u of %u recorded | seats:%s | classes: %s | departed list for the check: %u cat(s) %llx %llx%s",
+                 kMarkName[(int)cr.mark], cr.reason, cr.counted, cr.recorded, cr.detail, cr.classes, cr.outn, (unsigned long long)cr.out[0], (unsigned long long)(cr.outn > 1 ? cr.out[1] : 0),
+                 rule ? "" : " -- !! NOT written: the departed list cannot hold it (no buffer or too small)");
+    } else {
+        log_line_lvl(LogLevel::Warn, "COMPLETION", "rule NOT applied (%s) -- the game's own check runs on the departed list as it stands: the 0.1.131 behaviour, which counts the HOST's cats", cr.why_not);
+    }
+    if (rule) { s_expect = (int)cr.mark; strcpy_s(s_run_classes, sizeof(s_run_classes), cr.names); }
+    if (party_own && !rule) {
+        log_line("COMPLETION", "event '%s' (seat %u): the party is this player's own already --%s", why ? why : "?", (unsigned)me, before);
+        return false;
+    }
+    uint64_t mine_m[16] = {}; uint32_t nm = 0;
+    for (uint32_t i = 0; i < mn && nm < 16; ++i) if (own(mirror[i])) mine_m[nm++] = mirror[i];
+    const bool swap_mirror = !rule && nm && nm <= mcap && nm != mn;      // without the rule: the departed list is this player's own too (0.1.131)
+    s_cc.pn = pn; memcpy(s_cc.party, party, sizeof(party));
+    s_cc.mn = mn; memcpy(s_cc.mirror, mirror, sizeof(mirror));
+    auto put_back = [&]() {
+        if (pn) mem_write(pd, party, pn * 8);
+        mem_write((uint8_t*)dir + kDir_CatIdCap + 4, &pn, 4);
+        if (mn) mem_write(md, mirror, mn * 8);
+        mem_write((uint8_t*)dir + kDir_MirrorCap + 4, &mn, 4);
+    };
+    if (!party_own && (!mem_write(pd, mine, n * 8) || !mem_write((uint8_t*)dir + kDir_CatIdCap + 4, &n, 4))) {
+        put_back();
+        s_expect = -1;
+        log_line_lvl(LogLevel::Error, "COMPLETION", "!! event '%s': the party list could not be written -- put back, the game's own check runs", why ? why : "?");
+        return false;
+    }
+    if (rule && (!mem_write(md, cr.out, cr.outn * 8) || !mem_write((uint8_t*)dir + kDir_MirrorCap + 4, &cr.outn, 4))) {
+        put_back();
+        s_expect = -1;
+        log_line_lvl(LogLevel::Error, "COMPLETION", "!! event '%s': the departed list could not be written -- put back, the game's own check runs", why ? why : "?");
+        return false;
+    }
+    if (swap_mirror && (!mem_write(md, mine_m, nm * 8) || !mem_write((uint8_t*)dir + kDir_MirrorCap + 4, &nm, 4))) { if (mn) mem_write(md, mirror, mn * 8); mem_write((uint8_t*)dir + kDir_MirrorCap + 4, &mn, 4); }
+    s_cc.on = true;
+    const uint64_t* counted_ids = party_own ? party : mine;
+    const uint32_t counted_n = party_own ? pn : n;
+    char after[400]; cc_describe(registry, counted_ids, counted_n, after, sizeof(after));
+    log_line("COMPLETION", "event '%s' (seat %u): the class check counts THIS player's own cats --%s (the party list held%s; the departed list %s)",
+             why ? why : "?", (unsigned)me, after, before,
+             rule ? "was written by the room's rule" : swap_mirror ? "is this player's too" : "is left as it is");
+    // each party cat against the game's own test: which of them the check will count
+    {
+        char flags[700] = {};
+        for (uint32_t i = 0; i < counted_n && i < 8; ++i) { char tok[160]; cc_flags_token(registry, counted_ids[i], tok, sizeof(tok)); cc_app(flags, sizeof(flags), " %s", tok); }
+        log_line("COMPLETION", "party cats against the game's test (alive, on the adventure):%s", flags);
+    }
+    return true;
+}
+
+// THE RECORDS BEFORE AND AFTER THE GAME'S CHECK (0.1.149). `catsync_marks_before` is called right before it, `catsync_marks_after` right after: every record that is new or
+// changed is logged, the mark that came out is compared with the one the room's rule promised, and the check is kept in the ledger of the run.
+void catsync_marks_before(const void* progression) {
+    s_prog = progression;
+    if (!mark_snapshot(progression, s_snap)) log_line_lvl(LogLevel::Warn, "COMPLETION", "!! the progression records could not be read before the check -- they cannot be compared afterwards");
+}
+void catsync_marks_after(const void* progression, const char* chapter, bool hard_path, bool swapped) {
+    MarkSnap after;
+    const bool have_a = mark_snapshot(progression, after);
+    Ledger L{};
+    strncpy_s(L.chapter, sizeof(L.chapter), chapter ? chapter : "?", _TRUNCATE);
+    L.hard = hard_path; L.expect = s_expect; L.swapped = swapped; L.read = s_snap.ok && have_a;
+    if (!L.read) {
+        log_line_lvl(LogLevel::Warn, "COMPLETION", "!! chapter '%s': the progression records could not be compared (before %s, after %s)", L.chapter, s_snap.ok ? "read" : "unreadable", have_a ? "read" : "unreadable");
+        if (s_ledger_n < 32) s_ledger[s_ledger_n++] = L;
+        s_snap = MarkSnap{};
+        return;
+    }
+    bool wrong = false;
+    for (const MarkRec& a : after.r) {
+        const MarkRec* b = nullptr;
+        for (const MarkRec& x : s_snap.r) if (!strcmp(x.chapter, a.chapter) && !strcmp(x.cls, a.cls)) { b = &x; break; }
+        static const int32_t zero[5] = { -1, -1, 0, 0, 0 };
+        const int32_t* pv = b ? b->v : zero;
+        if (b && !memcmp(pv, a.v, sizeof(a.v))) continue;
+        const bool clear_up = a.v[2] > pv[2], mono_up = a.v[3] > pv[3], solo_up = a.v[4] > pv[4];
+        if (b) ++L.changed; else ++L.created;
+        if (clear_up) ++L.clears;
+        if (mono_up) ++L.mono;
+        if (solo_up) ++L.solo;
+        log_line("COMPLETION", "record %s: chapter '%s' class '%s' | best difficulty %d/%d -> %d/%d (normal/hard) | clears %d -> %d | same-class clears %d -> %d | solo-cat clears %d -> %d%s",
+                 b ? "changed" : "NEW", a.chapter, a.cls, pv[0], pv[1], a.v[0], a.v[1], pv[2], a.v[2], pv[3], a.v[3], pv[4], a.v[4],
+                 solo_up ? " | SOLO-CAT MARK GIVEN" : mono_up ? " | SAME-CLASS MARK GIVEN" : "");
+        if (s_expect >= 0 && clear_up) {
+            const bool ok = s_expect == 0 ? (solo_up && !mono_up) : s_expect == 1 ? (mono_up && !solo_up) : (!solo_up && !mono_up);
+            if (!ok) {
+                wrong = true;
+                log_line_lvl(LogLevel::Warn, "COMPLETION", "!! chapter '%s' class '%s': the room's rule promised the %s mark, the game gave %s -- the departed list the game read was not the one written?",
+                             a.chapter, a.cls, kMarkName[s_expect], solo_up ? "the solo-cat mark" : mono_up ? "the same-class mark" : "no mark");
+            }
+        } else if (s_expect == 2 && (solo_up || mono_up)) {
+            wrong = true;
+            log_line_lvl(LogLevel::Warn, "COMPLETION", "!! chapter '%s' class '%s': the room's rule promised no mark, the game gave %s", a.chapter, a.cls, solo_up ? "the solo-cat mark" : "the same-class mark");
+        }
+    }
+    if (!L.clears)
+        log_line_lvl(s_expect >= 0 ? LogLevel::Warn : LogLevel::Info, "COMPLETION", "%schapter '%s': no record's clear count rose -- the game counted none of the party's cats (see the party line above: dead, left, or not on the adventure)",
+                     s_expect >= 0 ? "!! " : "", L.chapter);
+    log_line("COMPLETION", "check done: chapter '%s', hard path %s, rule %s | %u new, %u changed record(s) | clears +%u, same-class +%u, solo-cat +%u%s",
+             L.chapter, hard_path ? "yes" : "no", s_expect >= 0 ? kMarkName[s_expect] : "not applied", L.created, L.changed, L.clears, L.mono, L.solo, wrong ? " | !! DIFFERS FROM THE RULE" : "");
+    if (s_ledger_n < 32) s_ledger[s_ledger_n++] = L;
+    s_snap = MarkSnap{};
+}
+
+// THE RUN IS SETTLED (win, defeat or abandon): the checks of the run, and where the records of its classes stand now.
+void catsync_marks_run_summary(const char* how) {
+    log_line("COMPLETION", "run summary (%s): %u chapter check(s) this run; this run's classes: %s", how ? how : "?", s_ledger_n, s_run_classes[0] ? s_run_classes : "(not recorded)");
+    for (uint32_t i = 0; i < s_ledger_n; ++i) {
+        const Ledger& L = s_ledger[i];
+        log_line("COMPLETION", "  #%u chapter '%s'%s: rule %s%s | %s | %u new, %u changed record(s); clears +%u, same-class +%u, solo-cat +%u", i + 1, L.chapter, L.hard ? " (hard path)" : "",
+                 L.expect >= 0 ? kMarkName[L.expect] : "not applied", L.swapped ? ", lists swapped" : "", L.read ? "records compared" : "records NOT readable", L.created, L.changed, L.clears, L.mono, L.solo);
+    }
+    MarkSnap now;
+    if (s_ledger_n && s_run_classes[0] && mark_snapshot(s_prog, now)) {
+        unsigned shown = 0;
+        for (const MarkRec& m : now.r) {
+            bool mine = false;
+            for (uint32_t i = 0; i < s_ledger_n && !mine; ++i) if (!strcmp(s_ledger[i].chapter, m.chapter)) mine = true;
+            if (!mine || shown >= 48) continue;
+            // only the classes of this run: the record's class key in the game's words is in s_run_classes
+            if (!strstr(s_run_classes, cc_class_name(m.cls))) continue;
+            ++shown;
+            log_line("COMPLETION", "  record now: chapter '%s' class '%s' | best difficulty %d/%d | clears %d | same-class clears %d | solo-cat clears %d", m.chapter, m.cls, m.v[0], m.v[1], m.v[2], m.v[3], m.v[4]);
+        }
+    }
+    s_ledger_n = 0; s_expect = -1; s_run_classes[0] = 0; s_snap = MarkSnap{};
+}
+
+void catsync_completion_end() {
+    if (!s_cc.on) return;
+    s_cc.on = false;
+    const uint8_t* dir = nullptr;
+    if (!g.director_slot || !mem_read(g.director_slot, &dir, sizeof(dir)) || !dir) return;
+    uint64_t* pd = nullptr; uint64_t* md = nullptr;
+    bool ok = mem_read(dir + kDir_CatIdCap + 8, &pd, 8) && pd && (!s_cc.pn || mem_write(pd, s_cc.party, s_cc.pn * 8)) && mem_write((uint8_t*)dir + kDir_CatIdCap + 4, &s_cc.pn, 4);
+    ok = mem_read(dir + kDir_MirrorCap + 8, &md, 8) && md && (!s_cc.mn || mem_write(md, s_cc.mirror, s_cc.mn * 8)) && mem_write((uint8_t*)dir + kDir_MirrorCap + 4, &s_cc.mn, 4) && ok;
+    if (!ok) log_line_lvl(LogLevel::Error, "COMPLETION", "!! the run's lists could not be put back after the class check");
+}
+
 bool catsync_prepare_party_setup(SetupMsg& out, uint8_t owner_pos) {
+    if (s_seat_override >= 0) { log_line("SEATGUARD", "a new run is set up: the seat override (%d) of the run before ends", s_seat_override); s_seat_override = -1; }
     // Clones a previous run left as live cats at home (the old behaviour, still in saves made by it) go back to
     // their originals first: the targets below are fixed ids, and a live cat there would be overwritten.
     if (owner_pos == net_peer_pos()) { catsync_relocate_squatters("before setup"); catsync_merge_session_cats("before setup"); catsync_release_stuck_cats("before setup"); }
     SetupMsg original{};
     if (!catsync_export_party_setup(original)) return false;
-    if (owner_pos >= net_peer_count() || owner_pos >= kMaxPeers) {
+    if (owner_pos >= net_seat_span() || owner_pos >= kMaxPeers) {
         for (uint8_t i = 0; i < original.count; ++i) free(original.cats[i].data);
         return false;
     }
@@ -2963,13 +3597,32 @@ void catsync_shutdown() {
 // not per-peer, so without this the next node's publish tells a freshly
 // arrived peer about only the cats that happened to change since the last
 // node -- and it has none of the others.
+// 0.1.145 (room KD8E, 2026-10-29 16:57): the settlement raises g.settling so no deferred swap puts a peer cat back while the game writes the House.
+// Only catsync_forget lowered it, and only in a room -- a run ended ALONE (the room had dropped, the role still said client) left it up, and every
+// catsync_apply_snapshot after that returned false without a word: the next room's setup could never take the host's cats.
+// A gained cat of seat p, slot k, is in this run (restored, or another player's that arrived): that seat's next gained cat takes a later slot. (0.1.146)
+void catsync_gained_seen(uint64_t id) {
+    const int p = session_gained_owner(id);
+    if (p < 0) return;
+    const uint32_t k = (uint32_t)((id & 0xFFFFFF) - kGainedSlot0) + 1;
+    if (g.gained_n[p] < k) g.gained_n[p] = k;
+}
+
+void catsync_settle_done(const char* why) {
+    ensure_state();
+    catsync_departure_clear();       // 0.1.147: the run is over -- who brought what is the next run's business
+    if (!g.settling) return;
+    g.settling = false;
+    log_line("CATSYNC", "the settlement is over (%s) -- cats may be applied again", why);
+}
+
 void catsync_forget() {
     ensure_state();
     g_last_house = nullptr;          // 0.1.86: the next House save names the House again (a new save builds a new one)
+    g.settling = false;              // 0.1.145: before the g.on gate -- a settlement is over whatever the role says now
     if (!g.on) return;
     catsync_log_snapshot("forget (a new run, or the end of one)");
-    g.settling = false;
-    g.gained_n = 0;
+    memset(g.gained_n, 0, sizeof(g.gained_n));
     g.base_count = 0;
     memset(g.base_id,   0, sizeof(g.base_id));
     memset(g.base_hash, 0, sizeof(g.base_hash));
@@ -3041,54 +3694,51 @@ static void alone_check() {
     catsync_log_audit("alone, the other players' cats removed");
 }
 
-// A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05, a three-player test: the player who left lost the others' cats, the two who stayed kept the leaver's). The membership is watched on the map tick: the
-// ids of the session as last seen with the position each one holds (its index in the list while the room was whole -- the namespace of its clones), and an id that is gone puts its position in the mask. The leaver's
-// cats are then taken out of this run's lists and their copies retired, on the map and not in a fight, as for a player who leaves.
-static uint8_t  s_seen_ids[kMaxPeers] = {};
-static uint8_t  s_seen_n = 0;
-static uint8_t  s_pos_of[kMaxPeers] = {};            // by peer id: the position it had when the room was whole
-static bool     s_dropped_any = false;
-static uint32_t s_drop_mask = 0;
-static unsigned s_drop_tries = 0;
+// A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05, a three-player test: the player who left lost the others' cats, the two who stayed kept the leaver's). REWRITTEN 0.1.119 as a LEVEL, not an edge:
+// a cat's owner is its seat (the id carries it, the seat order comes from the players' identities), so "the owner is gone" is read straight off the seat order and the roster -- net_absent_seats() -- on every
+// map update, with no memory of who was here when. The old watch compared the member list with the list it had last seen whole: a player who left before the first look was never found, and a removal that
+// failed 120 times (a map update is a frame) was given up for good, the leaver's cats then stayed in the run. Now it is retried at every update until the lists are clean.
+static uint32_t s_gone_logged = 0;    // seats already announced in the log
+static uint32_t s_gone_retired = 0;   // seats whose registry copies were retired
+static ULONGLONG s_gone_fail_log = 0;
+static unsigned s_gone_fails = 0;
 
-static void members_watch() {
-    uint8_t ids[kMaxPeers] = {};
-    if (!net_peer_ids(ids, kMaxPeers)) return;
-    const uint8_t n = net_peer_count();
-    if (n < 2 || n > kMaxPeers) return;
-    if (n >= s_seen_n && !s_dropped_any) {                       // the room is as whole as it has been: remember who holds which position
-        for (uint8_t i = 0; i < n; ++i) if (ids[i] < kMaxPeers) s_pos_of[ids[i]] = i;
-        memcpy(s_seen_ids, ids, n); s_seen_n = n;
-        return;
-    }
-    if (n >= s_seen_n) { memcpy(s_seen_ids, ids, n); s_seen_n = n; return; }
-    uint32_t gone = 0;
-    for (uint8_t k = 0; k < s_seen_n; ++k) {
-        bool still = false;
-        for (uint8_t i = 0; i < n; ++i) if (ids[i] == s_seen_ids[k]) still = true;
-        if (!still && s_seen_ids[k] < kMaxPeers) gone |= 1u << s_pos_of[s_seen_ids[k]];
-    }
-    memcpy(s_seen_ids, ids, n); s_seen_n = n;
-    if (!gone) return;
-    s_dropped_any = true;
-    s_drop_mask |= gone; s_drop_tries = 0;
-    log_line("CATSYNC", "player(s) of position mask %#x left the room, which goes on with %u player(s): their cats leave this run at the next map update", gone, (unsigned)n);
-}
-
-static void drop_apply() {
-    if (!s_drop_mask) return;
+static void drop_absent_seats() {
+    uint32_t absent = net_absent_seats();
+    if (!absent) { s_gone_logged = s_gone_retired = 0; s_gone_fails = 0; return; }
     ensure_state();
-    if (!g.resolved) { s_drop_mask = 0; return; }
-    const int removed = roster_drop_positions(s_drop_mask, "a player left the room");
+    if (!g.resolved) return;
+    seat_evidence_check("a player left the room", false);
+    {   // never the seat this player's own cats come from (0.1.129), whatever the seat order says
+        const uint8_t me = my_session_pos();
+        if (me < 32 && (absent & (1u << me))) {
+            static uint32_t s_said = 0;
+            if (s_said != absent) { s_said = absent; log_line_lvl(LogLevel::Error, "SEATGUARD", "!! the seats counted as gone (%#x) include this player's own seat %u -- its cats are kept", absent, (unsigned)me); }
+            absent &= ~(1u << me);
+            if (!absent) return;
+        }
+    }
+    if (absent & ~s_gone_logged) {
+        s_gone_logged |= absent;
+        log_line("CATSYNC", "player(s) of seat mask %#x are no longer in the room (%u present): their cats leave this run at the next map update", absent, (unsigned)net_peer_count());
+    }
+    const int removed = roster_drop_positions(absent, "a player left the room");
     if (removed < 0) {
-        if (++s_drop_tries >= 120) { log_line_lvl(LogLevel::Error, "CATSYNC", "!! a player left the room: their cats could not be taken out of the run after %u tries -- giving up", s_drop_tries); s_drop_mask = 0; }
+        ++s_gone_fails;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_gone_fail_log > 30000) {
+            s_gone_fail_log = now;
+            log_line_lvl(LogLevel::Warn, "CATSYNC", "!! seat mask %#x left the room and their cats could not be taken out of the run yet (%u tries) -- tried again at every map update", absent, s_gone_fails);
+        }
         return;
     }
-    const unsigned retired = catsync_retire_peer_copies("a player left the room", s_drop_mask);
+    s_gone_fails = 0;
+    if (removed == 0 && !(absent & ~s_gone_retired)) return;           // nothing of theirs in the lists, and their copies were retired before
+    const unsigned retired = catsync_retire_peer_copies("a player left the room", absent);
+    s_gone_retired |= absent;
     roster_party_swap_reset();
-    log_line("CATSYNC", "a player left the room: %d cat(s) of position mask %#x taken out of the run's lists, %u of their copies retired", removed, s_drop_mask, retired);
-    s_drop_mask = 0;
-    catsync_log_audit("a player left the room, on the map");
+    log_line("CATSYNC", "a player left the room: %d cat(s) of seat mask %#x taken out of the run's lists, %u of their copies retired", removed, absent, retired);
+    if (removed > 0) catsync_log_audit("a player left the room, on the map");
 }
 
 // THE GAME'S ID COUNTER, KEPT OUT OF THE CLONE RANGE (2026-10-05). It was put back only when a run was merged or a clone adopted, and the game made a cat in between -- the day turning at the departure box
@@ -3114,13 +3764,15 @@ static void counter_tick() {
 
 void catsync_leave_tick() {
     counter_tick();
-    if (!net_active()) { s_seen_n = 0; s_dropped_any = false; s_drop_mask = 0; }     // no session: the next one starts with a clean membership
-    if (net_active() && net_peer_count() >= 2) { members_watch(); drop_apply(); return; }
+    if (!net_active()) { s_gone_logged = s_gone_retired = 0; s_gone_fails = 0; }     // no session: the next one starts with a clean membership
+    if (net_active()) drop_absent_seats();                                            // also a host left alone in a room that stays open: the others' cats go when their players do
+    if (net_active() && net_peer_count() >= 2) return;
     if (!s_leave_pending) { if (net_peer_count() < 2) alone_check(); return; }
     if (net_peer_count() >= 2) { s_leave_pending = false; return; }       // a new session began: the leaving is moot
     ensure_state();
     if (!g.resolved || !s_run_pos_known) { s_leave_pending = false; return; }
-    const int removed = roster_leave_prune(s_run_pos, "left the room");
+    seat_evidence_check("left the room", true);
+    const int removed = roster_leave_prune(my_session_pos(), "left the room");
     if (removed < 0) {
         if (++s_leave_tries >= 120) { s_leave_pending = false; log_line_lvl(LogLevel::Error, "CATSYNC", "!! left the room: the other players' cats could not be taken out of the run after %u tries -- giving up", s_leave_tries); }
         return;
@@ -3315,7 +3967,12 @@ static bool publish_impl(uint8_t target, const char* why, bool quiet_if_nothing,
 
 bool catsync_apply_snapshot(const CatDataMsg& m, const char* when, bool allow_create) {
     ensure_state();
-    if (!g.on || g.settling || !m.data || !m.size || m.size > kMaxCatBytes) return false;
+    if (g.on && g.settling) {
+        static ULONGLONG said = 0; const ULONGLONG now = GetTickCount64();
+        if (!said || now - said > 10000) { said = now; log_line_lvl(LogLevel::Warn, "CATSYNC", "!! cat %016llx not applied (%s): a settlement is in progress on this peer", (unsigned long long)m.id, when); }
+        return false;
+    }
+    if (!g.on || !m.data || !m.size || m.size > kMaxCatBytes) return false;
     if (fnv1a(m.data, m.size) != m.hash) {
         log_line("CATSYNC", "!! cat %016llx failed its hash -- not applied",
                  (unsigned long long)m.id);
@@ -3347,13 +4004,17 @@ bool catsync_apply_snapshot(const CatDataMsg& m, const char* when, bool allow_cr
     }
 
     const bool created = cat == nullptr;
+    // 0.1.146: ANOTHER PLAYER'S GAINED CAT (a cat its own random event brought in, 0x7p000019+) exists nowhere but on its owner's peer until this push:
+    // it may be created here, and is then listed with that owner (below).
+    const int gained_seat = session_gained_owner(m.id);
+    const bool foreign_gained = created && gained_seat >= 0 && gained_seat != (int)my_session_pos() && gained_seat < (int)net_seat_span();
     // THE ROLE GATE IS NOW A FEATURE GATE (2026-09-23). "Only a client may create" was
     // right while the only new cats were the host's arriving at a client. The 4+4 import
     // needs the mirror image: a cat the HOST has never seen, sent from the client's OWN
     // save. tune::kPartyImport is what says the session is deliberately in that shape;
     // with it off this is the old rule exactly, so a stray message still cannot
     // populate the host's registry.
-    if (created && (!allow_create || !g.import_ready ||
+    if (created && (!(allow_create || foreign_gained) || !g.import_ready ||
                     (!g.is_client && !tune::kPartyImport))) {
         log_line_lvl(LogLevel::Error, "CATSYNC", "!! cat %016llx missing; import not authorized or unresolved",
                      (unsigned long long)m.id);
@@ -3441,6 +4102,13 @@ bool catsync_apply_snapshot(const CatDataMsg& m, const char* when, bool allow_cr
         log_line("CATSYNC", "<- applied cat %016llx (%u bytes, %s)",
                  (unsigned long long)m.id, m.size, when);
         if (when && strcmp(when, "all-player setup exchange") == 0) catsync_log_cat_parts(cat, "setup: as applied here");
+        if (session_is_gained(m.id)) catsync_gained_seen(m.id);
+        if (foreign_gained) {
+            lockstep_note_owner(m.id, (uint8_t)gained_seat);
+            const bool listed = roster_add_familiars(&m.id, 1, "another player's gained cat");
+            log_line("CATSYNC", "gained cat %016llx of seat %d (its own random event) arrived: created here, noted as that player's, %s", (unsigned long long)m.id, gained_seat,
+                     listed ? "listed in the familiars (the host's next node lists it for everybody)" : "!! NOT listed (the familiars could not be written)");
+        }
     }
     return ok;
 }
@@ -3559,7 +4227,7 @@ constexpr uint32_t kSlowEvery   = 16;
 uint8_t authority_of(uint64_t id) {
     const uint8_t me = net_peer_pos(), n = net_peer_count();
     uint8_t owner = kNoPeer;
-    const bool noted = lockstep_owner_pos(id, owner) && owner < n;
+    const bool noted = lockstep_owner_pos(id, owner) && owner < net_seat_span();
     bool mine = false;
     if (lockstep_cat_is_mine(id, mine)) {
         if (mine) return me;

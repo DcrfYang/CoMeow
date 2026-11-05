@@ -30,8 +30,9 @@ void setup_tick();
 // A taken-over lock is waiting: the player is, for the room, on the chapter page.
 bool setup_no_chapter_pending();
 // Called at the entry of MapScreen::generate_map on every peer: the stream is set to the seed the host committed for this chapter, so the map's
-// node seeds do not depend on how many draws each peer made between the commit and the generation. Once per commit.
-void setup_on_generate_map();
+// node seeds do not depend on how many draws each peer made between the commit and the generation. Once per commit. The same seed is written
+// into the map's SAVED generation seed (MapScreen+0x38), so a save loaded later rebuilds this very map; a rebuild in a room starts from that seed.
+void setup_on_generate_map(void* map);
 // Live, idle map only: paired in-run saves skip the chapter screen entirely.
 void setup_on_map(uint64_t checkpoint);
 bool setup_runtime_ready();

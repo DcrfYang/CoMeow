@@ -94,6 +94,15 @@ int main() {
     make(2, 5, 0, 100);
     balance_scale_enemy(chr, 0x3fffffff, 4);                         // x2 by halves is the old rule exactly
     CHECK(max_hp(5) == 0 && F(kChr_Shield) == 200);
+    make(2, 5, 67, 13, 41);
+    balance_scale_enemy(chr, 0x3fffffff, 2);                         // x1 (0.1.179): every number is the game's own
+    CHECK(max_hp(5) == 67 && F(kChr_Shield) == 13 && F(kChr_Hp) == 41);
+    make(2, 5, -7, 0);
+    balance_scale_enemy(chr, 0x3fffffff, 2);                         // ... a negative health bonus too
+    CHECK(max_hp(5) == -7);
+    make(2, 5, 40, 9);
+    balance_scale_enemy(chr, 0x3fffffff, 0);                         // below the range: clamped to x1
+    CHECK(max_hp(5) == 40 && F(kChr_Shield) == 9);
 
     printf("-- not enemies: untouched --\n");
     for (int f : { 0, 1, 3, 6, 7 }) {

@@ -165,7 +165,7 @@ struct Config {
     // ui.block_new_cats: the event effect "a new cat joins the run" does nothing. Off by default (the game as it is); set from the main menu's
     // mod settings. Part of the handshake's ruleset: both players must agree.
     bool     block_new_cats = false;
-    // ui.enemy_scale: the room's enemy health and armor multiplier, 2.0 .. 8.0 in steps of 0.5 (2026-10-19), kept here in HALVES (4 .. 16).
+    // ui.enemy_scale: the room's enemy health and armor multiplier, 1.0 .. 8.0 in steps of 0.5 (2026-10-19; down to x1 since 0.1.179), kept here in HALVES (2 .. 16). Default x2.
     // Set from the mod settings' slider; in a room the HOST's counts (its HELLO carries it).
     uint8_t  enemy_scale_half = 4;
     // THE EXPERIMENTAL FEATURES (2026-10-18): each one switched on and off on its own in the mod settings, all off by default. In a room the HOST's settings
@@ -179,6 +179,10 @@ struct Config {
     bool     exp_house_coop = false;
     // ui.exp_indep_events: the random "?" events are each player's own -- own cats, own choice; the draw follows the host (mgmp_indepevt).
     bool     exp_indep_events = true;
+    // ui.exp_voice (0.1.118): voice chat in the room -- the room panel gets a microphone and a sound button (mgmp_voice). The HOST's setting counts. Experimental: off.
+    bool     exp_voice = false;
+    // ui.voice_volume (0.1.133): how loud the other players' voices are played, in percent (0 .. 200, steps of 10; 100 = as received). Set from the room panel's slider.
+    uint16_t voice_volume = 100;
     // ui.player_name (0.1.89): the name this player last connected with, from the multiplayer window -- the box starts with it next time
     // (before signal.name, which a shipped config may set). "" = never saved.
     char     ui_player_name[32] = {};
@@ -260,10 +264,13 @@ bool        config_set_block_new_cats(bool on);
 bool        config_set_exp_treasure(bool on);
 bool        config_set_exp_house_coop(bool on);
 bool        config_set_exp_indep_events(bool on);
+bool        config_set_exp_voice(bool on);
+// ui.voice_volume in percent (clamped 0 .. 200). `persist` false changes only the live value (the slider while it is dragged).
+bool        config_set_voice_volume(int pct, bool persist);
 // ui.player_name: remembered in mgmp.json when it changed (true = written). config_json_string: a JSON string literal, quotes included.
 bool        config_set_player_name(const char* name);
 std::string config_json_string(const char* s);
-// ui.enemy_scale in halves (4 = x2 .. 16 = x8; clamped). `persist` false changes only the live value (the slider while it is dragged).
+// ui.enemy_scale in halves (2 = x1 .. 16 = x8; clamped). `persist` false changes only the live value (the slider while it is dragged).
 bool        config_set_enemy_scale_half(uint8_t half, bool persist);
 // The text rewrite of any ui.<key> with a literal JSON value (a number, true/false), as config_rewrite_ui_bool does it.
 std::string config_rewrite_ui_value(const std::string& text, const char* key, const char* value);

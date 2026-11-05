@@ -11,6 +11,9 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace mgmp {
 
@@ -98,6 +101,11 @@ void unlockq_on_peer(uint8_t from, const UqdMsg& m);          // another peer's 
 void unlockq_stats(uint32_t& compared, uint32_t& mismatched);  // this battle's comparisons, for the summary line
 struct PropsMsg;
 void unlocks_props_on_message(uint8_t from, const PropsMsg& m);  // a chunk of the host's save-property table (client)
+void unlocks_send_host_flags(const char* why, bool force);        // HOST: the live map flags to the clients (CHAPTER kChapterFlags generation 2)
+void unlocks_host_flags_poll();                                    // HOST, every frame an event screen is up (throttled)
+void unlocks_flagguard_reset();                                   // a save was loaded: the guard learns its flags again
+void hooks_prop_set_int(void* gamestr_name, int value);           // defined in mgmp_hooks.cpp: the game's own property setter (the name string is destroyed by it)
+void unlocks_on_host_flags(uint32_t flags);                        // CLIENT: the host's live map flags arrived
 // Every frame: notes that the battle has been built (the window then stays open until the map is ready again).
 void unlocks_tick();
 // The detours' answer for a check made inside the window: `local` is what this save said. Returns the HOST's answer for a name on a blacklist, and `local`
@@ -141,6 +149,14 @@ void unlocks_build_enemies_begin();
 void unlocks_event_roll();
 // True between the battle build's start and its end (the window unlocks_build_stage_end works in); false for a mid-battle spawner.
 bool unlocks_in_build();
+
+// THE DIFFICULTY INDEX (0.1.167, sim 41; see T_Difficulty). Called by the detour with the return address (relative to the image) and the game's own answer;
+// returns the value the caller gets. In a room the battle build's parameters and a shared event's row take the host's index (sent with UNLOCKS, proto 110);
+// every other caller -- and the host -- keep their own. unlocks_event_ctor brackets the WorldEvent constructor (T_EvSetup).
+int32_t unlocks_difficulty(uint32_t ra, int32_t own);
+// 0.1.170 (sim 43; see T_TagCount): the detour's answer for a tag count -- the host's at an event node's extra-event call and a shared event's difficulty call.
+int32_t unlocks_tag_count(uint32_t ra, int32_t own);
+void unlocks_event_ctor(bool begin);
 // The call that picks an event's SUBJECT cat (`cat_choice random` ...): `vec` = the candidate vector (count at +4, element pointers at +8), `pick` = the game's own "random element"
 // helper. In a room the candidates are sorted by cat id and the helper's draw indexes THAT list, so every peer names the same cat whatever order its own lists are in. False (the
 // caller then runs the original) outside a room or when the vector does not read as cats.
@@ -150,7 +166,14 @@ bool unlocks_event_subject(void* vec, void* stream, void* pick, void** out);
 // False (the game picks as it would) outside a room or when a candidate cannot be read.
 bool unlocks_bounty_target(void* vec, void* pick, bool faction1, void** out);
 // The game is writing an int save property (T_PropSetInt; `name` = the std::string it passes, `value` = what it stores). Inside an event window the value becomes what the property reads as.
-void unlocks_property_set(const void* name, int value);
+int  unlocks_property_set(const void* name, int value);        // the int the property setter should STORE (this save's own number, not the host's answer)
+bool unlocks_progress_key(const char* key);
+// 0.1.130 (mgmp_progressguard): this save's own value of a progress property, set through the game's setter (the guard's repair of the game's copy); false when it could not be set
+bool unlocks_set_own_progress(const char* key, int value);
+// the HOST's value of a save property, from the host's table this room received (false when it is not known) -- for the guard's log only
+bool unlocks_host_property(const char* key, int32_t& value);
+// the names a window answered "UNLOCKED" from the host's lists while this save had them locked, since the last call (category = the unlocks blob's: 1 ability, 2 passive, 3 item, 4 boss, 6 level group)
+void unlocks_host_only_take(std::vector<std::pair<int, std::string>>& out);                       // a property that only goes up in a save (flags, unlocks, upgrades)
 
 // The level picker (T_LevelPick), before (picked = false: in a room the shared stream is set from the node's seed -- the battle id without a node)
 // and after (`out` = the std::string holding the picked level's name): both peers log the stream and the pick.

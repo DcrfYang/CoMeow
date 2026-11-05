@@ -518,6 +518,166 @@ void* unit_spawn_at(void* tc, const void* like, const char* def, int32_t x, int3
     return made;
 }
 
+// --- 0.1.190: revive, an ability by name, a unit from cat data ------------------------------------------------------------------------------
+namespace {
+constexpr uintptr_t kChar_AbilSlot0  = 0xD0;   // move, attack, bonus: three Ability*; then the spells' CustomVector {u32 cap, u32 count, Ability** data}
+constexpr uintptr_t kChar_SpellCap   = 0xE8, kChar_SpellCount = 0xEC, kChar_SpellData = 0xF0;
+constexpr uintptr_t kCat_SpellNames  = 0x810;  // CatData: the cat's spells, std::string each (0x20); the console's set-ability writes the first four
+constexpr uint32_t  kCatSpellNames   = 4;
+constexpr uintptr_t kAbil_FromItem   = 0x8A1;  // +0x8A1 weapon, +0x8A2 trinket: an ability an item gave (mgmp_ability.h)
+// SpawnDatabase+0x198: the ability definitions (3076 on 2026-11-05) -- CreateAbility looks an ordinary name up here and an unknown one ends in the game's error
+// report (0x1407ACEDC); the console's set-ability checks the same node first. (+0x3A8 is the four ability POOLS: a name starting "RandomFrom" draws from one.)
+constexpr uintptr_t kDb_AbilityGon   = 0x198;
+constexpr uintptr_t kGon_Kind        = 0xA8;   // 0 = the game's empty node: no such child
+constexpr uintptr_t kTempAbil_DbLoad = 0x1C0;  // C_AddTempAbility + 0x1C0: 48 8B 1D rel32 = mov rbx, [the SpawnDatabase pointer]
+constexpr uint32_t  kMaxSpells       = 64;
+
+using fn_revive   = void  (__fastcall*)(void* chr, int32_t hp);
+using fn_mkabil   = void* (__fastcall*)(void* db, void* owner, const GameStr* name, void* extra);
+using fn_spawncat = void* (__fastcall*)(void* unused, GameStr* name, void* cat, void* world);
+using fn_uiof     = void* (__fastcall*)(void* chr);
+using fn_uibuild  = void  (__fastcall*)(void* comp, bool unused);
+using fn_gonget   = const uint8_t* (__fastcall*)(const void* gon, const GameStr* key);
+using fn_deldtor  = void* (__fastcall*)(void* obj, uint32_t flags);
+using fn_assign   = void* (__fastcall*)(void* str, const char* p, size_t n);
+
+void* spawn_database() {
+    const uintptr_t f = addr_of_call(C_AddTempAbility);
+    if (!f) return nullptr;
+    uint8_t op[3] = {}; int32_t rel = 0;
+    if (!mem_read((const void*)(f + kTempAbil_DbLoad), op, 3) || op[0] != 0x48 || op[1] != 0x8B || op[2] != 0x1D ||
+        !mem_read((const void*)(f + kTempAbil_DbLoad + 3), &rel, 4)) return nullptr;
+    void* db = nullptr;
+    mem_read((const void*)(f + kTempAbil_DbLoad + 7 + (intptr_t)rel), &db, 8);
+    return db;
+}
+// The game's ability definitions know the name (a name past 15 characters leaves its game-heap buffer behind: a few dozen bytes per repair).
+bool ability_known(void* db, const GameStr& key) {
+    auto get = (fn_gonget)addr_of_call(C_GonGet);
+    if (!get || !db) return false;
+    const uint8_t* a = nullptr;
+    __try { a = get((const uint8_t*)db + kDb_AbilityGon, &key); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    int32_t ka = 0;
+    return a && mem_read(a + kGon_Kind, &ka, 4) && ka != 0;
+}
+bool from_item(const void* ab) { uint8_t f[2] = {}; return ab && mem_read((const uint8_t*)ab + kAbil_FromItem, f, 2) && (f[0] || f[1]); }
+bool destroy_ability(void* ab) {          // vtable slot 0, the deleting destructor, as the console calls it
+    void* const* vt = nullptr; void* fn = nullptr;
+    if (!ab || !mem_read(ab, &vt, 8) || !vt || !mem_read(vt, &fn, 8) || !fn) return false;
+    __try { ((fn_deldtor)fn)(ab, 1); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void rebuild_bar(void* chr) {
+    auto of = (fn_uiof)addr_of_call(C_AbilityUiOf);
+    auto build = (fn_uibuild)addr_of_call(C_AbilityUiBuild);
+    if (!of || !build) return;
+    __try { if (void* c = of(chr)) build(c, false); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+} // namespace
+
+bool unit_revive(void* chr, int32_t hp) {
+    auto f = (fn_revive)addr_of_call(C_CharRevive);
+    if (!f || !chr) return false;
+    __try { f(chr, hp > 0 ? hp : 1); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    uint8_t dead = 1;
+    return mem_read((const uint8_t*)chr + kChar_Dead, &dead, 1) && dead == 0;
+}
+
+bool unit_die(void* chr) {
+    auto die = (fn_die)addr_of_call(C_CharDie);
+    uint8_t dead = 0;
+    if (!die || !chr || !mem_read((const uint8_t*)chr + kChar_Dead, &dead, 1)) return false;
+    if (dead) return true;
+    __try { die(chr, false, nullptr, false); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return mem_read((const uint8_t*)chr + kChar_Dead, &dead, 1) && dead != 0;
+}
+
+bool unit_set_ability(void* chr, uint8_t slot, const char* name, bool cat_too, const char*& why) {
+    why = nullptr;
+    auto make = (fn_mkabil)addr_of_call(C_CreateAbility);
+    void* db = spawn_database();
+    if (!chr || !make || !db) { why = "the game's ability factory is not resolved"; return false; }
+    if (!name || !usable_def(name)) { why = "not a usable ability name"; return false; }
+    if (_strnicmp(name, "RandomFrom", 10) == 0 || _stricmp(name, "none") == 0) { why = "a pool or 'none', not an ability (the factory would draw one or make nothing)"; return false; }
+    GameStr key;
+    if (!make_str(key, name)) { why = "the name could not be built"; return false; }
+    if (!ability_known(db, key)) { why = "the game knows no ability of that name"; return false; }
+    uint8_t* c = (uint8_t*)chr;
+    uint8_t* where = nullptr;
+    bool append = false;
+    uint32_t idx = 0;
+    if (slot < 3) where = c + kChar_AbilSlot0 + slot * 8;
+    else {
+        idx = slot - 3u;
+        uint32_t cap = 0, count = 0; uint8_t* data = nullptr;
+        if (!mem_read(c + kChar_SpellCap, &cap, 4) || !mem_read(c + kChar_SpellCount, &count, 4) || !mem_read(c + kChar_SpellData, &data, 8) || count > kMaxSpells || cap > 4096) {
+            why = "the spell list is unreadable"; return false;
+        }
+        if (idx > count) { why = "a gap in the spell list (an earlier slot is missing too)"; return false; }
+        if (idx == count) {
+            if (!data || count >= cap) { why = "the spell list has no room for one more"; return false; }
+            append = true;
+        }
+        where = data + idx * 8;
+    }
+    void* old = nullptr;
+    if (!append && !mem_read(where, &old, 8)) { why = "the slot is unreadable"; return false; }
+    if (old && from_item(old)) { why = "the slot holds an item's ability (the gear repair owns it)"; return false; }
+    void* made = nullptr;
+    __try { made = make(db, chr, &key, nullptr); } __except (EXCEPTION_EXECUTE_HANDLER) { made = nullptr; }
+    if (!made) { why = "the game's factory made nothing"; return false; }
+    mem_write(where, &made, 8);
+    if (append) { const uint32_t n = idx + 1; mem_write(c + kChar_SpellCount, &n, 4); }
+    if (old && !destroy_ability(old)) log_line_lvl(LogLevel::Warn, "USYNC", "!! the old ability of slot %u (%p) faulted in its destructor -- left as it is", (unsigned)slot, old);
+    if (cat_too && slot >= 3 && idx < kCatSpellNames) {
+        uint8_t* cat = nullptr;
+        auto assign = (fn_assign)addr_of_call(C_StrAssign);
+        if (assign && mem_read(c + kChar_CatData, &cat, 8) && cat) {
+            __try { assign(cat + kCat_SpellNames + idx * 0x20, name, strlen(name)); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    rebuild_bar(chr);
+    return true;
+}
+
+bool unit_trim_spells(void* chr, uint32_t keep, const char*& why) {
+    why = nullptr;
+    uint8_t* c = (uint8_t*)chr;
+    uint32_t count = 0; uint8_t* data = nullptr;
+    if (!chr || !mem_read(c + kChar_SpellCount, &count, 4) || !mem_read(c + kChar_SpellData, &data, 8) || !data || count > kMaxSpells) { why = "the spell list is unreadable"; return false; }
+    while (count > keep) {
+        void* ab = nullptr;
+        if (!mem_read(data + (count - 1) * 8, &ab, 8)) { why = "a spell slot is unreadable"; return false; }
+        if (from_item(ab)) { why = "the last spell is an item's ability (the gear repair owns it)"; return false; }
+        void* const none = nullptr;
+        mem_write(data + (count - 1) * 8, &none, 8);
+        --count;
+        mem_write(c + kChar_SpellCount, &count, 4);
+        if (ab && !destroy_ability(ab)) log_line_lvl(LogLevel::Warn, "USYNC", "!! a trimmed spell (%p) faulted in its destructor -- left as it is", ab);
+    }
+    rebuild_bar(chr);
+    return true;
+}
+
+void* unit_spawn_catdata_at(void* tc, const void* like, const char* def, void* cat, int32_t x, int32_t y, const int32_t* keys, const char*& why) {
+    why = nullptr;
+    auto spawn = (fn_spawncat)addr_of_call(C_SpawnWithCatData);
+    if (!spawn) { why = "the game's cat-data spawn is not resolved"; return nullptr; }
+    if (!tc || !like || !def || !cat || !usable_def(def)) { why = "no usable definition name, no cat data or no unit to borrow the world from"; return nullptr; }
+    void* world = nullptr;
+    int32_t f[2] = {};
+    mem_read((const uint8_t*)like + kChar_World, &world, 8);
+    mem_read((const uint8_t*)like + kChar_Facing, f, 8);
+    GameStr s;
+    if (!world || !make_str(s, def)) { why = "no world, or the name could not be built"; return nullptr; }
+    void* made = nullptr;
+    __try { made = spawn(nullptr, &s, cat, world); } __except (EXCEPTION_EXECUTE_HANDLER) { why = "the spawn raised an exception"; return nullptr; }
+    if (!made) { why = "the game returned no unit"; return nullptr; }
+    const int rc = call_place(made, tc, x, y, f[0], f[1], keys);
+    if (rc) { why = "placing the new unit failed"; log_line_lvl(LogLevel::Error, "SPAWNTEST", "unit_spawn_catdata_at: placing '%s' %p at (%d,%d) failed (rc %d)", def, made, x, y, rc); return nullptr; }
+    return made;
+}
+
 bool unit_remove_silent(void* chr) { return chr && call_remove(chr, false) == 0; }
 bool unit_remove_game_way(void* chr) { return chr && call_remove(chr, true) == 0; }
 

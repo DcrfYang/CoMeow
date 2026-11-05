@@ -13,10 +13,11 @@ namespace {
 unsigned current=0,npeers=2,live=2,counts[4]{4,4,4,4},commits[4]{},imports[4]{};
 uint8_t transport[4]={0,1,2,3};
 State states[4];Config cfg{};uint64_t rngs[4][4]{};
-bool online=true,send_ok=true,apply_ok=true,install_ok=true,capture_ok=true;
+bool online=true,send_ok=true,apply_ok=true,install_ok=true,capture_ok=true,client_install_fails=false;
 struct Frame{unsigned from,to;std::vector<uint8_t> bytes;};std::deque<Frame> frames;
 void at(unsigned p,const std::function<void()>& f){current=p;strcpy_s(cfg.net_role,p?"client":"host");std::swap(g,states[p]);f();std::swap(g,states[p]);}
-void drain(){unsigned budget=400;while(!frames.empty()){CHECK(budget--);auto f=frames.front();frames.pop_front();at(f.to,[&]{Reader r(f.bytes.data(),(uint32_t)f.bytes.size());auto t=r.u8v();
+unsigned drained=0;
+void drain(){unsigned budget=400;while(!frames.empty()){CHECK(budget--);auto f=frames.front();frames.pop_front();++drained;at(f.to,[&]{Reader r(f.bytes.data(),(uint32_t)f.bytes.size());auto t=r.u8v();
  if(t==MSG_SETUP){SetupMsg m{};CHECK(dec_setup(r,m));setup_on_message(m,(uint8_t)f.from);free_msg(m);}
  else if(t==MSG_CHAPTER){ChapterMsg m{};CHECK(dec_chapter(r,m));setup_on_chapter_message(m,(uint8_t)f.from);}
  else {ChapterSeedMsg m{};CHECK(t==MSG_CHAPTERSEED&&dec_chapterseed(r,m));setup_on_chapterseed_message(m,(uint8_t)f.from);}
@@ -45,8 +46,8 @@ bool catsync_prepare_party_setup(SetupMsg& m,uint8_t owner){if(!capture_ok)retur
 bool catsync_export_resume(SetupMsg& m,uint8_t owner){return catsync_prepare_party_setup(m,owner);}
 void catsync_setup_sent(const SetupMsg&){}
 bool catsync_apply_snapshot(const CatDataMsg& m,const char*,bool create){CHECK(create&&session_cat_owner(m.id)>=0);++imports[current];return apply_ok;}
-bool roster_setup_install_shared(const uint64_t* ids,uint32_t n,const char*){unsigned seen[4]{};for(unsigned i=0;i<n;++i){int p=session_cat_owner(ids[i]);CHECK(p>=0&&p<(int)npeers);++seen[p];}
- for(unsigned p=0;p<npeers;++p)CHECK(seen[p]==counts[p]);return install_ok;}
+bool roster_setup_install_shared(const uint64_t* ids,uint32_t n,const char*,bool){unsigned seen[4]{};for(unsigned i=0;i<n;++i){int p=session_cat_owner(ids[i]);CHECK(p>=0&&p<(int)npeers);++seen[p];}
+ for(unsigned p=0;p<npeers;++p)CHECK(seen[p]==counts[p]);return install_ok&&!(client_install_fails&&current!=0);}
 void roster_setup_set_ready(bool){}
 bool net_send_setup(const SetupMsg& m){std::vector<uint8_t>b(setup_frame_size(m));CHECK(enc_setup(b.data(),(uint32_t)b.size(),m)==b.size());return send(std::move(b));}
 bool net_send_chapter(const ChapterMsg& m){std::vector<uint8_t>b(32);auto n=enc_chapter(b.data(),32,m);CHECK(n);b.resize(n);return send(std::move(b));}
@@ -57,8 +58,15 @@ namespace mgmp {
 int say_client=0,say_wait=0,say_story=0;
 void room_say_chapter_client(){++say_client;}
 void room_say_chapter_wait(){++say_wait;}
+int marks_calls=0;
+void catsync_announce_marks(){++marks_calls;}
 bool over_self=false;int over_row=-1,say_over=0,say_peer_over=0;
 bool room_self_over_limit(uint32_t*){return over_self;}
+void room_push_notice(const char*){}   // 0.1.163: the notice for a save whose run cannot be resumed in this room
+const char* tr(Tx){return "";}
+void ui_error_popup(const char*, const char*) {}   // 0.1.169: the file / save problem popup
+PageState page_self() { return PageState::Equipment; }   // 0.1.170: a held start runs on the gear screen
+const char* page_name(PageState) { return ""; }
 int room_other_over_limit(uint32_t*){return over_row;}
 void room_say_party_over(){++say_over;}
 void room_say_peer_over(int){++say_peer_over;}
@@ -79,6 +87,7 @@ void unlocks_publish(){}
 // the area gate (mgmp_areagate) is told every client's map flags: its READY's and its kChapterFlags reports
 int ag_calls=0;uint8_t ag_from=255;uint32_t ag_flags=0;
 void areagate_on_flags(uint8_t from,uint32_t flags,const char*){++ag_calls;ag_from=from;ag_flags=flags;}
+uint32_t host_flags_seen=0;int host_flags_calls=0;void unlocks_on_host_flags(uint32_t f){host_flags_seen=f;++host_flags_calls;}
 // experimental own random events (mgmp_indepevt): a client says it is done with its event on a node (kChapterEventDone)
 static int ie_calls=0;static uint8_t ie_from=0xFF;static uint64_t ie_seed=0;
 void indepevt_on_done(uint8_t from,uint64_t seed){++ie_calls;ie_from=from;ie_seed=seed;}
@@ -217,13 +226,35 @@ void test_chapter_unlocks(){
  uint64_t committed[4]{};
  at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,2,&d,native);memcpy(committed,rngs[0],32);CHECK(setup_on_select_act(2));});drain();
  for(int i=0;i<4;++i)rngs[0][i]^=0x5555u;   // draws between the commit and the generation
- at(0,[]{setup_on_generate_map();});CHECK(!memcmp(rngs[0],committed,32));
- rngs[0][0]^=1;at(0,[]{setup_on_generate_map();});CHECK(rngs[0][0]!=committed[0]);   // used once
+ alignas(8) static uint8_t map0[0x60],map1[0x60];memset(map0,0xCD,sizeof(map0));memset(map1,0xCD,sizeof(map1));
+ at(0,[]{setup_on_generate_map(map0);});CHECK(!memcmp(rngs[0],committed,32));
+ CHECK(!memcmp(map0+0x38,committed,32));   // ... and it is the map's saved generation seed (MapScreen+0x38): a save of this chapter rebuilds this map
+ rngs[0][0]^=1;at(0,[]{setup_on_generate_map(nullptr);});CHECK(rngs[0][0]!=committed[0]);   // used once
+ at(0,[]{setup_on_generate_map(map0);});CHECK(!memcmp(rngs[0],committed,32));   // a rebuild (a save loaded) starts from the saved seed
  control(1);for(int i=0;i<4;++i)rngs[1][i]^=0x7777u;
- at(1,[]{setup_on_generate_map();});CHECK(!memcmp(rngs[1],committed,32));
+ at(1,[]{setup_on_generate_map(map1);});CHECK(!memcmp(rngs[1],committed,32));CHECK(!memcmp(map1+0x38,committed,32));
+}
+void test_marks_notice(){
+ // 0.1.149: once every player is on the chapter page (the shared roster is installed) each player is told, once, whether the run can earn a special mark
+ for(unsigned n=2;n<=4;++n){reset(n,0);marks_calls=0;prepare();CHECK(marks_calls==(int)n);retry();CHECK(marks_calls==(int)n);}   // once per player, not again on the retries
+ reset(2,0);marks_calls=0;install_ok=false;retry();CHECK(marks_calls==0);install_ok=true;retry();CHECK(marks_calls==2);          // nothing is said before the roster is installed
+ reset(3,0);marks_calls=0;prepare(true);CHECK(marks_calls==0);                                                                   // a resumed run has no chapter page
+ reset(2,0);marks_calls=0;prepare();for(unsigned p=0;p<2;++p)at(p,[]{setup_reset_run();});prepare();CHECK(marks_calls==4);     // the next preparation is a new round
+}
+void test_no_pingpong(){
+ // 0.1.145 (room KD8E, 2026-10-29): a client that cannot take the host's roster (its catsync refused every apply) answered every reply with its export
+ // at once, and the host every export with its reply -- an endless exchange paced only by the link (1.5 MB/s, the round trip up to 2.5 s, a drop).
+ // Now the client asks again only on the setup cadence, and the host answers a repeated export at most once a second.
+ reset(2,0);client_install_fails=true;drained=0;
+ for(unsigned k=0;k<250;++k){tick(0);tick(1);drain();}          // two setup cadences (120 ticks each)
+ CHECK(drained<40);                                               // a handful of frames per cadence, not one per round trip
+ at(1,[]{CHECK(!g.host_reply_seen&&g.pending.count);});         // held, not lost ...
+ client_install_fails=false;retry();                              // ... and taken on the next cadence once the client can
+ at(1,[]{CHECK(g.host_reply_seen&&!g.pending.count&&setup_runtime_ready());});
+ at(0,[]{CHECK(setup_runtime_ready());});
 }
 int main(){
- test_equipment();test_hints();test_no_chapter();test_chapter_unlocks();
+ test_equipment();test_hints();test_no_chapter();test_chapter_unlocks();test_no_pingpong();test_marks_notice();
  // Polling readiness before all players join must not freeze a two-player room.
  reset(4,0);live=2;at(0,[]{CHECK(!setup_runtime_ready());});live=4;prepare();
  // Transport peer IDs can have holes; ownership always uses session position.
@@ -258,6 +289,10 @@ int main(){
  reset(2,0);prepare();at(0,[]{const bool ready=g.ready[1];const int before=ag_calls;ChapterMsg m{};m.kind=kChapterFlags;m.generation=1;m.mapflags=0x1234u;
   setup_on_chapter_message(m,1);CHECK(ag_calls==before+1&&ag_from==1&&ag_flags==0x1234u);CHECK(g.ready[1]==ready);
   m.generation=0;CHECK(!valid_chapter(m));m.generation=1;m.act=1;CHECK(!valid_chapter(m));});
+ // 0.1.121: generation 2 is the HOST's live flags: they go to the unlock answers, never to the area gate (which collects the clients' own reports)
+ reset(2,0);prepare();at(1,[]{const int before=ag_calls,hb=host_flags_calls;ChapterMsg m{};m.kind=kChapterFlags;m.generation=2;m.mapflags=0x2000u;
+  setup_on_chapter_message(m,0);CHECK(host_flags_calls==hb+1&&host_flags_seen==0x2000u&&ag_calls==before);
+  setup_on_chapter_message(m,1);CHECK(host_flags_calls==hb+1&&ag_calls==before);});   // not from a client
  at(0,[]{const int before=ag_calls;ChapterMsg m{};m.kind=kChapterReady;m.generation=g.round;m.mapflags=0x55u;setup_on_chapter_message(m,1);CHECK(ag_calls==before+1&&ag_flags==0x55u);});
  // proto 102: a client's "done with my own random event" goes to mgmp_indepevt with the whole node seed, and nowhere else
  at(0,[]{const int before=ie_calls,agb=ag_calls;const bool ready=g.ready[1];ChapterMsg m{};m.kind=kChapterEventDone;m.generation=0x89ABCDEFu;m.mapflags=0x01234567u;

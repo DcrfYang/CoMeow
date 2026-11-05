@@ -81,6 +81,7 @@ bool room_refuse_story_item(const char* item);
 //  - a client pressed a chapter (only the host chooses it),
 //  - the host pressed a chapter while some player is not ready yet.
 void room_say_story_only_host();
+void room_say_gear_locked();             // 0.1.192: a client's gear click after the host has entered the next node
 void room_say_chapter_client();
 void room_say_chapter_wait();
 // The host picked a chapter some player has not unlocked: 2 = somebody lacks chapter 2 (chapters 2 and 3 are closed), 3 = only chapter 3 is closed.
@@ -103,6 +104,8 @@ bool room_peer_name(uint8_t id, char* out, size_t cap);
 // Another module's notice (an OK closes it) / one-line toast, in the room's queue.
 void room_push_notice(const char* text);
 void room_toast(const char* text);
+// The special-mark notice at the chapter page (0.1.149): a toast AND a line in this player's chat history, so it is not missed.
+void room_say_marks(const char* text);
 
 // --- solo house boss ---------------------------------------------------------------------------------
 bool room_solo_active();        // this player is away fighting a house boss on its own

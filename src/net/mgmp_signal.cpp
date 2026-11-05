@@ -24,6 +24,7 @@
 #include "mgmp_steambridge.h"
 #include "mgmp_net.h"
 #include "mgmp_log.h"
+#include "mgmp_server_addr.h"   // comeow.top: the address when the name does not resolve
 #include "mgmp_session.h"
 
 #include "json.hpp"
@@ -49,9 +50,12 @@ using nlohmann::json;
 // Lines the worker may run ahead of the game thread before it starts dropping.
 // The lobby is a handful of messages a second, so overflow means the game
 // thread stopped draining -- a bug worth counting, not a buffer worth growing.
-constexpr uint32_t kRing       = 64;
-constexpr uint32_t kLineMax    = 1024;
-constexpr uint32_t kMaxRooms   = 32;
+constexpr uint32_t kRing       = 256;   // 64 until 0.1.182; a line is a string now, an empty slot costs little
+// THE LONGEST LINE (0.1.181; 2026-11-04 "the room list is empty but the admin page shows rooms"). It was 1 KB: a room list of a dozen rooms with Chinese names (3 bytes
+// a character) is longer -- the line was cut at 1023 bytes, json::parse refused the rest ("not a JSON object"), and the whole list was thrown away; past 2 KB the
+// reader even dropped the link and dialled again, over and over. Lines are kept as strings now, up to 256 KB.
+constexpr uint32_t kLineMax    = 256 * 1024;
+constexpr uint32_t kMaxRooms   = kSignalMaxRooms;
 constexpr uint32_t kMaxMembers = 8;
 
 // A dial that has not connected by now is not going to. Five seconds is long
@@ -92,8 +96,7 @@ struct State {
     // The ring of complete lines, worker -> game thread.
     CRITICAL_SECTION ring_cs;
     bool     ring_cs_ready = false;
-    char     lines[kRing][kLineMax];
-    uint16_t len[kRing];
+    std::string lines[kRing];
     uint32_t head = 0, count = 0, dropped = 0;
 
     // Serializes a send against the worker clearing g.sock.
@@ -198,25 +201,26 @@ void ring_push(const char* line, uint32_t n) {
         // Drop the NEWEST and count it, like the transport does and for the
         // same reason: reordering a lobby message would show a stale member
         // list, and a dropped one is visible as a count.
-        ++g.dropped;
+        const uint32_t dropped = ++g.dropped;
         LeaveCriticalSection(&g.ring_cs);
+        if ((dropped & (dropped - 1)) == 0)   // 0.1.182: said (1st, 2nd, 4th, 8th...), not only counted
+            log_line_lvl(LogLevel::Warn, "SIGNAL", "!! the lobby line ring is full (%u) -- a line from the server was DROPPED (%u so far)", (unsigned)kRing, (unsigned)dropped);
         return;
     }
     const uint32_t slot = (g.head + g.count) % kRing;
-    memcpy(g.lines[slot], line, n);
-    g.lines[slot][n] = 0;
-    g.len[slot]      = (uint16_t)n;
+    g.lines[slot].assign(line, n);
     ++g.count;
     LeaveCriticalSection(&g.ring_cs);
 }
 
-bool ring_pop(char* out, uint32_t cap) {
+bool ring_pop(std::string& out) {
     bool got = false;
     EnterCriticalSection(&g.ring_cs);
     if (g.count) {
         const uint32_t i = g.head;
-        const uint16_t n = g.len[i];
-        if ((uint32_t)n < cap) { memcpy(out, g.lines[i], n); out[n] = 0; got = true; }
+        out.swap(g.lines[i]);
+        g.lines[i].clear();
+        got = true;
         g.head = (g.head + 1) % kRing;
         --g.count;
     }
@@ -308,7 +312,11 @@ SOCKET dial(const char* addr, uint16_t port) {
         char portstr[8];
         _snprintf_s(portstr, sizeof(portstr), _TRUNCATE, "%u", (unsigned)port);
         addrinfo* res = nullptr;
-        const int rc = getaddrinfo(addr, portstr, &hints, &res);
+        int rc = getaddrinfo(addr, portstr, &hints, &res);
+        if ((rc != 0 || !res) && official_fallback(addr)) {
+            log_line_lvl(LogLevel::Warn, "SIGNAL", "'%s' does not resolve (%d) -- trying the server's address %s", addr, rc, official_fallback(addr));
+            rc = getaddrinfo(official_fallback(addr), portstr, &hints, &res);
+        }
         if (rc != 0 || !res) {
             set_error("'%s' is neither an address nor a name that resolves", addr);
             return INVALID_SOCKET;
@@ -599,6 +607,10 @@ int jint(const json& o, const char* key, int fallback = 0) {
 void store_rooms(const json& arr) {
     g.room_count = 0;
     if (arr.is_array()) {
+        if (arr.size() > kMaxRooms) {   // 0.1.182: said, not silent
+            static size_t s_said = 0;
+            if (arr.size() != s_said) { s_said = arr.size(); log_line_lvl(LogLevel::Warn, "SIGNAL", "!! the server lists %u rooms -- only the first %u are kept", (unsigned)arr.size(), (unsigned)kMaxRooms); }
+        }
         for (const json& r : arr) {
             if (g.room_count >= kMaxRooms) break;
             if (!r.is_object()) continue;
@@ -618,6 +630,7 @@ void store_rooms(const json& arr) {
 void store_peers(const json& arr) {
     g.peer_count = 0;
     if (!arr.is_array()) return;
+    if (arr.size() > kMaxMembers) log_line_lvl(LogLevel::Warn, "SIGNAL", "!! the room lists %u members -- only the first %u are kept", (unsigned)arr.size(), (unsigned)kMaxMembers);
     for (const json& p : arr) {
         if (g.peer_count >= kMaxMembers) break;
         if (!p.is_object()) continue;
@@ -792,6 +805,13 @@ void handle_line(const char* line) {
         forget_room();
         // The room was the session's reason to exist. A client whose host has
         // gone has nothing left to wait for.
+        // 0.1.184: unless the GAME link is still up. The lobby drops a member whose own connection to it went quiet (75 s) and closes the room with its
+        // host -- a lobby hiccup, not the end of the game, which goes on over its own link (and is waited for when that goes quiet too). The session
+        // ends when the game link itself closes, or by hand.
+        if (net_active() && net_peer_count() >= 2) {
+            log_line_lvl(LogLevel::Warn, "SIGNAL", "the lobby room is gone but the game link is up -- the game goes on (it ends when the link closes, or by hand)");
+            return;
+        }
         session_request_disconnect();
         return;
     }
@@ -1084,8 +1104,8 @@ void signal_update() {
         }
     }
 
-    char line[kLineMax];
-    while (ring_pop(line, sizeof(line))) handle_line(line);
+    std::string line;
+    while (ring_pop(line)) handle_line(line.c_str());
 
     // Only when nothing newer is queued: auto_room_step may record a request,
     // and applying it out of order would defeat "the last click wins".

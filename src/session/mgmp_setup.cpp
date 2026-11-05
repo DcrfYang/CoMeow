@@ -10,11 +10,14 @@
 #include "mgmp_rng.h"
 #include "mgmp_roster.h"
 #include "mgmp_room.h"
+#include "mgmp_i18n.h"     // tr: the notice for a save whose run cannot be resumed in this room (0.1.163)
 #include "mgmp_tuning.h"
 #include "mgmp_unlocks.h"
 #include "mgmp_mem.h"
+#include "mgmp_page.h"      // page_self: a held start runs only on the screen it was held on (0.1.170)
 #include <cstdlib>
 #include <cstring>
+#include <windows.h>
 
 namespace mgmp {
 namespace {
@@ -30,6 +33,9 @@ struct State {
     uint64_t checkpoint=0;
     uint32_t generation=0,round=0,retry_ticks=0;
     bool said_blocked=false;
+    uint32_t marks_said=0;                    // the round whose special-mark notice was given (0.1.149)
+    uint32_t said_apply_fail=0;               // the round whose host reply could not be applied here (logged once)
+    ULONGLONG replied_at[kMaxPeers]{};        // host: when a repeated export was last answered
     int32_t difficulty[3]{};bool have_difficulty[3]{};
     SetupMsg exports[kMaxPeers]{},outgoing{},pending{},reply{};
     ChapterMsg command{};ChapterSeedMsg seed{};
@@ -74,13 +80,16 @@ bool valid(const SetupMsg& m,int owner=-1){
     return true;
 }
 bool install(const SetupMsg& m){uint64_t ids[kSetupMaxCats]{};for(unsigned i=0;i<m.count;++i)ids[i]=m.cats[i].id;
-    return roster_setup_install_shared(ids,m.count,"all-player setup barrier");}
+    return roster_setup_install_shared(ids,m.count,"all-player setup barrier",g.resume);}
 bool apply(const SetupMsg& m,bool skip_own){
     for(unsigned i=0;i<m.count;++i){const auto& c=m.cats[i];if(skip_own&&session_cat_owner(c.id)==net_peer_pos())continue;
         CatDataMsg x{};x.id=c.id;x.size=c.size;x.hash=c.hash;x.data=c.data;
         if(!catsync_apply_snapshot(x,"all-player setup exchange",true))return false;}
     return true;
 }
+// 0.1.149: the shared roster is installed -- which only happens once every player is on the chapter page (a client exports from it, the host answers from it) -- so every
+// player is told, once per round, whether this run can earn the solo-cat or the same-class mark. Not for a resumed run (no chapter page).
+void announce_marks(){if(g.resume||g.marks_said==g.round)return;g.marks_said=g.round;catsync_announce_marks();}
 void progress(){
     if(!freeze()||!(g.chapter_seen||g.resume))return;
     if(g.retry_ticks){--g.retry_ticks;return;}g.retry_ticks=120;
@@ -98,10 +107,15 @@ void progress(){
             if(!net_send_setup(g.outgoing))return;
             catsync_setup_sent(g.outgoing);g.sent=true;
             log_line("SETUP","exported %u cats for player %u, request %u",g.outgoing.count,net_peer_pos(),g.generation);
-        }else if(!g.host_reply_seen)net_send_setup(g.outgoing);
+        }else if(!g.host_reply_seen&&!g.pending.count)net_send_setup(g.outgoing);   // a reply held here is not re-asked for (0.1.145)
         if(g.pending.count&&!g.host_reply_seen){
-            if(!apply(g.pending,true)||!install(g.pending))return;
-            g.round=g.pending.generation;g.host_reply_seen=true;roster_setup_set_ready(true);free_msg(g.pending);
+            const bool applied=apply(g.pending,true);
+            if(!applied||!install(g.pending)){
+                if(g.said_apply_fail!=g.pending.generation){g.said_apply_fail=g.pending.generation;
+                    log_line_lvl(LogLevel::Error,"SETUP","!! the host's shared roster (round %u, %u cats) %s here -- retried on the setup cadence, not re-asked for",
+                                 g.pending.generation,g.pending.count,applied?"could not be installed":"could not be applied (the CATSYNC lines above say why)");}
+                return;}
+            g.round=g.pending.generation;g.host_reply_seen=true;roster_setup_set_ready(true);free_msg(g.pending);announce_marks();
         }
         if(g.host_reply_seen&&!g.ready_sent){ChapterMsg m{};m.generation=g.round;m.mapflags=unlocks_mapflags();g.ready_sent=net_send_chapter(m);}
         return;
@@ -130,7 +144,7 @@ void progress(){
         for(unsigned i=0;i<g.exports[p].count;++i)reply.cats[reply.count++]=g.exports[p].cats[i];
     }
     if(!valid(reply)||!apply(reply,true)||!install(reply)||!retain(g.reply,reply)||!net_send_setup(g.reply))return;
-    catsync_setup_sent(g.reply);g.round=g.generation;g.reply_sent=true;roster_setup_set_ready(true);
+    catsync_setup_sent(g.reply);g.round=g.generation;g.reply_sent=true;roster_setup_set_ready(true);announce_marks();
     log_line("SETUP","shared roster sent: %u players, %u cats; waiting for every READY",g.members,reply.count);
 }
 } // namespace
@@ -138,19 +152,40 @@ void setup_init(){clear();refresh();g.generation=++next_generation;g.client_lock
 void setup_shutdown(){map_seed_armed=false;clear();roster_setup_set_ready(true);}
 void setup_reset_run(){setup_init();}
 void setup_on_chapter_page(){refresh();if(!g.on||g.resume)return;g.chapter_seen=true;progress();}
-void setup_on_generate_map(){
-    if(!map_seed_armed)return;
-    map_seed_armed=false;
+// THE MAP'S SAVED GENERATION SEED (room VTC9, 2026-10-25). MapScreen::load_def (0x14021AE00, called by MapScreen::init right before generate_map)
+// copies the stream into MapScreen+0x38, the save writes it, and loading a save mid-chapter (0x140228940) puts it back into the stream before
+// init -- generate_map then rebuilds the map from it. The commit's seed above is set AFTER load_def, so +0x38 kept each peer's OWN stream from
+// before the commit: every restore rebuilt the chapter map from a different seed on every peer. Its first draw is the map's random_generation_flags
+// pick (lab: "choose_one [GenFlag_Boss_Stacy, GenFlag_Boss_Spewer]") -- the host's restored map had Stacy (node 19 a special event, the boss
+// StacyMutant), the client's Spewer, and the chapter boss battle was two different battles. Now the committed seed is also the saved one, and a
+// rebuild in a room starts from the saved seed itself (whatever load_def did to the stream in between). A save written before this still holds
+// a per-peer seed: that chapter can still differ after a restore; the next chapter is right.
+constexpr uintptr_t kMapScreen_GenSeed=0x38;
+void setup_on_generate_map(void* map){
     uint64_t* s=rng_global_stream();
     if(!s)return;
-    log_line("SETUP","the chapter map is being generated -- the stream is set to the host's committed seed %016llx (it was %016llx)",(unsigned long long)map_seed[0],(unsigned long long)s[0]);
-    memcpy(s,map_seed,sizeof(map_seed));
+    if(map_seed_armed){
+        map_seed_armed=false;
+        log_line("SETUP","the chapter map is being generated -- the stream is set to the host's committed seed %016llx (it was %016llx)",(unsigned long long)map_seed[0],(unsigned long long)s[0]);
+        memcpy(s,map_seed,sizeof(map_seed));
+        if(map&&mem_write((uint8_t*)map+kMapScreen_GenSeed,map_seed,sizeof(map_seed)))
+            log_line("SETUP","the same seed is the map's saved generation seed now (MapScreen+0x38): a save of this chapter rebuilds this map on every peer");
+        return;
+    }
+    if(!map||!net_active())return;
+    uint64_t saved[4]={};
+    if(!mem_read((const uint8_t*)map+kMapScreen_GenSeed,saved,sizeof(saved)))return;
+    if(memcmp(s,saved,sizeof(saved))){
+        log_line("SETUP","a chapter map is rebuilt (a save was loaded) -- the stream is set to the map's saved generation seed %016llx (it was %016llx)",(unsigned long long)saved[0],(unsigned long long)s[0]);
+        memcpy(s,saved,sizeof(saved));
+    } else log_line("SETUP","a chapter map is rebuilt (a save was loaded) from its saved generation seed %016llx -- compare with the other peer: a different one means this save was written before 0.1.109 and this chapter's map can differ",(unsigned long long)saved[0]);
 }
 void setup_on_map(uint64_t checkpoint){
     if(checkpoint){unlocks_override_clear();map_seed_armed=false;}   // a readable live map: its generation is over
     refresh();if(!g.on||g.chapter_seen||!checkpoint||!freeze())return;
     if(!g.resume){SetupMsg probe{};if(!catsync_export_resume(probe,net_peer_pos())){free_msg(probe);
-        if(!g.resume_error)log_line_lvl(LogLevel::Error,"SETUP","resume held: invalid saved player roster");g.resume_error=true;return;}
+        if(!g.resume_error){log_line_lvl(LogLevel::Error,"SETUP","resume held: invalid saved player roster -- the player is told");room_push_notice(tr(Tx::R_RESUME_FOREIGN_RUN));}
+        g.resume_error=true;return;}
         free_msg(probe);g.resume=true;g.checkpoint=checkpoint;}
     progress();
 }
@@ -229,6 +264,12 @@ void setup_tick(){
     refresh();
     void* director=g.hold.director;auto go=g.hold.go;const bool house=g.hold.house;
     if(!g.on||g.resume||!net_active()){   // the room is gone: the player pressed lock, let the game do what it would have done
+        // ...BUT ONLY ON THE SCREEN THE LOCK WAS PRESSED ON (0.1.170, 2026-11-03, FEI: the host left, this player was back on the main menu, and the held start ran
+        // there -- the game's chapter start looked up a House scene that was gone and crashed). Anywhere else the start is dropped, the way the game drops it.
+        const PageState pg=page_self();
+        if(pg!=PageState::Equipment&&pg!=PageState::House&&pg!=PageState::Collar&&pg!=PageState::Chapter){
+            log_line_lvl(LogLevel::Warn,"SETUP","the session ended while the %s start was held, and this player is on '%s' now -- the start is dropped, not run there",house?"house boss":"chapter-1",page_name(pg));
+            g.hold=Hold{};if(house)house_go_done();return;}
         log_line("SETUP","the session ended while the %s start was held -- starting it on its own",house?"house boss":"chapter-1");
         g.hold=Hold{};go(director);if(house)house_go_done();return;}
     setup_on_chapter_page();   // progress(): the export / the shared roster, retried on its own cadence as the chapter page's buttons do
@@ -267,7 +308,8 @@ void setup_on_chapter_control(void* screen,int act,int32_t* difficulty,void(*sel
 }
 void setup_on_chapter_message(const ChapterMsg& m,uint8_t from){
     // proto 99: a client's own map flags, whenever they change -- for the area gate, outside any preparation round
-    if(m.kind==kChapterFlags){areagate_on_flags(from,m.mapflags,"its report");return;}
+    // 0.1.121: generation 2 is the HOST's live flags (a client's own report is generation 1)
+    if(m.kind==kChapterFlags){if(m.generation==2){if(from==kHostPeer)unlocks_on_host_flags(m.mapflags);return;}areagate_on_flags(from,m.mapflags,"its report");return;}
     // proto 102: a client is done with its own random event (mgmp_indepevt)
     if(m.kind==kChapterEventDone){indepevt_on_done(from,((uint64_t)m.mapflags<<32)|m.generation);return;}
     if(m.kind==kChapterEventName){indepevt_on_host_event(from,m.generation,m.mapflags);return;}
@@ -287,7 +329,10 @@ void setup_on_message(const SetupMsg& m,uint8_t from){
        (resumed&&!m.checkpoint))return;   // a resume message names a readable map; WHICH map is not compared (see progress)
     const int p=pos(from);
     if(!g.is_client&&(m.kind==kSetupClientExport||m.kind==kSetupResumeExport)&&p>0&&valid(m,p)){
-        if(g.reply_sent){if(m.generation==g.reply.requests[p])net_send_setup(g.reply);return;}
+        if(g.reply_sent){
+            const ULONGLONG now=GetTickCount64();
+            if(m.generation==g.reply.requests[p]&&now-g.replied_at[p]>=1000){g.replied_at[p]=now;net_send_setup(g.reply);}
+            return;}
         if(!retain(g.exports[p],m))return;
         g.retry_ticks=0;progress();return;
     }
@@ -299,7 +344,9 @@ void setup_on_message(const SetupMsg& m,uint8_t from){
             if(!found)return;++own;}
         if(own!=g.outgoing.count)return;
         if(g.host_reply_seen){if(m.generation==g.round){g.ready_sent=false;g.retry_ticks=0;progress();}return;}
-        if(!retain(g.pending,m))return;g.retry_ticks=0;progress();
+        const bool first=!g.pending.count;
+        if(!retain(g.pending,m))return;
+        if(first){g.retry_ticks=0;progress();}   // 0.1.145: not on every reply -- with apply failing, each reply sent the export again (KD8E: 1.5 MB/s)
     }
 }
 } // namespace mgmp

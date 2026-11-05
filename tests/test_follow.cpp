@@ -10,6 +10,7 @@
 #include "mgmp_log.h"
 #include "mgmp_net.h"
 #include "mgmp_page.h"
+#include "mgmp_resolve.h"
 #include <chrono>
 #include <thread>
 #include "mgmp_tuning.h"
@@ -486,12 +487,16 @@ void consumed_mark_cascades_like_native() {
 }
 namespace mgmp {
 const Config& config() { return cfg; }
+uintptr_t addr_of_call(Call) { return 0; }   // no game here: the party marker is placed, not walked (align_party_marker)
+bool mapvote_node_world(void*, float&, float&) { return false; }   // no geometry here: follow_unstick_marker moves nothing
 NetRole net_role() { return role; }
 bool net_active() { return connected; }
 uint8_t net_self(){return 0;}
 PageState page_of(uint8_t peer) { return peer == 1 ? peer_page : PageState::Unknown; }
 uint32_t page_age_ms(uint8_t) { return peer_page_age; }
 uint8_t net_peer_count(){return 4;}
+uint8_t net_seat_span(){return 4;}
+bool net_seat_peer(uint8_t pos,uint8_t& id){if(pos>=4)return false;id=pos;return true;}
 bool net_peer_ids(uint8_t* ids,uint8_t cap){if(cap<4)return false;for(unsigned i=0;i<4;++i)ids[i]=(uint8_t)i;return true;}
 bool checkpoint_can_enter() { return checkpoint_ready; }
 bool checkpoint_needs_map() { return needs_map; }
@@ -500,6 +505,8 @@ unsigned unlock_publishes = 0, unlock_windows = 0;
 void unlocks_publish() { ++unlock_publishes; }
 void unlocks_window_open(const char*, bool) { ++unlock_windows; }
 void unlocks_on_map(bool) {}
+bool solo_run_session = true;
+uint32_t catsync_run_cat_list(uint64_t* out, uint32_t cap) { if (!out || !cap) return 0; out[0] = solo_run_session ? 0x70000001ull : 0x1234ull; return 1; }
 bool session_exp_treasure() { return false; }   // the shared treasure chest (mgmp_treasure): off here
 bool indepevt_hold_node() { return false; }     // own random events (mgmp_indepevt): the host never waits for a client here
 void treasure_publish_luck(uint64_t) {}         // the host's party luck for the shared chest (mgmp_treasure, proto 101): off here
@@ -614,6 +621,93 @@ void map_sync_host_merges() {
     CHECK(seeds_published == 2);                          // once per map
     needs_map = false; role = NetRole::Client;
 }
+// THE FOOD BOX / FURNITURE BOX ARE ENTERED WHEN THE PARTY HAS ARRIVED (0.1.120). EnterNode finishes these two nodes in the same call, for the node the marker stands on: a client that entered at once
+// finished the PREVIOUS node, and could not click the next one (rooms B9KU / KD8E).
+void instant_nodes_wait_for_the_party_to_arrive() {
+    for (const uint32_t type : {15u, 14u}) {
+        Fixture f;
+        put(f.map, 0xA0, (void*)f.marker);
+        put(f.marker, 0x50, f.nodes[0]);                  // the party stands on the previous node
+        put(f.nodes[1], 0x138, type);
+        f.snapshot(5);
+        EnterNodeMsg m = f.node(1); m.type = type;
+        follow_on_message(m);
+        follow_test_set_instant_walk_ms(60000);
+        CHECK(follow_map_update(f.map) == nullptr);       // held: the party has to walk first
+        void* sel = nullptr; std::memcpy(&sel, f.marker + 0x60, sizeof(sel));
+        CHECK(sel == f.nodes[1]);                         // ... and was sent there
+        CHECK(f.nodes[1][0x168] == 1);                    // the arrival does not call EnterNode itself
+        CHECK(battle == 0 && cat_values.empty());         // nothing was applied or entered yet
+        put(f.marker, 0x58, f.nodes[1]);                  // walking
+        CHECK(follow_map_update(f.map) == nullptr);
+        put(f.marker, 0x58, (void*)nullptr);              // the arrival: +58 -> +50, selection cleared
+        put(f.marker, 0x50, f.nodes[1]);
+        put(f.marker, 0x60, (void*)nullptr);
+        CHECK(follow_map_update(f.map) == f.nodes[1]);    // entered now
+        CHECK(f.nodes[1][0x168] == 0);                    // as EnterNode always saw it: the node's own finish consumes it
+        CHECK(battle == 101 && remembered == 101 && cat_values.size() == 1);
+        follow_test_set_instant_walk_ms(6000);
+    }
+    {   // the party never arrives: the entry is made anyway after the time, never lost
+        Fixture f;
+        put(f.map, 0xA0, (void*)f.marker);
+        put(f.marker, 0x50, f.nodes[0]);
+        put(f.nodes[1], 0x138, uint32_t(15));
+        f.snapshot(5);
+        EnterNodeMsg m = f.node(1); m.type = 15;
+        follow_on_message(m);
+        follow_test_set_instant_walk_ms(0);
+        CHECK(follow_map_update(f.map) == f.nodes[1]);
+        CHECK(f.nodes[1][0x168] == 0);
+        follow_test_set_instant_walk_ms(6000);
+    }
+    {   // a node that opens a screen is entered at once, as before (its finish comes when the screen closes)
+        Fixture f;
+        put(f.map, 0xA0, (void*)f.marker);
+        put(f.marker, 0x50, f.nodes[0]);
+        put(f.nodes[1], 0x138, uint32_t(12));
+        f.snapshot(5);
+        EnterNodeMsg m = f.node(1); m.type = 12;
+        follow_on_message(m);
+        CHECK(follow_map_update(f.map) == f.nodes[1]);
+    }
+    {   // no marker reading: the old behaviour
+        Fixture f;
+        put(f.nodes[1], 0x138, uint32_t(15));
+        f.snapshot(5);
+        EnterNodeMsg m = f.node(1); m.type = 15;
+        follow_on_message(m);
+        CHECK(follow_map_update(f.map) == f.nodes[1]);
+    }
+}
+
+// A NODE THE PARTY STANDS ON AND NEVER ENTERED, IN A RUN PLAYED ALONE (0.1.126): the game's own entry is run for it, once -- only in a run the mod made.
+void stranded_node_alone_is_entered() {
+    Fixture f;
+    follow_shutdown(); role = NetRole::Host; follow_init();
+    connected = false;                                   // no room
+    put(f.map, 0xA0, (void*)f.marker);
+    put(f.marker, 0x50, f.nodes[3]);                     // the party stands on node 3 (an event), nothing selected, not walking
+    follow_test_set_solo_recover_ms(0);
+    CHECK(follow_map_update(f.map) == nullptr);          // first sight only starts the clock
+    CHECK(follow_map_update(f.map) == f.nodes[3]);       // still so: entered
+    CHECK(follow_map_update(f.map) == nullptr);          // once
+    // a plain-game run (no session clones) is left alone
+    solo_run_session = false;
+    follow_test_set_solo_recover_ms(0);
+    CHECK(follow_map_update(f.map) == nullptr);
+    CHECK(follow_map_update(f.map) == nullptr);
+    solo_run_session = true;
+    // consumed, walking, or the chapter's start node: nothing to enter
+    f.nodes[3][0x168] = 1; follow_test_set_solo_recover_ms(0);
+    CHECK(follow_map_update(f.map) == nullptr); CHECK(follow_map_update(f.map) == nullptr);
+    f.nodes[3][0x168] = 0; put(f.marker, 0x58, f.nodes[4]); follow_test_set_solo_recover_ms(0);
+    CHECK(follow_map_update(f.map) == nullptr); CHECK(follow_map_update(f.map) == nullptr);
+    put(f.marker, 0x58, (void*)nullptr); put(f.nodes[3], 0x138, uint32_t(2)); follow_test_set_solo_recover_ms(0);
+    CHECK(follow_map_update(f.map) == nullptr); CHECK(follow_map_update(f.map) == nullptr);
+    follow_test_set_solo_recover_ms(1500);
+}
+
 int main() {
     map_seed_sync_adopts();
     map_sync_host_merges();
@@ -632,6 +726,8 @@ int main() {
     held_host_entry_survives_native_selection_clear();
     consumed_mark_preserves_adjacent_flags();
     consumed_mark_cascades_like_native();
+    instant_nodes_wait_for_the_party_to_arrive();
+    stranded_node_alone_is_entered();
     {
         Fixture f; role = NetRole::Host; follow_init();
         checkpoint_ready = false;

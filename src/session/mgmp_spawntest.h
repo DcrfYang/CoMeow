@@ -56,6 +56,24 @@ bool unit_remove_silent(void* chr);
 // The game's own DeleteObject sequence (killers list emptied, Die, OnCorpsePop, Remove): the unit is dead and off the board when this returns, its death events have run.
 bool unit_remove_game_way(void* chr);
 
+// --- 0.1.190: the board's repairs of a player's cat's life, of a unit's ability bar, and of a unit made from cat data ---
+
+// The game's own revive (Character::revive 0x140115B20, what the ReviveNextRound status and the debug revive-all call): the death flag cleared, hp set (capped at max
+// hp), the "revive" animation. Game thread, turn boundary. True when the unit is alive afterwards (a unit the game refuses -- +0xED2 -- stays dead).
+bool unit_revive(void* chr, int32_t hp);
+// The game's death, NOW: Character::Die (0x140115070) with the arguments of the per-frame death test (late_update 0x1401084E9: Die(chr, false, null, false)),
+// which would otherwise take the unit a frame later -- after the boundary's hash. True when the unit is dead afterwards.
+bool unit_die(void* chr);
+// The ability in `slot` (0 move, 1 attack, 2 bonus, 3+ spell slot - 3) becomes a new one of GON name `name`, made by the game's SpawnDatabase::CreateAbility; the old one is
+// destroyed the game's way (its passives go with it) -- the sequence of the game's debug console's set-ability (0x14088A350). A spell slot one past the last is appended
+// when the vector has room. `cat_too`: the cat data's spell name (+0x810, the first four spells) follows, as the console does (never for a player's cat: that is its save).
+// Refused (false, `why`) for an unknown name (the game would stop on it), an ability an item gave (+0x8A1/+0x8A2: the gear repair owns it) and a gap in the spells.
+bool unit_set_ability(void* chr, uint8_t slot, const char* name, bool cat_too, const char*& why);
+// The spells past the first `keep` are destroyed (an item's ability ends the trim: false, `why`).
+bool unit_trim_spells(void* chr, uint32_t keep, const char*& why);
+// As unit_spawn_at, but the unit is made from `cat` (a CatData, which the game copies) the way the game's `catdata` summon makes one (SpawnCharacterWithCatData 0x1407ACFD0).
+void* unit_spawn_catdata_at(void* tc, const void* like, const char* def, void* cat, int32_t x, int32_t y, const int32_t* keys, const char*& why);
+
 // h_NextTurn, before the original. Runs the pending request (if any) and reports on the units earlier requests touched.
 void spawntest_turn_boundary(void* turn_control);
 

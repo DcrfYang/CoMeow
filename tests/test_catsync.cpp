@@ -8,6 +8,8 @@
 #include "mgmp_log.h"
 #include "mgmp_net.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_i18n.h"
+namespace mgmp { int seat_toasts = 0; }
 #include "mgmp_roster.h"
 #include "mgmp_rng.h"
 #include "mgmp_mem.h"
@@ -15,7 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "mgmp_gameconsole.h"
 #include <map>
+#include <string>
 #include <vector>
 
 using namespace mgmp;
@@ -31,7 +35,7 @@ uint8_t peer_position = 0, peer_count = 2;
 bool net_active_flag = true;                         // the session exists (false: left / never joined)
 int census_notices = 0; unsigned census_lost = 0, census_dup = 0, reserved_notices = 0; char census_lost_names[300] = {}, census_dup_names[300] = {};   // the room notices catsync raised
 uint8_t member_ids[4] = {0, 1, 2, 3};                // net_peer_ids: who is in the session (peer ids), as many as peer_count says
-int drop_calls = 0; uint32_t drop_mask = 0;          // roster_drop_positions, as the membership watch calls it
+int drop_calls = 0; uint32_t drop_mask = 0, absent_seats = 0; int drop_result = 0;   // roster_drop_positions, as the leave tick calls it (the seats gone: net_absent_seats; its result)
 int prune_calls = 0, prune_keep = -1;                // roster_leave_prune, as the catsync alone-check calls it
 uint64_t rng[4] = {1, 2, 3, 4}, counter = 10;
 unsigned char director[0x800]{}, registry[0x200]{};
@@ -602,25 +606,46 @@ void alone_check_finds_this_players_position() {
 }
 
 // A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05): the two who stay take the leaver's cats out of the run; nobody else's.
+// 0.1.119: read off the seat order (net_absent_seats), every update, until the lists are clean -- no memory of who was here when, no giving up.
 void a_player_who_drops_out_loses_their_cats_for_everyone_else() {
-    entries.clear(); peer_position = 0; peer_count = 3; net_active_flag = true; initialize();
-    member_ids[0] = 0; member_ids[1] = 1; member_ids[2] = 2;
-    drop_calls = 0; drop_mask = 0;
-    catsync_leave_tick();                                   // the room is whole: its members and their positions are remembered
+    entries.clear(); peer_position = 2; peer_count = 3; net_active_flag = true; initialize();
+    absent_seats = 0; drop_result = 0; drop_calls = 0; drop_mask = 0;
+    catsync_leave_tick();                                   // the room is whole
     CHECK(drop_calls == 0);
-    peer_count = 2; member_ids[0] = 0; member_ids[1] = 2;    // peer id 1 (position 1) left; peer id 2 is now second in the list
+    peer_count = 2; absent_seats = 1u << 1;                  // seat 1 left; this peer is seat 2, which is now ABOVE the count of the players present
     catsync_leave_tick();
-    CHECK(drop_calls == 1 && drop_mask == (1u << 1));        // position 1's cats, not position 2's (whose index in the list changed)
+    CHECK(drop_calls == 1 && drop_mask == (1u << 1));        // seat 1's cats, not seat 2's
     drop_calls = 0; drop_mask = 0;
     catsync_leave_tick();
-    CHECK(drop_calls == 0);                                 // done once
-    peer_count = 2; member_ids[0] = 0; member_ids[1] = 1; member_ids[2] = 2;
-    net_active_flag = false; catsync_leave_tick();            // the session is gone: the next one starts clean
-    net_active_flag = true; peer_count = 3; catsync_leave_tick();
-    peer_count = 2; member_ids[0] = 1; member_ids[1] = 2;    // now the HOST (peer id 0, position 0) is the one gone
+    CHECK(drop_calls == 1 && drop_mask == (1u << 1));        // asked again at every update (cheap when the lists are clean)
+    // a removal that fails is retried, never given up: far more than the 120 tries the old watch allowed
+    drop_result = -1; drop_calls = 0;
+    for (int i = 0; i < 500; ++i) catsync_leave_tick();
+    CHECK(drop_calls == 500);
+    drop_result = 0; drop_calls = 0;
+    catsync_leave_tick();
+    CHECK(drop_calls == 1);                                 // and it goes through once the lists can be written
+    // a player who left BEFORE anybody looked (the room was never seen whole) is found just the same
+    net_active_flag = false; catsync_leave_tick();           // the session is gone: the next one starts clean
+    peer_position = 1;                                       // this peer is seat 1 now; seat 2 left
+    net_active_flag = true; peer_count = 2; absent_seats = 1u << 2; drop_calls = 0; drop_mask = 0;
+    catsync_leave_tick();
+    CHECK(drop_calls == 1 && drop_mask == (1u << 2));
+    // the HOST is the one gone
+    absent_seats = 1u; drop_calls = 0; drop_mask = 0;
     catsync_leave_tick();
     CHECK(drop_calls == 1 && drop_mask == 1u);
-    entries.clear(); peer_count = 2; net_active_flag = true;
+    // a host left alone in a room that stays open
+    peer_position = 0; peer_count = 2; absent_seats = 0; CHECK(catsync_my_seat() == 0);     // this peer is the host (seat 0), remembered while the room was whole
+    peer_count = 1; absent_seats = (1u << 1) | (1u << 2); drop_calls = 0; drop_mask = 0;
+    catsync_leave_tick();
+    CHECK(drop_calls == 1 && drop_mask == ((1u << 1) | (1u << 2)));
+    // 0.1.129: a seat order that counts THIS peer's own seat as gone -- its cats are kept, only the others' leave
+    peer_position = 2; peer_count = 2; absent_seats = (1u << 1) | (1u << 2); drop_calls = 0; drop_mask = 0;
+    catsync_leave_tick();
+    CHECK(drop_calls == 1 && drop_mask == (1u << 1));
+    absent_seats = 0;
+    entries.clear(); peer_position = 0; peer_count = 2; net_active_flag = true;
 }
 
 void legacy_clones_are_merged_before_they_are_overwritten() {
@@ -725,6 +750,259 @@ void the_fallback_filter_takes_out_only_other_players_cats() {
     put(director, kDir_MirrorData, (const uint64_t*)party); put(director, kDir_MirrorCount, uint32_t(0));
     put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
     peer_count = 2;
+}
+
+// 0.1.131, THE CLASS COMPLETION CHECK: a client's party list is the room's shared layout (the host's cats) when the game checks the classes of a beaten boss; for the
+// check it holds this player's own cats (party first, then the familiars), the departed list too, and both are put back exactly afterwards.
+// 0.1.147: THE ROOM'S RULE for the solo-cat / same-class marks. The game counts them from the departed list; the check puts a list there that makes it come out as the rule.
+Tx last_tr = Tx(-1); int marks_notices = 0; char marks_text[420] = {};
+std::string captured; bool capture_on = false;          // the log lines of a test that asserts on them (0.1.149)
+typedef std::pair<uint64_t, const char*> ClassedCat;
+void set_class(uint64_t id, const char* cls) {
+    void* cat = entries[id].cat;
+    if (!cat) { cat = allocate(0xC58); put(cat, kCatData_SaveId, id); entries[id].cat = cat; }
+    char* s = (char*)cat + 0xC10; std::memset(s, 0, 0x20);
+    std::strcpy(s, cls); put<uint64_t>(cat, 0xC10 + 16, std::strlen(cls)); put<uint64_t>(cat, 0xC10 + 24, 15);        // an inline std::string
+}
+// runs the check as `seat` with `brought` registered (id, class) and remembered as the departure; returns what the lists held DURING the check
+struct MarkRun { bool changed; uint32_t mirror_n; uint64_t mirror[2]; uint32_t party_n; uint64_t party0; int notice; };
+static uint64_t mk_lst[4], mk_mir[4], mk_fam[4];
+uint32_t setup_room(uint8_t seat, std::initializer_list<ClassedCat> brought, std::initializer_list<uint64_t> host_party, std::initializer_list<uint64_t> own_fam) {
+    entries.clear(); peer_position = seat; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, seat ? "client" : "host"); catsync_init();
+    uint64_t(&lst)[4] = mk_lst; uint64_t(&mir)[4] = mk_mir; uint64_t(&fam)[4] = mk_fam;
+    std::memset(lst, 0, sizeof(lst)); std::memset(mir, 0, sizeof(mir)); std::memset(fam, 0, sizeof(fam));
+    uint32_t pn = 0, fn = 0; for (auto id : host_party) lst[pn++] = id; for (auto id : own_fam) fam[fn++] = id;
+    for (uint32_t i = 0; i < pn; ++i) mir[i] = lst[i];                                      // the shared layout: the departed list is the host's party
+    put(director, kDir_CatIdCount, pn); put(director, kDir_CatIdCap, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_MirrorCount, pn); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)mir);
+    put(director, kDir_CatFamiliars, uint32_t(4)); put(director, kDir_CatFamiliars + 4, fn); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    std::vector<uint64_t> ids; for (auto& c : brought) { set_class(c.first, c.second); ids.push_back(c.first); }
+    catsync_note_departure(ids.data(), (uint32_t)ids.size());
+    return pn;
+}
+MarkRun run_marks(uint8_t seat, std::initializer_list<ClassedCat> brought, std::initializer_list<uint64_t> host_party, std::initializer_list<uint64_t> own_fam) {
+    const uint32_t pn = setup_room(seat, brought, host_party, own_fam);
+    uint64_t(&lst)[4] = mk_lst; uint64_t(&mir)[4] = mk_mir;
+    marks_notices = 0; catsync_announce_marks();                                         // what the chapter page told this player
+    MarkRun r{}; r.notice = marks_notices ? (int)last_tr : -1;
+    r.changed = catsync_completion_begin("beat_chapter_boss");
+    r.mirror_n = get<uint32_t>(director, kDir_MirrorCount); r.mirror[0] = mir[0]; r.mirror[1] = mir[1];
+    r.party_n = get<uint32_t>(director, kDir_CatIdCount); r.party0 = lst[0];
+    catsync_completion_end();
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == pn && get<uint32_t>(director, kDir_MirrorCount) == pn);       // put back exactly
+    for (uint32_t i = 0; i < pn; ++i) CHECK(lst[i] == host_party.begin()[i] && mir[i] == host_party.begin()[i]);
+    catsync_departure_clear();
+    return r;
+}
+void the_class_marks_follow_the_rooms_rule() {
+    const uint64_t H1 = 0x70000001ull, H2 = 0x70000002ull, H3 = 0x70000003ull, H4 = 0x70000004ull, C1 = 0x71000001ull;
+    // the host brought one cat, the client brought one, of ONE class: BOTH are solo (each gets the list of ONE cat -- its own)
+    MarkRun r = run_marks(1, {{H1, "Hunter"}, {C1, "Hunter"}}, {H1}, {C1});
+    CHECK(r.changed && r.mirror_n == 1 && r.mirror[0] == C1 && r.party_n == 1 && r.party0 == C1);
+    CHECK(r.notice == (int)Tx::R_MARK_SOLO && std::strstr(marks_text, "Hunter"));                  // the chapter page said so, with the class
+    r = run_marks(0, {{H1, "Hunter"}, {C1, "Hunter"}}, {H1}, {C1});
+    CHECK(r.changed && r.mirror_n == 1 && r.mirror[0] == H1 && r.notice == (int)Tx::R_MARK_SOLO);
+    // ... of two classes (0.1.148): neither mark, whatever the number of cats
+    r = run_marks(1, {{H1, "Hunter"}, {C1, "Mage"}}, {H1}, {C1});
+    CHECK(r.changed && r.mirror_n == 2 && r.mirror[0] != r.mirror[1] && r.party_n == 1 && r.party0 == C1);
+    CHECK(r.notice == (int)Tx::R_MARK_NONE && std::strstr(marks_text, "Hunter/Mage"));             // the classes that make it "no mark"
+    r = run_marks(0, {{H1, "Hunter"}, {C1, "Mage"}}, {H1}, {C1});
+    CHECK(r.changed && r.mirror_n == 2 && r.mirror[0] != r.mirror[1]);
+    // willkyu's room (X7SS): the host brought four, the client ONE. The list was the host's four, so the client got no solo mark; now nobody gets one (not everybody has one cat)
+    r = run_marks(1, {{H1, "Fighter"}, {H2, "Mage"}, {H3, "Monk"}, {H4, "Fighter"}, {C1, "Colorless"}}, {H1, H2, H3, H4}, {C1});
+    CHECK(r.changed && r.mirror_n == 2 && r.mirror[0] != r.mirror[1] && r.party_n == 1 && r.party0 == C1);
+    // ... and the host's own check (its party is its own already) is changed all the same, its party left alone
+    r = run_marks(0, {{H1, "Fighter"}, {H2, "Mage"}, {H3, "Monk"}, {H4, "Fighter"}, {C1, "Colorless"}}, {H1, H2, H3, H4}, {C1});
+    CHECK(r.changed && r.mirror_n == 2 && r.mirror[0] != r.mirror[1] && r.party_n == 4 && r.party0 == H1);
+    // everybody's cats are of one class, although a player brought four: the same-class mark for all (the same cat twice, so the game finds one class)
+    r = run_marks(1, {{H1, "Fighter"}, {H2, "Fighter"}, {H3, "Fighter"}, {H4, "Fighter"}, {C1, "Fighter"}}, {H1, H2, H3, H4}, {C1});
+    CHECK(r.changed && r.mirror_n == 2 && r.mirror[0] == r.mirror[1] && r.notice == (int)Tx::R_MARK_MONO);
+    // one cat each, one class: solo, not same-class
+    r = run_marks(1, {{H1, "Fighter"}, {C1, "Fighter"}}, {H1}, {C1});
+    CHECK(r.changed && r.mirror_n == 1);
+    // a player who has left does not count: seat 2 is not in this 2-seat room, so the host (one cat) with the client (one cat) is solo although seat 2 had brought two
+    // (of another class, at that)
+    r = run_marks(1, {{H1, "Hunter"}, {C1, "Hunter"}, {0x72000001ull, "Thief"}, {0x72000002ull, "Thief"}}, {H1}, {C1});
+    CHECK(r.changed && r.mirror_n == 1 && r.mirror[0] == C1);
+    // no record of who brought what (a run the mod did not set up, or a cat that cannot be read): the 0.1.131 behaviour -- the host's party is left alone
+    entries.clear(); peer_position = 0; peer_count = 2; initialize(); catsync_departure_clear();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    static uint64_t lst[4] = {H1, H2, 0, 0};
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_CatIdCap, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    CHECK(!catsync_completion_begin("beat_chapter_boss"));
+    catsync_completion_end();
+    const uint64_t unreadable[2] = {H1, 0x71000009ull};                                  // the second is in no registry
+    catsync_note_departure(unreadable, 2);
+    CHECK(!catsync_completion_begin("beat_chapter_boss"));
+    catsync_completion_end(); catsync_departure_clear();
+}
+
+// a fake GlobalProgressionData: records of 0x58 at +0x768/+0x770 (chapter string +0, class string +0x20, ints +0x40..+0x50)
+alignas(16) static uint8_t g_prog[0x800]; alignas(16) static uint8_t g_recs[6 * 0x58];
+void fake_str(uint8_t* at, const char* s) { std::memset(at, 0, 0x20); std::strcpy((char*)at, s); put<uint64_t>(at, 16, std::strlen(s)); put<uint64_t>(at, 24, 15); }
+void fake_rec(uint32_t i, const char* chapter, const char* cls, int32_t d0, int32_t d1, int32_t clears, int32_t mono, int32_t solo) {
+    uint8_t* r = g_recs + i * 0x58; std::memset(r, 0, 0x58); fake_str(r, chapter); fake_str(r + 0x20, cls);
+    put<int32_t>(r, 0x40, d0); put<int32_t>(r, 0x44, d1); put<int32_t>(r, 0x48, clears); put<int32_t>(r, 0x4C, mono); put<int32_t>(r, 0x50, solo);
+}
+void fake_end(uint32_t n) { put<uint64_t>(g_prog, 0x768, (uint64_t)g_recs); put<uint64_t>(g_prog, 0x770, (uint64_t)(g_recs + n * 0x58)); }
+bool logged(const char* s) { return captured.find(s) != std::string::npos; }
+void the_marks_are_logged_and_compared() {
+    const uint64_t H1 = 0x70000001ull, C1 = 0x71000001ull;
+    capture_on = true;
+    // 1. the rule says solo, the game gives it: the record is logged as changed, "SOLO-CAT MARK GIVEN", the check is in the ledger
+    setup_room(1, {{H1, "Hunter"}, {C1, "Hunter"}}, {H1}, {C1});
+    fake_rec(0, "alley", "Mage", 2, -1, 3, 0, 0); fake_rec(1, "alley", "Hunter", 1, -1, 1, 0, 0); fake_end(2);
+    captured.clear(); catsync_marks_before(g_prog);
+    CHECK(catsync_completion_begin("alley"));
+    fake_rec(1, "alley", "Hunter", 1, -1, 2, 0, 1);                                    // the game's check: one more clear and a solo-cat clear
+    catsync_completion_end(); catsync_marks_after(g_prog, "alley", false, true);
+    CHECK(logged("rule: solo-cat mark"));
+    CHECK(logged("party cats against the game's test"));
+    CHECK(logged("record changed: chapter 'alley' class 'Hunter'") && logged("solo-cat clears 0 -> 1") && logged("SOLO-CAT MARK GIVEN"));
+    CHECK(!logged("record changed: chapter 'alley' class 'Mage'"));                    // untouched records are not logged
+    CHECK(logged("check done: chapter 'alley', hard path no, rule solo-cat | 0 new, 1 changed record(s) | clears +1, same-class +0, solo-cat +1"));
+    CHECK(!logged("promised") && !logged("DIFFERS"));
+    // 2. the rule says solo, the game does not give it: said loudly
+    captured.clear(); catsync_marks_before(g_prog);
+    CHECK(catsync_completion_begin("alley"));
+    fake_rec(1, "alley", "Hunter", 1, -1, 3, 0, 1);                                    // one more clear, no new solo-cat clear
+    catsync_completion_end(); catsync_marks_after(g_prog, "alley", true, true);
+    CHECK(logged("the room's rule promised the solo-cat mark, the game gave no mark") && logged("DIFFERS FROM THE RULE") && logged("hard path yes"));
+    // 3. a record that is new, and a check that counted nobody
+    captured.clear(); catsync_marks_before(g_prog);
+    CHECK(catsync_completion_begin("sewers"));
+    fake_rec(2, "sewers", "Hunter", 0, -1, 1, 0, 1); fake_end(3);
+    catsync_completion_end(); catsync_marks_after(g_prog, "sewers", false, true);
+    CHECK(logged("record NEW: chapter 'sewers' class 'Hunter'"));
+    captured.clear(); catsync_marks_before(g_prog);
+    CHECK(catsync_completion_begin("lab"));
+    catsync_completion_end(); catsync_marks_after(g_prog, "lab", false, true);
+    CHECK(logged("no record's clear count rose") && logged("0 new, 0 changed"));
+    // 4. the settlement: the ledger of the run and where the records of its classes stand
+    captured.clear(); catsync_marks_run_summary("return home");
+    CHECK(logged("run summary (return home): 4 chapter check(s) this run; this run's classes: Hunter"));
+    CHECK(logged("#1 chapter 'alley': rule solo-cat, lists swapped | records compared | 0 new, 1 changed record(s); clears +1, same-class +0, solo-cat +1"));
+    CHECK(logged("#3 chapter 'sewers'") && logged("#4 chapter 'lab'"));
+    CHECK(logged("record now: chapter 'alley' class 'Hunter' | best difficulty 1/-1 | clears 3 | same-class clears 0 | solo-cat clears 1"));
+    CHECK(!logged("class 'Mage'"));                                                    // only the classes of this run
+    captured.clear(); catsync_marks_run_summary("again");
+    CHECK(logged("0 chapter check(s) this run"));                                      // the ledger was emptied
+    // 5. no record of who brought what: no notice, and the log says why; a rule that is not applied is not compared
+    catsync_departure_clear(); marks_notices = 0; captured.clear();
+    catsync_announce_marks();
+    CHECK(marks_notices == 0 && logged("marks notice NOT given: no record of who brought what"));
+    captured.clear(); catsync_marks_before(g_prog);
+    CHECK(catsync_completion_begin("alley"));
+    fake_rec(1, "alley", "Hunter", 1, -1, 4, 0, 1); catsync_completion_end(); catsync_marks_after(g_prog, "alley", false, true);
+    CHECK(logged("rule NOT applied (no record of who brought what") && logged("rule not applied") && !logged("promised"));
+    // 6. records that cannot be read (no progression object): the check still runs, the log says so
+    captured.clear(); catsync_marks_before(nullptr); catsync_marks_after(nullptr, "alley", false, false);
+    CHECK(logged("could not be read before the check") && logged("could not be compared"));
+    catsync_marks_run_summary("end"); capture_on = false; captured.clear(); catsync_departure_clear();
+}
+
+// 0.1.150: THE GAME'S DEBUG CONSOLE: open only when it was seen, is enabled (+0x174) and is open (+0x198)
+void the_game_console_state_is_read_from_the_object() {
+    alignas(16) static uint8_t console[0x240];
+    std::memset(console, 0, sizeof(console));
+    gameconsole_note(nullptr); CHECK(!gameconsole_open());                          // never seen
+    gameconsole_note(console); CHECK(!gameconsole_open());                          // seen, disabled, closed
+    console[kConsole_Open] = 1; CHECK(!gameconsole_open());                         // a disabled console shows nothing, whatever the flag says
+    console[kConsole_Enabled] = 1; CHECK(gameconsole_open());                       // enabled and open: Enter is the game's
+    console[kConsole_Open] = 0; CHECK(!gameconsole_open());                         // closed again (the toggle, Esc, or Enter on an empty line)
+    console[kConsole_Open] = 1; gameconsole_note((const void*)(uintptr_t)8); CHECK(!gameconsole_open());   // a pointer that cannot be read
+    gameconsole_note(nullptr);
+}
+
+// 0.1.151: THE GAINED-CAT REVIEW. (1) the class check leaves a gained cat out of the party; (2) the settlement accepts a mirror that lacks only gained cats.
+void gained_cats_in_the_class_check_and_the_settlement() {
+    const uint64_t H1 = 0x70000001ull, H2 = 0x70000002ull, HG = 0x70000019ull, C1 = 0x71000001ull, CG = 0x71000019ull;
+    // (1) the host's party holds its gained cat: the check gets the party without it (and the room's rule as before)
+    setup_room(0, {{H1, "Hunter"}, {C1, "Hunter"}}, {H1, HG}, {C1});
+    set_class(HG, "Mage");
+    CHECK(catsync_completion_begin("alley"));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 1 && mk_lst[0] == H1);
+    catsync_completion_end();
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 2 && mk_lst[0] == H1 && mk_lst[1] == HG);
+    catsync_departure_clear();
+    // ... a client's own gained cat (in its familiars) is not handed to the check either
+    setup_room(1, {{H1, "Hunter"}, {C1, "Hunter"}}, {H1}, {C1, CG});
+    set_class(CG, "Mage");
+    CHECK(catsync_completion_begin("alley"));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 1 && mk_lst[0] == C1);
+    catsync_completion_end(); catsync_departure_clear();
+    // (2) the host's settlement: the party has its gained cat, the mirror (the game never adds it there) does not -- settled, the gained cat with the host's own
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    static uint64_t lst[4] = {H1, H2, HG, 0}, mir[4] = {H1, H2, 0, 0}, fam[4] = {C1, 0, 0, 0};
+    lst[0] = H1; lst[1] = H2; lst[2] = HG; mir[0] = H1; mir[1] = H2; fam[0] = C1;
+    for (uint64_t id : {H1, H2, HG, C1}) { void* cat = allocate(0xC58); put(cat, kCatData_SaveId, id); entries[id].cat = cat; }
+    put(director, kDir_CatIdCount, uint32_t(3)); put(director, kDir_CatIdCap, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_MirrorCount, uint32_t(2)); put(director, kDir_MirrorCap, uint32_t(4)); put(director, kDir_MirrorData, (const uint64_t*)mir);
+    put(director, kDir_CatFamiliars, uint32_t(4)); put(director, kDir_CatFamiliars + 4, uint32_t(1)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    notes_ready = true;
+    CHECK(catsync_prepare_settlement(director));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 3 && lst[2] == HG && get<uint32_t>(director, kDir_MirrorCount) == 3 && mir[2] == HG);   // the mirror is this player's own too now
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);                                                 // the client's cat leaves
+    catsync_forget();
+    // 0.1.152: room 2026-10-28 (the nuclear ending, a white screen): the host brought THREE cats; after the final battle the game promoted the client's cat into
+    // its party (party 4, mirror 3) and no map tick came before the settlement. Settled: the host's own three home, the client's cat out of both lists.
+    lst[0] = H1; lst[1] = H2; lst[2] = HG; lst[3] = C1; mir[0] = H1; mir[1] = H2; mir[2] = HG; fam[0] = 0x71000002ull;
+    { void* cat = allocate(0xC58); put(cat, kCatData_SaveId, uint64_t(0x71000002ull)); entries[0x71000002ull].cat = cat; }
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_MirrorCount, uint32_t(3)); put(director, kDir_CatFamiliars + 4, uint32_t(1));
+    CHECK(catsync_prepare_settlement(director));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 3 && lst[0] == H1 && lst[2] == HG && get<uint32_t>(director, kDir_MirrorCount) == 3 && get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);
+    catsync_forget();
+    // ... a death in the final battle: the dead cat left the party, the mirror still names it (party 2, mirror 3)
+    lst[0] = H1; lst[1] = H2; mir[0] = H1; mir[1] = H2; mir[2] = HG; fam[0] = C1;
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_MirrorCount, uint32_t(3)); put(director, kDir_CatFamiliars + 4, uint32_t(1));
+    CHECK(catsync_prepare_settlement(director));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 2 && get<uint32_t>(director, kDir_MirrorCount) == 2 && mir[0] == H1 && mir[1] == H2);
+    catsync_forget();
+    // ... every cat of this player died and the others won: the lists are emptied of the others' cats, the door is not held
+    // (the game promoted the client's cats into the emptied party; the mirror still names the host's dead)
+    lst[0] = C1; lst[1] = 0x71000002ull; mir[0] = H1; mir[1] = H2; mir[2] = HG;
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_MirrorCount, uint32_t(3)); put(director, kDir_CatFamiliars + 4, uint32_t(0));
+    CHECK(catsync_prepare_settlement(director));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 0 && get<uint32_t>(director, kDir_MirrorCount) == 0 && get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);
+    catsync_forget();
+    put(director, kDir_CatIdData, (const uint64_t*)party); put(director, kDir_CatIdCount, uint32_t(4));
+    put(director, kDir_MirrorData, (const uint64_t*)party); put(director, kDir_MirrorCount, uint32_t(0));
+    put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
+    notes_ready = false; std::strcpy(cfg.net_role, "host"); peer_position = 0; peer_count = 2;
+}
+
+void the_class_completion_check_counts_own_cats() {
+    entries.clear(); peer_position = 1; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "client"); catsync_init();
+    uint64_t lst[4] = {0x70000001ull, 0x70000002ull, 0x70000003ull, 0x70000004ull};          // the shared layout: the host's four
+    uint64_t mir[7] = {0x70000001ull, 0x70000002ull, 0x70000003ull, 0x70000004ull, 0x71000001ull, 0x71000002ull, 0x71000003ull};
+    uint64_t fam[3] = {0x71000001ull, 0x71000002ull, 0x71000003ull};                        // this player's own three
+    put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdCap, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_MirrorCount, uint32_t(7)); put(director, kDir_MirrorCap, uint32_t(7)); put(director, kDir_MirrorData, (const uint64_t*)mir);
+    put(director, kDir_CatFamiliars, uint32_t(3)); put(director, kDir_CatFamiliars + 4, uint32_t(3)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    CHECK(catsync_completion_begin("beat_chapter_boss"));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 3 && lst[0] == 0x71000001ull && lst[1] == 0x71000002ull && lst[2] == 0x71000003ull);
+    CHECK(get<uint32_t>(director, kDir_MirrorCount) == 3 && mir[0] == 0x71000001ull && mir[2] == 0x71000003ull);
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 3);                               // the familiars are not touched
+    catsync_completion_end();
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 4 && lst[0] == 0x70000001ull && lst[3] == 0x70000004ull);
+    CHECK(get<uint32_t>(director, kDir_MirrorCount) == 7 && mir[0] == 0x70000001ull && mir[6] == 0x71000003ull);
+    // the host: its party is its own already -- nothing changes
+    peer_position = 0;
+    CHECK(!catsync_completion_begin("beat_chapter_boss"));
+    CHECK(get<uint32_t>(director, kDir_CatIdCount) == 4 && lst[0] == 0x70000001ull);
+    catsync_completion_end();
+    // a run of the plain game (no session cats): nothing changes
+    uint64_t plain[2] = {0x355ull, 0x356ull};
+    put(director, kDir_CatIdCount, uint32_t(2)); put(director, kDir_CatIdData, (const uint64_t*)plain);
+    CHECK(!catsync_completion_begin("beat_chapter_boss") && get<uint32_t>(director, kDir_CatIdCount) == 2 && plain[0] == 0x355ull);
+    catsync_forget();
+    put(director, kDir_CatIdData, (const uint64_t*)party); put(director, kDir_CatIdCount, uint32_t(4));
+    put(director, kDir_MirrorData, (const uint64_t*)party); put(director, kDir_MirrorCount, uint32_t(0));
+    put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
+    std::strcpy(cfg.net_role, "host"); peer_position = 0; peer_count = 2;
 }
 
 void settlement_survives_the_other_player_leaving() {
@@ -1151,6 +1429,22 @@ void merge_refusals_and_rollback() {
     // no original at all: kept as a new cat, with every bit of the progress it carries
     fresh(); entries[party[2]].cat = nullptr; entries.erase(party[2]);
     CHECK(catsync_merge_session_cats("t") == 4 && flags_of(0x71000003ull) == 0 && adopted_with_stat(92));
+    // 0.1.129: NOT FROM THIS SAVE -- a cat the run settled, with no recorded origin and no cat here with its seed (another player's clone taken for this one's): retired, never kept as a new cat
+    { static uint64_t run[4] = { 0x71000001ull, 0x71000002ull, 0x71000003ull, 0x71000004ull };
+      fresh(); catsync_origin_clear(); entries[party[2]].cat = nullptr; entries.erase(party[2]);
+      put(director, kDir_CatIdCount, uint32_t(4)); put(director, kDir_CatIdData, (const uint64_t*)run);
+      const int toasts = seat_toasts; const size_t before = entries.size();
+      catsync_merge_session_cats("t", true);
+      CHECK(flags_of(0x71000003ull) == 0 && !adopted_with_stat(92) && entries.size() == before && seat_toasts > toasts);
+      put(director, kDir_CatIdCount, uint32_t(0)); }
+    // 0.1.129: THE SEAT THE CATS COME FROM WINS. This peer's clones (seat 1) have their originals here; the room now says seat 2 (a seat order gone wrong): the merge still brings seat 1's clones home
+    { fresh(); const int toasts = seat_toasts;
+      peer_position = 2; peer_count = 3;
+      CHECK(catsync_merge_session_cats("t") == 4 && flags_of(0x71000001ull) == 0 && get<int32_t>(entries[party[0]].cat, 0x70C) == 90 && seat_toasts > toasts);
+      CHECK(catsync_my_seat() == 1);
+      SetupMsg m{}; catsync_prepare_party_setup(m, 2); free_msg_cats(m);              // a new run's setup ends the correction
+      CHECK(catsync_my_seat() == 2);
+      catsync_origin_clear(); peer_position = 1; peer_count = 2; }
     // a clone still out on a run
     fresh(); put(entries[0x71000004ull].cat, kCatData_Flags, uint64_t(kAway));
     CHECK(catsync_merge_session_cats("t") == 3 && flags_of(0x71000004ull) == kAway);
@@ -1392,6 +1686,8 @@ bool net_active() { return net_active_flag; }
 bool setup_runtime_ready() { return setup_ready; }
 uint8_t net_peer_pos() { return peer_position; }
 uint8_t net_peer_count() { return peer_count; }
+uint8_t net_peer_rank() { return peer_position; }
+uint8_t net_seat_span() { return peer_count; }
 bool lockstep_in_battle() { return battle_up; }
 bool lockstep_cat_is_mine(uint64_t id, bool& mine) {
     if (resume_owners && session_cat_owner(id)>=0) {
@@ -1406,6 +1702,10 @@ bool lockstep_cat_is_mine(uint64_t id, bool& mine) {
 // roster install / journal import WITHOUT any battle.
 void room_say_cat_census(unsigned lost, const char* lost_names, unsigned dup, const char* dup_names) { ++census_notices; census_lost = lost; census_dup = dup; strncpy_s(census_lost_names, lost_names ? lost_names : "", _TRUNCATE); strncpy_s(census_dup_names, dup_names ? dup_names : "", _TRUNCATE); }
 void room_say_reserved_real() { ++reserved_notices; }
+void room_toast(const char*) { ++seat_toasts; }
+const char* tr(Tx k) { last_tr = k; return "[%s]"; }
+const char* gametext_class_name(uint8_t) { return nullptr; }
+void room_say_marks(const char* t) { ++marks_notices; strncpy_s(marks_text, t ? t : "", _TRUNCATE); }
 bool lockstep_owner_pos(uint64_t id, uint8_t& owner_pos) {
     if (!notes_ready && !resume_owners) return false;
     const int p=session_cat_owner(id);if(p>=0){owner_pos=(uint8_t)p;return true;}
@@ -1422,15 +1722,19 @@ bool roster_setup_replace_party(const uint64_t* ids, uint32_t count, const char*
 }
 void roster_setup_set_ready(bool) {}
 bool roster_add_familiars(const uint64_t*, uint32_t, const char*) { return true; }
+bool indepevt_in_own_event() { return false; }   // 0.1.146: a cat that joins is the host's unless this player's own random event brought it in
 int roster_leave_prune(uint8_t keep, const char*) { ++prune_calls; prune_keep = keep; return 0; }
-int roster_drop_positions(uint32_t mask, const char*) { ++drop_calls; drop_mask |= mask; return 0; }
+int roster_drop_positions(uint32_t mask, const char*) { ++drop_calls; drop_mask |= mask; return drop_result; }
+uint32_t net_absent_seats() { return absent_seats; }
+bool net_seat_peer(uint8_t pos, uint8_t& id) { if (pos >= peer_count) return false; id = member_ids[pos]; return true; }
 bool net_peer_ids(uint8_t* out, uint8_t cap) { if (cap < peer_count) return false; for (unsigned i = 0; i < peer_count; ++i) out[i] = member_ids[i]; return true; }
 void roster_party_swap_reset() {}
 uint64_t* rng_global_stream() { return rng; }
 void log_stage(const char*, ...) {}
 void log_stage_quiet(const char*, ...) {}
-void log_line(const char* tag, const char* fmt, ...) { if (!std::getenv("MGMP_TEST_LOG")) return; va_list a; va_start(a, fmt); std::printf("[%s] ", tag); std::vprintf(fmt, a); std::putchar(10); va_end(a); }
-void log_line_lvl(LogLevel, const char* tag, const char* fmt, ...) { if (!std::getenv("MGMP_TEST_LOG")) return; va_list a; va_start(a, fmt); std::printf("[%s] ", tag); std::vprintf(fmt, a); std::putchar(10); va_end(a); }
+static void capture_line(const char* tag, const char* fmt, va_list a) { char b[2400]; vsnprintf(b, sizeof(b), fmt, a); captured += tag; captured += ": "; captured += b; captured += "\n"; }
+void log_line(const char* tag, const char* fmt, ...) { va_list a; va_start(a, fmt); if (capture_on) { va_list c; va_copy(c, a); capture_line(tag, fmt, c); va_end(c); } if (std::getenv("MGMP_TEST_LOG")) { std::printf("[%s] ", tag); std::vprintf(fmt, a); std::putchar(10); } va_end(a); }
+void log_line_lvl(LogLevel, const char* tag, const char* fmt, ...) { va_list a; va_start(a, fmt); if (capture_on) { va_list c; va_copy(c, a); capture_line(tag, fmt, c); va_end(c); } if (std::getenv("MGMP_TEST_LOG")) { std::printf("[%s] ", tag); std::vprintf(fmt, a); std::putchar(10); } va_end(a); }
 bool net_send_catdata(const CatDataMsg& m) {
     published.push_back(m.id);
     if (m.size == sizeof(CatImage)) std::memcpy(&published_images[m.id], m.data, sizeof(CatImage));
@@ -1472,7 +1776,7 @@ int main() {
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
     in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals(); alone_check_finds_this_players_position(); a_player_who_drops_out_loses_their_cats_for_everyone_else();
-    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_dead_squatter_does_not_take_a_new_cats_house_entity(); a_squatter_without_a_house_entity_is_not_lost(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); the_fallback_filter_takes_out_only_other_players_cats(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
+    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_dead_squatter_does_not_take_a_new_cats_house_entity(); a_squatter_without_a_house_entity_is_not_lost(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); the_fallback_filter_takes_out_only_other_players_cats(); the_class_completion_check_counts_own_cats(); the_game_console_state_is_read_from_the_object(); the_class_marks_follow_the_rooms_rule(); the_marks_are_logged_and_compared(); gained_cats_in_the_class_check_and_the_settlement(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);
     std::free(ids->data);

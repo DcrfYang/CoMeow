@@ -17,7 +17,7 @@ static Config g_cfg_stub;
 const Config& config() { return g_cfg_stub; }
 static wchar_t g_cur_log[MAX_PATH];
 bool log_current_path(wchar_t* out, size_t cap) { wcsncpy_s(out, cap, g_cur_log, _TRUNCATE); return true; }
-void log_line(const char*, const char*, ...) {}
+void log_line(const char*, const char*, ...) {} void log_flush() {}
 }
 
 static int fails = 0;

@@ -27,6 +27,7 @@
 // shape and the font falls back to the system's CJK face, and the log says which.
 #pragma once
 
+struct ImFont;     // ImGui's (global namespace): menu_font
 namespace mgmp {
 
 // After the ImGui context and both backends are up, before the first frame.
@@ -53,8 +54,16 @@ void menu_toggle_log_window();
 // harness; the title screen's own auto-Play uses the same path.
 void menu_request_press(const char* button_name);
 
+// The CJK face the menus draw with (null before the menus are up). mgmp_imeui draws the IME's candidates with it.
+::ImFont* menu_font();
+
 // Dev harness: pick save slot N (0-based) the next time the save screen ticks. -1 if none pending.
 void menu_request_slot(int slot);
 int  menu_take_slot_request();
+
+// A FILE OR SAVE PROBLEM THE PLAYER HAS TO KNOW ABOUT (0.1.169): a file that cannot be read or written, a save that cannot be copied, read or
+// restored. Queued from any thread; the menu shows it as a popup over whatever screen is up, one at a time, until the player presses OK. The same
+// text is shown once per run. Keep the log line beside the call -- the popup is for the player, the log for us.
+void ui_error_popup(const char* title, const char* text);
 
 } // namespace mgmp

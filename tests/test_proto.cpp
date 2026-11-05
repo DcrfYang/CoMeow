@@ -1,4 +1,4 @@
-// test_proto.cpp -- covers the wire codec.
+﻿// test_proto.cpp -- covers the wire codec.
 //
 // The transport it belongs to can only be exercised with two game instances, so
 // the encoding is tested here instead. Same reasoning as test_timedelay.cpp:
@@ -9,10 +9,16 @@
 #include "mgmp_proto.h"
 #include "mgmp_treasure.h"   // TreasureLedger (pure)
 #include "mgmp_mapvote.h"    // MapVoteBook (pure)
+#include "mgmp_voicecodec.h" // IMA ADPCM of the voice chat (pure)
+#include "mgmp_event_class.h" // which events may be each player's own (generated)
+#include "mgmp_completion_rule.h" // the solo-cat / same-class marks of a room (pure)
+#include "mgmp_server_addr.h"     // the project's server by name, the address as the fallback (pure)
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <utility>
 
 using namespace mgmp;
 
@@ -96,7 +102,45 @@ int main() {
         check(o.rules == 1, "the host's rule bits ride in the HELLO (proto 51)");
         check(kProtoVersion >= 51, "the rule bits require protocol 51 or later");
         check(session_is_gained(session_gained_id(0)) && session_is_gained(session_gained_id(kGainedSlots - 1)) && !session_is_gained(session_gained_id(kGainedSlots)), "the gained-cat ids (proto 96)");
-        check(session_cat_owner(session_gained_id(0)) < 0 && !session_is_gained(0x70000001ull) && !session_is_gained(0x71000000ull + kGainedSlot0), "a gained id is no clone slot and only in the host namespace");
+        check(session_cat_owner(session_gained_id(0)) < 0 && !session_is_gained(0x70000001ull), "a gained id is no clone slot");
+        // 0.1.146 (proto 108): every seat has its own gained slots -- a cat that joins in a player's own random event is that player's
+        check(session_gained_id(0) == session_gained_id_of(0, 0) && session_gained_owner(0x71000000ull + kGainedSlot0) == 1 &&
+              session_gained_owner(session_gained_id_of(3, kGainedSlots - 1)) == 3 && !session_is_gained(session_gained_id_of(1, kGainedSlots)) &&
+              session_gained_owner(0x71000004ull) < 0 && session_cat_owner_any(session_gained_id_of(2, 0)) == 2 && session_cat_owner_any(0x71000003ull) == 1 &&
+              session_cat_owner_any(0x700000FFull) < 0, "each seat's gained slots (proto 108)");
+        // 0.1.153: THE PROJECT'S SERVER BY NAME: the address is the fallback for its own name only
+        check(official_fallback("comeow.top") && !strcmp(official_fallback("COMEOW.TOP"), "49.233.209.67") && official_fallback("www.comeow.top") &&
+              !official_fallback("example.com") && !official_fallback("49.233.209.67") && !official_fallback(nullptr) && !official_fallback("comeow.top.evil"),
+              "server: the fallback address only for comeow.top");
+        check(is_official_server("comeow.top:27700") && is_official_server("49.233.209.67:27700") && is_official_server("comeow.top") &&
+              !is_official_server("192.168.1.5:27700") && !is_official_server("") && !is_official_server(nullptr), "server: the project's own server by name or address");
+        // 0.1.147: THE ROOM'S RULE FOR THE SOLO-CAT / SAME-CLASS MARKS: everybody brought one cat -> solo for all; else all cats of one class -> same-class for all; else none
+        {
+            auto cats = [](std::initializer_list<std::pair<int, const char*>> l, CompletionCat* out) { uint32_t n = 0; for (auto& c : l) { out[n].seat = (uint8_t)c.first; strcpy(out[n].cls, c.second); ++n; } return n; };
+            CompletionCat c[16]; uint32_t a = 9, b = 9;
+            uint32_t n = cats({{0, "Hunter"}, {1, "Mage"}}, c);
+            check(completion_rule(c, n, 1, a, b) == CompletionMark::None && strcmp(c[a].cls, c[b].cls) != 0 && a != b, "marks (0.1.148): one cat each, two classes -> neither (the solo-cat mark needs one class)");
+            n = cats({{0, "Fighter"}, {1, "Fighter"}, {2, "Fighter"}}, c);
+            check(completion_rule(c, n, 0, a, b) == CompletionMark::Solo && a == 0, "marks: one cat each, one class -> solo (not same-class)");
+            n = cats({{0, "Fighter"}, {1, "Fighter"}, {2, "Mage"}}, c);
+            check(completion_rule(c, n, 2, a, b) == CompletionMark::None, "marks (0.1.148): one cat each, one of them of another class -> neither");
+            n = cats({{0, "Fighter"}, {1, "Fighter"}}, c);
+            check(completion_rule(c, n, 1, a, b) == CompletionMark::Solo && a == 1 && b == 1, "marks: the list of a solo run holds this player's own cat");
+            n = cats({{0, "Hunter"}, {0, "Mage"}, {0, "Monk"}, {0, "Fighter"}, {1, "Mage"}}, c);
+            check(completion_rule(c, n, 1, a, b) == CompletionMark::None && strcmp(c[a].cls, c[b].cls) != 0 && a != b, "marks: one player brought four, classes differ -> neither (two cats of different classes)");
+            n = cats({{0, "Fighter"}, {0, "Fighter"}, {0, "Fighter"}, {1, "Fighter"}}, c);
+            check(completion_rule(c, n, 1, a, b) == CompletionMark::Mono && a == b, "marks: several cats, all one class -> same-class for all (the same cat twice)");
+            n = cats({{0, "Fighter"}, {1, "Fighter"}, {1, "Mage"}}, c);
+            check(completion_rule(c, n, 0, a, b) == CompletionMark::None && strcmp(c[a].cls, c[b].cls) != 0, "marks: one class but for a different cat -> neither");
+            n = cats({{1, "Colorless"}}, c);
+            check(completion_rule(c, n, 1, a, b) == CompletionMark::Solo && a == 0, "marks: the only player left with one cat -> solo");
+            n = cats({{0, "Mage"}, {0, "Mage"}}, c);
+            check(completion_rule(c, n, 0, a, b) == CompletionMark::Mono, "marks: one player, two cats of one class -> same-class");
+            check(completion_rule(nullptr, 0, 0, a, b) == CompletionMark::None, "marks: no cats -> none");
+        }
+        // ... and the two events whose only shared effect was the new cat are each player's own; the three with next-fight effects still follow the host
+        check(event_class_independent("CatOrgy") && event_class_independent("ExtraLife") && !event_class_independent("StrayCat") &&
+              !event_class_independent("DeadCat") && !event_class_independent("Blessing"), "the new-cat events' classes (0.1.146)");
         check(o.enemy_scale_half == 4, "the default enemy multiplier is x2 (4 halves)");
         h.enemy_scale_half = 11;
         n = enc_hello(buf, sizeof(buf), h);
@@ -472,13 +516,15 @@ int main() {
         }
         {   // proto 104: the ping with frame statistics
             PingMsg g; g.kind = 1; g.seq = 7; g.t = 0xABCDEF01u; g.frames = 120; g.avg_x10 = 166; g.max_ms = 812; g.slow = 3; g.mod_max_x10 = 42; uint8_t gb[96]{};
-            g.n_rtt = 2; g.rtt_peer[0] = 1; g.rtt_ms[0] = 85; g.rtt_peer[1] = 3; g.rtt_ms[1] = 17000;
+            g.n_rtt = 2; g.rtt_peer[0] = 1; g.rtt_ms[0] = 85; g.rtt_peer[1] = 3; g.rtt_ms[1] = 17000; g.clock_x100 = 1275; g.clock_bad = 1;
             check(kProtoVersion >= 105, "the ping's round-trip list needs protocol 105");
             const uint32_t gn = enc_ping(gb, sizeof(gb), g);
-            check(gn == 2 + 4 + 4 + 5 * 4 + 1 + 2 * 5, "a ping encodes to its exact size");
+            check(kProtoVersion >= 109, "the ping's clock rate needs protocol 109");
+            check(gn == 2 + 4 + 4 + 5 * 4 + 1 + 2 * 5 + 4 + 1, "a ping encodes to its exact size");
             Reader r(gb, gn); r.u8v(); PingMsg c{};
             check(dec_ping(r, c) && c.kind == 1 && c.seq == 7 && c.t == 0xABCDEF01u && c.frames == 120 && c.avg_x10 == 166 && c.max_ms == 812 && c.slow == 3 && c.mod_max_x10 == 42, "a ping round-trips");
             check(c.n_rtt == 2 && c.rtt_peer[0] == 1 && c.rtt_ms[0] == 85 && c.rtt_peer[1] == 3 && c.rtt_ms[1] == 17000, "a ping's round-trip list round-trips");
+            check(c.clock_x100 == 1275 && c.clock_bad == 1, "a ping's clock rate and judgement round-trip");
             for (uint32_t cut = 1; cut < gn; ++cut) { Reader sr(gb, cut); sr.u8v(); PingMsg x{}; check(!dec_ping(sr, x), "a truncated ping is refused"); }
             g.kind = 2; check(!enc_ping(gb, sizeof(gb), g), "a ping of an unknown kind is refused");
             g.kind = 0; g.n_rtt = kMaxPeers + 1; check(!enc_ping(gb, sizeof(gb), g), "a ping listing more members than a room holds is refused");
@@ -519,23 +565,24 @@ int main() {
                 u.tx = (int)i - 2; u.ty = 8 - (int)i; u.fx = -1; u.fy = (int)(i & 1);
                 u.key_a = 12 + (int)i; u.key_b = 0xFF000001 + (int)i * 977; u.speed = 5 + (int)(i & 3); u.init_base = -3 + (int)i;   // proto 69/70: the turn-order keys
                 u.faction = 2 + (int)i; u.carried = i == 3 ? 4 : -1; u.mana = 17 + (int)i; // proto 83/84: faction, captured-follower slot, mana
+                u.deep = 0xD0000000u + i * 7;                                           // proto 113: the deep-state digest
                 if ((i & 1) == 0) strcpy(u.def, "Leaper");               // proto 75: the definition name (empty for the odd ones)
             }
             strcpy(m.units[7].def, "Leaper_With_A_Rather_Long_Name_XYZ"); m.units[7].flags |= kBoardChampion;   // 34 characters: fits (limit 39)
             m.units[7].tx = -5000; m.units[7].ty = -5000;
-            uint8_t bytes[1024]{};
+            uint8_t bytes[1536]{};
             const uint32_t n = enc_board(bytes, sizeof(bytes), m);
-            check(n == 1 + 8 + 4 + 4 + 4 + 4 + 1 + 32 + 8 * (62 + 1) + 4 * 6 + 34, "board chunk wire size");
-            check(n <= 1024 && kBoardChunk * (62 + 1 + (kBoardDefLen - 1)) + 58 <= 1024, "a full board chunk of the longest names fits the send buffer");
+            check(n == 1 + 8 + 4 + 4 + 4 + 4 + 1 + 32 + 8 * (66 + 1) + 4 * 6 + 34, "board chunk wire size");
+            check(n <= 1536 && kBoardChunk * (66 + 1 + (kBoardDefLen - 1)) + 58 <= 1536, "a full board chunk of the longest names fits the send buffer (1536 since proto 113)");
             Reader r(bytes, n); r.u8v(); BoardMsg copy{};
             check(dec_board(r, copy) && copy.battle == m.battle && copy.turn == 7 && copy.cats == 36 && copy.total == 25 && copy.first == 16 && copy.count == 8 &&
                   copy.rng[3] == m.rng[3] && copy.units[0].index == 14 && copy.units[7].tx == -5000 && copy.units[3].hp == 17 && copy.units[5].ident == 0xA0000005u &&
                   copy.units[2].fx == -1 && copy.units[1].flags == 1 && copy.units[4].key_a == 16 && copy.units[4].key_b == (int32_t)(0xFF000001u + 4 * 977) && copy.units[6].speed == 7 && copy.units[5].init_base == 2 &&
-                  copy.units[3].faction == 5 && copy.units[3].carried == 4 && copy.units[3].mana == 20 &&
+                  copy.units[3].faction == 5 && copy.units[3].carried == 4 && copy.units[3].mana == 20 && copy.units[6].deep == 0xD0000000u + 42 &&
                   strcmp(copy.units[0].def, "Leaper") == 0 && copy.units[1].def[0] == 0 && strcmp(copy.units[7].def, "Leaper_With_A_Rather_Long_Name_XYZ") == 0 && (copy.units[7].flags & kBoardChampion), "board round-trip (with definition names)");
             {   // the longest name fits and the cursor stays in step
                 BoardMsg longm = m; memset(longm.units[0].def, 'a', kBoardDefLen - 1);
-                uint8_t lb[1024]{}; const uint32_t ln = enc_board(lb, sizeof(lb), longm);
+                uint8_t lb[1536]{}; const uint32_t ln = enc_board(lb, sizeof(lb), longm);
                 Reader lr(lb, ln); lr.u8v(); BoardMsg lc{};
                 check(ln > 0 && dec_board(lr, lc) && strlen(lc.units[0].def) == kBoardDefLen - 1 && lc.units[7].tx == -5000, "the longest definition name round-trips");
             }
@@ -547,8 +594,8 @@ int main() {
                     for (int k = 0; k < 7; ++k) hm.units[i].stat[k] = 5 + k + (int)i;
                     hm.units[i].stat_bonus = -2 - (int)i;
                 }
-                uint8_t hb[1024]{}; const uint32_t hn = enc_board(hb, sizeof(hb), hm);
-                check(hn > 0 && hn <= 1024, "a chunk of eight player's cats fits the send buffer");
+                uint8_t hb[1536]{}; const uint32_t hn = enc_board(hb, sizeof(hb), hm);
+                check(hn > 0 && hn <= 1536, "a chunk of eight player's cats fits the send buffer");
                 Reader hr(hb, hn); hr.u8v(); BoardMsg hc{};
                 check(dec_board(hr, hc) && hc.units[3].stat[6] == 5 + 6 + 3 && hc.units[3].stat_bonus == -5 && hc.units[0].stat[0] == 5 && (hc.units[3].flags & kBoardDead), "a player's cat round-trips its stats");
                 BoardMsg en = m; en.units[2].stat[1] = 99;                    // an enemy's stat fields are not sent
@@ -631,6 +678,36 @@ int main() {
                 bad = miss; bad.size = 4; bad.data = img; check(!enc_soulcat(sb2, sizeof(sb2), bad), "a 'missing' frame carries no image");
                 check(strcmp(msg_name(MSG_SOULCAT), "SOULCAT") == 0, "SOULCAT has a name");
             }
+            {   // proto 115: a unit made from cat data travels as that cat data
+                check(kProtoVersion >= 115, "UCAT needs protocol 115");
+                check((kBoardCatData & (kBoardDead | kBoardLinked | kBoardHuman | kBoardGone | kBoardChampion | kBoardRemoved)) == 0, "kBoardCatData is a bit of its own");
+                BoardUnit bu{}; bu.index = 3; bu.ident = 9; BoardUnit bc = bu; bc.flags = kBoardCatData;
+                check(board_unit_digest(bu) == board_unit_digest(bc), "kBoardCatData is not in the board digest");
+                UcatReqMsg q{}; q.battle = 0x1122334455667788ull; q.index = 41; q.key = -7;
+                uint8_t qb[32]; const uint32_t qn = enc_ucatreq(qb, sizeof(qb), q);
+                UcatReqMsg qo{};
+                check(qn == 1 + 8 + 1 + 4 && dec_ucatreq(qb, qn, qo) && qo.battle == q.battle && qo.index == 41 && qo.key == -7, "a UCATREQ round-trips");
+                bool qcut = true; for (uint32_t cut = 1; cut < qn; ++cut) { UcatReqMsg x{}; if (dec_ucatreq(qb, cut, x)) qcut = false; }
+                check(qcut, "no truncated UCATREQ decodes");
+                UcatReqMsg qbad = q; qbad.battle = 0; check(!enc_ucatreq(qb, sizeof(qb), qbad), "a UCATREQ of no battle is refused");
+                uint8_t img[200]; for (uint32_t i = 0; i < sizeof(img); ++i) img[i] = (uint8_t)(i * 13 + 5);
+                UcatMsg m{}; m.battle = q.battle; m.index = 41; m.key = -7; m.save_id = 0x70000005ull; m.status = kUcatImage; m.size = sizeof(img); m.hash = 0xABCDull; m.data = img;
+                static uint8_t ub[512];
+                const uint32_t un = enc_ucat(ub, sizeof(ub), m);
+                UcatMsg mo{};
+                check(un == 1 + 8 + 1 + 4 + 8 + 1 + 4 + 8 + sizeof(img) && un <= ucat_frame_size(m), "a UCAT frame is its header plus the image");
+                check(dec_ucat(ub, un, mo) && mo.battle == m.battle && mo.index == 41 && mo.key == -7 && mo.save_id == m.save_id && mo.status == kUcatImage && mo.size == sizeof(img) &&
+                      mo.hash == 0xABCDull && mo.data && memcmp(mo.data, img, sizeof(img)) == 0, "a UCAT round-trips");
+                bool ucut = true; for (uint32_t cut = 1; cut < un; ++cut) { UcatMsg x{}; if (dec_ucat(ub, cut, x)) ucut = false; }
+                check(ucut, "no truncated UCAT decodes");
+                UcatMsg none{}; none.battle = 5; none.index = 2; none.key = 1; none.status = kUcatNone;
+                const uint32_t nn = enc_ucat(ub, sizeof(ub), none);
+                UcatMsg no{}; check(nn && dec_ucat(ub, nn, no) && no.status == kUcatNone && !no.data && no.size == 0, "a 'none' UCAT round-trips");
+                UcatMsg bad = none; bad.size = 4; bad.data = img; check(!enc_ucat(ub, sizeof(ub), bad), "a 'none' UCAT carries no image");
+                bad = m; bad.status = 3; check(!enc_ucat(ub, sizeof(ub), bad), "an unknown UCAT status is refused");
+                bad = m; bad.index = (uint8_t)kBoardMax; check(!enc_ucat(ub, sizeof(ub), bad), "a UCAT past the roster cap is refused");
+                check(strcmp(msg_name(MSG_UCATREQ), "UCATREQ") == 0 && strcmp(msg_name(MSG_UCAT), "UCAT") == 0, "the UCAT frames have names");
+            }
             {   // proto 101: the host's party luck for a treasure node
                 check(kProtoVersion >= 101, "the shared chest's luck needs protocol 101");
                 TreasureMsg t{}; t.kind = kTreasureLuck; t.node = 0x1234ull; t.luck_e6 = 800000;
@@ -666,7 +743,21 @@ int main() {
             m.n_weather = 2; strcpy_s(m.weather[0], "OilSpill"); strcpy_s(m.weather[1], "GeomagneticStorm"); m.build_info = 1;
             uint8_t bytes[400]{};
             const uint32_t n = enc_unlocks(bytes, sizeof(bytes), m);
-            check(n == 1 + 4 + 4 + 4 + 16 + 1 + 1 + 4 + 1 + 1 + 3 * 4 + 1 + 2 * 12 + 8 + 1 + 12 + 3 + 4 * 16 + 3 * 4 + 1 + (1 + 8) + (1 + 16) + 1 + 2, "unlock snapshot wire size (proto 92: + each queue's true length)");
+            check(n == 1 + 4 + 4 + 4 + 16 + 1 + 1 + 4 + 1 + 1 + 3 * 4 + 1 + 2 * 12 + 8 + 1 + 12 + 3 + 4 * 16 + 3 * 4 + 1 + (1 + 8) + (1 + 16) + 1 + 2 + 1 + 2, "unlock snapshot wire size (proto 92: + each queue's true length; proto 110: + the difficulty byte; proto 112: + two tag counts)");
+            {   // proto 112: the host's tag counts round-trip
+                UnlocksMsg tm = m; tm.extra_events = 2; tm.event_difficulty = 3;
+                uint8_t tb[400]{}; const uint32_t tn = enc_unlocks(tb, sizeof(tb), tm);
+                Reader tr(tb, tn); tr.u8v(); UnlocksMsg tc{};
+                check(tn && dec_unlocks(tr, tc) && tc.extra_events == 2 && tc.event_difficulty == 3, "the host's tag counts round-trip (proto 112)");
+            }
+            {   // proto 110: the host's difficulty index, -1 = not read
+                UnlocksMsg dm = m; dm.difficulty = 3;
+                uint8_t db[400]{}; const uint32_t dn = enc_unlocks(db, sizeof(db), dm);
+                Reader dr(db, dn); dr.u8v(); UnlocksMsg dc{};
+                check(dn == n && dec_unlocks(dr, dc) && dc.difficulty == 3, "the difficulty index round-trips");
+                Reader nr(bytes, n); nr.u8v(); UnlocksMsg nc{}; nc.difficulty = 5;
+                check(dec_unlocks(nr, nc) && nc.difficulty == -1, "an unread difficulty stays -1");
+            }
             {   // proto 78: the host's class names ride along; 255 = not sent
                 UnlocksMsg cm = m;
                 cm.n_classes[0] = 4; cm.n_classes[1] = 5;
@@ -1379,6 +1470,64 @@ int main() {
                 bad = nv; bad.index = 5000; uint8_t bb[32]{}; const uint32_t bn = enc_nodevote(bb, sizeof(bb), bad);
                 Reader br(bb, bn); br.u8v(); NodeVoteMsg bo{}; check(bn && !dec_nodevote(br, bo), "a node index past any map is refused on arrival");
                 check(strcmp(msg_name(MSG_NODEVOTE), "NODEVOTE") == 0, "NODEVOTE has a name");
+
+                // 0.1.118 (proto 107): voice chat -- the codec and its frame
+                {
+                    check(kProtoVersion >= 107, "voice chat needs protocol 107");
+                    int16_t pcm[640], back[640];
+                    for (int i = 0; i < 640; ++i) pcm[i] = (int16_t)(8000.0 * std::sin(i * 2.0 * 3.14159265 * 440.0 / 16000.0) + 2500.0 * std::sin(i * 2.0 * 3.14159265 * 1250.0 / 16000.0));
+                    VoiceCodec st; st.index = 20;
+                    VoiceMsg vm; vm.pred = pcm[0]; vm.index = (uint8_t)st.index; vm.samples = 640;
+                    vm.len = (uint16_t)voice_adpcm_encode(pcm, 640, st, vm.data);
+                    check(vm.len == 320, "40 ms of speech is 320 bytes");
+                    check(voice_adpcm_decode(vm.data, vm.len, vm.pred, vm.index, vm.samples, back) && back[0] == pcm[0], "a frame decodes, the first sample exact");
+                    double err = 0, sig = 0;
+                    for (int i = 64; i < 640; ++i) { const double d = back[i] - pcm[i]; err += d * d; sig += (double)pcm[i] * pcm[i]; }
+                    check(sig > 0 && err / sig < 0.01, "the decoded tone is within 20 dB of the original (about 40 dB in practice)");
+                    check(st.index >= 0 && st.index <= 88, "the step index stays in its table");
+                    int16_t loud[64]; for (int i = 0; i < 64; ++i) loud[i] = (i & 1) ? 32767 : -32768;
+                    VoiceCodec s2; uint8_t lb[40]{}; const uint32_t ln = voice_adpcm_encode(loud, 64, s2, lb);
+                    int16_t lback[64]; check(ln == 32 && voice_adpcm_decode(lb, ln, loud[0], 0, 64, lback), "a full-scale square wave encodes and decodes without leaving the 16-bit range");
+                    check(!voice_adpcm_decode(vm.data, 100, vm.pred, vm.index, 640, back), "a frame too short for its sample count is refused");
+
+                    uint8_t vb[512]{};
+                    const uint32_t vn = enc_voice(vb, sizeof(vb), vm);
+                    check(vn == 1 + 2 + 2 + 1 + 2 + 2 + 320, "a voice frame encodes to its exact size");
+                    Reader vr(vb, vn); check(vr.u8v() == MSG_VOICE, "type VOICE");
+                    VoiceMsg vo{}; check(dec_voice(vr, vo) && vo.samples == 640 && vo.len == 320 && vo.pred == vm.pred && vo.index == vm.index && !memcmp(vo.data, vm.data, 320), "a voice frame round-trips");
+                    bool vcut = true;
+                    for (uint32_t cut = 1; cut < vn; ++cut) { Reader c(vb, cut); c.u8v(); VoiceMsg x{}; if (dec_voice(c, x)) { vcut = false; break; } }
+                    check(vcut, "no truncated voice frame decodes");
+                    VoiceMsg vbad = vm; vbad.index = 89; check(!enc_voice(vb, sizeof(vb), vbad), "a step index past the table is not sent");
+                    vbad = vm; vbad.samples = 800; check(!enc_voice(vb, sizeof(vb), vbad), "a frame of more samples than the cap is not sent");
+                    vbad = vm; vbad.len = 100; check(!enc_voice(vb, sizeof(vb), vbad), "a frame with fewer bytes than its samples need is not sent");
+                    check(strcmp(msg_name(MSG_VOICE), "VOICE") == 0, "VOICE has a name");
+                }
+                {   // proto 111: the round's turn queue
+                    TurnQueueMsg q{};
+                    q.battle = 0x900F1232D70C3DBCull; q.turn = 3; q.cur = 28; q.n = 4;
+                    const uint8_t k[4] = { 0, 0, 7, 0 }, u[4] = { 32, 33, kTurnQueueNoUnit, 24 };
+                    memcpy(q.kind, k, 4); memcpy(q.unit, u, 4);
+                    uint8_t tb[600]{};
+                    const uint32_t tn = enc_turnqueue(tb, sizeof(tb), q);
+                    check(tn == 1 + 8 + 4 + 1 + 1 + 2 * 4, "a turn queue encodes to its exact size");
+                    Reader tr(tb, tn); check(tr.u8v() == MSG_TURNQUEUE, "type TURNQUEUE");
+                    TurnQueueMsg to{}; check(dec_turnqueue(tr, to) && to.battle == q.battle && to.turn == 3 && to.cur == 28 && to.n == 4 && !memcmp(to.kind, k, 4) && !memcmp(to.unit, u, 4), "a turn queue round-trips");
+                    bool tcut = true;
+                    for (uint32_t cut = 1; cut < tn; ++cut) { Reader c(tb, cut); c.u8v(); TurnQueueMsg x{}; if (dec_turnqueue(c, x)) { tcut = false; break; } }
+                    check(tcut, "no truncated turn queue decodes");
+                    TurnQueueMsg full{}; full.battle = 1; full.n = (uint8_t)kTurnQueueMax;
+                    check(enc_turnqueue(tb, sizeof(tb), full) == 1 + 8 + 4 + 2 + 2 * kTurnQueueMax, "a queue of the cap fits its buffer");
+                    TurnQueueMsg none{}; check(!enc_turnqueue(tb, sizeof(tb), none), "a queue of no battle is not sent");
+                    check(strcmp(msg_name(MSG_TURNQUEUE), "TURNQUEUE") == 0, "TURNQUEUE has a name");
+                    // proto 112: the owner's facing rides on every decision
+                    ActionMsg am{}; am.battle_id = 7; am.turn = 3; am.type = 2; am.fx = -1; am.fy = 1; am.chain = 2;
+                    uint8_t ab[256]{}; const uint32_t an = enc_action(ab, sizeof(ab), am);
+                    Reader ar(ab, an); ar.u8v(); ActionMsg ao{};
+                    check(an && dec_action(ar, ao) && ao.fx == -1 && ao.fy == 1 && ao.chain == 2, "a decision carries its owner's facing (proto 112)");
+                    Reader ar2(ab, an - 2); ar2.u8v(); ActionMsg ao2{};
+                    check(dec_action(ar2, ao2) && ao2.fx == 0 && ao2.fy == 0, "a decision from before proto 112 (no facing) still decodes, facing unknown");
+                }
 
                 // the book: toggling, switching, who has picked
                 MapVoteBook bk;

@@ -104,6 +104,45 @@ bool code_write(uint8_t* at, const uint8_t* bytes, size_t n) {
 }
 }
 
+// THE LEFT-SHIFT SKIP OF A MAP NODE (0.1.128, found reading EnterNode for the food-box fix): MapScreen::EnterNode opens with "is Left Shift held?" (SDL keycode 0x400000E1 -> scancode -> the
+// input's held test 0x140985AF0) and, if so, calls finish_node (0x140392FC0) at once -- the node is passed without its battle, event or shop. In a room that happens on the one peer whose player
+// happens to hold Shift when the node is entered (the client enters the host's node by itself, whenever it arrives): that peer skips a battle the others fight. In a room the branch is never
+// taken (je -> jmp, the same length); outside a room the game's own byte is put back.
+//   48 8B CE    mov rcx, rsi
+//   84 C0       test al, al
+//   74 0A       je  +0x0A        <- EB 0A in a room
+//   E8 ....     call finish_node
+namespace {
+const uint8_t kShiftFind[8] = { 0x48, 0x8B, 0xCE, 0x84, 0xC0, 0x74, 0x0A, 0xE8 };
+struct ShiftSkip { bool looked = false; uint8_t* site = nullptr; bool on = false; } g_shift;
+}
+void rngfix_node_shift_tick() {
+    if (!g_shift.looked) {
+        g_shift.looked = true;
+        const uintptr_t fn = addr_of(T_EnterNode);
+        uint8_t code[0x100] = {};
+        if (fn && mem_read((const void*)fn, code, sizeof(code))) {
+            for (size_t i = 0; i + sizeof(kShiftFind) <= sizeof(code) && !g_shift.site; ++i)
+                if (memcmp(code + i, kShiftFind, sizeof(kShiftFind)) == 0) g_shift.site = (uint8_t*)(fn + i + 5);
+        }
+        log_line("RNGFIX", "EnterNode's Left-Shift skip %s", g_shift.site ? "found -- in a room a node is always entered for what it is" : "NOT found -- left as the game has it");
+    }
+    if (!g_shift.site) return;
+    const bool want = net_active() && net_peer_count() >= 2;
+    if (want == g_shift.on) return;
+    const uint8_t from = want ? 0x74 : 0xEB, to = want ? 0xEB : 0x74;
+    uint8_t now = 0;
+    if (!mem_read(g_shift.site, &now, 1) || now != from) {
+        log_line_lvl(LogLevel::Warn, "RNGFIX", "!! EnterNode's Left-Shift branch does not hold the expected byte (%02x) -- left alone", (unsigned)now);
+        g_shift.site = nullptr;
+        return;
+    }
+    if (code_write(g_shift.site, &to, 1)) {
+        g_shift.on = want;
+        log_line("RNGFIX", "EnterNode's Left-Shift skip: %s", want ? "off in this room (holding Shift no longer passes a node on one peer)" : "the game's own again (out of a room)");
+    }
+}
+
 void rngfix_simultaneous_aoe_tick() {
     if (!g_r013.looked) {
         g_r013.looked = true;
@@ -207,8 +246,8 @@ void* rngfix_clay(void* self, void* a, void* b, void* c, fn_rngfix_4 orig) {
         mem_read((const uint8_t*)cat + 0xC48, &cat_id, sizeof(cat_id));
     static uint64_t s_battle = 0;
     static uint64_t s_id[100] = {};
-    static uint32_t s_n[100] = {};
-    if (s_battle != battle) { s_battle = battle; memset(s_id, 0, sizeof(s_id)); memset(s_n, 0, sizeof(s_n)); }
+    static uint32_t s_n[100] = {}, s_gen = ~0u;
+    if (s_battle != battle || s_gen != lockstep_battle_gen()) { s_battle = battle; s_gen = lockstep_battle_gen(); memset(s_id, 0, sizeof(s_id)); memset(s_n, 0, sizeof(s_n)); }
     uint32_t k = 0;
     while (k < 100 && s_id[k] && s_id[k] != cat_id) ++k;
     if (k == 100) k = 99;

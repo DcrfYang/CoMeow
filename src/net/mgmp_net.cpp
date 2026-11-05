@@ -2,6 +2,7 @@
 
 #include "mgmp_net.h"
 #include "mgmp_log.h"
+#include "mgmp_server_addr.h"   // comeow.top: the address when the name does not resolve
 #include "mgmp_perf.h"
 #include "mgmp_steambridge.h"
 
@@ -71,6 +72,8 @@ struct State {
 
     NetMsg   queue[kQueueCap];
     uint32_t head = 0, count = 0;
+    uint32_t evicted = 0;            // voice/pointer frames pushed out of a full queue (0.1.182)
+    uint8_t  dropped_last = 0;       // the type of the last message dropped because the queue was full
 
     CRITICAL_SECTION send_cs;
     bool     send_cs_ready = false;
@@ -106,7 +109,11 @@ bool wsa_init() {
     return true;
 }
 
-struct LevelBox { uint64_t node = 0; char name[64] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint32_t pending_total[kPendingQueues] = {}; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {}; } g_level_box;
+struct LevelBox { uint64_t node = 0; char name[64] = {}; uint64_t bnode = 0; uint8_t n_pending[kPendingQueues] = {}; PendingEnemy pending[kPendingQueues][kPendingMax]; uint32_t pending_total[kPendingQueues] = {}; uint8_t n_weather = 0; char weather[kWeatherNames][kWeatherLen] = {};
+                  int8_t bdifficulty = -1;   // proto 110: the host's difficulty with the build information of battle `bnode`
+                  int8_t difficulty = -1;    // ... and the latest the host sent with any UNLOCKS (a shared event's)
+                  int8_t extra_events = -1, event_difficulty = -1;   // proto 112: the host's latest tag counts (T_TagCount)
+                } g_level_box;
 // The last few FULL boards (since proto 98 a later turn's board only comes when asked for, or streamed). Guarded by g.cs like the level box.
 // 4 until 0.1.50, when a client that fell more than four boundaries behind the host found its turn's board already overwritten and waited out the whole 3 s for it, at every
 // boundary, until the host stopped for a player (2026-10-20: nine boundaries in a row).
@@ -117,6 +124,10 @@ uint32_t g_board_next = 0;
 constexpr uint32_t kSumRing = 128;
 BoardSumMsg g_sum_ring[kSumRing];
 uint32_t g_sum_next = 0;
+// CLIENT: the host's turn queues (proto 111), one per boundary, the same mailbox shape.
+constexpr uint32_t kTqRing = 16;
+TurnQueueMsg g_tq_ring[kTqRing];
+uint32_t g_tq_next = 0;
 uint64_t g_board_latest_battle = 0;
 uint32_t g_board_latest_turn = 0;
 void board_note_latest(uint64_t battle, uint32_t turn) {
@@ -132,14 +143,49 @@ uint32_t g_kept_next = 0;
 uint64_t g_board_stream[kMaxPeers] = {};
 constexpr uint32_t kRollRing = 64;
 RollMsg g_roll_ring[kRollRing];            // the host's last rolls, guarded by g.cs
+// PROTO 113, mgmp_unitstate. HOST: every unit's deep-state record of the last kUsKeep boundaries (encoded MSG_USTATE payloads), answered on a client's request from its
+// receive thread. CLIENT: the records the host sent, by battle/turn/index. Both guarded by g.cs.
+constexpr uint32_t kUsKeep = 6;
+struct KeptUstate { uint64_t battle = 0; uint32_t turn = 0; uint8_t* blob[kBoardMax] = {}; uint32_t len[kBoardMax] = {}; };
+KeptUstate g_us_kept[kUsKeep];
+uint32_t g_us_kept_next = 0;
+// PROTO 115 (0.1.190): units made from cat data. HOST: the battle's cat images (encoded MSG_UCAT frames), by battle/index/key; CLIENT: the frames the host sent. Both under g.cs.
+constexpr uint32_t kUcatKeep = 64, kUcatBox = 16;
+struct UcatFrame { uint64_t battle = 0; uint8_t index = 0; int32_t key = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+UcatFrame g_ucat_kept[kUcatKeep];
+uint32_t g_ucat_kept_next = 0;
+UcatFrame g_ucat_box[kUcatBox];
+uint32_t g_ucat_box_next = 0;
+constexpr uint32_t kUsBox = 128;
+struct UstateBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t index = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+UstateBox g_us_box[kUsBox];
+uint32_t g_us_box_next = 0;
 uint32_t g_roll_next = 0;
+
+// A FULL QUEUE (0.1.182). The game thread drains it once a frame; while it is stalled (a save load, a scene change: seconds) a voice frame comes ~24 times a second
+// for each speaker and a pointer several times more -- 256 slots go in a few seconds, and the message then dropped was simply the newest: an ACTION, a CHOICE, a
+// HASH, lost without a word. A voice frame, a pointer or an aim preview is worth nothing late, so the oldest of those makes room first (the others keep their
+// order); only a queue full of game messages drops one. Called under g.cs.
+bool queue_cheap(uint8_t type) { return type == MSG_VOICE || type == MSG_CURSOR || type == MSG_AIM; }
+bool queue_make_room(uint8_t incoming) {
+    if (queue_cheap(incoming)) return false;                       // a cheap frame never pushes out another one: it is the one that goes
+    for (uint32_t k = 0; k < g.count; ++k) {
+        if (!queue_cheap(g.queue[(g.head + k) % kQueueCap].type)) continue;
+        for (uint32_t j = k; j + 1 < g.count; ++j)                  // close the gap (a cheap frame owns no memory; the slot left at the end is the new message's)
+            g.queue[(g.head + j) % kQueueCap] = g.queue[(g.head + j + 1) % kQueueCap];
+        --g.count;
+        ++g.evicted;
+        return true;
+    }
+    return false;
+}
 
 void queue_push(const NetMsg& m) {
     // A PING never reaches the game thread's queue: the receive thread takes its statistics and answers a request AT ONCE, so the round trip is the link's alone (mgmp_perf).
     if (m.type == MSG_PING) {
         perf_on_ping(m.from, m.ping);
         if (m.ping.kind == 0) {
-            uint8_t p[96];
+            uint8_t p[kSendPing];
             const uint32_t n = perf_make_reply(p, sizeof(p), m.ping);
             if (n) net_send_peer(m.from, p, n);
         }
@@ -157,7 +203,11 @@ void queue_push(const NetMsg& m) {
         memcpy(g_level_box.pending_total, m.unlocks.pending_total, sizeof(g_level_box.pending_total));
         g_level_box.n_weather = m.unlocks.n_weather;
         memcpy(g_level_box.weather, m.unlocks.weather, sizeof(g_level_box.weather));
+        g_level_box.bdifficulty = m.unlocks.difficulty;
     }
+    if (m.type == MSG_UNLOCKS && m.unlocks.difficulty >= 0) g_level_box.difficulty = m.unlocks.difficulty;
+    if (m.type == MSG_UNLOCKS && m.unlocks.extra_events >= 0) g_level_box.extra_events = m.unlocks.extra_events;           // proto 112
+    if (m.type == MSG_UNLOCKS && m.unlocks.event_difficulty >= 0) g_level_box.event_difficulty = m.unlocks.event_difficulty;
     if (m.type == MSG_ROLL) g_roll_ring[g_roll_next++ % kRollRing] = m.roll;
     if (m.type == MSG_BOARD) {
         const BoardMsg& b = m.board;
@@ -187,18 +237,26 @@ void queue_push(const NetMsg& m) {
         *slot = s;
         board_note_latest(s.battle, s.turn);
     }
+    if (m.type == MSG_TURNQUEUE) {
+        const TurnQueueMsg& q = m.turnqueue;
+        TurnQueueMsg* slot = nullptr;
+        for (uint32_t k = 0; k < kTqRing && !slot; ++k) if (g_tq_ring[k].battle == q.battle && g_tq_ring[k].turn == q.turn) slot = &g_tq_ring[k];
+        if (!slot) slot = &g_tq_ring[g_tq_next++ % kTqRing];
+        *slot = q;
+    }
     // The board's frames live in their mailboxes only (the game thread waits on those inside the turn boundary): queuing them as well cost five slots of the 256 per boundary
     // and nothing ever read them.
-    if (m.type == MSG_BOARD || m.type == MSG_BOARDSUM) {
+    if (m.type == MSG_BOARD || m.type == MSG_BOARDSUM || m.type == MSG_TURNQUEUE) {
         ++g.stats.received;
         LeaveCriticalSection(&g.cs);
         return;
     }
-    if (g.count >= kQueueCap) {
+    if (g.count >= kQueueCap && !queue_make_room(m.type)) {
         // Drop the newest rather than the oldest. Losing the oldest would
         // reorder the action stream, and an out-of-order ACTION is a desync;
         // a dropped one is at least detectable as a stall at the turn barrier.
         ++g.stats.dropped;
+        g.dropped_last = m.type;
         LeaveCriticalSection(&g.cs);
         // The frame is ours by the time it reaches here, so dropping it means
         // freeing it -- a dropped SAVEFILE that leaked would be 45 KB gone with
@@ -300,8 +358,10 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_BOARD:     return dec_board(r, m.board);
         case MSG_BOARDSUM:  return dec_boardsum(r, m.boardsum);
         case MSG_BOARDREQ:  return dec_boardreq(r, m.boardreq);
+        case MSG_TURNQUEUE: return dec_turnqueue(r, m.turnqueue);
         case MSG_SOULCAT:   return dec_soulcat(r, m.soulcat);
         case MSG_NODEVOTE:  return dec_nodevote(r, m.nodevote);
+        case MSG_VOICE:     return dec_voice(r, m.voice);
         case MSG_ROLL:      return dec_roll(r, m.roll);
         case MSG_PEERS:   return dec_peers(r, m.peers);
         case MSG_HALT:    return dec_halt(r, m.halt);
@@ -424,6 +484,83 @@ void links_drain(DWORD max_ms) {
 
 // HOST, receive thread of the asking client (proto 98): the kept chunks of that boundary, to that client only; with kBoardReqStream it is sent every later boundary's chunks
 // of this battle as well (net_board_publish).
+void host_answer_ustatereq(Link& l, const uint8_t* payload, uint32_t plen) {
+    UstateReqMsg q{};
+    if (!g.cs_ready || l.id >= kMaxPeers || !dec_ustatereq(payload, plen, q)) return;
+    uint32_t sent = 0, missing = 0;
+    for (uint32_t i = 0; i < q.n; ++i) {
+        uint8_t* copy = nullptr; uint32_t len = 0;
+        EnterCriticalSection(&g.cs);
+        for (uint32_t k = 0; k < kUsKeep && !copy; ++k) {
+            const KeptUstate& s = g_us_kept[k];
+            if (s.battle == q.battle && s.turn == q.turn && s.blob[q.index[i]]) {
+                len = s.len[q.index[i]];
+                copy = (uint8_t*)malloc(len);
+                if (copy) memcpy(copy, s.blob[q.index[i]], len);
+            }
+        }
+        LeaveCriticalSection(&g.cs);
+        if (!copy) { ++missing; continue; }
+        if (link_send(l, kHostPeer, copy, len)) ++sent;
+        free(copy);
+    }
+    log_line("USYNC", "-> peer %u asked for %u unit record(s) of turn %u (their deep state differed there): %u sent%s", (unsigned)l.id, (unsigned)q.n, (unsigned)q.turn, sent,
+             missing ? " -- some are no longer kept here" : "");
+}
+// HOST, receive thread (proto 115): the cat image of the unit a client has to make, or "none".
+void host_answer_ucatreq(Link& l, const uint8_t* payload, uint32_t plen) {
+    UcatReqMsg q{};
+    if (!g.cs_ready || !dec_ucatreq(payload, plen, q)) return;
+    uint8_t* copy = nullptr; uint32_t len = 0;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kUcatKeep && !copy; ++k) {
+        const UcatFrame& f = g_ucat_kept[k];
+        if (f.data && f.battle == q.battle && f.index == q.index && f.key == q.key) { copy = (uint8_t*)malloc(f.len); if (copy) { memcpy(copy, f.data, f.len); len = f.len; } }
+    }
+    LeaveCriticalSection(&g.cs);
+    if (copy) {
+        const bool ok = link_send(l, kHostPeer, copy, len);
+        log_line("UCAT", "-> peer %u asked for the cat data of unit %u (key %08x) of battle %016llx: %u bytes %s", (unsigned)l.id, (unsigned)q.index, (unsigned)q.key,
+                 (unsigned long long)q.battle, len, ok ? "sent" : "NOT sent (the link refused it)");
+        free(copy);
+        return;
+    }
+    UcatMsg none{};
+    none.battle = q.battle; none.index = q.index; none.key = q.key; none.status = kUcatNone;
+    uint8_t p[64];
+    const uint32_t n = enc_ucat(p, sizeof(p), none);
+    if (n) link_send(l, kHostPeer, p, n);
+    log_line("UCAT", "-> peer %u asked for the cat data of unit %u (key %08x) of battle %016llx: the host keeps none (answered 'none')", (unsigned)l.id, (unsigned)q.index,
+             (unsigned)q.key, (unsigned long long)q.battle);
+}
+void client_store_ucat(const uint8_t* payload, uint32_t plen) {
+    UcatMsg m{};
+    if (!g.cs_ready || !dec_ucat(payload, plen, m)) return;
+    UcatFrame f{};
+    f.battle = m.battle; f.index = m.index; f.key = m.key;
+    f.data = (uint8_t*)malloc(plen);
+    if (!f.data) return;
+    memcpy(f.data, payload, plen); f.len = plen;
+    EnterCriticalSection(&g.cs);
+    UcatFrame& slot = g_ucat_box[g_ucat_box_next++ % kUcatBox];
+    free(slot.data);
+    slot = f;
+    LeaveCriticalSection(&g.cs);
+}
+void client_store_ustate(const uint8_t* payload, uint32_t plen) {
+    if (!g.cs_ready || plen < 1 + 8 + 4 + 1) return;
+    UstateBox b{};
+    memcpy(&b.battle, payload + 1, 8); memcpy(&b.turn, payload + 9, 4); b.index = payload[13];
+    b.data = (uint8_t*)malloc(plen);
+    if (!b.data) return;
+    memcpy(b.data, payload, plen); b.len = plen;
+    EnterCriticalSection(&g.cs);
+    UstateBox& slot = g_us_box[g_us_box_next++ % kUsBox];
+    free(slot.data);
+    slot = b;
+    LeaveCriticalSection(&g.cs);
+}
+
 void host_answer_boardreq(Link& l, const BoardReqMsg& q) {
     if (!g.cs_ready || l.id >= kMaxPeers) return;
     uint8_t* copy = nullptr; uint32_t len = 0;
@@ -501,6 +638,8 @@ bool relayed(uint8_t type) {
         case MSG_SOULCAT:
         // NODEVOTE (proto 106): every player's pick of the next map node, for every other screen
         case MSG_NODEVOTE:
+        // VOICE (proto 107): every player's own microphone, for every other player's speakers
+        case MSG_VOICE:
         // NODEHASH is symmetric -- every peer authors its own -- so with more
         // than two players a client's has to reach the other clients, exactly
         // like the per-turn HASH above it.
@@ -562,7 +701,7 @@ void host_publish_roster() {
         if (!InterlockedCompareExchange(&l.live, 0, 0)) continue;
         PeersMsg mine = roster;
         mine.you = l.id;
-        uint8_t p[64];
+        uint8_t p[kSendPeers];
         uint32_t n = enc_peers(p, sizeof(p), mine);
         if (n) link_send(l, kHostPeer, p, n);
     }
@@ -610,6 +749,13 @@ void recv_loop(Link& link) {
         // thread may be mid-frame; the other clients should not wait on either.
         if (g.role == NetRole::Host && relayed(payload[0]))
             host_relay(from, payload, plen);
+
+        // proto 113 (mgmp_unitstate): a unit-record request is answered here, from the kept records; a record is put in the mailbox. Neither goes through the game thread.
+        if (payload[0] == MSG_USTATEREQ) { if (g.role == NetRole::Host) host_answer_ustatereq(link, payload, plen); continue; }
+        if (payload[0] == MSG_USTATE)    { if (g.role != NetRole::Host) client_store_ustate(payload, plen); continue; }
+        // proto 115: a unit's cat data, asked for and answered the same way
+        if (payload[0] == MSG_UCATREQ)   { if (g.role == NetRole::Host) host_answer_ucatreq(link, payload, plen); continue; }
+        if (payload[0] == MSG_UCAT)      { if (g.role != NetRole::Host) client_store_ucat(payload, plen); continue; }
 
         NetMsg m{};
         if (!decode_into(payload, plen, m)) {
@@ -670,8 +816,23 @@ void nodelay_on(SOCKET s) {
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
 }
 
+// A LINK IS WAITED FOR, NOT CLOSED (0.1.184, see mgmp_steambridge kWaitTimeoutMs). Windows gives up on a TCP connection whose data goes unacknowledged
+// after its retransmission limit (some tens of seconds); TCP_MAXRT -1 retransmits for as long as the socket lives (a day where -1 is refused).
+void wait_forever(SOCKET s) {
+#ifndef TCP_MAXRT
+#define TCP_MAXRT 5
+#endif
+    static LONG said = 0;
+    DWORD v = (DWORD)-1;
+    bool ok = setsockopt(s, IPPROTO_TCP, TCP_MAXRT, (const char*)&v, sizeof(v)) == 0;
+    if (!ok) { v = 24 * 3600; ok = setsockopt(s, IPPROTO_TCP, TCP_MAXRT, (const char*)&v, sizeof(v)) == 0; }
+    if (!InterlockedExchange(&said, 1))
+        log_line("NET", "a link whose other end goes quiet is waited for, not closed: TCP retransmits %s", !ok ? "with Windows' default limit (TCP_MAXRT refused)" : v == (DWORD)-1 ? "without a time limit" : "for a day");
+}
+
 bool start_link(int slot, SOCKET s, uint8_t id) {
     Link& l = g.links[slot];
+    wait_forever(s);
     l.sock = s;
     l.id   = id;
     // the outgoing queue of a fresh link: empty, with its own writer (a slot reused after a peer left starts clean; the old writer was stopped by its receive thread)
@@ -732,7 +893,7 @@ DWORD WINAPI accept_thread(LPVOID) {
             // Refuse politely rather than dropping the socket: a player who
             // turns up to a full session should be told, not left staring at a
             // connect that appears to succeed and then does nothing.
-            uint8_t p[128];
+            uint8_t p[kSendRefuseFull];
             uint32_t n = enc_refuse(p, sizeof(p), "session is full");
             if (n) send_framed(c, kHostPeer, p, n);
             log_line("NET", "!! refused a connection -- the session already has "
@@ -836,12 +997,15 @@ int rl_connect(SOCKET& out, volatile LONG* stop, LONG gen) {
     } else {
         addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
         addrinfo* res = nullptr;
-        if (getaddrinfo(g_rl_host, nullptr, &hints, &res) != 0 || !res) return WSAHOST_NOT_FOUND;
+        if ((getaddrinfo(g_rl_host, nullptr, &hints, &res) != 0 || !res) &&
+            (!official_fallback(g_rl_host) || getaddrinfo(official_fallback(g_rl_host), nullptr, &hints, &res) != 0 || !res)) return WSAHOST_NOT_FOUND;
         inet_ntop(AF_INET, &((sockaddr_in*)res->ai_addr)->sin_addr, ip, sizeof(ip));
         freeaddrinfo(res);
     }
     (void)stop; (void)gen;
-    return dial_one(ip, g_rl_port, out);
+    const int e = dial_one(ip, g_rl_port, out);
+    if (e == 0 && out != INVALID_SOCKET) wait_forever(out);     // the relay pipe's own hop (0.1.184)
+    return e;
 }
 
 // One line (up to 300 bytes), read byte by byte so that nothing after it is consumed. False on a timeout, a stop or a closed connection.
@@ -1151,12 +1315,58 @@ static uint8_t ordered_members(uint8_t* out) {
     return k;
 }
 
-uint8_t net_peer_pos() {
+// The place among the members who are HERE (host 0, then the others in seat order): 0..count-1. Only what has to split something evenly over the present players
+// wants this; a session cat's id carries the SEAT (net_peer_pos), which must not move when somebody leaves.
+uint8_t net_peer_rank() {
     uint8_t ids[kMaxPeers] = {};
     const uint8_t n = ordered_members(ids);
     for (uint8_t i = 0; i < n; ++i)
         if (ids[i] == g.self) return i;
     return 0;
+}
+
+// THE SEAT, STABLE (0.1.115; room 3KGX 2026-10-26, three players: the one in seat 1 dropped out and the player in seat 2 became "position 1" -- the dropped player's cats
+// (71......) were taken for its own, its real cats (72......) were taken out of the run "as another player's", and the settlement brought the OTHER player's cats home).
+// The index in the seat order the checkpoint fixed (net_set_seat_order), whoever has left since; before a seat order exists, the place among the present members.
+uint8_t net_peer_pos() {
+    if (g.roster_valid && g.seat_count)
+        for (uint8_t s = 0; s < g.seat_count; ++s)
+            if (g.seat_ids[s] == g.self) return s;
+    return net_peer_rank();
+}
+
+// How many positions exist: the seats of the session, or the players present when there is no seat order. A position below this may belong to somebody who has left.
+uint8_t net_seat_span() {
+    const uint8_t present = g.roster_valid ? (g.roster.count < kMaxPeers ? g.roster.count : (uint8_t)kMaxPeers) : 0;
+    return g.seat_count > present ? g.seat_count : present;
+}
+
+// WHO HOLDS A SEAT (0.1.119). A seat is the index in the seat order the checkpoint fixed from the players' identities (Steam id / install fingerprint), so "seat s" names a person for the whole run; the peer id
+// is only the connection that person has now. Without a seat order the place among the present members stands in for it.
+bool net_seat_peer(uint8_t pos, uint8_t& id) {
+    if (!g.roster_valid) return false;
+    uint8_t ids[kMaxPeers] = {};
+    const uint8_t n = ordered_members(ids);
+    if (g.seat_count) {
+        if (pos >= g.seat_count) return false;
+        for (uint8_t i = 0; i < n; ++i) if (ids[i] == g.seat_ids[pos]) { id = ids[i]; return true; }
+        return false;
+    }
+    if (pos >= n) return false;
+    id = ids[pos];
+    return true;
+}
+
+// The seats whose player has left the room. Level, not edge: it needs no memory of who was here when, so a player who left before anybody looked is found just the same.
+uint32_t net_absent_seats() {
+    if (!g.roster_valid || !g.seat_count) return 0;
+    uint32_t mask = 0;
+    for (uint8_t s = 0; s < g.seat_count && s < 32; ++s) {
+        bool here = false;
+        for (uint8_t i = 0; i < g.roster.count && i < kMaxPeers; ++i) if (g.roster.ids[i] == g.seat_ids[s]) here = true;
+        if (!here) mask |= 1u << s;
+    }
+    return mask;
 }
 
 bool net_peer_ids(uint8_t* out, uint8_t cap) {
@@ -1296,7 +1506,7 @@ bool net_send_peer(uint8_t peer, const uint8_t* payload, uint32_t len) {
 // Every encoder writes into a stack buffer and hands the result to net_send.
 // 512 bytes covers every phase-4 message; RUNSTATE will need its own path.
 #define MGMP_SEND_WITH(encoder, arg)                       \
-    uint8_t p[512];                                        \
+    uint8_t p[kSendSmall];                                 \
     uint32_t n = encoder(p, sizeof(p), arg);               \
     return n && net_send(p, n)
 
@@ -1309,7 +1519,7 @@ bool net_send_control(const ControlMsg& c) { MGMP_SEND_WITH(enc_control, c); }
 bool net_send_cursor (const CursorMsg& c)  { MGMP_SEND_WITH(enc_cursor,  c); }
 bool net_send_aim    (const AimMsg& m)     { MGMP_SEND_WITH(enc_aim,     m); }
 bool net_send_enter_node(const EnterNodeMsg& m) {
-    uint8_t p[1024];
+    uint8_t p[kSendEnterNode];
     const uint32_t n = enc_enter_node(p, sizeof(p), m);
     return n && net_send(p, n);
 }
@@ -1350,7 +1560,8 @@ bool net_send_catdigest(const CatDigestMsg& m) {
 bool net_send_hostleft(const HostLeftMsg& m) { MGMP_SEND_WITH(enc_hostleft, m); }
 bool net_send_page    (const PageMsg& m)     { MGMP_SEND_WITH(enc_page,     m); }
 bool net_send_nodevote(const NodeVoteMsg& m) { MGMP_SEND_WITH(enc_nodevote, m); }
-bool net_send_cats    (const CatsMsg& m)     { MGMP_SEND_WITH(enc_cats,     m); }
+bool net_send_voice(const VoiceMsg& m) { MGMP_SEND_WITH(enc_voice, m); }
+bool net_send_cats    (const CatsMsg& m)     { uint8_t p[kSendCats]; const uint32_t n = enc_cats(p, sizeof(p), m); return n && net_send(p, n); }   // 8 long names > 512 (0.1.182)
 // Host-authored, so it is NOT in relayed(): net_send already reaches every client.
 bool net_send_savewait(const SaveWaitMsg& m) { MGMP_SEND_WITH(enc_savewait, m); }
 // Peer-authored and relayed by the host (see relayed()).
@@ -1359,11 +1570,11 @@ bool net_send_roomctl(const RoomCtlMsg& m) { MGMP_SEND_WITH(enc_roomctl, m); }
 // Host-authored, so it is NOT in relayed(): net_send already reaches every client.
 bool net_send_mapseeds(const MapSeedsMsg& m) { MGMP_SEND_WITH(enc_mapseeds, m); }
 // Host-authored, so it is NOT in relayed() either.
-bool net_send_unlocks(const UnlocksMsg& m) { static thread_local uint8_t p[16384]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // 2048 since proto 78 (the class names)   // bigger than the 512-byte default since proto 62
+bool net_send_unlocks(const UnlocksMsg& m) { static thread_local uint8_t p[kSendUnlocks]; const uint32_t n = enc_unlocks(p, sizeof(p), m); return n && net_send(p, n); }   // 2048 since proto 78 (the class names)   // bigger than the 512-byte default since proto 62
 
 // Host-authored, so it is NOT in relayed() either. Bigger than the 512-byte default: a chunk is up to 16 units.
-bool net_send_board(const BoardMsg& m) { uint8_t p[1024]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_board_to(uint8_t peer, const BoardMsg& m) { uint8_t p[1024]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send_peer(peer, p, n); }
+bool net_send_board(const BoardMsg& m) { uint8_t p[kSendBoard]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_board_to(uint8_t peer, const BoardMsg& m) { uint8_t p[kSendBoard]; const uint32_t n = enc_board(p, sizeof(p), m); return n && net_send_peer(peer, p, n); }
 bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n) {
     n = 0;
     if (!g.cs_ready || !names || !node_id) return false;
@@ -1373,7 +1584,21 @@ bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n) 
     LeaveCriticalSection(&g.cs);
     return ok;
 }
-bool net_send_roll(const RollMsg& m) { uint8_t p[64]; const uint32_t n = enc_roll(p, sizeof(p), m); return n && net_send(p, n); }
+int net_host_tag_count(bool extra_events) {
+    if (!g.cs_ready) return -1;
+    EnterCriticalSection(&g.cs);
+    const int v = extra_events ? g_level_box.extra_events : g_level_box.event_difficulty;
+    LeaveCriticalSection(&g.cs);
+    return v;
+}
+int net_host_difficulty(uint64_t node_id) {
+    if (!g.cs_ready) return -1;
+    EnterCriticalSection(&g.cs);
+    const int d = node_id ? (g_level_box.bnode == node_id ? g_level_box.bdifficulty : -1) : g_level_box.difficulty;
+    LeaveCriticalSection(&g.cs);
+    return d;
+}
+bool net_send_roll(const RollMsg& m) { uint8_t p[kSendRoll]; const uint32_t n = enc_roll(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_host_roll(uint64_t battle, uint32_t seq, uint8_t site, RollMsg& out) {
     if (!g.cs_ready || !battle) return false;
     EnterCriticalSection(&g.cs);
@@ -1393,10 +1618,16 @@ void net_clear_battle_caches() {
     g_level_box = LevelBox{};
     for (uint32_t k = 0; k < kSumRing; ++k) g_sum_ring[k] = BoardSumMsg{};
     g_sum_next = 0;
+    for (uint32_t k = 0; k < kTqRing; ++k) g_tq_ring[k] = TurnQueueMsg{};
+    g_tq_next = 0;
     g_board_latest_battle = 0; g_board_latest_turn = 0;
     for (uint32_t k = 0; k < kBoardKeep; ++k) { free(g_kept[k].data); g_kept[k] = KeptBoard{}; }
     g_kept_next = 0;
     for (uint32_t p = 0; p < kMaxPeers; ++p) g_board_stream[p] = 0;
+    for (uint32_t k = 0; k < kUcatBox; ++k) { free(g_ucat_box[k].data); g_ucat_box[k] = UcatFrame{}; }      // a battle entered again keeps its id: an old fight's cat must not be taken
+    g_ucat_box_next = 0;
+    for (uint32_t k = 0; k < kUcatKeep; ++k) { free(g_ucat_kept[k].data); g_ucat_kept[k] = UcatFrame{}; }
+    g_ucat_kept_next = 0;
     LeaveCriticalSection(&g.cs);
 }
 bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
@@ -1412,11 +1643,11 @@ bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
 uint32_t net_board_publish(const BoardMsg* chunks, uint32_t n, const BoardSumMsg* sum) {
     if (!g.cs_ready || !chunks || !n || g.role != NetRole::Host) return 0;
     // the chunks, encoded once: [u32 length][payload] each
-    uint8_t* data = (uint8_t*)malloc((size_t)n * (4 + 1024));
+    uint8_t* data = (uint8_t*)malloc((size_t)n * (4 + 1536));
     if (!data) return 0;
     uint32_t len = 0;
     for (uint32_t c = 0; c < n; ++c) {
-        const uint32_t k = enc_board(data + len + 4, 1024, chunks[c]);
+        const uint32_t k = enc_board(data + len + 4, 1536, chunks[c]);
         if (!k) continue;
         memcpy(data + len, &k, 4);
         len += 4 + k;
@@ -1476,7 +1707,78 @@ bool net_board_seen_past(uint64_t battle, uint32_t turn) {
     return past;
 }
 
-bool net_send_boardreq(const BoardReqMsg& m) { uint8_t p[32]; const uint32_t n = enc_boardreq(p, sizeof(p), m); return n && net_send(p, n); }
+void net_ustate_publish(uint64_t battle, uint32_t turn, uint8_t* const* blobs, const uint32_t* lens, uint32_t n) {
+    if (!g.cs_ready || g.role != NetRole::Host) { for (uint32_t i = 0; i < n; ++i) free(blobs[i]); return; }
+    EnterCriticalSection(&g.cs);
+    KeptUstate* s = nullptr;
+    for (uint32_t k = 0; k < kUsKeep && !s; ++k) if (g_us_kept[k].battle == battle && g_us_kept[k].turn == turn) s = &g_us_kept[k];
+    if (!s) s = &g_us_kept[g_us_kept_next++ % kUsKeep];
+    for (uint32_t i = 0; i < kBoardMax; ++i) { free(s->blob[i]); s->blob[i] = nullptr; s->len[i] = 0; }
+    s->battle = battle; s->turn = turn;
+    for (uint32_t i = 0; i < n && i < kBoardMax; ++i) { s->blob[i] = blobs[i]; s->len[i] = lens[i]; }
+    LeaveCriticalSection(&g.cs);
+    for (uint32_t i = kBoardMax; i < n; ++i) free(blobs[i]);
+}
+bool net_ucat_keep(uint64_t battle, uint8_t index, int32_t key, uint64_t save_id, const uint8_t* image, uint32_t size, uint64_t hash) {
+    if (!g.cs_ready || g.role != NetRole::Host || !image || !size) return false;
+    UcatMsg m{};
+    m.battle = battle; m.index = index; m.key = key; m.save_id = save_id; m.status = kUcatImage; m.size = size; m.hash = hash; m.data = image;
+    const uint32_t cap = ucat_frame_size(m);
+    uint8_t* p = (uint8_t*)malloc(cap);
+    if (!p) return false;
+    const uint32_t n = enc_ucat(p, cap, m);
+    if (!n) { free(p); return false; }
+    EnterCriticalSection(&g.cs);
+    UcatFrame* f = nullptr;
+    for (uint32_t k = 0; k < kUcatKeep && !f; ++k) if (g_ucat_kept[k].data && g_ucat_kept[k].battle == battle && g_ucat_kept[k].index == index) f = &g_ucat_kept[k];
+    if (!f) f = &g_ucat_kept[g_ucat_kept_next++ % kUcatKeep];
+    free(f->data);
+    f->battle = battle; f->index = index; f->key = key; f->data = p; f->len = n;
+    LeaveCriticalSection(&g.cs);
+    return true;
+}
+bool net_send_ucatreq(const UcatReqMsg& m) { uint8_t p[32]; const uint32_t n = enc_ucatreq(p, sizeof(p), m); return n && net_send(p, n); }
+uint32_t net_host_ucat(uint64_t battle, uint8_t index, int32_t key, uint8_t* out, uint32_t cap) {
+    if (!g.cs_ready || !battle || !out) return 0;
+    uint32_t got = 0;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kUcatBox && !got; ++k) {
+        const UcatFrame& f = g_ucat_box[k];
+        if (f.data && f.battle == battle && f.index == index && f.key == key && f.len <= cap) { memcpy(out, f.data, f.len); got = f.len; }
+    }
+    LeaveCriticalSection(&g.cs);
+    return got;
+}
+bool net_send_ustatereq(const UstateReqMsg& m) { uint8_t p[32 + kUstateReqMax]; const uint32_t n = enc_ustatereq(p, sizeof(p), m); return n && net_send(p, n); }
+uint32_t net_host_ustate(uint64_t battle, uint32_t turn, uint8_t index, uint8_t* out, uint32_t cap) {
+    if (!g.cs_ready || !battle) return 0;
+    uint32_t got = 0;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kUsBox && !got; ++k) {
+        const UstateBox& b = g_us_box[k];
+        if (b.data && b.battle == battle && b.turn == turn && b.index == index && b.len <= cap) { memcpy(out, b.data, b.len); got = b.len; }
+    }
+    LeaveCriticalSection(&g.cs);
+    return got;
+}
+
+bool net_send_boardreq(const BoardReqMsg& m) { uint8_t p[kSendBoardReq]; const uint32_t n = enc_boardreq(p, sizeof(p), m); return n && net_send(p, n); }
+
+bool net_send_turnqueue(const TurnQueueMsg& m) {
+    if (g.role != NetRole::Host) return false;
+    uint8_t p[16 + 2 * kTurnQueueMax];
+    const uint32_t n = enc_turnqueue(p, sizeof(p), m);
+    return n && net_send(p, n);
+}
+bool net_host_turnqueue(uint64_t battle, uint32_t turn, TurnQueueMsg& out) {
+    if (!g.cs_ready || !battle) return false;
+    EnterCriticalSection(&g.cs);
+    bool ok = false;
+    for (uint32_t k = 0; k < kTqRing && !ok; ++k)
+        if (g_tq_ring[k].battle == battle && g_tq_ring[k].turn == turn) { out = g_tq_ring[k]; ok = true; }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
 
 bool net_host_pending(uint64_t node_id, PendingEnemy (*out)[kPendingMax], uint8_t* n, uint32_t* total) {
     for (uint32_t q = 0; q < kPendingQueues; ++q) { n[q] = 0; if (total) total[q] = 0; }
@@ -1505,7 +1807,7 @@ bool net_send_refuse (const char* reason) { MGMP_SEND_WITH(enc_refuse,  reason);
 #undef MGMP_SEND_WITH
 
 bool net_send_hello_to(uint8_t peer, const Hello& h) {
-    uint8_t p[512];
+    uint8_t p[kSendSmall];
     uint32_t n = enc_hello(p, sizeof(p), h);
     return n && net_send_peer(peer, p, n);
 }
@@ -1515,7 +1817,7 @@ bool net_send_hello_to(uint8_t peer, const Hello& h) {
 // pend_take cannot tell a replay from a live decision, correctly, because
 // there is no difference except who still needs it.
 bool net_send_action_to(uint8_t peer, const ActionMsg& a) {
-    uint8_t p[512];
+    uint8_t p[kSendSmall];
     uint32_t n = enc_action(p, sizeof(p), a);
     return n && net_send_peer(peer, p, n);
 }
@@ -1523,19 +1825,19 @@ bool net_send_action_to(uint8_t peer, const ActionMsg& a) {
 // To one peer: telling a joiner where the run is standing. A broadcast would
 // re-drive peers that are already in that node back into it.
 bool net_send_enter_node_to(uint8_t peer, const EnterNodeMsg& m) {
-    uint8_t p[1024];
+    uint8_t p[kSendEnterNode];
     uint32_t n = enc_enter_node(p, sizeof(p), m);
     return n && net_send_peer(peer, p, n);
 }
 
 bool net_send_welcome_to(uint8_t peer, const Welcome& w) {
-    uint8_t p[512];
+    uint8_t p[kSendSmall];
     uint32_t n = enc_welcome(p, sizeof(p), w);
     return n && net_send_peer(peer, p, n);
 }
 
 bool net_send_refuse_to(uint8_t peer, const char* reason) {
-    uint8_t p[512];
+    uint8_t p[kSendSmall];
     uint32_t n = enc_refuse(p, sizeof(p), reason);
     return n && net_send_peer(peer, p, n);
 }
@@ -1682,10 +1984,10 @@ bool net_send_statedump(const StateDumpMsg& m) {
     return ok;
 }
 
-bool net_send_uqd(const UqdMsg& m) { uint8_t p[128]; const uint32_t n = enc_uqd(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_ping(const PingMsg& m) { uint8_t p[96]; const uint32_t n = enc_ping(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_setting(const SettingMsg& m) { uint8_t p[16]; const uint32_t n = enc_setting(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_equip(const EquipMsg& m) { uint8_t p[160]; const uint32_t n = enc_equip(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_uqd(const UqdMsg& m) { uint8_t p[kSendUqd]; const uint32_t n = enc_uqd(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_ping(const PingMsg& m) { uint8_t p[kSendPing]; const uint32_t n = enc_ping(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_setting(const SettingMsg& m) { uint8_t p[kSendSetting]; const uint32_t n = enc_setting(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_equip(const EquipMsg& m) { uint8_t p[kSendEquip]; const uint32_t n = enc_equip(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_soulcat(const SoulCatMsg& m) {
     const uint32_t need = soulcat_frame_size(m);
     if (need > kMaxFrame) { log_line("NET", "!! a soul jar's cat is %u bytes, over the %u-byte frame cap", m.size, kMaxFrame); return false; }
@@ -1696,13 +1998,13 @@ bool net_send_soulcat(const SoulCatMsg& m) {
     free(p);
     return ok;
 }
-bool net_send_chat(const ChatMsg& m) { uint8_t p[320]; const uint32_t n = enc_chat(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_draw(const DrawMsg& m) { uint8_t p[320]; const uint32_t n = enc_draw(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_treasure(const TreasureMsg& m) { uint8_t p[160]; const uint32_t n = enc_treasure(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_housecoop(const HouseCoopMsg& m) { uint8_t p[96]; const uint32_t n = enc_housecoop(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_rngl(const RnglMsg& m) { uint8_t p[512]; const uint32_t n = enc_rngl(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_deep(const DeepMsg& m) { uint8_t p[2048]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }
-bool net_send_props(const PropsMsg& m) { uint8_t p[1024]; const uint32_t n = enc_props(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_chat(const ChatMsg& m) { uint8_t p[kSendChat]; const uint32_t n = enc_chat(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_draw(const DrawMsg& m) { uint8_t p[kSendDraw]; const uint32_t n = enc_draw(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_treasure(const TreasureMsg& m) { uint8_t p[kSendTreasure]; const uint32_t n = enc_treasure(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_housecoop(const HouseCoopMsg& m) { uint8_t p[kSendHouseCoop]; const uint32_t n = enc_housecoop(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_rngl(const RnglMsg& m) { uint8_t p[kSendSmall]; const uint32_t n = enc_rngl(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_deep(const DeepMsg& m) { uint8_t p[kSendDeep]; const uint32_t n = enc_deep(p, sizeof(p), m); return n && net_send(p, n); }
+bool net_send_props(const PropsMsg& m) { uint8_t p[kSendProps]; const uint32_t n = enc_props(p, sizeof(p), m); return n && net_send(p, n); }
 bool net_send_audit(const AuditMsg& m) {
     uint8_t* p = (uint8_t*)malloc(8192);
     if (!p) return false;
@@ -1755,6 +2057,20 @@ void net_msg_release(NetMsg& m) {
 bool net_poll(NetMsg& out) {
     if (!g.cs_ready) return false;
     EnterCriticalSection(&g.cs);
+    {   // 0.1.182: what a full queue cost, said where it can be seen (it used to be a count in the closing line only)
+        static uint32_t s_dropped = 0, s_evicted = 0;
+        static ULONGLONG s_said = 0;
+        if ((g.stats.dropped != s_dropped || g.evicted != s_evicted) && GetTickCount64() - s_said > 5000) {
+            const uint32_t d = g.stats.dropped - s_dropped, e = g.evicted - s_evicted;
+            const uint8_t last = g.dropped_last;
+            s_dropped = g.stats.dropped; s_evicted = g.evicted; s_said = GetTickCount64();
+            LeaveCriticalSection(&g.cs);
+            if (d) log_line_lvl(LogLevel::Warn, "NET", "!! receive queue FULL (%u slots, the game thread stopped draining): %u message(s) DROPPED, the last a %s; %u voice/pointer frame(s) pushed out",
+                                kQueueCap, d, msg_name(last), e);
+            else   log_line("NET", "receive queue full (%u slots, the game thread stopped draining): %u voice/pointer frame(s) pushed out to keep every game message", kQueueCap, e);
+            EnterCriticalSection(&g.cs);
+        }
+    }
     bool got = g.count > 0;
     if (got) {
         out = g.queue[g.head];

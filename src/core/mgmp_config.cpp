@@ -2,6 +2,7 @@
 #include "mgmp_addresses.h"
 #include "mgmp_tuning.h"
 #include "mgmp_paths.h"
+#include "mgmp_server_addr.h"   // 0.1.188: the official server by name
 
 #include "json.hpp"
 
@@ -22,6 +23,7 @@ using nlohmann::json;
 
 Config g_cfg;
 wchar_t g_dir[MAX_PATH] = {};   // where mgmp.json lives, remembered for config_set_beta_notice
+bool g_migrate_addr = false;    // 0.1.188: signal.addr was the official address -- the file is moved to the name at the end of the load
 
 void warn(const char* fmt, ...) {
     char note[256];
@@ -319,6 +321,8 @@ void hooks_implied_by(bool net_configured) {
 static wchar_t g_dll_dir_copy[MAX_PATH] = {};
 const wchar_t* config_dll_dir() { return g_dll_dir_copy; }
 
+static bool migrate_signal_addr_file();   // 0.1.188, below
+
 void config_load(const wchar_t* dll_dir) {
     wcsncpy_s(g_dll_dir_copy, MAX_PATH, dll_dir ? dll_dir : L"", _TRUNCATE);
     // Start from a fresh Config every time. The mod calls this once, so nothing
@@ -353,6 +357,7 @@ void config_load(const wchar_t* dll_dir) {
     // are genuinely worth having in it.
     json j = json::parse(in, nullptr, /*allow_exceptions=*/false,
                          /*ignore_comments=*/true);
+    in.close();     // 0.1.188: the file is free again -- migrate_signal_addr_file may swap it at the end of this load
     if (j.is_discarded() || !j.is_object()) {
         warn("mgmp.json is not valid JSON -- EVERY setting in it was ignored "
              "and the mod is running on defaults");
@@ -381,6 +386,10 @@ void config_load(const wchar_t* dll_dir) {
     if (const json* sig = member(j, "signal")) {
         read_bool(*sig, "enabled",      g_cfg.signal_on);
         read_str (*sig, "addr",         g_cfg.signal_addr, sizeof(g_cfg.signal_addr));
+        if (strcmp(g_cfg.signal_addr, kOfficialIp) == 0) {         // 0.1.188: the official server by its name (see migrate_signal_addr_file)
+            strncpy_s(g_cfg.signal_addr, sizeof(g_cfg.signal_addr), kOfficialHost, _TRUNCATE);
+            g_migrate_addr = true;
+        }
         read_str (*sig, "name",         g_cfg.signal_name, sizeof(g_cfg.signal_name));
         read_str (*sig, "room",         g_cfg.signal_room, sizeof(g_cfg.signal_room));
         read_bool(*sig, "auto_connect", g_cfg.signal_auto_connect);
@@ -402,13 +411,22 @@ void config_load(const wchar_t* dll_dir) {
         if (const json* v = member(*ui, "enemy_scale")) {
             if (v->is_number()) {
                 double d = v->get<double>();
-                if (d < 2.0 || d > 8.0) warn("ui.enemy_scale = %g is outside 2..8, clamped", d);
-                d = d < 2.0 ? 2.0 : d > 8.0 ? 8.0 : d;
+                if (d < 1.0 || d > 8.0) warn("ui.enemy_scale = %g is outside 1..8, clamped", d);   // 0.1.179: down to x1, the game's own numbers
+                d = d < 1.0 ? 1.0 : d > 8.0 ? 8.0 : d;
                 g_cfg.enemy_scale_half = (uint8_t)(d * 2.0 + 0.5);
             } else warn("ui.enemy_scale is not a number, kept %g", g_cfg.enemy_scale_half / 2.0);
         }
         read_bool(*ui, "exp_house_coop", g_cfg.exp_house_coop);
         read_bool(*ui, "exp_indep_events", g_cfg.exp_indep_events);
+        read_bool(*ui, "exp_voice", g_cfg.exp_voice);
+        if (const json* v = member(*ui, "voice_volume")) {
+            if (v->is_number()) {
+                double d = v->get<double>();
+                if (d < 0 || d > 200) warn("ui.voice_volume = %g is outside 0..200, clamped", d);
+                d = d < 0 ? 0 : d > 200 ? 200 : d;
+                g_cfg.voice_volume = (uint16_t)(d + 0.5);
+            } else warn("ui.voice_volume is not a number, kept %u", (unsigned)g_cfg.voice_volume);
+        }
         read_str (*ui, "player_name", g_cfg.ui_player_name, sizeof(g_cfg.ui_player_name));
         read_bool(*ui, "auto_upload_crash_log", g_cfg.auto_upload_crash_log);
     }
@@ -479,6 +497,12 @@ void config_load(const wchar_t* dll_dir) {
     const bool wants_coop = role_named || g_cfg.signal_on;
     g_cfg.coop_implied = wants_coop;
     hooks_implied_by(wants_coop);
+
+    if (g_migrate_addr) {
+        g_migrate_addr = false;
+        const bool saved = migrate_signal_addr_file();
+        warn("signal.addr was the server's address %s -- it is now its name %s (%s)", kOfficialIp, kOfficialHost, saved ? "mgmp.json updated" : "mgmp.json could not be updated, only for this run");
+    }
 }
 
 const Config& config() { return g_cfg; }
@@ -613,6 +637,38 @@ std::string config_rewrite_beta_notice(const std::string& text, bool on) { retur
 static bool write_ui_value(const char* key, const char* val);
 static bool write_ui_bool(const char* key, bool on) { return write_ui_value(key, on ? "true" : "false"); }
 
+// THE LOBBY BY ITS NAME (0.1.188, user request 2026-11-04): releases have shipped signal.addr = comeow.top since 0.1.153, but the updater keeps a player's own
+// mgmp.json, so every install made before still connects to the bare address. An mgmp.json whose signal.addr is the official address is moved to the name -- here,
+// and in the file (only that value inside the "signal" object; everything else in the file is left as written). The connection code falls back to the
+// address by itself when the name does not resolve (mgmp_server_addr.h), so nothing is lost on a machine without DNS.
+static bool migrate_signal_addr_file() {
+    if (!g_dir[0]) return false;
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\mgmp.json", g_dir);
+    std::string text;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const size_t sig = text.find("\"signal\"");
+    if (sig == std::string::npos) return false;
+    const size_t close = text.find('}', sig);
+    const std::string ip = std::string("\"") + kOfficialIp + "\"";
+    const size_t at = text.find(ip, sig);
+    if (at == std::string::npos || (close != std::string::npos && at > close)) return false;
+    const std::string out = text.substr(0, at) + "\"" + kOfficialHost + "\"" + text.substr(at + ip.size());
+    wchar_t tmp[MAX_PATH];
+    swprintf_s(tmp, L"%s.tmp", path);
+    {
+        std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+        o << out;
+        if (!o) { o.close(); DeleteFileW(tmp); return false; }
+    }
+    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp); return false; }
+    return true;
+}
+
 static bool write_ui_value(const char* key, const char* val) {
     if (!g_dir[0]) return false;
     wchar_t path[MAX_PATH];
@@ -650,6 +706,15 @@ bool config_set_exp_treasure(bool on) { g_cfg.exp_treasure = on; return write_ui
 bool config_set_exp_house_coop(bool on) { g_cfg.exp_house_coop = on; return write_ui_bool("exp_house_coop", on); }
 
 bool config_set_exp_indep_events(bool on) { g_cfg.exp_indep_events = on; return write_ui_bool("exp_indep_events", on); }
+bool config_set_exp_voice(bool on) { g_cfg.exp_voice = on; return write_ui_bool("exp_voice", on); }
+bool config_set_voice_volume(int pct, bool persist) {
+    pct = pct < 0 ? 0 : pct > 200 ? 200 : pct;
+    g_cfg.voice_volume = (uint16_t)pct;
+    if (!persist) return true;
+    char val[16];
+    _snprintf_s(val, sizeof(val), _TRUNCATE, "%d", pct);
+    return write_ui_value("voice_volume", val);
+}
 
 std::string config_json_string(const char* s) {
     std::string out = "\"";
@@ -670,7 +735,7 @@ bool config_set_player_name(const char* name) {
 }
 
 bool config_set_enemy_scale_half(uint8_t half, bool persist) {
-    if (half < 4) half = 4;
+    if (half < 2) half = 2;                  // x1 (0.1.179)
     if (half > 16) half = 16;
     g_cfg.enemy_scale_half = half;
     if (!persist) return true;

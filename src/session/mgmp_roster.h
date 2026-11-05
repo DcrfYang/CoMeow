@@ -208,8 +208,9 @@ bool roster_add_familiars(const uint64_t* ids, uint32_t count, const char* why);
 // Setup barrier helpers.  They replace the local party and establish the same
 // party=host/familiars=client layout on both peers before the map is entered.
 bool roster_setup_replace_party(const uint64_t* ids, uint32_t count, const char* why);
+// keep_gained (0.1.145): a resumed run keeps the gained cats (0x70000019+) its saved lists hold, after the clones.
 bool roster_setup_install_shared(const uint64_t* ids, uint32_t count,
-                                 const char* why);
+                                 const char* why, bool keep_gained = false);
 void roster_setup_set_ready(bool ready);
 
 // A PARTY message. kind 0 = a peer's picks (stored, and merged if we are peer 0);

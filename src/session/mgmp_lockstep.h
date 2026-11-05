@@ -171,6 +171,8 @@ void lockstep_reseed_decision(const void* brain, const void* out);
 // A RANDOM PICK BOTH PEERS MUST MAKE ALIKE, wherever the shared stream stands (0.1.74): sets the stream from (battle, turn, the acting unit, the current action's number, the n-th such pick of this
 // action, `salt`). The caller fences the stream around it (it is put back afterwards). False outside a room's snapshotted battle -- the stream is left alone then.
 bool lockstep_stream_for_pick(uint64_t salt, uint64_t* seed_out);
+void lockstep_battle_build_begin();   // the build of a battle opens the battle-start window: turn 0, no old-roster lookups, a fresh action count until the first turn boundary
+bool lockstep_presentation_seed(uint64_t salt, uint64_t st[4]);   // a state for TLS+0x198 that every peer derives alike (in a fight in a room), false otherwise
 
 // The armed click's landing point: apply AND broadcast, so both peers write the
 // same hp change. Local-only was the first version and it left the other peer
@@ -203,6 +205,23 @@ void lockstep_dev_arm_stat_repair();
 // when there is nothing to halt (no battle snapshotted in a session, or already halted).
 bool lockstep_dev_force_halt();
 const void* lockstep_dev_player_cat();
+const void* lockstep_dev_unit(uint32_t index);   // 0.1.190 DEV: roster entry `index` (null when out of range or gone)
+// DEV (mgmp_unitprobe): logs every unit of the live battle list (works in single player too); `deep` adds the raw field dumps. Returns the units logged.
+uint32_t lockstep_dev_unitprobe(bool deep);
+// The roster index of a unit of the current battle, -1 when it is none (mgmp_unitstate's log).
+int lockstep_unit_index(const void* chr);
+// 0.1.176 (mgmp_unitstate's gear repair): the named item made and equipped on `chr` the game's way (Item::make + equip_if_slot_free + items_changed) with this
+// durability and aux. The slot it went to, or < 0 (refused / faulted / not a cat).
+int lockstep_equip_named(void* chr, const char* name, int32_t durability, int32_t aux);
+// 0.1.192: the item in slot `slot` becomes a new item of GON name `name` with that durability/aux, the game's way (the gear page's swap, C_EquipSwap). `own`: the cat is this
+// player's -- the item of that name in this player's backpack is the one taken (no duplicate), the old one goes into the backpack; not own (another player's cat, an enemy):
+// the old item is taken out of this player's backpack again (it is not this player's). 1 = done, 0 = the slot does not hold the name afterwards, < 0 = not available / faulted.
+int lockstep_swap_item_named(void* chr, uint32_t slot, const char* name, int32_t durability, int32_t aux, bool own);
+// DEV (0.1.174, harness usdev): on THIS game only -- rotate three non-player roster entries (a -> b -> c -> a: the numbering the board must put back), or move unit u's entry
+// to the end of this round's turn queue (the order the queue sync must put back). False when refused.
+bool lockstep_dev_roster_rotate(uint32_t a, uint32_t b, uint32_t c);
+bool lockstep_dev_queue_last(uint32_t u);
+bool lockstep_dev_queue_drop(uint32_t u);   // 0.1.176 DEV: unit u's entry taken out of this round's queue (the node is left to leak: a test)
 
 // Send the tail of this log to the other player(s), who write it into theirs (PEERLOG lines): so that the one log a player uploads holds both sides.
 // Called on a desync, a halt and a failed checkpoint; rate-limited inside.
@@ -228,6 +247,7 @@ void lockstep_disarm_enemy_hit();
 uint64_t lockstep_battle_id();
 // The turn number of the battle in progress (0 outside one).
 uint32_t lockstep_turn();
+uint32_t lockstep_battle_gen();   // goes up at every battle build and save load: a per-battle counter that sees it change starts again (a local number -- never in a seed)
 // The first word the shared stream was last reseeded with (lockstep_reseed / lockstep_reseed_action: each actor-turn and each action). Both peers
 // reseed at the same points with the same numbers, so it names "this action" the same way everywhere; 0 before the first reseed. mgmp_dmgfence keys
 // each damage instance with it.

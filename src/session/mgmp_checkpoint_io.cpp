@@ -1,10 +1,13 @@
 #include "mgmp_checkpoint_io.h"
+#include "sqlite/sqlite3.h"
 #include <windows.h>
 #include <bcrypt.h>
 #include "mgmp_proto.h"
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
+#include <algorithm>
 #pragma comment(lib, "bcrypt.lib")
 
 namespace mgmp { namespace checkpoint_io {
@@ -106,9 +109,10 @@ bool identity(uint64_t& id, const wchar_t* adopt_root, bool* adopted) {
 }
 
 // Use SQLite's backup API, not a raw copy of a possibly WAL-backed live DB.
-// winsqlite3 is loaded from System32 only; no game SQLite pointers cross DLLs.
+// THE MOD'S OWN SQLITE (0.1.107, room XR8U): Windows' winsqlite3.dll was used, and an older Windows 10 ships one that cannot read the saves' STRICT tables --
+// every save was refused and a client's click on a slot did nothing. SQLite is compiled into mgmp.dll now (mgmp_sqlite.c); no game SQLite pointer crosses DLLs.
 struct Sql {
-    HMODULE module=nullptr;
+    bool module=false;
     int (*open)(const char*,void**,int,const char*)=nullptr;
     int (*close)(void*)=nullptr;
     int (*exec)(void*,const char*,int(*)(void*,int,char**,char**),void*,char**)=nullptr;
@@ -117,15 +121,16 @@ struct Sql {
     int (*finish)(void*)=nullptr;
     bool load() {
         if(module) return open && close && exec && init && step && finish;
-        module=LoadLibraryExW(L"winsqlite3.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if(!module) return false;
-#define GET(field, name) field=reinterpret_cast<decltype(field)>(GetProcAddress(module,name))
-        GET(open,"sqlite3_open_v2"); GET(close,"sqlite3_close"); GET(exec,"sqlite3_exec");
-        GET(init,"sqlite3_backup_init"); GET(step,"sqlite3_backup_step"); GET(finish,"sqlite3_backup_finish");
-#undef GET
+        module=true;
+        open=reinterpret_cast<decltype(open)>(&sqlite3_open_v2); close=reinterpret_cast<decltype(close)>(&sqlite3_close);
+        exec=reinterpret_cast<decltype(exec)>(&sqlite3_exec); init=reinterpret_cast<decltype(init)>(&sqlite3_backup_init);
+        step=reinterpret_cast<decltype(step)>(&sqlite3_backup_step); finish=reinterpret_cast<decltype(finish)>(&sqlite3_backup_finish);
         return open && close && exec && init && step && finish;
     }
 } sql;
+// What SQLite said about the last failed open/query of a save check, for the refusal line (empty when the last one worked).
+static char g_sql_why[200] = "";
+const char* sql_last_error() { return g_sql_why; }
 static std::string utf8(const std::wstring& s) {
     int n=WideCharToMultiByte(CP_UTF8,0,s.c_str(),-1,nullptr,0,nullptr,nullptr);
     if(n<1) return {}; std::string out(n,0);
@@ -235,10 +240,14 @@ static int run_row(void* result,int n,char** vals,char**) {
     if(n==1 && vals[0]) *(bool*)result=strcmp(vals[0],"0")!=0; return 0;
 }
 bool in_run(const std::wstring& source,bool& running) {
-    running=false; if(!sql.load()) return false;
+    running=false; g_sql_why[0]=0;
+    if(!sql.load()) { strcpy_s(g_sql_why,"sqlite unavailable"); return false; }
     void* db=nullptr;
-    bool ok=sql.open(utf8(source).c_str(),&db,1,nullptr)==0;
-    if(ok) ok=healthy(db) && sql.exec(db,"SELECT data FROM properties WHERE key='on_adventure'",run_row,&running,nullptr)==0;
+    const int rc=sql.open(utf8(source).c_str(),&db,1,nullptr);
+    bool ok=rc==0;
+    if(!ok) _snprintf_s(g_sql_why,sizeof(g_sql_why),_TRUNCATE,"open failed (%d: %s)",rc,db?sqlite3_errmsg((sqlite3*)db):"no handle");
+    if(ok && !healthy(db)) { ok=false; _snprintf_s(g_sql_why,sizeof(g_sql_why),_TRUNCATE,"quick_check is not ok (%s)",sqlite3_errmsg((sqlite3*)db)); }
+    if(ok && sql.exec(db,"SELECT data FROM properties WHERE key='on_adventure'",run_row,&running,nullptr)!=0) { ok=false; _snprintf_s(g_sql_why,sizeof(g_sql_why),_TRUNCATE,"the properties table cannot be read (%s)",sqlite3_errmsg((sqlite3*)db)); }
     if(db) sql.close(db); return ok;
 }
 // "Is this save's adventure already ON THE MAP?" The durable signal is
@@ -365,7 +374,96 @@ bool read_property(const std::wstring& source,const char* key,bool& have,std::st
     }
     if(db) sql.close(db); return ok;
 }
+// THE SAVE A RECOVERY REPLACES IS KEPT, EVERY TIME (0.1.123). `<save>.before-mgmp-recovery` was overwritten by the next recovery, so a second restore in a row (the usual case when a run is tried again) destroyed
+// the very copy of the player's own save from before the room. The previous copy is moved aside under a stamp first, and the five newest of those are kept.
+static void keep_previous_recovery_copy(const std::wstring& target) {
+    const std::wstring latest=target+L".before-mgmp-recovery";
+    if(GetFileAttributesW(latest.c_str())==INVALID_FILE_ATTRIBUTES) return;
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    wchar_t stamp[40]; swprintf_s(stamp,L".%04u%02u%02u-%02u%02u%02u",st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+    std::wstring aside=latest+stamp;
+    for(unsigned n=1;GetFileAttributesW(aside.c_str())!=INVALID_FILE_ATTRIBUTES && n<100;++n) aside=latest+stamp+L"-"+std::to_wstring(n);   // two in the same second
+    if(!MoveFileExW(latest.c_str(),aside.c_str(),0)) return;
+    std::vector<std::wstring> older;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h=FindFirstFileW((latest+L".*").c_str(),&fd);
+    if(h!=INVALID_HANDLE_VALUE) {
+        do { older.push_back(fd.cFileName); } while(FindNextFileW(h,&fd));
+        FindClose(h);
+    }
+    std::sort(older.begin(),older.end());
+    const size_t slash=target.find_last_of(L"\\/");
+    const std::wstring dir=slash==std::wstring::npos ? std::wstring() : target.substr(0,slash+1);
+    for(size_t i=0;i+5<older.size();++i) DeleteFileW((dir+older[i]).c_str());
+}
+// THE NOTE OF THE LAST RESTORE for the log of the caller (what the merge raised, what it left, or why it refused).
+static char g_restore_note[700]="";
+const char* restore_note() { return g_restore_note; }
+static void note_add(const char* fmt,const char* a="",const char* b="") {
+    const size_t at=strlen(g_restore_note);
+    if(at+8<sizeof(g_restore_note)) _snprintf_s(g_restore_note+at,sizeof(g_restore_note)-at,_TRUNCATE,fmt,a,b);
+}
+// The properties that only go UP in a save (an area unlocked, a token earned, the warehouse's upgrades) as an SQL condition on `col` -- the same list as mgmp_unlocks' unlocks_progress_key.
+static std::string progress_sql(const char* col) {
+    static const char* const like[]={"mapflag!_%","unlock!_%","map!_unlock!_%","sfunlockcounter!_%","PlotFlag!_%","AntennaQuest!_%","MeatWorldQuest!_%","TheRift!_%","TimeMachineQuest!_%",
+        "WorldEventLegacyToken!_%","GameStat!_%","SeenLevelup%","catinfo!_unlock!_%","%Unlocked"};
+    static const char* const exact[]={"house_storage_upgrades","house_pipe_unlocked","house_boss_times_fought","butch_box_unlocked","BonusBirdsKilled","savefile_timer","savefile_timer_adjusted",
+        "save_file_percent","departed_first_real_adventure","game_began","given_junk_furniture"};
+    std::string c="(";
+    for(const char* p:like) { c+=col; c+=" LIKE '"; c+=p; c+="' ESCAPE '!' OR "; }
+    c+=col; c+=" IN (";
+    for(size_t i=0;i<sizeof(exact)/sizeof(exact[0]);++i) { if(i) c+=","; c+="'"; c+=exact[i]; c+="'"; }
+    c+="))";
+    return c;
+}
+static int collect_row(void* result,int n,char** vals,char**) {
+    auto* o=static_cast<std::pair<unsigned*,std::string*>*>(result);
+    ++*o->first;
+    if(*o->first<=10 && n>=3 && vals[0]) { if(!o->second->empty()) *o->second+=", "; *o->second+=vals[0]; *o->second+=" "; *o->second+=vals[1]?vals[1]:"?"; *o->second+="->"; *o->second+=vals[2]?vals[2]:"?"; }
+    return 0;
+}
+static int text_row(void* result,int n,char** vals,char**) {
+    if(n>=1 && vals[0]) *static_cast<std::string*>(result)=vals[0];
+    return 0;
+}
+// THE RECOVERY MUST NOT TAKE PROGRESS AWAY (0.1.124). A recovery puts the run's checkpoint copy of the save over the live one: everything the live save had gained since -- an area unlocked, the
+// warehouse's upgrades -- is gone with it (the reports: the Ice Age route locked, the warehouse level lower, in a save that had been played solo in between). Each progress property that is HIGHER
+// in the live save is raised in the staged copy before it goes in; a property only the live save has is added. What is not progress that only goes up (gold, food, cats, the run itself) is the
+// checkpoint's, as before -- and the live save is kept whole beside it (.before-mgmp-recovery).
+static void merge_progress(const std::wstring& staged,const std::wstring& live_copy) {
+    if(!sql.load()) { note_add("progress merge: no sqlite; "); return; }
+    void* db=nullptr;
+    if(sql.open(utf8(staged).c_str(),&db,2,nullptr)!=0 || !db) { if(db) sql.close(db); note_add("progress merge: the staged save would not open; "); return; }
+    std::string live=utf8(live_copy); while(!live.empty() && live.back()==0) live.pop_back();      // utf8() counts the terminator
+    for(size_t i=0;i<live.size();++i) if(live[i]=='\'') { live.insert(i,"'"); ++i; }
+    char* aerr=nullptr;
+    bool ok=sql.exec(db,("ATTACH DATABASE '"+live+"' AS cur").c_str(),nullptr,nullptr,&aerr)==0;
+    if(!ok) { char m[260]; _snprintf_s(m,sizeof(m),_TRUNCATE,"progress merge: the live save would not attach (%s); ",aerr?aerr:"?"); note_add("%s",m); }
+    if(aerr) sqlite3_free(aerr);
+    if(ok) {
+        const std::string pk=progress_sql("p.key"), pk2=progress_sql("key");
+        const std::string raised="FROM properties p JOIN cur.properties c ON c.key=p.key WHERE "+pk+" AND typeof(p.data) IN ('integer','real') AND typeof(c.data) IN ('integer','real') AND c.data>p.data";
+        unsigned n=0; std::string names; std::pair<unsigned*,std::string*> o{&n,&names};
+        ok=sql.exec(db,("SELECT p.key,p.data,c.data "+raised).c_str(),collect_row,&o,nullptr)==0;
+        if(ok) ok=sql.exec(db,("UPDATE properties SET data=(SELECT c.data FROM cur.properties c WHERE c.key=properties.key) WHERE EXISTS (SELECT 1 FROM properties p JOIN cur.properties c ON c.key=p.key WHERE p.key=properties.key AND "+pk+" AND typeof(p.data) IN ('integer','real') AND typeof(c.data) IN ('integer','real') AND c.data>p.data)").c_str(),nullptr,nullptr,nullptr)==0;
+        unsigned added=0; std::string added_names; std::pair<unsigned*,std::string*> o2{&added,&added_names};
+        if(ok) ok=sql.exec(db,("SELECT key,'-',data FROM cur.properties WHERE "+pk2+" AND key NOT IN (SELECT key FROM properties)").c_str(),collect_row,&o2,nullptr)==0;
+        if(ok) ok=sql.exec(db,("INSERT OR IGNORE INTO properties(key,data) SELECT key,data FROM cur.properties WHERE "+pk2).c_str(),nullptr,nullptr,nullptr)==0;
+        std::string gold_live,gold_run,up_live,up_run;
+        sql.exec(db,"SELECT data FROM cur.properties WHERE key='house_gold'",text_row,&gold_live,nullptr);
+        sql.exec(db,"SELECT data FROM properties WHERE key='house_gold'",text_row,&gold_run,nullptr);
+        sql.exec(db,"SELECT data FROM cur.properties WHERE key='house_storage_upgrades'",text_row,&up_live,nullptr);
+        sql.exec(db,"SELECT data FROM properties WHERE key='house_storage_upgrades'",text_row,&up_run,nullptr);
+        char buf[300];
+        _snprintf_s(buf,sizeof(buf),_TRUNCATE,"progress merge %s: %u raised from the live save (%s), %u added (%s); warehouse gold live %s / checkpoint %s, upgrades %s / %s; ",ok?"done":"FAILED",n,names.c_str(),added,added_names.c_str(),
+                    gold_live.c_str(),gold_run.c_str(),up_live.c_str(),up_run.c_str());
+        note_add("%s",buf);
+        sql.exec(db,"DETACH DATABASE cur",nullptr,nullptr,nullptr);
+    }
+    sql.close(db);
+}
 bool restore(const std::wstring& target,const Bytes& bytes,bool require_run) {
+    g_restore_note[0]=0;
     // Called ONLY before ContinueSlot. Never replace an open game database.
     for(auto suffix:{L"-wal",L"-shm",L"-journal"})
         if(GetFileAttributesW((target+suffix).c_str())!=INVALID_FILE_ATTRIBUTES) return false;
@@ -383,7 +481,15 @@ bool restore(const std::wstring& target,const Bytes& bytes,bool require_run) {
         before.resize((size_t)n.QuadPart);
         ok=ReadFile(lease,before.data(),(DWORD)before.size(),&got,nullptr) && got==before.size();
     }
-    if(ok) ok=atomic_write(target+L".before-mgmp-recovery",before);
+    if(ok) { keep_previous_recovery_copy(target); ok=atomic_write(target+L".before-mgmp-recovery",before); }
+    if(ok) {
+        // ANOTHER ACCOUNT'S SAVE is never put over this one: both files name their owner (owner_steamid)
+        bool hl=false,hs=false; std::string ol,os;
+        read_property(target+L".before-mgmp-recovery","owner_steamid",hl,ol); read_property(staged,"owner_steamid",hs,os);
+        if(hl && hs && !ol.empty() && !os.empty() && ol!=os) { note_add("REFUSED: the checkpoint's save belongs to account %s, the live one to %s; ",os.c_str(),ol.c_str()); ok=false; }
+        else merge_progress(staged,target+L".before-mgmp-recovery");
+    }
+    if(!ok) DeleteFileW(staged.c_str());
     CloseHandle(lease); // Windows replacement itself needs to open the destination.
     if(ok) ok=MoveFileExW(staged.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
     return ok;

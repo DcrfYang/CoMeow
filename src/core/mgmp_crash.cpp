@@ -8,6 +8,7 @@
 #include "mgmp_prevrun.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_catsync.h"
+#include "mgmp_i18n.h"       // tr: the popup for a save the game could not read or write (0.1.170)
 
 #include <windows.h>
 
@@ -26,6 +27,7 @@ struct Record {
     DWORD     code = 0;
     void*     addr = nullptr;
     char      type[96] = {};              // the C++ type name, when we get one
+    char      what[200] = {};             // 0.1.168: the text it carries (a thrown std::string, or a std::exception's what())
     void*     frames[kMaxFrames] = {};
     USHORT    frame_count = 0;
 };
@@ -107,6 +109,32 @@ void type_name_of(const EXCEPTION_RECORD* er, char* out, size_t out_n) {
 
     size_t i = 0;
     for (; i + 1 < out_n && name[i]; ++i) out[i] = name[i];
+    out[i] = 0;
+}
+
+// WHAT THE THROW SAYS (0.1.168, a client's crash at the end of a lost run: the game's SQLSaveFile::DoError threw a std::string and only the type reached the log, so the
+// SQLite error it carried was lost). ExceptionInformation[1] is the thrown object. A std::string (MSVC: 16 bytes of buffer or a pointer, then size, then capacity) is read as
+// text; any other std:: type is taken for a std::exception, whose what() string is the pointer at +8. Every read is checked; anything odd leaves `out` empty.
+void what_of(const EXCEPTION_RECORD* er, const char* type, char* out, size_t out_n) {
+    out[0] = 0;
+    if (er->NumberParameters < 2 || !type[0] || !strstr(type, "@std@@")) return;
+    const uint8_t* obj = (const uint8_t*)er->ExceptionInformation[1];
+    if (!obj || !readable(obj, 32)) return;
+    const char* text = nullptr;
+    size_t len = 0;
+    if (strstr(type, "basic_string@D")) {
+        const uint64_t size = *(const uint64_t*)(obj + 16), cap = *(const uint64_t*)(obj + 24);
+        if (size > cap || size > 4096) return;
+        text = cap > 15 ? *(const char* const*)obj : (const char*)obj;
+        len = (size_t)size;
+    } else {
+        text = *(const char* const*)(obj + 8);
+        if (!text || !readable(text, 1)) return;
+        while (len < out_n - 1 && readable(text + len, 1) && text[len]) ++len;
+    }
+    if (!text || (len && !readable(text, len))) return;
+    size_t i = 0;
+    for (; i < len && i + 1 < out_n; ++i) { const unsigned char c = (unsigned char)text[i]; out[i] = (c < 0x20 || c == 0x7F) ? ' ' : (char)c; }
     out[i] = 0;
 }
 
@@ -228,7 +256,9 @@ void dump_pointers(const CONTEXT* c) {
 void dump_record(const char* why, const Record& r) {
     char at[128];
     describe(r.addr, at, sizeof(at));
-    if (r.type[0])
+    if (r.type[0] && r.what[0])
+        log_line("CRASH", "%s code %08lX '%s' at %s -- it says: \"%s\"", why, r.code, r.type, at, r.what);
+    else if (r.type[0])
         log_line("CRASH", "%s code %08lX '%s' at %s", why, r.code, r.type, at);
     else
         log_line("CRASH", "%s code %08lX at %s", why, r.code, at);
@@ -275,7 +305,7 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
     Record r;
     r.code = code;
     r.addr = er->ExceptionAddress;
-    if (code == kCppThrow) type_name_of(er, r.type, sizeof(r.type));
+    if (code == kCppThrow) { type_name_of(er, r.type, sizeof(r.type)); what_of(er, r.type, r.what, sizeof(r.what)); }
     r.frame_count = capture_frames(ep, r.frames, kMaxFrames);
 
     LONG slot = InterlockedIncrement(&g.ring_next) - 1;
@@ -372,6 +402,26 @@ void dump_session_context() {
 }
 
 // The crash handler's own upload of the log and dump (mgmp_prevrun): a second fault in here (the process may be in any state) must end this attempt, not the report.
+// THE PLAYER IS TOLD WHY (0.1.170, DESKTOP-TLE0N7N 2026-11-03: twice "database or disk is full" -- the game's SQLSaveFile::DoError threw it and the process went
+// down with no word to the player). For a fatal throw whose text is one of SQLite's storage errors, a message box after the log and the upload.
+char g_fatal_what[200] = {};
+void tell_save_error() {
+    const char* w = g_fatal_what;
+    if (!w[0]) return;
+    const bool full = strstr(w, "disk is full") || strstr(w, "SQLITE_FULL");
+    const bool io = full || strstr(w, "readonly") || strstr(w, "unable to open") || strstr(w, "disk I/O error") || strstr(w, "database is locked") ||
+                    strstr(w, "malformed") || strstr(w, "not a database") || strstr(w, "cannot open");
+    if (!io) return;
+    char text[1200];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_CRASH_SAVE), w, tr(full ? Tx::ERR_HINT_DISKFULL : Tx::ERR_HINT_SAVEIO));
+    wchar_t wt[1200] = {}, wh[200] = {};
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wt, 1199);
+    MultiByteToWideChar(CP_UTF8, 0, tr(Tx::ERR_CRASH_SAVE_TITLE), -1, wh, 199);
+    log_line("CRASH", "  the player is shown why: %s", text);
+    log_flush();
+    MessageBoxW(nullptr, wt, wh, MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
 void try_upload_crash_log() {
     __try {
         prevrun_crash_upload();
@@ -389,9 +439,10 @@ LONG WINAPI on_unhandled(EXCEPTION_POINTERS* ep) {
         Record r;
         r.code = ep->ExceptionRecord->ExceptionCode;
         r.addr = ep->ExceptionRecord->ExceptionAddress;
-        if (r.code == kCppThrow) type_name_of(ep->ExceptionRecord, r.type, sizeof(r.type));
+        if (r.code == kCppThrow) { type_name_of(ep->ExceptionRecord, r.type, sizeof(r.type)); what_of(ep->ExceptionRecord, r.type, r.what, sizeof(r.what)); }
         r.frame_count = capture_frames(ep, r.frames, kMaxFrames);
         dump_record("FATAL", r);
+        strncpy_s(g_fatal_what, sizeof(g_fatal_what), r.what, _TRUNCATE);
         dump_fault(ep);
         if (ep->ContextRecord) {
             dump_pointers(ep->ContextRecord);
@@ -418,6 +469,7 @@ LONG WINAPI on_unhandled(EXCEPTION_POINTERS* ep) {
 
     if (ep) write_minidump(ep);
     try_upload_crash_log();     // after the dump: the log and the dump are what is sent
+    tell_save_error();          // 0.1.170: a save read/write error is named to the player (after the upload: the box waits for a click)
     log_shutdown();
     return EXCEPTION_CONTINUE_SEARCH;   // let WER do what it would have done
 }

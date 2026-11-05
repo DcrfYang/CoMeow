@@ -19,6 +19,7 @@ void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_s
 bool leave_scene_live(const char*) { return false; }
 bool checkpoint_cleanup_due() { return false; }
 void checkpoint_cleanup_deferred(const char*) {}     // the warehouse trigger is not under test: no scene is ever live here
+bool checkpoint_archive_handshake_file(const std::wstring& path) { return DeleteFileW(path.c_str()) || GetLastError()==ERROR_FILE_NOT_FOUND; }   // the archive itself is tested in test_checkpoint
 // The journal's own reader is tested in test_checkpoint; here a file is a handshake save when the test says so (the file's bytes ARE the database).
 struct FakeHs { std::wstring name; uint8_t slot; uint64_t seq, stamp; bool boss; uint8_t stage = 0; };
 static std::vector<FakeHs> g_fake_hs;

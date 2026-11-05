@@ -26,6 +26,9 @@
 #include "mgmp_event_keys.h"
 #include "mgmp_spawntest.h"
 #include "mgmp_page.h"         // page_self / page_button_live: the screen an unlock check is asked on (UNLOCKSRC)
+#include "mgmp_treasure.h"     // treasure_rebuild_item_pools (0.1.154)
+#include "mgmp_follow.h"       // follow_here_seed / indepevt_own_node: a player's own random event keeps its own difficulty (0.1.167)
+#include "mgmp_indepevt.h"
 
 namespace mgmp {
 namespace {
@@ -202,6 +205,10 @@ struct HostProps {
     int32_t  value[kMax] = {};
     bool lookup(uint32_t h, int32_t& v) const { for (uint32_t i = 0; i < got; ++i) if (hash[i] == h) { v = value[i]; return true; } return false; }
 } hprops;
+
+// the host's LIVE map flags (one bit per kFlagNames entry), as its last CHAPTER kChapterFlags (generation 2) said -- what a mapflag_* read answers while it is known
+bool     g_hostflags_have = false;
+uint32_t g_hostflags = 0;
 
 // the key hash both peers use: the low 32 bits of the FNV-1a the game itself hashes a property name with
 uint32_t prop_key_hash(const char* key) {
@@ -418,6 +425,30 @@ void props_publish() {
     else if (n != last_n) { last_n = n; log_line("UNLOCK", "the host's whole save-property table sent to the clients: %u integer properties from the save file (%u of %u known keys equal to the live getter)", n, equal, found); }
 }
 
+// THIS GAME'S DIFFICULTY INDEX (0.1.167; see T_Difficulty), as the game's own function says it: called through its entry, so with the hook in place the
+// detour runs too and, this not being one of the shared call sites, hands back the game's own answer. -1 when it cannot be read.
+static int8_t own_difficulty(void* dir) {
+    typedef int32_t(__fastcall* fn_difficulty)(void* director, uint64_t with_items);
+    const auto fn = (fn_difficulty)addr_of(T_Difficulty);
+    if (!fn || !dir) return -1;
+    int32_t d = -1;
+    __try { d = fn(dir, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return (int8_t)(d < 0 ? 0 : d > 100 ? 100 : d);
+}
+
+// THIS GAME'S COUNT OF ONE ITEM TAG (0.1.170; see T_TagCount), through the hooked entry like own_difficulty (the detour hands back the game's own answer to a caller
+// that is not one of the shared sites). The tag is taken BY VALUE and destroyed by the callee, so it is built on the game's heap (make_key). -1 when it cannot be read.
+static int8_t own_tag_count(void* dir, fn_alloc alloc, const char* tag) {
+    typedef int32_t(__fastcall* fn_tag)(void* director, GameStr* tag);
+    const auto fn = (fn_tag)addr_of(T_TagCount);
+    if (!fn || !dir || !alloc) return -1;
+    GameStr k;
+    if (!make_key(k, tag, alloc)) return -1;
+    int32_t n = -1;
+    __try { n = fn(dir, &k); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return (int8_t)(n < 0 ? 0 : n > 100 ? 100 : n);
+}
+
 bool snapshot(UnlocksMsg& out) {
     const uintptr_t at = addr_of_data(D_MewDirectorPtr);
     void* dir = nullptr;
@@ -449,6 +480,10 @@ bool snapshot(UnlocksMsg& out) {
         if (!ask_property(save, get, alloc, event_keys::kKeys[i], v)) return false;
         out.events[i] = v < -2000000000LL ? -2000000000 : v > 2000000000LL ? 2000000000 : (int32_t)v;
     }
+    out.difficulty = own_difficulty(dir);   // proto 110
+    out.extra_events = own_tag_count(dir, alloc, "trigger_extra_event");               // proto 112
+    out.event_difficulty = own_tag_count(dir, alloc, "increase_event_difficulty");
+    log_line("DIFFICULTY", "the host's difficulty index %d goes with its unlock answers%s", (int)out.difficulty, unlocks_in_build() ? " (this battle's build)" : "");
     // proto 78: the class names the game's class-list function returns for this save, for both flag values (what the ability pools of "any unlocked class" are built from)
     if (auto fn = (fn_classes)addr_of(T_UnlockedClasses)) {
         for (int f = 0; f < 2; ++f) {
@@ -461,6 +496,93 @@ bool snapshot(UnlocksMsg& out) {
                  out.n_classes[1] == 255 ? "not read" : class_text(out.classes[1], out.n_classes[1]).c_str());
     }
     return true;
+}
+
+// --- THE ABILITY / PASSIVE POOL CACHES (0.1.154) ------------------------------------------------------------------------------------------------
+// Room 9FX7, 2026-10-31: Path of the Void (ConjureBonusAbility Colorless) gave the host's cat Path of the Fighter and the client's copy Path of the Thief
+// -- the same seed on both peers (RNGFRAME turn 12 #4), so the same index into two DIFFERENT lists. The pool a pick draws from (sub_1407B9F00, "Colorless",
+// "AnyUnlocked", a class name, "Jester" ...) is built once, keeping only the abilities the save has unlocked, and then CACHED in the registry by its name
+// (+0x1538, an unordered_map<std::string, GonObject>; the passive pools likewise at +0x1578, sub_1407BAA30). Only MewDirector::init empties the caches
+// (sub_1407AACD0, at every load). So a pool the client first built in its House -- with ITS unlocks: PathOfTheMonk, PathOfTheVoid and Metronome locked --
+// was the one every pick in the battle used, whatever the window answered: the host's answers only reach a pool built INSIDE the window. Same cause as
+// the cat whose slot 4 was 'TrainArms' on the client and 'PathOfTheMonk' on the host at turn 1 (a pick at the battle's build).
+// Now the two caches are emptied when a client's window opens and on the host as it publishes its answers at the same node entry (its own cache may be
+// older than the unlocks it publishes), and again after the window closes (the client's own pools come back from its own save). The game builds them again at the next pick, from the answers then in
+// force.
+// THE ITEM POOLS (+0x13D8) TOO (0.1.154, the same audit): sub_1407AB3D0 builds them at every load only, from the save's unlocked items, and the battle
+// draws from them -- EquipRandomTemporaryItemFromPool (a battle-start passive), ModelingClay's random weapon, an item's random_class_ability, the
+// events' get_item_from_pool. They are not built lazily, so they are built again at once (0 ms in the shared chest's logs, which has done it since
+// 0.1.75) at the same points: node entry (the host with its own answers, a client with the host's), the fight's reward (a client: its own), and
+// after the window.
+// WHEN A CLIENT'S OWN POOLS COME BACK: the unlock answers are the client's own again from the fight's end (unlocks_fight_released: the last kill, or
+// the level-up screen's constructor), and the level-up draws its options from the ability/passive pools. So the level-up screen's opener (a pre-call
+// hook: nothing of the game's is mid-pick there) empties them and rebuilds the items first. A fight's end seen inside an unlock check only asks for
+// the next frame (the abilities and passives; the items wait for the window's close: a reward screen may hold an item of theirs).
+// The map clear is the function sub_1407AACD0 calls on +0x1538 and +0x1578 (the same one for both, checked); it frees the game's nodes with the game's
+// allocator. Never called from inside a pick: the opening is at node entry, the closing's clear waits for the next frame (a window can close from an
+// unlock check, which can be inside sub_1407B9F00 or a caller still holding the GonObject it returned).
+constexpr size_t kAbilityPools = 0x1538, kPassivePools = 0x1578;
+typedef void (__fastcall* fn_map_clear)(void* map);
+bool call_map_clear(uintptr_t fn, void* map) { __try { ((fn_map_clear)fn)(map); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+
+// the registry the pool picks read: AlliesScrambleSpellAfterCast+0x53 is `mov rbx, [rip+disp]` (as mgmp_treasure finds it)
+void* pool_registry() {
+    const uint8_t* at = (const uint8_t*)addr_of(T_AlliesScramble);
+    uint8_t b[7] = {};
+    void* reg = nullptr;
+    if (at && mem_read(at + 0x53, b, sizeof(b)) && b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x1D) {
+        int32_t d = 0; memcpy(&d, b + 3, 4);
+        mem_read(at + 0x5A + d, &reg, sizeof(reg));
+    }
+    return reg;
+}
+
+// sub_1407AACD0: +0x09 add rcx, 1538h / +0x10 call MAPCLEAR / +0x15 lea rcx, [rbx+1578h] / +0x1C call MAPCLEAR
+uintptr_t pool_map_clear_fn() {
+    static uintptr_t fn = 0;
+    static bool tried = false;
+    if (tried) return fn;
+    tried = true;
+    const uint8_t* f = (const uint8_t*)addr_of_call(C_PoolCachesClear);
+    uint8_t b[0x21] = {};
+    if (!f || !mem_read(f, b, sizeof(b)) || b[0x10] != 0xE8 || b[0x1C] != 0xE8) {
+        log_line_lvl(LogLevel::Warn, "UNLOCK", "!! the pool caches' clear could not be read -- the ability pools stay as first built (a client's may differ from the host's)");
+        return 0;
+    }
+    int32_t r1 = 0, r2 = 0;
+    memcpy(&r1, b + 0x11, 4); memcpy(&r2, b + 0x1D, 4);
+    const uintptr_t t1 = (uintptr_t)f + 0x15 + (intptr_t)r1, t2 = (uintptr_t)f + 0x21 + (intptr_t)r2;
+    if (t1 != t2) {
+        log_line_lvl(LogLevel::Warn, "UNLOCK", "!! the pool caches' clear calls two different functions (+%llx / +%llx) -- not used", (unsigned long long)(t1 - (uintptr_t)f), (unsigned long long)(t2 - (uintptr_t)f));
+        return 0;
+    }
+    fn = t1;
+    return fn;
+}
+
+bool g_pools_reset_pending = false;     // the ability/passive caches go at the next frame
+bool g_items_reset_pending = false;     // ... and the item pools are built again then
+bool g_pools_hostbuilt = false;         // a client: the pools were built with the host's answers since the last reset to its own
+
+void pool_caches_reset(const char* why, bool items) {
+    g_pools_reset_pending = false;
+    if (items) {
+        g_items_reset_pending = false;
+        treasure_rebuild_item_pools(why);
+    }
+    const uintptr_t fn = pool_map_clear_fn();
+    uint8_t* reg = (uint8_t*)pool_registry();
+    if (!fn || !reg) {
+        if (fn) log_line_lvl(LogLevel::Warn, "UNLOCK", "!! the ability pool caches could not be emptied %s: the registry was not found", why);
+        return;
+    }
+    uint64_t na = 0, np = 0;
+    mem_read(reg + kAbilityPools + 0x10, &na, sizeof(na));          // std::unordered_map: the list's size at +0x10
+    mem_read(reg + kPassivePools + 0x10, &np, sizeof(np));
+    const bool ok = call_map_clear(fn, reg + kAbilityPools) && call_map_clear(fn, reg + kPassivePools);
+    if (ok) log_line("UNLOCK", "the ability/passive pool caches emptied %s (%llu ability pool(s), %llu passive pool(s) were cached) -- the next picks build them from the answers in force",
+                     why, (unsigned long long)na, (unsigned long long)np);
+    else    log_line_lvl(LogLevel::Error, "UNLOCK", "!! emptying the ability/passive pool caches %s FAULTED", why);
 }
 
 } // namespace
@@ -1137,7 +1259,7 @@ void unlocks_build_stage_end(const char* stage) {
 // The same cure: the load starts from a stream both peers derive from the stream they share at that moment, and when it is over the stream is set to another value derived the same way -- whatever
 // the load drew in between does not reach the next roll. (Both values are a function of the shared stream, so the fight's own randomness is not frozen; and the host's board still sets the stream at
 // every turn boundary as before.)
-namespace { bool g_mid_in = false; uint32_t g_mid_no = 0; uint64_t g_mid_seed = 0; int g_mid_depth = 0; }
+namespace { bool g_mid_in = false; uint32_t g_mid_no = 0; uint64_t g_mid_seed = 0, g_mid_battle = 0; int g_mid_depth = 0; char g_mid_what[48] = {}; }
 
 void unlocks_midbattle_load(const char* what) {
     if (g_mid_depth++ > 0) return;                                  // a load inside a load: the outer one's fence covers it
@@ -1149,13 +1271,26 @@ void unlocks_midbattle_load(const char* what) {
     uint64_t cur[4] = {};
     if (!mem_read(s, cur, sizeof(cur))) return;
     uint64_t x = cur[0] ^ (cur[1] * 0x9E3779B97F4A7C15ull) ^ (cur[2] * 0xBF58476D1CE4E5B9ull) ^ (cur[3] * 0x94D049BB133111EBull) ^ lockstep_battle_id() ^ 0x6D676D706D696431ull;      // NOT a running load counter: the two peers' counters can differ (a load one of them did not count), and a seed built on it parted the streams at the very first load (2026-10-03)
+    if (g_mid_battle != lockstep_battle_id()) { g_mid_battle = lockstep_battle_id(); g_mid_no = 0; }   // the log's cap is per battle (it was per session: a long session logged nothing of The Creator's clones)
     ++g_mid_no;                                                    // only for the log
+    snprintf(g_mid_what, sizeof(g_mid_what), "%s", what ? what : "?");
     g_mid_seed = x;
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = splitmix64(x);
     if (!mem_write(s, st, sizeof(st))) return;
     g_mid_in = true;
-    if (g_mid_no <= 64) log_line("RNGTRACE", "mid-battle load of '%s': the stream was %016llx, the load starts from %016llx", what ? what : "?", (unsigned long long)cur[0], (unsigned long long)st[0]);
+    if (g_mid_no <= 64) {
+        // WHO ASKED FOR IT (0.1.187): a unit loaded on one peer only (room P9HG 11-04: a 'CustomEnemyCat' on the host alone at the battle's start) is found by its callers
+        static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+        void* fr[10] = {};
+        const USHORT nf = RtlCaptureStackBackTrace(1, 10, fr, nullptr);
+        char chain[160] = {}; int cw = 0;
+        for (USHORT i = 0; i < nf && cw >= 0 && (size_t)cw < sizeof(chain) - 12; ++i) {
+            const uintptr_t a = (uintptr_t)fr[i];
+            if (a > base && a - base < 0x2000000) cw += _snprintf_s(chain + cw, sizeof(chain) - cw, _TRUNCATE, " %X", (unsigned)(a - base));
+        }
+        log_line("RNGTRACE", "mid-battle load of '%s': the stream was %016llx, the load starts from %016llx | callers:%s", what ? what : "?", (unsigned long long)cur[0], (unsigned long long)st[0], chain[0] ? chain : " ?");
+    }
 }
 
 void unlocks_midbattle_load_done() {
@@ -1165,6 +1300,11 @@ void unlocks_midbattle_load_done() {
     g_mid_in = false;
     uint64_t* s = rng_global_stream();
     if (!s) return;
+    if (g_mid_no <= 64) {
+        uint64_t ended = 0;
+        mem_read(s, &ended, sizeof(ended));
+        log_line("RNGTRACE", "mid-battle load of '%s' is over: the stream ended on %016llx (the same number of draws gives the same word on every peer)", g_mid_what, (unsigned long long)ended);
+    }
     uint64_t x = g_mid_seed ^ 0x6D676D706D696432ull;
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = splitmix64(x);
@@ -1190,9 +1330,67 @@ bool unlocks_describe_cat(void* catdata, uint64_t& id, char* text, size_t cap, u
     return id != 0;
 }
 
+// ---- THE DIFFICULTY INDEX OF SHARED THINGS (0.1.167, sim 41; see T_Difficulty) ----------------------------------------------------------------------------
+namespace { int g_ev_ctor_depth = 0; uint64_t g_diff_said_battle = 0; int g_diff_said_own = -2, g_diff_said_host = -2; }
+void unlocks_event_ctor(bool begin) { g_ev_ctor_depth += begin ? 1 : (g_ev_ctor_depth > 0 ? -1 : 0); }
+
+// THE TAG COUNTS OF SHARED THINGS (0.1.170, sim 43; see T_TagCount): an event node's extra events and a shared event's difficulty take the host's count in a room.
+int32_t unlocks_tag_count(uint32_t ra, int32_t own) {
+    const bool extra = ra == kRet_TagExtraEvent;
+    const bool evdiff = ra == kRet_TagEventDifficulty;
+    if ((!extra && !evdiff) || !net_active() || net_peer_count() < 2 || net_role() == NetRole::Host) return own;
+    if (evdiff && indepevt_own_node(follow_here_seed())) return own;      // a player's own random event (experimental): its own difficulty, as its own cats
+    const char* what = extra ? "an event node's extra events (trigger_extra_event, e.g. UltraVision3000)" : "a shared event's difficulty (increase_event_difficulty)";
+    const int host = net_host_tag_count(extra);
+    static int s_said_own[2] = { -2, -2 }, s_said_host[2] = { -2, -2 };
+    const int k = extra ? 0 : 1;
+    if (host < 0) {
+        if (s_said_host[k] != -1) { s_said_host[k] = -1; log_line_lvl(LogLevel::Warn, "TAGCOUNT", "!! %s: the host's count has not arrived -- this player's own (%d) is used", what, own); }
+        return own;
+    }
+    if (s_said_own[k] != own || s_said_host[k] != host) {
+        s_said_own[k] = own; s_said_host[k] = host;
+        log_line("TAGCOUNT", host != own ? "%s: this player counts %d, the host %d -- the host's is used" : "%s: %d, the same as the host's", what, own, host);
+    }
+    return host;
+}
+
+int32_t unlocks_difficulty(uint32_t ra, int32_t own) {
+    const bool battle = ra == kRet_DifficultyBattle;
+    const bool event = ra == kRet_DifficultyRow && g_ev_ctor_depth > 0;
+    if ((!battle && !event) || !net_active() || net_peer_count() < 2) return own;
+    const char* what = battle ? "the battle build's parameters (champions, elites, boss health)" : "a shared event's difficulty";
+    if (net_role() == NetRole::Host) {
+        if (battle && g_diff_said_battle != lockstep_battle_id()) {
+            g_diff_said_battle = lockstep_battle_id();
+            log_line("DIFFICULTY", "%s: the host's difficulty index %d (battle %016llx)", what, own, (unsigned long long)g_diff_said_battle);
+        }
+        return own;
+    }
+    if (event && indepevt_own_node(follow_here_seed())) return own;   // a player's own random event (experimental): its own difficulty, as its own cats
+    const uint64_t battle_id = battle ? lockstep_battle_id() : 0;
+    const int host = net_host_difficulty(battle_id);
+    if (host < 0) {
+        log_line_lvl(LogLevel::Warn, "DIFFICULTY", "!! %s: the host's difficulty index has not arrived%s -- this player's own (%d) is used, the battle may differ",
+                     what, battle ? " with the build information" : "", own);
+        return own;
+    }
+    if (battle ? g_diff_said_battle != battle_id : (g_diff_said_own != own || g_diff_said_host != host)) {
+        if (battle) g_diff_said_battle = battle_id;
+        g_diff_said_own = own; g_diff_said_host = host;
+        if (host != own)
+            log_line("DIFFICULTY", "%s: this player's difficulty index is %d, the host's %d -- the host's is used (an increase_difficulty item such as HardPill in one backpack%s)",
+                     what, own, host, battle ? "; room 86N5's champion TomTom" : "");
+        else
+            log_line("DIFFICULTY", "%s: difficulty index %d, the same as the host's", what, own);
+    }
+    return host;
+}
+
 void unlocks_battle_build() {
     g_in_build = false;
     if (!net_active() || net_peer_count() < 2) return;
+    lockstep_battle_build_begin();
     uint64_t* s = rng_global_stream();
     const uint64_t id = lockstep_battle_id();
     if (!s || !id) {
@@ -1419,7 +1617,11 @@ bool unlocks_window_active() {
 }
 
 static void publish_impl(const char* level, uint64_t level_node);
-void unlocks_publish() { publish_impl(nullptr, 0); }
+void unlocks_publish() {
+    // 0.1.154: the host's pools are built again from what it publishes now (its cache may predate an unlock); a client does the same as its window opens
+    if (net_active() && net_role() == NetRole::Host && net_peer_count() >= 2) pool_caches_reset("as the host publishes its unlock answers at node entry", true);
+    publish_impl(nullptr, 0);
+}
 
 static void publish_impl(const char* level, uint64_t level_node) {
     if (!net_active() || net_role() != NetRole::Host) return;
@@ -1441,6 +1643,7 @@ static void publish_impl(const char* level, uint64_t level_node) {
     }
     if (!net_send_unlocks(m)) return;
     props_publish();
+    unlocks_send_host_flags("node entry", true);
     predicted.n = m.n_spawn;
     for (uint32_t i = 0; i < m.n_spawn; ++i) { predicted.ids[i] = m.spawn_ids[i]; predicted.keys[i] = m.spawn_keys[i]; }
     if (m.n_spawn) {
@@ -1477,6 +1680,51 @@ void unlocks_props_on_message(uint8_t from, const PropsMsg& m) {
     }
 }
 
+// HOST: tell the clients the live map flags (CHAPTER kChapterFlags, generation 2; a client's own report is generation 1 and goes the other way). Sent at every node entry with the property table and
+// right after an event result that can change a flag; `force` sends even when nothing changed since the last one.
+void unlocks_send_host_flags(const char* why, bool force) {
+    static bool sent = false; static uint32_t last = 0;
+    if (!net_active()) { sent = false; return; }
+    if (net_role() != NetRole::Host || net_peer_count() < 2) return;
+    if (lockstep_fight_up()) return;                            // the getter's reads inside a fight are recorded in the unlock-query digest: not from here
+    uint32_t flags = 0;
+    if (!unlocks_mapflags_try(flags)) return;
+    if (!force && sent && flags == last) return;
+    ChapterMsg m{};
+    m.kind = kChapterFlags; m.generation = 2; m.act = 0; m.difficulty = 0; m.mapflags = flags;
+    if (!net_send_chapter(m)) return;
+    if (!sent || flags != last) log_line("UNLOCK", "the host's live map flags sent to the clients: %08x%s (%s)", (unsigned)flags, sent ? " (changed)" : "", why ? why : "?");
+    sent = true; last = flags;
+}
+
+// HOST, every frame an event screen is up: a flag an event result wrote a moment after the result returned still reaches the clients (throttled).
+void unlocks_host_flags_poll() {
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 200;
+    unlocks_send_host_flags("an event page", false);
+}
+
+// CLIENT: the host's live flags arrived. The answers a window has already given for those flags follow them, and the table's rows are corrected.
+void unlocks_on_host_flags(uint32_t flags) {
+    if (net_role() != NetRole::Client) return;
+    const bool first = !g_hostflags_have;
+    const uint32_t before = g_hostflags;
+    g_hostflags_have = true; g_hostflags = flags;
+    if (!first && before == flags) return;
+    unsigned moved = 0;
+    for (int i = 0; i < kFlagCount; ++i) {
+        const int32_t v = (int32_t)((flags >> i) & 1u);
+        char key[96];
+        _snprintf_s(key, sizeof(key), _TRUNCATE, "mapflag_%s", kFlagNames[i]);
+        const uint32_t h = prop_key_hash(key);
+        for (uint32_t k = 0; k < hprops.got; ++k) if (hprops.hash[k] == h) hprops.value[k] = v;
+        for (unsigned d = 0; d < win.dyn_n; ++d) if (win.dyn_hash[d] == h && win.dyn_virt[d] != v) { win.dyn_virt[d] = v; ++moved; }
+    }
+    log_line("UNLOCK", "the host's live map flags arrived: %08x (before: %s%08x) -- %u answer(s) already given in this window follow them", (unsigned)flags, first ? "none, " : "", (unsigned)before, moved);
+}
+
 void unlocks_on_message(uint8_t from, const UnlocksMsg& m) {
     if (net_role() != NetRole::Client || from != kHostPeer || !valid_unlocks(m)) return;
     if (m.n_abilities != unlock_lists::kAbilityCount || m.n_passives != unlock_lists::kPassiveCount ||
@@ -1504,6 +1752,11 @@ void unlocks_window_open(const char* why, bool event) {
     _snprintf_s(win.why, sizeof(win.why), _TRUNCATE, "%s", why ? why : "");
     log_line("UNLOCK", "window OPEN (%s): until the map is ready again (the %s) the unlock checks and the save properties answer with the host's", win.why,
              event ? "event" : "battle and its rewards");
+    // 0.1.154: the pools built again inside the window, with the host's answers (see pool_caches_reset)
+    char w[96];
+    _snprintf_s(w, sizeof(w), _TRUNCATE, "with the host's unlock answers as the window opens (%s)", win.why);
+    pool_caches_reset(w, true);
+    g_pools_hostbuilt = true;
 }
 
 const char* unlocks_window_why() { return win.on ? win.why : nullptr; }
@@ -1511,6 +1764,10 @@ const char* unlocks_window_why() { return win.on ? win.why : nullptr; }
 void unlocks_window_close(const char* why) {
     if (!win.on) return;
     win.on = false;
+    if (g_pools_hostbuilt || g_pools_reset_pending) {   // 0.1.154: the pools built with the host's answers go at the next frame (this can run inside a pick)
+        g_pools_reset_pending = true;
+        g_items_reset_pending = true;
+    }
     if (win.own_reads) log_line("HOUSE", "window closing (%s): %u read(s) of this player's own House/stash numbers inside it, all answered from this save", why ? why : "", win.own_reads);
     log_line("UNLOCK", "window CLOSED (%s) after %llu ms: checks ability %u, passive %u, item %u, level group %u, boss %u; answered differently from this save: %u, %u, %u, %u, %u; event properties read %u, differing %u",
              why ? why : "", (unsigned long long)(GetTickCount64() - win.at),
@@ -1519,13 +1776,89 @@ void unlocks_window_close(const char* why) {
 
 void unlocks_tick() {
     unlocksrc_tick();
+    if (g_pools_reset_pending && (!win.on || cls.released)) {
+        const bool items = g_items_reset_pending && !win.on;
+        pool_caches_reset(items ? "with this save's own unlocks after the window closed" : "with this save's own unlocks: the fight is over", items);
+        if (items) g_pools_hostbuilt = false;
+    }
+    if (!net_active() && g_hostflags_have) g_hostflags_have = false;      // the room is gone: the next one tells its own
     if (!win.on || win.left_map || !lockstep_battle_ready()) return;
     win.left_map = true;
     log_line("UNLOCK", "the battle is built (%u ability, %u passive, %u item, %u level group, %u boss check(s) so far) -- the window stays open until the map is ready again",
              win.checks[0], win.checks[1], win.checks[2], win.checks[3], win.checks[4]);
 }
 
+// THE MAP-FLAG GUARD (0.1.123). A player's own area unlocks (mapflag_IceAgeUnlocked ... the 27 of kFlagNames) only ever go UP in the game: nothing in its data clears one. A tester reported the Ice Age
+// route of the lab marked locked in a save after a session with a friend. Inside a room the mod answers these properties with the HOST's values (so every player's events and maps are the same), and a
+// save restore (CHECKPOINT RESTORE) replaces the local save file with an older copy: either could take a flag away from the real save. The save's REAL values are read here (own reads, which the answers
+// do not touch) every 2 s while a room is up and once more after it; a flag that was set and is not any more is set again, and the log says so (FLAGGUARD). The floor starts again at every save load.
+static uint32_t g_floor = 0;
+static bool     g_floor_have = false, g_floor_room = false;
+static ULONGLONG g_floor_next = 0;
+
+void unlocks_flagguard_reset() { g_floor = 0; g_floor_have = false; g_floor_room = false; g_floor_next = 0; }
+
+void unlocks_flagguard_tick() {
+    const bool room = net_active() && net_peer_count() >= 2;
+    if (room) g_floor_room = true;
+    else if (!g_floor_room) return;                                  // not in a room, and none since the save was loaded: the mod has not been near these flags
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_floor_next) return;
+    g_floor_next = now + 2000;
+    if (lockstep_fight_up() || g_own_read) return;
+    uint32_t flags = 0;
+    if (!unlocks_mapflags_try(flags) || flags == 0xFFFFFFFFu) return;   // no save loaded yet / a debug-unlocked save reads as everything
+    if (!g_floor_have) {
+        g_floor_have = true; g_floor = flags;
+        log_line("FLAGGUARD", "this save's own map flags, as the room found them: %08x", (unsigned)flags);
+    } else {
+        const uint32_t lost = g_floor & ~flags;
+        if (flags & ~g_floor) { log_line("FLAGGUARD", "this save's own map flags grew: %08x -> %08x", (unsigned)g_floor, (unsigned)(g_floor | flags)); g_floor |= flags; }
+        if (lost) {
+            const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+            auto alloc = (fn_alloc)addr_of_call(C_GameStrAlloc);
+            auto get = (fn_prop_int)addr_of_call(C_PropGetInt);
+            void* dir = nullptr;
+            unsigned fixed = 0;
+            char names[240] = {}; int w = 0;
+            if (at && alloc && get && mem_read((const void*)at, &dir, sizeof(dir)) && dir) {
+                void* props = (uint8_t*)dir + kDir_SaveProps;
+                for (int i = 0; i < kFlagCount; ++i) {
+                    if (!((lost >> i) & 1u)) continue;
+                    char key[96];
+                    _snprintf_s(key, sizeof(key), _TRUNCATE, "mapflag_%s", kFlagNames[i]);
+                    GameStr k;
+                    if (!make_key(k, key, alloc)) continue;
+                    hooks_prop_set_int(&k, 1);                      // the setter destroys the name
+                    bool on = false;
+                    if (read_flag(props, get, alloc, kFlagNames[i], on) && on) { ++fixed; if (w >= 0 && (size_t)w < sizeof(names) - 40) w += _snprintf_s(names + w, sizeof(names) - w, _TRUNCATE, " %s", kFlagNames[i]); }
+                }
+            }
+            log_line_lvl(LogLevel::Error, "FLAGGUARD", "!! %u of this save's own map flag(s) read 0 though they were set (%08x lost of %08x):%s -- %u set again", (unsigned)__popcnt(lost), (unsigned)lost, (unsigned)g_floor, names, fixed);
+        }
+    }
+    if (!room && g_floor_room) g_floor_room = false;                 // the one look after the room
+}
+
+// 0.1.130 (mgmp_progressguard): the guard's repair of the game's own copy -- the same setter FLAGGUARD uses.
+bool unlocks_set_own_progress(const char* key, int value) {
+    if (!key || !key[0]) return false;
+    const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+    auto alloc = (fn_alloc)addr_of_call(C_GameStrAlloc);
+    void* dir = nullptr;
+    if (!at || !alloc || !mem_read((const void*)at, &dir, sizeof(dir)) || !dir) return false;
+    GameStr k;
+    if (!make_key(k, key, alloc)) return false;
+    hooks_prop_set_int(&k, value);                          // the setter destroys the name
+    return true;
+}
+bool unlocks_host_property(const char* key, int32_t& value) {
+    if (!key || !hprops.have) return false;
+    return hprops.lookup(prop_key_hash(key), value);
+}
+
 void unlocks_on_map(bool ready) {
+    unlocks_flagguard_tick();
     if (g_wswap.on && ready && GetTickCount64() - g_wswap.at_ms > 3000 && !lockstep_fight_up()) weather_restore();   // the map does not tick during a fight, so "ready again" is the signal
     if (!win.on) return;
     if (!ready) { win.left_map = true; return; }
@@ -1625,11 +1958,17 @@ bool event_property_answer(const char* key, int64_t local, int64_t fallback, int
     // (unlocks_override_set, checked first); inside a window a map flag answers what the HOST's save says. The host's table is the integer rows of its save file, and a flag the host never earned
     // has no row: then the answer is the getter's own default, which is what the host's game reads too.
     const bool mapflag = strncmp(key, "mapflag_", 8) == 0;
-    if (hprops.have && hprops.got == hprops.total && strncmp(key, "SeenLevelup", 11) != 0 && strcmp(key, "on_adventure") != 0 &&
-        strcmp(key, "departed_first_real_adventure") != 0) {
+    // THE HOST'S LIVE MAP FLAGS (0.1.121, room KD8E: the time machine). The table above is the host's save FILE as of the node's entry; an event that unlocks an area (Quest_BrokenTimeMachine's
+    // trigger_adventure_unlock) changes a flag in the middle of the node, and the next page of the same event is built from it -- on the host with the new value, here with the table's old one: the host's
+    // page had two options (the Ice Age and "back"), this peer's one, and the host's choice could not be applied. The host now sends its live flags whenever they change (unlocks_send_host_flags).
+    const int live_bit = (mapflag && g_hostflags_have) ? unlocks_flag_bit(key + 8) : -1;
+    if (live_bit >= 0 || (hprops.have && hprops.got == hprops.total && strncmp(key, "SeenLevelup", 11) != 0 && strcmp(key, "on_adventure") != 0 &&
+        strcmp(key, "departed_first_real_adventure") != 0)) {
         const uint32_t h = prop_key_hash(key);
         int32_t host = 0;
-        bool known = hprops.lookup(h, host);
+        bool known = false;
+        if (live_bit >= 0) { host = (int32_t)((g_hostflags >> live_bit) & 1u); known = true; }
+        else known = hprops.lookup(h, host);
         if (!known && mapflag) { host = fallback < -2000000000LL ? -2000000000 : fallback > 2000000000LL ? 2000000000 : (int32_t)fallback; known = true; }
         if (known) {
             unsigned d = 0;
@@ -1655,20 +1994,73 @@ bool event_property_answer(const char* key, int64_t local, int64_t fallback, int
     return false;
 }
 
-void unlocks_property_set(const void* name, int value) {
-    if (!event_window_on()) return;
+// THE PROGRESS KEYS (0.1.124): the properties that only ever go UP in a save -- an area unlocked, a token earned, the warehouse's upgrades. The same list, as SQL patterns, is the restore's merge
+// (mgmp_checkpoint_io: merge_progress); keep the two together. Nothing here is a counter the game resets or spends (gold, food, the day, the run's own tokens are NOT in it).
+bool unlocks_progress_key(const char* key) {
+    if (!key || !key[0]) return false;
+    static const char* const kPrefix[] = { "mapflag_", "unlock_", "map_unlock_", "sfunlockcounter_", "PlotFlag_", "AntennaQuest_", "MeatWorldQuest_", "TheRift_", "TimeMachineQuest_",
+                                           "WorldEventLegacyToken_", "GameStat_", "SeenLevelup", "catinfo_unlock_" };
+    for (const char* p : kPrefix) if (strncmp(key, p, strlen(p)) == 0) return true;
+    const size_t n = strlen(key);
+    if (n > 8 && strcmp(key + n - 8, "Unlocked") == 0) return true;
+    static const char* const kExact[] = { "house_storage_upgrades", "house_pipe_unlocked", "house_boss_times_fought", "butch_box_unlocked", "BonusBirdsKilled", "savefile_timer",
+                                          "savefile_timer_adjusted", "save_file_percent", "departed_first_real_adventure", "game_began", "given_junk_furniture" };
+    for (const char* e : kExact) if (strcmp(key, e) == 0) return true;
+    return false;
+}
+
+namespace {
+// WHAT TO STORE when the game writes `value` to a property the window answered with `answered` while this save's own value is `own`. The answer is the host's (or this window's running value built on
+// it); a write the game derives from it -- a counter +1, a value stored back as it was read -- must not carry the HOST'S number into THIS player's save (the reported losses: the Ice Age flag, the
+// warehouse's level and money). Own progress never goes down; a counter moves by what the event added to it; a flag takes what the event set.
+int translate_write(const char* key, int64_t own, int32_t answered, int value) {
+    if (own == (int64_t)answered) return value;                          // host and save agree: the write is the save's own
+    if (unlocks_progress_key(key)) return (int)(value > own ? value : own);   // progress only goes up
+    const bool flag = (own == 0 || own == 1) && (answered == 0 || answered == 1) && (value == 0 || value == 1);
+    if (flag) return value;                                              // the event sets or clears a token: this save's token follows
+    if (value == answered) return (int)(own < -2000000000LL ? -2000000000 : own > 2000000000LL ? 2000000000 : own);   // written back as it was answered: no change to this save
+    if (value == 0 && answered > 1) return 0;                            // a reset
+    int64_t r = own + (int64_t)value - (int64_t)answered;                // a counter: what the event added or took, on this save's own number
+    if (r < 0 && own >= 0) r = 0;
+    if (r > 2000000000LL) r = 2000000000LL;
+    if (r < -2000000000LL) r = -2000000000LL;
+    return (int)r;
+}
+void note_translated(const char* key, int64_t own, int32_t answered, int value, int store) {
+    static unsigned lines = 0;
+    if (store != value && lines < 80) {
+        ++lines;
+        log_line_lvl(LogLevel::Warn, "PROPGUARD", "'%s': the game wrote %d on top of the host's %d; this save's own value was %lld -- %d is stored, not the host's number", key, value, (int)answered, (long long)own, store);
+    }
+}
+} // namespace
+
+// The int the setter should store. Called before the game's own setter runs; the window's answers move along with what the event writes (the reads that follow see the value as the event meant it),
+// but the SAVE gets this player's own number (translate_write).
+int unlocks_property_set(const void* name, int value) {
+    if (!event_window_on()) return value;
     char key[96] = {};
-    if (!name || !mem_read_std_string((const uint8_t*)name, key, sizeof(key))) return;
+    if (!name || !mem_read_std_string((const uint8_t*)name, key, sizeof(key))) return value;
+    if (unlocks_per_player_property(key)) return value;
     for (int i = 0; i < event_keys::kCount; ++i) {
         if (strcmp(event_keys::kKeys[i], key) != 0) continue;
+        int store = value;
+        if (win.prop_have[i]) store = translate_write(key, win.prop_last[i], win.prop_virt[i], value);
+        if (win.prop_have[i]) note_translated(key, win.prop_last[i], win.prop_virt[i], value, store);
         win.prop_have[i] = true;
-        win.prop_last[i] = value;
+        win.prop_last[i] = store;
         win.prop_virt[i] = value;
-        log_line("UNLOCK", "event property '%s' is being written by the event: %d (built on the host's %d) -- the reads follow it", key, value, (int)host_lists.msg.events[i]);
-        return;
+        log_line("UNLOCK", "event property '%s' is being written by the event: %d (built on the host's %d) -- the reads follow it; this save stores %d", key, value, (int)host_lists.msg.events[i], store);
+        return store;
     }
     const uint32_t h = prop_key_hash(key);
-    for (unsigned d = 0; d < win.dyn_n; ++d) if (win.dyn_hash[d] == h) { win.dyn_last[d] = value; win.dyn_virt[d] = value; return; }
+    for (unsigned d = 0; d < win.dyn_n; ++d) if (win.dyn_hash[d] == h) {
+        const int store = translate_write(key, win.dyn_last[d], win.dyn_virt[d], value);
+        note_translated(key, win.dyn_last[d], win.dyn_virt[d], value, store);
+        win.dyn_last[d] = store; win.dyn_virt[d] = value;
+        return store;
+    }
+    return value;
 }
 
 // ============================================================================================================================================
@@ -1691,6 +2083,7 @@ bool unlocks_fight_released() {
         cls.released = true;
         log_line("UNLOCK", "the unlock answers (abilities, passives, items, level groups, bosses, classes) are this save's own again: the fight is over (%s; the level-up and the rewards that follow use this save's unlocks)",
                  won ? "every enemy is down" : "the battle's character list is gone");
+        if (g_pools_hostbuilt) g_pools_reset_pending = true;     // 0.1.154: inside a check -- the next frame empties the pool caches
     }
     return cls.released;
 }
@@ -1760,10 +2153,17 @@ void unlocks_level_screen_opens() {
     if (!lockstep_active() || !lockstep_battle_ready()) return;    // an event's level-up is not a fight's reward: the window goes on there
     const uint64_t battle = lockstep_battle_id();
     if (cls.battle != battle) { cls = ClassState{}; cls.battle = battle; }
-    if (cls.released) return;
-    cls.released = true;
-    log_line("UNLOCK", "the unlock answers (abilities, passives, items, level groups, bosses, classes) are this save's own again: the fight is over (the level-up screen of its reward is being built; the level-up uses this save's unlocks)");
-    lockstep_log_standing("the fight is over here");
+    if (!cls.released) {
+        cls.released = true;
+        log_line("UNLOCK", "the unlock answers (abilities, passives, items, level groups, bosses, classes) are this save's own again: the fight is over (the level-up screen of its reward is being built; the level-up uses this save's unlocks)");
+        lockstep_log_standing("the fight is over here");
+    }
+    // 0.1.154: the level-up's options come from the pool caches -- built in the fight with the host's answers on a client. A pre-call hook (the screen's
+    // constructor), so nothing is mid-pick: emptied now, the items rebuilt, all with this save's own answers (released above).
+    if (g_pools_hostbuilt && net_role() == NetRole::Client) {
+        pool_caches_reset("with this save's own unlocks as the level-up screen of the fight's reward opens", true);
+        g_pools_hostbuilt = false;
+    }
 }
 
 void unlocks_classes_after(void* out_vector, bool with_colorless) {
@@ -2054,6 +2454,17 @@ void unlocksrc_tick() {
     if (g_src.on && GetTickCount64() - g_src.last > kSrcQuietMs) src_flush("a quiet second");
 }
 
+// THE NAMES THE HOST'S LISTS ANSWERED "UNLOCKED" while this save had them locked (0.1.130): the progress guard later says which of them this save still lacks -- the evidence for an unlock
+// the game may have skipped because it asked "is it unlocked already?" and the window said yes.
+static std::vector<std::pair<int, std::string>> g_host_only;
+static void host_only_note(int li, const char* name) {
+    static const int kBlobCat[5] = { 1, 2, 3, 6, 4 };   // UnlockList (ability, passive, item, level group, boss) -> the unlocks blob's list
+    if (!name || li < 0 || li > 4 || g_host_only.size() >= 200) return;
+    for (const auto& e : g_host_only) if (e.first == kBlobCat[li] && e.second == name) return;
+    g_host_only.push_back({ kBlobCat[li], name });
+}
+void unlocks_host_only_take(std::vector<std::pair<int, std::string>>& out) { out.swap(g_host_only); g_host_only.clear(); }
+
 static bool unlocks_window_answer_impl(UnlockList list, const char* name, bool local);
 bool unlocks_window_answer(UnlockList list, const char* name, bool local) {
     const bool host_answer = unlocks_window_answer_impl(list, name, local);
@@ -2075,6 +2486,7 @@ static bool unlocks_window_answer_impl(UnlockList list, const char* name, bool l
     ++win.overridden[li];
     if (host != local) {
         ++win.differing[li];
+        if (host && !local) host_only_note(li, name);
         if (win.logged < kMaxDifferenceLines) {
             ++win.logged;
             log_line("UNLOCK", "%s '%s': the host says %s, this save says %s -- answered with the host's",

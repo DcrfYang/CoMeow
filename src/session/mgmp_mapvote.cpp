@@ -47,6 +47,8 @@ struct State {
     bool      exec = false;           // the host's click ran, the node is not entered yet
     ULONGLONG exec_at = 0;
     bool      force = false;          // the host asked to go on without the others (Ctrl)
+    ULONGLONG arrived_at = 0;         // the party reached the host's pick; 0 = not there (yet)
+    ULONGLONG held_said = 0;
     uint64_t  exec_seed = 0;          // the node the host's click was run for (its seed word): the party "arrives" when the marker stands on it
     bool      exec_home = false;
     ULONGLONG click_at = 0;           // this player's last accepted click (debounce)
@@ -88,7 +90,7 @@ void members(uint8_t* ids, uint8_t& n) {
 void reset_locked(const char* why) {
     if (g.book.any() || g.exec) log_line("MAPVOTE", "the picks are forgotten (%s)", why);
     g.book.clear();
-    g.exec = false; g.force = false; g.said_blocked = ~0u;
+    g.exec = false; g.force = false; g.said_blocked = ~0u; g.arrived_at = 0;
     for (uint32_t& x : g.geo_logged) x = 0;
 }
 
@@ -156,26 +158,47 @@ bool node_stage(void* node, float& cx, float& cy, float& half, bool verbose, uin
 }
 
 // This player's click on a node: the mouse is on it. Only compared with the model (the log); how far off the model is, is what a later fix needs.
+// The marker's "at" is the game's own idea of where the party stands; a client's can be STALE (room KD8E, alley map, three runs in a row: the client's clicks on the shop,
+// node 12, opened the gear page -- the game's click on the party's own node -- or were swallowed silently, and the host's pick of it hung at "1 / 2" for ever; the host's
+// own clicks on it worked). The node the party REALLY stands on is the one the host last entered (follow_here_seed).
+bool party_really_on(void* node, void* at) { return node && node == at && follow_node_seed(node) == follow_here_seed(); }
+
+// A click that is NOT taken as a pick, with the reason: the 0.1.106 logs of two rooms ("the next node cannot be picked") could not say which gate turned the click away.
+void said_pass(const char* why, uint32_t idx, bool swallowed) {
+    static uint32_t last_idx = ~0u; static const char* last_why = nullptr; static int lines = 0;
+    if (lines >= 80 || (last_idx == idx && last_why == why)) return;
+    last_idx = idx; last_why = why; ++lines;
+    log_line("MAPVOTE", "a click on node %u is not taken as a pick: %s (%s)", idx, why, swallowed ? "the click is swallowed" : "the game's own click runs");
+}
+
 void note_click(void* node, uint32_t idx) {
     if (GetTickCount64() - g.mouse_at > 500) return;
     float cx, cy, half;
     if (!node_stage(node, cx, cy, half, false, idx)) return;
-    if (g.cal_lines < 40) { ++g.cal_lines; log_line("MAPVOTE", "click on node %u: mouse at stage (%.0f, %.0f), the model puts the node at (%.0f, %.0f): %+.0f / %+.0f", idx, g.mouse_x, g.mouse_y, cx, cy, g.mouse_x - cx, g.mouse_y - cy); }
+    if (g.cal_lines < 300) { ++g.cal_lines; log_line("MAPVOTE", "click on node %u: mouse at stage (%.0f, %.0f), the model puts the node at (%.0f, %.0f): %+.0f / %+.0f", idx, g.mouse_x, g.mouse_y, cx, cy, g.mouse_x - cx, g.mouse_y - cy); }
 }
 
 } // namespace
+
+bool mapvote_node_world(void* node, float& x, float& y) { return node_world(node, x, y, false, 0); }
 
 bool mapvote_on_click(void* node) {
     Lock lock;
     if (!node || !engaged()) return false;
     void* map = g.map ? g.map : follow_map_screen();
     uint32_t idx = 0;
-    if (!map || !follow_map_ready(map) || !follow_index_of(map, node, idx)) return false;      // not a node of this map: the game's own click
+    if (!map) { said_pass("no map screen seen yet", ~0u, false); return false; }
+    if (!follow_map_ready(map)) { said_pass("the map is still starting up or entering a node", ~0u, false); return false; }
+    if (!follow_index_of(map, node, idx)) { said_pass("not a node of the map the vote follows", ~0u, false); return false; }      // the game's own click
     void *marker = nullptr, *at = nullptr, *moving = nullptr, *sel = nullptr;
-    if (!follow_marker(map, marker, at, moving, sel)) return false;
-    if (node == at) return false;                                                               // the node the party stands on: the game clears its selection
-    if (moving) return true;                                                                    // the party is walking: the game ignores a click now as well
-    if (follow_node_consumed(node) || marker_blocks(marker, node)) {
+    if (!follow_marker(map, marker, at, moving, sel)) { said_pass("the party marker does not read", idx, false); return false; }
+    const bool host = net_role() == NetRole::Host;
+    if (party_really_on(node, at)) { said_pass("the party already stands on this node", idx, false); return false; }           // the game clears its selection
+    if (node == at) log_line("MAPVOTE", "node %u: the party marker says the party stands here but the host last entered another node -- this click is taken as a pick (stale marker)", idx);
+    // A client does not walk the party itself (the host's click does, on every peer): its marker's walking state and path check say nothing about whether its PICK is
+    // valid, and a stale one must not turn the pick away.
+    if (moving && host) { said_pass("the party is walking", idx, true); return true; }                                          // the game ignores a click now as well
+    if (follow_node_consumed(node) || (host && marker_blocks(marker, node))) {
         if (g.said_blocked != idx) { g.said_blocked = idx; log_line("MAPVOTE", "a click on node %u (%s): the party cannot walk there -- not a pick", idx, "blocked or behind"); }
         return true;
     }
@@ -200,6 +223,22 @@ void mapvote_on_message(uint8_t from, const NodeVoteMsg& m) {
     Lock lock;
     if (from >= kMaxPeers || from == net_self() || !engaged()) return;
     if (m.on) {
+        // Only a node that is ahead of the party on THIS map is taken in. The 0.1.106 logs showed the other way round: a pick put in, dropped by the tick as "no longer
+        // names a node ahead", sent again 1.5 s later, put in, dropped ... 118 times while the host's entry was held.
+        if (g.map && follow_map_ready(g.map)) {
+            void *marker = nullptr, *at = nullptr, *moving = nullptr, *sel = nullptr;
+            follow_marker(g.map, marker, at, moving, sel);
+            void* node = follow_node_by_index(g.map, m.index);
+            const bool entering = g.exec && node && follow_node_seed(node) == g.exec_seed;            // the host's own pick, walked to and waiting to be entered
+            if (!entering && (!node || follow_node_seed(node) != m.seed0 || follow_node_consumed(node) || party_really_on(node, at))) {
+                static uint8_t last_from = 0xFF; static uint32_t last_idx = ~0u; static uint64_t last_seed = 0;
+                if (last_from != from || last_idx != m.index || last_seed != m.seed0) {
+                    last_from = from; last_idx = m.index; last_seed = m.seed0;
+                    log_line("MAPVOTE", "peer %u's pick of node %u is not a node ahead of the party on this map -- not taken in", (unsigned)from, m.index);
+                }
+                return;
+            }
+        }
         if (g.book.put(from, m.seed0, m.index)) log_line("MAPVOTE", "peer %u picks node %u", (unsigned)from, m.index);
     } else if (g.book.is(from, m.seed0, m.index)) {
         g.book.drop(from);
@@ -231,7 +270,7 @@ void mapvote_tick(void* map, MapVoteClickFn click) {
     if (!follow_map_ready(map)) return;
     void *marker = nullptr, *at = nullptr, *moving = nullptr, *sel = nullptr;
     follow_marker(map, marker, at, moving, sel);
-    if (g.dumped_map != map) {                                                                  // every node's place in the layer, for the calibration
+    if (g.dumped_map != map && follow_node_count() > 0) {                                       // every node's place in the layer, for the calibration (once the map has its nodes)
         g.dumped_map = map;
         g.cam_lines = 0; g.cal_lines = 0; g.cam_logged_x = g.cam_logged_y = 1e9f;
         double cx = 0, cy = 0, cw = 0, ch = 0, cz = 0;
@@ -240,6 +279,8 @@ void mapvote_tick(void* map, MapVoteClickFn click) {
         for (int i = 0; i < 4; ++i) read_d(map, kMap_Bounds + 8 * i, b[i]);
         log_line("MAPVOTE", "camera: %s, at (%.1f, %.1f, %.1f), view %.1f x %.1f; bounds %.1f %.1f %.1f %.1f", cam_ok ? "read" : "NOT readable", cx, cy, cz, cw, ch, b[0], b[1], b[2], b[3]);
         const uint32_t cnt = follow_node_count();
+        { uint32_t ai = ~0u, mi = ~0u, si = ~0u; if (at) follow_index_of(map, at, ai); if (moving) follow_index_of(map, moving, mi); if (sel) follow_index_of(map, sel, si);
+          log_line("MAPVOTE", "party marker: at node %d, walking to node %d, selected node %d; the host last entered %016llx", (int)ai, (int)mi, (int)si, (unsigned long long)follow_here_seed()); }
         for (uint32_t i = 0; i < cnt && i < 64; ++i) {
             void* nd = follow_node_by_index(map, i);
             float wx = 0, wy = 0;
@@ -251,7 +292,11 @@ void mapvote_tick(void* map, MapVoteClickFn click) {
     for (uint8_t p = 0; p < kMaxPeers; ++p) {
         if (!g.book.has(p)) continue;
         void* node = follow_node_by_index(map, g.book.v[p].index);
-        if (!node || follow_node_seed(node) != g.book.v[p].seed0 || follow_node_consumed(node) || node == at) {
+        // The host's click walked the party onto the picked node (node == at) and the game's entry is HELD (the follow module's barrier: a checkpoint, a player on the gear
+        // screen, the room's setup): the picks stay until the node is really entered (here_seed changes), or the picks vanish while the node is not entered and nobody
+        // can pick again (0.1.106 logs, 118 lines of "forgotten").
+        const bool entering = g.exec && node && follow_node_seed(node) == g.exec_seed;
+        if (!entering && (!node || follow_node_seed(node) != g.book.v[p].seed0 || follow_node_consumed(node) || party_really_on(node, at))) {
             log_line("MAPVOTE", "peer %u's pick of node %u no longer names a node ahead -- forgotten", (unsigned)p, g.book.v[p].index);
             g.book.drop(p);
         }
@@ -266,7 +311,17 @@ void mapvote_tick(void* map, MapVoteClickFn click) {
     // THE HOST: every player has picked (or it holds Ctrl) -- its own pick is entered
     if (g.exec) {
         if (moving) { g.exec_at = now; return; }                                                // walking: the node is entered on arrival
-        if (at && follow_node_seed(at) == g.exec_seed) { g.exec_at = now; return; }             // arrived: EnterNode (or its barrier's retry) takes it from here
+        if (at && follow_node_seed(at) == g.exec_seed) {                                        // arrived: EnterNode (or its barrier's retry) takes it from here
+            g.exec_at = now;
+            if (!g.arrived_at) g.arrived_at = now;
+            if (now - g.arrived_at > 4000 && now - g.held_said > 20000) {
+                g.held_said = now;
+                log_line_lvl(LogLevel::Warn, "MAPVOTE", "the party stands on the host's pick and the node is still not entered after %llu s -- the game's entry is held (see the FOLLOW 'holding host node' lines; SETUP 'resume held' means the room's setup has not accepted the cats)",
+                             (unsigned long long)((now - g.arrived_at) / 1000));
+            }
+            return;
+        }
+        g.arrived_at = 0;
         const ULONGLONG limit = g.exec_home ? kClickTakeHomeMs : kClickTakeMs;
         if (now - g.exec_at > limit) {
             log_line("MAPVOTE", "the host's click did not take (the party did not move) -- its pick is taken back; it clicks again");
@@ -334,6 +389,11 @@ int mapvote_marks(MapVoteMark* out, int cap) {
         ++m;
     }
     return m;
+}
+
+bool mapvote_held() {
+    Lock lock;
+    return g.exec && g.arrived_at && GetTickCount64() - g.arrived_at > 3000;
 }
 
 bool mapvote_counts(unsigned& have, unsigned& total, bool& i_picked) {

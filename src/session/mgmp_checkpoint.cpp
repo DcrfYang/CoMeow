@@ -1,4 +1,5 @@
 #include "mgmp_checkpoint.h"
+#include "sqlite/sqlite3.h"
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
@@ -6,6 +7,8 @@
 #include "mgmp_lockstep.h"
 #include "mgmp_catsync.h"     // the clone -> original record rides in the journal
 #include "mgmp_room.h"        // the notice naming the join order the records were made under
+#include "mgmp_i18n.h"        // tr: the notice for two players nothing tells apart (0.1.160)
+#include "mgmp_menu.h"      // ui_error_popup: a file or save problem the player is shown (0.1.169)
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
@@ -260,9 +263,62 @@ bool marker(uint8_t mode) {
 bool erase(const wchar_t* suffix) {
     auto path=file(suffix); return DeleteFileW(path.c_str()) || GetLastError()==ERROR_FILE_NOT_FOUND;
 }
+// THE HANDSHAKE SAVES ARE A QUEUE OF 100 AND NOTHING ELSE REMOVES THEM (2026-10-26; before: the run's saves were deleted when it settled, when another run started, when the player
+// went solo and when a backup was loaded). A save that leaves the live queue of its run (settlement, another run's commit, a restore, a backup load) is MOVED to <save dir>\mgmp_handshake_old\<id>\
+// as "<pairing>-old.<n>" -- the same self-checking file, so the "restore from a handshake save" page reads it like any other -- and the oldest are dropped only when the live queue and the
+// archive of one pairing together exceed kKeepSaves. The recovery logic never looks in the archive (its names do not fit "<pairing>.<n>"), so an old run can not be offered as the run to resume.
+constexpr unsigned kKeepSaves=100;
+std::wstring archive_root(const std::wstring& root) {   // <save dir>\mgmp_handshake\<id>  ->  <save dir>\mgmp_handshake_old\<id>
+    const size_t cut=root.find_last_of(L'\\'); if(cut==std::wstring::npos) return {};
+    return root.substr(0,cut)+L"_old\\"+root.substr(cut+1);
+}
+std::vector<unsigned> numbered_files(const std::wstring& dir,const std::wstring& prefix) {   // "<prefix><digits>" in dir, ascending
+    std::vector<unsigned> out; WIN32_FIND_DATAW fd{};
+    HANDLE h=FindFirstFileW((dir+L"\\"+prefix+L"*").c_str(),&fd);
+    if(h==INVALID_HANDLE_VALUE) return out;
+    do {
+        const std::wstring name=fd.cFileName;
+        if(name.size()<=prefix.size() || name.compare(0,prefix.size(),prefix)!=0) continue;
+        const std::wstring tail=name.substr(prefix.size());
+        if(tail.size()>6 || tail.find_first_not_of(L"0123456789")!=std::wstring::npos) continue;
+        out.push_back((unsigned)std::stoul(tail));
+    } while(FindNextFileW(h,&fd));
+    FindClose(h); std::sort(out.begin(),out.end()); return out;
+}
+// A file that is a whole confirmed save of this machine (read without a room's say-so: another build's counts, it is a plain game save either way).
+bool archivable(const std::wstring& path) {
+    Bytes bytes; Entry e{};
+    if(!checkpoint_io::read(path,bytes) || !parse_entry(bytes,e,false,true)) return false;
+    return e.certificate.kind==kCheckpointCommit && e.certificate.run && e.certificate.seq && !e.database.empty();
+}
+void trim_archive(const std::wstring& root,const std::wstring& key) {
+    const std::wstring dir=archive_root(root); if(dir.empty()) return;
+    const unsigned live=(unsigned)numbered_files(root,key+L".").size();
+    const std::vector<unsigned> nums=numbered_files(dir,key+L"-old.");
+    const size_t budget=live>=kKeepSaves ? 0 : kKeepSaves-live;
+    unsigned dropped=0;
+    for(size_t i=0;nums.size()-i>budget;++i) if(DeleteFileW((dir+L"\\"+key+L"-old."+std::to_wstring(nums[i])).c_str())) ++dropped;
+    if(dropped) log_line("CHECKPOINT","archive: %u oldest handshake save(s) dropped (a pairing keeps %u)",dropped,kKeepSaves);
+}
+bool archive_path(const std::wstring& root,const std::wstring& key,const std::wstring& from) {
+    const std::wstring dir=archive_root(root); if(dir.empty()) return false;
+    const size_t cut=dir.find_last_of(L'\\');
+    CreateDirectoryW(dir.substr(0,cut).c_str(),nullptr);
+    if(!CreateDirectoryW(dir.c_str(),nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS) return false;
+    const std::vector<unsigned> nums=numbered_files(dir,key+L"-old.");
+    const unsigned n=nums.empty() ? 1u : (nums.back()>=999999u ? 1u : nums.back()+1u);
+    const std::wstring to=dir+L"\\"+key+L"-old."+std::to_wstring(n);
+    if(!MoveFileExW(from.c_str(),to.c_str(),MOVEFILE_WRITE_THROUGH)) return false;
+    return true;
+}
+bool archive_index(unsigned k) { return archive_path(g.root,g.key,qfile(k)); }
 bool cleanup() {
-    // Exact pairing only. No wildcard deletion of other runs or other local instances.
-    bool ok=true; for(unsigned k:queue_indices()) ok=erase_index(k)&&ok;
+    // Exact pairing only. No wildcard deletion of other runs or other local instances. The saves are not deleted: they go to the archive (see kKeepSaves).
+    bool ok=true;
+    for(unsigned k:queue_indices()) {
+        if(archivable(qfile(k))) ok=archive_index(k)&&ok; else ok=erase_index(k)&&ok;
+    }
+    trim_archive(g.root,g.key);
     return erase(L".pending")&&ok;
 }
 CheckpointRef reference(const Entry& e) {
@@ -297,11 +353,15 @@ bool promote(const CheckpointMsg& c) {
     std::vector<CheckpointRef> seen; seen.push_back(reference(g.pending));
     for(unsigned k:queue_indices()) {
         Entry e{};
-        bool ok=read_entry(qfile(k),e,true) && e.certificate.run==c.run;
+        const bool readable=read_entry(qfile(k),e,true);
+        bool ok=readable && e.certificate.run==c.run;
         if(ok) for(const auto& s:seen) if(equal(s,reference(e))) ok=false;
         if(ok) { keep.push_back(k); seen.push_back(reference(e)); }
-        else if(!erase_index(k)) return false;
+        else if(readable && e.certificate.run!=c.run) { if(!archive_index(k)) return false; }   // another run's save: kept, in the archive
+        else if(!erase_index(k)) return false;                                                  // unreadable, or an exact duplicate
     }
+    // The queue is 100 long: the oldest of this run's saves goes when the new one makes it 101.
+    while(keep.size()+1>kKeepSaves) { if(!erase_index(keep.back())) return false; keep.pop_back(); }
     // keep[r] goes to r+1. The ones that move UP (keep[r]==r) are a prefix: move them newest-last (descending); the ones that move DOWN
     // (keep[r]>r+1) move ascending. Either way the target is free when it is used.
     auto mv=[&](unsigned from,unsigned to) {
@@ -312,6 +372,7 @@ bool promote(const CheckpointMsg& c) {
     if(!checkpoint_io::atomic_write(qfile(0),encode_entry(g.pending))) return false;
     log_line("CHECKPOINT","journal: %u confirmed save(s) of run %016llx kept%s",(unsigned)keep.size()+1,(unsigned long long)c.run,
              (g.pending.flags&kCheckpointAfterBoss)?" -- the new one is AFTER THE CHAPTER BOSS":"");
+    trim_archive(g.root,g.key);
     return erase(L".pending");
 }
 // A restore puts the chosen entry at the head and KEEPS every other save of the same run (2026-10-04; it used to delete the ones newer than the
@@ -321,6 +382,10 @@ bool promote(const CheckpointMsg& c) {
 bool restore_queue(const Entry& chosen) {
     std::vector<Entry> older;
     const std::vector<unsigned> had=queue_indices();
+    for(unsigned k:had) {                                          // another run's save is not part of the chain: it goes to the archive before the chain is written over its place
+        Entry o{};
+        if(read_entry(qfile(k),o,true) && o.certificate.run!=chosen.certificate.run && !archive_index(k)) return false;
+    }
     for(unsigned k:had) {
         Entry o{};
         if(!read_entry(qfile(k),o,true) || o.certificate.run!=chosen.certificate.run || equal(reference(o),reference(chosen))) continue;
@@ -336,6 +401,7 @@ bool restore_queue(const Entry& chosen) {
     // Best effort: a leftover that cannot be deleted (a directory squatting on the name, a sharing
     // violation) must not fail a restore whose own entry is safely at the head.
     for(unsigned k:had) if(k>=chain.size()) erase_index(k);
+    trim_archive(g.root,g.key);
     return true;
 }
 bool has_candidate(const CheckpointMsg& m) { for(const auto& c:m.candidates) if(c.run) return true; return false; }
@@ -563,6 +629,28 @@ void configure_host() {
         m.identities[i]=g.selections[ids[i]].identity; m.identities2[i]=g.selections[ids[i]].identity2;
         m.hashes[i]=g.selections[ids[i]].token; // selection nonce, not a DB hash yet
     }
+    // ONE STEAM ID FOR TWO PLAYERS (0.1.160, room KD8E 2026-11-01: two machines on one LAN both reported Steam id 76561197960271872 -- an emulated Steam gives every
+    // install the same id). A participant list with two equal ids is refused below (and by every peer's configure), so the host never got to start. When the
+    // primary ids collide, the room uses each player's OTHER id -- the install fingerprint beside the DLL (mgmp-peer-id.bin) -- as the primary for everybody:
+    // configure accepts either id of a player, and resolve_paths looks for a run's records under both, so the same pair of players finds its run again.
+    // Only when the fingerprints collide too (one copied the other's whole mod folder) is it refused, and the players are told which file to delete.
+    {
+        bool dup=false;
+        for(unsigned i=1;i<n && !dup;++i) for(unsigned j=0;j<i;++j) if(m.identities[i]==m.identities[j]) { dup=true; break; }
+        if(dup) {
+            bool alt_ok=true;
+            for(unsigned i=0;i<n;++i) if(!m.identities2[i] || m.identities2[i]==m.identities[i]) alt_ok=false;
+            for(unsigned i=1;i<n && alt_ok;++i) for(unsigned j=0;j<i;++j) if(m.identities2[i]==m.identities2[j]) alt_ok=false;
+            if(!alt_ok) {
+                log_line_lvl(LogLevel::Error,"CHECKPOINT","!! two players have the same Steam id AND the same install fingerprint (mgmp-peer-id.bin -- a copied mod folder?): they cannot be told apart");
+                room_push_notice(tr(Tx::R_SAME_PLAYER_ID));
+                fail("two players have the same Steam id and the same install fingerprint (mgmp-peer-id.bin)");
+                return;
+            }
+            for(unsigned i=0;i<n;++i) std::swap(m.identities[i],m.identities2[i]);
+            log_line_lvl(LogLevel::Warn,"CHECKPOINT","!! two or more players report the same Steam id (an emulated or shared Steam?) -- the install fingerprints are this room's player ids instead");
+        }
+    }
     // THE SEATS (proto 86): the host first, the others by their persistent id (the Steam id where there is one), so the same players get the same positions
     // whichever of them connected first -- and with them the same session cat ids, owner notes and journal name (net_set_seat_order). Selection sort: four at most.
     for(unsigned i=1;i<n;++i) for(unsigned j=i+1;j<n;++j) {
@@ -701,8 +789,15 @@ void apply_select(const CheckpointMsg& m) {
         Entry e{};
         if(!find({m.run,m.seq,m.stamp,m.token},e) || !checkpoint_io::restore(g.path,e.database,checkpoint_stage_of_seq(m.seq)==0) ||
            !restore_queue(e)) {
+            if(checkpoint_io::restore_note()[0]) log_line_lvl(LogLevel::Warn,"CHECKPOINT","RESTORE: %s",checkpoint_io::restore_note());
+            {   // 0.1.169: the player is told, not only the log (room KD8E: this refusal looked like "the save pick keeps starting over")
+                char text[1024];
+                _snprintf_s(text,sizeof(text),_TRUNCATE,tr(Tx::ERR_RESTORE),checkpoint_io::restore_note()[0]?checkpoint_io::restore_note():"selected snapshot unavailable, corrupt or local save is open");
+                ui_error_popup(tr(Tx::ERR_FILE_TITLE),text);
+            }
             fail("recovery refused: selected snapshot unavailable, corrupt or local save is open"); return;
         }
+        if(checkpoint_io::restore_note()[0]) log_line("CHECKPOINT","RESTORE: %s",checkpoint_io::restore_note());
         // Repopulate the ownership table from the journal BEFORE the game loads
         // the save: a resumed run can walk straight into the home node, and the
         // settlement's ownership filter must not wait for a battle's split.
@@ -894,7 +989,10 @@ static bool select_impl(uint8_t slot,const wchar_t* path,bool inSession) {
         return false;
     }
     bool running=false;
-    if(!checkpoint_io::in_run(selected_path,running)) { fail("save selection refused: unreadable or invalid SQLite save"); return false; }
+    if(!checkpoint_io::in_run(selected_path,running)) {
+        log_line_lvl(LogLevel::Error,"CHECKPOINT","!! the save %ls could not be checked: %s (sqlite %s)",selected_path.c_str(),checkpoint_io::sql_last_error(),sqlite3_libversion());
+        fail("save selection refused: unreadable or invalid SQLite save"); return false;
+    }
     if(!net_active() || net_peer_count()<2) {   // only the in-session next chapter gets here
         status("unfinished save held; reconnect all players and select saves again");
         return false;
@@ -1173,12 +1271,14 @@ void checkpoint_cleanup_deferred(const char* why) {
             if(!queue && tail!=L"pending") continue;                  // the tombstone (.state) and anything else stays
             const std::wstring path=root+L"\\"+name;
             Entry e{};
-            if(!read_entry(path,e,false) || e.certificate.run!=run) { ++kept; continue; }   // another run's file, or one this build cannot read: not ours to delete
-            if(DeleteFileW(path.c_str())) ++erased; else ++kept;
+            if(!read_entry(path,e,false) || e.certificate.run!=run) { ++kept; continue; }   // another run's file, or one this build cannot read: not ours to touch
+            if(queue && archivable(path)) { if(archive_path(root,key,path)) ++erased; else ++kept; }   // a save: to the archive (kKeepSaves), not away
+            else if(DeleteFileW(path.c_str())) ++erased; else ++kept;                                  // the staged .pending: not a save
         } while(FindNextFileW(h,&fd));
         FindClose(h);
     }
-    log_line("CHECKPOINT","%s: the run's handshake saves are cleaned now (%u file(s) deleted, %u left)",why?why:"warehouse",erased,kept);
+    trim_archive(root,key);
+    log_line("CHECKPOINT","%s: the run's handshake saves are moved to the archive now (%u file(s), %u left where they were)",why?why:"warehouse",erased,kept);
 }
 // ONE JOURNAL FILE, READ WITHOUT A ROOM (2026-10-05): the main menu's "restore from a handshake save" page lists what the folders hold and puts one save back over a slot. Every file is a whole,
 // self-checking save of this player's own slot: its certificate says which slot (the position whose hash is the database's) and when it was confirmed. The build identity is not required to match -- the
@@ -1196,6 +1296,30 @@ bool checkpoint_peek_file(const std::wstring& path,uint64_t folder_id,HandshakeS
     info.slot=m.slots[pos]; info.players=m.count; info.after_boss=(e.flags&kCheckpointAfterBoss)!=0; info.stage=checkpoint_stage_of_seq(m.seq); info.run=m.run; info.seq=m.seq; info.stamp=m.stamp;
     if(database) *database=std::move(e.database);
     return true;
+}
+// THE NOTES OF A HANDSHAKE SAVE RESTORED FROM THE BACKUP PAGE (0.1.170, 2026-11-03): a run recovered in a room gets the journal's owner and clone-origin notes back
+// (apply_select), a run put back from the backup page did not -- played on alone, its settlement found no note naming its clones as this run's, took the run for
+// a solo one and never merged them: the House showed the originals as they left (level 1, the gear still on). The entry the save was taken from carries both.
+bool checkpoint_import_notes_file(const std::wstring& path) {
+    Bytes bytes; if(!checkpoint_io::read(path,bytes)) return false;
+    Entry e{}; if(!parse_entry(bytes,e,false,true)) return false;
+    if(e.owner_count) lockstep_owner_note_import(e.owners,e.owner_count);
+    if(e.origin_count) catsync_origin_import(e.origins,e.origin_count);
+    log_line("CHECKPOINT","backup page restore: %u owner note(s) and %u clone-origin note(s) taken from the handshake save",e.owner_count,e.origin_count);
+    return true;
+}
+// One file of the live handshake folder that is about to be removed by someone else (a backup load puts its own queue in its place): a save goes to the archive, anything else is deleted.
+bool checkpoint_archive_handshake_file(const std::wstring& path) {
+    const size_t bs=path.find_last_of(L'\\'), dot=path.find_last_of(L'.');
+    if(bs!=std::wstring::npos && dot!=std::wstring::npos && dot>bs) {
+        const std::wstring root=path.substr(0,bs), key=path.substr(bs+1,dot-bs-1), tail=path.substr(dot+1);
+        if(!tail.empty() && tail.size()<=6 && tail.find_first_not_of(L"0123456789")==std::wstring::npos && archivable(path)) {
+            if(!archive_path(root,key,path)) return false;
+            trim_archive(root,key);
+            return true;
+        }
+    }
+    return DeleteFileW(path.c_str()) || GetLastError()==ERROR_FILE_NOT_FOUND;
 }
 bool checkpoint_on_alone() {
     if(!g.configured || !g.run) return true;

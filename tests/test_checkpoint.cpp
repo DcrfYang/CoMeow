@@ -120,6 +120,9 @@ bool lockstep_halted(){return false;}
 void lockstep_share_log(const char*) {}
 std::string host_said[kMaxPeers];   // the notice name_other_order() gave each process ("who must host"), by process
 void room_say_recovery_host(const char* name) { host_said[current]=name?name:""; }
+void room_push_notice(const char*) {}              // 0.1.160: the notice for two players nothing tells apart
+const char* tr(Tx) { return ""; }
+void ui_error_popup(const char*, const char*) {}   // 0.1.169: the file / save problem popup
 uint8_t seats[kMaxPeers][kMaxPeers]{}; uint8_t seat_n[kMaxPeers]{};   // net_set_seat_order, by process
 void net_set_seat_order(const uint8_t* ids,uint8_t n) { memcpy(seats[current],ids,n); seat_n[current]=n; }
 bool room_peer_name(uint8_t id,char* out,size_t cap) { _snprintf_s(out,cap,_TRUNCATE,"peer%u",(unsigned)id); return true; }
@@ -173,6 +176,9 @@ bool savefile_read_stage(uint8_t** data,uint32_t* size,uint64_t* hash) {
     *size=(uint32_t)bytes.size(); *hash=savefile_hash(bytes.data(),*size); *data=(uint8_t*)malloc(*size); memcpy(*data,bytes.data(),*size); return true;
 }
 void log_line(const char*,const char* fmt,...) {
+    va_list a; va_start(a,fmt); vprintf(fmt,a); va_end(a); putchar('\n');
+}
+void log_line_lvl(LogLevel,const char*,const char* fmt,...) {
     va_list a; va_start(a,fmt); vprintf(fmt,a); va_end(a); putchar('\n');
 }
 }
@@ -288,6 +294,8 @@ int main() {
         checkpoint_cleanup_deferred("warehouse");
         CHECK(!disk_exists(file(L".0")) && !checkpoint_cleanup_due());
         CHECK(disk_exists(file(L".state")) && disk_exists(g.root+L"\\"+g.key+L".7"));
+        CHECK(numbered_files(archive_root(g.root),g.key+L"-old.").size()==1);        // 2026-10-26: the save is not gone, it is in the archive (and the page lists it)
+        HandshakeSaveInfo hi; CHECK(checkpoint_peek_file(archive_root(g.root)+L"\\"+g.key+L"-old.1",g.identity,hi,nullptr));
     });
     live=participants;
     reset(L"a solo settlement keeps the handshake saves until the warehouse"); start(); boundary(4600);
@@ -610,6 +618,39 @@ int main() {
         CHECK(close(db)==0);FreeLibrary(mod);
         CHECK(checkpoint_io::restore(g.path,snapshot));
         CHECK(disk_exists(g.path+L".before-mgmp-recovery"));
+        // 0.1.123: a second recovery keeps the copy the first one made (it used to overwrite it: the player's own save from before the room was gone)
+        {
+            auto count_kept=[&]{ unsigned n=0; WIN32_FIND_DATAW fd{}; HANDLE h=FindFirstFileW((g.path+L".before-mgmp-recovery.*").c_str(),&fd); if(h!=INVALID_HANDLE_VALUE){ do { if(wcschr(fd.cFileName,L'.') && wcsstr(fd.cFileName,L"recovery.")) ++n; } while(FindNextFileW(h,&fd)); FindClose(h);} return n; };
+            const unsigned before=count_kept();
+            for(unsigned i=0;i<7;++i) CHECK(checkpoint_io::restore(g.path,snapshot));
+            CHECK(disk_exists(g.path+L".before-mgmp-recovery"));
+            { const unsigned k=count_kept(); if(k!=5) printf("kept=%u before=%u\n",k,before); }
+            CHECK(count_kept()==5 && count_kept()>=before);                       // newest five, no more
+        }
+        // 0.1.124: a recovery does not take progress away -- what the live save gained (an area flag, the warehouse's upgrades) is raised in the restored copy; gold is the checkpoint's
+        {
+            sql_exec(g.path,"INSERT OR REPLACE INTO properties VALUES('mapflag_IceAgeUnlocked',1),('house_storage_upgrades',9),('house_gold',5000),('owner_steamid','111'),('PlotFlag_StevenMet',1)");
+            CHECK(checkpoint_io::restore(g.path,snapshot));
+            bool have=false; std::string v;
+            CHECK(checkpoint_io::read_property(g.path,"mapflag_IceAgeUnlocked",have,v) && have && v=="1");
+            CHECK(checkpoint_io::read_property(g.path,"house_storage_upgrades",have,v) && have && v=="9");
+            CHECK(checkpoint_io::read_property(g.path,"PlotFlag_StevenMet",have,v) && have && v=="1");
+            CHECK(checkpoint_io::read_property(g.path,"house_gold",have,v) && !have);          // not progress that only goes up: the checkpoint's (absent here)
+            CHECK(checkpoint_io::restore_note()[0]!=0);
+            // a LOWER live value never lowers the restored one, and a higher restored one stays
+            sql_exec(g.path,"INSERT OR REPLACE INTO properties VALUES('house_storage_upgrades',12),('mapflag_IceAgeUnlocked',1)");
+            Bytes high; CHECK(checkpoint_io::read(g.path,high,0x4000000));
+            sql_exec(g.path,"INSERT OR REPLACE INTO properties VALUES('house_storage_upgrades',4),('owner_steamid','111')");
+            CHECK(checkpoint_io::restore(g.path,high));
+            CHECK(checkpoint_io::read_property(g.path,"house_storage_upgrades",have,v) && have && v=="12");
+            // the save of ANOTHER account is refused, and the live one stays as it was
+            sql_exec(g.path,"INSERT OR REPLACE INTO properties VALUES('owner_steamid','222')");
+            Bytes other; CHECK(checkpoint_io::read(g.path,other,0x4000000));
+            sql_exec(g.path,"INSERT OR REPLACE INTO properties VALUES('owner_steamid','111'),('house_gold',777)");
+            CHECK(!checkpoint_io::restore(g.path,other));
+            CHECK(checkpoint_io::read_property(g.path,"owner_steamid",have,v) && have && v=="111");
+            CHECK(checkpoint_io::read_property(g.path,"house_gold",have,v) && have && v=="777");
+        }
         CHECK(!checkpoint_io::restore(g.path,Bytes{1,2,3}));
     });
 
@@ -688,6 +729,20 @@ int main() {
     at(1,[]{CHECK(!checkpoint_select(g.slot,g.path.c_str()));});drain();
     at(0,[]{CHECK(!checkpoint_select(g.slot,g.path.c_str()));});drain();
     CHECK(states[0].released && states[1].released && states[0].seq==1);
+
+    // ---- the queue is 100 long and a settlement does not clear it (2026-10-26) ----
+    reset(L"the queue is 100 long; a settlement moves the saves to the archive; the archive keeps the 100 newest in all");start();boundary(29000);
+    for(unsigned k=1;k<=104;++k) next(29000+k,0u);
+    for(unsigned i=0;i<2;++i) at(i,[]{
+        CHECK(queue_indices().size()==100);
+        Entry e{}; CHECK(read_entry(qfile(0),e,true)); CHECK(e.certificate.seq==105);
+        CHECK(numbered_files(archive_root(g.root),g.key+L"-old.").empty());
+    });
+    for(unsigned i=0;i<2;++i) at(i,[]{
+        checkpoint_clear();
+        CHECK(queue_indices().empty());
+        CHECK(numbered_files(archive_root(g.root),g.key+L"-old.").size()==100);       // all of them moved, none deleted
+    });
 
     // ---- the queue keeps the whole run (2026-10-04; it was four deep) ----
     reset(L"the confirmed-save queue keeps every save of the run, newest first");start();boundary(20000);

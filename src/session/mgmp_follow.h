@@ -175,6 +175,8 @@ bool follow_current_node(uint32_t& index);
 // This is the same 64 bits battle_id uses, and for the same reason: it is the
 // only name for a node that two processes can independently arrive at.
 uint64_t follow_here_seed();
+// 0.1.178: the host has entered a node this peer has not entered yet (an ENTERNODE is queued here) -- the host is past this peer's node.
+bool follow_host_ahead();
 // The type of that node (MapNode::str_to_type order: 13 = treasure), or 0 if it has not entered one this session.
 uint32_t follow_here_type();
 
@@ -200,5 +202,7 @@ bool follow_selected_node(uint32_t& index);
 // through the ordinary hook, so the client follows exactly as if the node had
 // been clicked. This EDITS THE RUN and says so in the log every time.
 void follow_request_jump(uint32_t index);
+void follow_test_set_instant_walk_ms(uint64_t ms);
+void follow_test_set_solo_recover_ms(uint64_t ms);     // tests: how long a stranded node must stay so before it is entered alone (default 1500)    // tests: how long an instant node waits for the party to arrive (default 6000)
 
 } // namespace mgmp

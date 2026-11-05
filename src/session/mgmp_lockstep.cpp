@@ -1,9 +1,12 @@
 // mgmp_lockstep.cpp -- see mgmp_lockstep.h for the design.
 
 #include "mgmp_lockstep.h"
+#include "mgmp_unitprobe.h"      // DEV: lockstep_dev_unitprobe
+#include "mgmp_unitstate.h"      // proto 113: the units' deep state, its digest and repair
 #include "mgmp_spawntest.h"   // unit_definition_name / unit_transform_to: the board sync repairs a unit of another kind
 #include "mgmp_souljar.h"     // MSG_SOULCAT
 #include "mgmp_mapvote.h"     // MSG_NODEVOTE
+#include "mgmp_voice.h"       // MSG_VOICE
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_barrier.h"
@@ -371,6 +374,12 @@ struct State {
     // be absorbed without renumbering anything.
     bool        summon[kMaxCats] = {};
 
+    // A HUMAN-BRAINED UNIT WITH NO SAVE ID OF ITS OWN (a Fetus, a Crow ... summoned at battle start): who owns it was worked out by each peer on its own, from
+    // memory the two peers do not lay out alike (find_derived_parent method 3). Room NTQZ 2026-10-25: the host found the client's cat as its parent, the client found
+    // nobody and gave it to the host -- the host's list left it out as "the client's", the client's list as "the host's", and the battle halted "claimed by no player".
+    // Such a unit is flagged here; verify_control settles a disagreement about it the one way both peers reach alone: it goes to the host.
+    bool        derived_unit[kMaxCats] = {};
+
     // `humans` is the SNAPSHOT's human count and stays that -- it is what CONTROL
     // carries, and verify_control HALTS when the peer's number differs. An
     // adopted human summon therefore must not touch it; it counts here instead,
@@ -468,6 +477,8 @@ struct State {
     bool     peer_hash_full_warned[kMaxPeers] = {};
 
     bool     halted = false;
+    // 0.1.122: the halt's auto-finish has struck every enemy down and the fight is still up -- a human cat's turn is what it is stuck in, so the parked decisions are end-turns from here (see lockstep_fill_choice)
+    bool     halt_pass_turns = false;
     // This battle was halted (it stays true after the halt is lifted at the fight's end, for the summary), and the battle whose halt was already lifted (a late HALT message of it is stale).
     bool     halted_in_battle = false;
     uint64_t halt_cleared_for = 0;
@@ -496,6 +507,12 @@ struct State {
     // the debounce (tune::kDesyncDebounce): the turn of the last state-only mismatch that was let through, and how many were this battle
     uint32_t debounce_turn   = ~0u;
     uint32_t debounced       = 0;
+    // STACKED UNITS: THE HOST'S BOARD DECIDES (0.1.140, room 4GHK). The turn of the last state diff whose every differing row was a non-player unit on a
+    // tile it shares with another one (or there on one game only) -- pickups piled up by a multi-hit attack, taken on one game and left on the other -- and
+    // how many boundaries in a row ended like that. Such a mismatch is not counted toward "two boundaries in a row": the host's board puts the pile right
+    // at every boundary, up to kStackMaxStreak of them.
+    uint32_t stack_turn      = ~0u;
+    uint32_t stack_streak    = 0;
     bool     desync_noticed  = false;   // the upload offer was raised for this battle
     char     halt_reason[192] = {};     // why the battle stopped (this peer's halt or the peer's), for the player-facing notice
     // --- THE RECORD OF ONE BATTLE (2026-10-04): what the BATTLE SUMMARY and the HALT RECORD report. Reset with the battle. ---
@@ -510,6 +527,8 @@ struct State {
         // 0.1.50 / proto 98: how long this client's game stood still at the boundaries waiting for the host's board, and how the digests went
         uint64_t board_wait_ms = 0; uint32_t board_wait_max = 0, board_waits_slow = 0;   // summed / longest / over 100 ms
         uint32_t board_sum_agreed = 0, board_asked = 0, board_skipped = 0;            // digests that agreed / full boards asked for / boundaries the host was already past
+        uint32_t queue_differed = 0, queue_reordered = 0;                              // proto 111: boundaries whose round queue differed from the host's / put in its order
+        uint32_t usync_units = 0, usync_repaired = 0, usync_late = 0;  uint32_t renumbered = 0;   // 0.1.174: roster entries renumbered to the host's                  // proto 113: units whose deep state differed / were put right / whose record did not come
         uint32_t board_req_run = 0; bool board_stream_asked = false;                  // boundaries in a row that needed the full board; whether the host was asked to stream it
     } bs;
     // The last turns, newest last: what was hashed and how it turned out. Printed whenever a hash disagrees, so even a log with no peer beside it shows the lead-up.
@@ -569,6 +588,17 @@ struct State {
 };
 
 State g;
+// THE BATTLE-START WINDOW (0.1.127, room ZK9F: The Creator's clone team came out in another order on each peer). Between the battle build and the FIRST turn boundary of a battle, g.turn, the roster
+// snapshot and the action counter still describe the PREVIOUS fight -- and after a save load or a rejoin they describe a different previous fight on each peer (the host stood on turn 1, the client on turn 6).
+// The battle-start abilities (a boss's SpawnOnBattleStart) run in that window, and every per-action stream below was derived from those stale numbers: the same action got another stream on each peer.
+// From the build to the first boundary the turn reads 0, no actor is looked up in the old roster, and the action numbering starts at 0 -- the same on every peer.
+bool g_prebattle = false;
+inline uint32_t cur_turn() { return g_prebattle ? 0u : g.turn; }
+// THE ENTRY OF A BATTLE, COUNTED (0.1.128). The battle id is the node's seed, so a save loaded from before a node brings the SAME id back -- and every per-battle counter that is reset only when the id
+// changes (the n-th fenced draw, the n-th roll, the n-th clay change...) carried on from the attempt before on the peer that kept running, while the peer that restarted its game began at 0 (room ZK9F: the
+// host's second Creator fight reported "1738 fenced calls, this battle" at its first draw). This number goes up at every build and every save load; a counter that sees it change starts again. It is a
+// local number (it differs between peers) and is only ever compared with itself, never mixed into a seed.
+uint32_t g_battle_gen = 0;
 DerivedHistory g_derived_history;
 
 DerivedFeatures derived_features(uint32_t index) {
@@ -770,7 +800,11 @@ bool off_board(const CatState& c) {
 // Character offsets do not fit this build". The sentinel is the opposite of
 // evidence about offsets: reading it proves the tile was read correctly.
 bool plausible(const CatState& c) {
-    if (c.maxhp <= 0 || c.maxhp > 100000) return false;
+    // HP 0 OF 0 IS THE GAME'S, NOT A WRONG OFFSET (0.1.163): the skeletons of the boneyard (SkeletonCat, Boneworm, TallSkeletonCat, SkeleShambler) lie as bones
+    // with 0/0 until they rise, and an idle SecurityBot / LoveBot reads the same. One such unit switched the state hash off for the WHOLE battle (7 logs in
+    // three days: "33/34 in range") while every other unit read right -- a battle with skeletons was never checked. Both zero passes; any other max <= 0 does not.
+    const bool dormant = c.maxhp == 0 && c.hp == 0;
+    if (!dormant && (c.maxhp <= 0 || c.maxhp > 100000)) return false;
     if (c.hp < -100000 || c.hp > 100000)  return false;
     if (c.shield < -100000 || c.shield > 100000) return false;
     if (off_board(c)) return true;
@@ -790,6 +824,49 @@ bool read_affecting_elements(const void* chr, uint32_t out[2]) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         out[0] = out[1] = 0;
+        return false;
+    }
+}
+
+// THE THREE SOURCES OF A UNIT'S ELEMENTS (0.1.160, room EWDZ 2026-11-01: two halts on "elem0 00000410|00000400" -- a host's cat had GRASS (bit 4 = 0x10, the enum of
+// Elements.cpp: electric 1, fire 2, water 3, grass 4, ice 5, earth 6, wind 7, holy 8, rock 9, metal 10, poison 11, dust 12, shadow 13, blood 14 ...; the mask is 1 << enum)
+// on one game and not on the other, nothing else of it different; the grass came and went with ENEMIES dying and moving, never with the cat moving).
+// Character::get_affecting_elements (sub_14011B250) ORs three things: at +0x18 `call` the statuses and passives (sub_14011B170(chr, out) -- writes out), at +0x25 `call`
+// the tiles the unit stands on (sub_140119D30(chr, tmp) -> tmp: each tile's +0x130/+0x134; nothing at all for a living unit whose TacticsObject+0x63 -- the
+// definition's "flying", Character+0x61C, set again by the Flying / FloatingRockTrap passives -- is set), then each piece of gear (vtable +0x288). Both callees are
+// taken from the calls themselves (bytes checked) -- only for a diff's log: the hash keeps the one call it always made.
+typedef void* (__fastcall* fn_elem_part)(const void* chr, uint32_t* out);
+struct ElemParts { bool tried = false; fn_elem_part statuses = nullptr, tile = nullptr; };
+ElemParts g_elem_parts;
+
+void elem_parts_resolve() {
+    if (g_elem_parts.tried) return;
+    g_elem_parts.tried = true;
+    const uint8_t* f = (const uint8_t*)g.affecting_elements;
+    uint8_t b[0x2A] = {};
+    if (!f || !mem_read(f, b, sizeof(b)) || b[0x18] != 0xE8 || b[0x25] != 0xE8) {
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! the element sources inside get_affecting_elements are not where this build has them -- a diff will not split a unit's elements");
+        return;
+    }
+    int32_t r1 = 0, r2 = 0;
+    memcpy(&r1, b + 0x19, 4); memcpy(&r2, b + 0x26, 4);
+    g_elem_parts.statuses = (fn_elem_part)(f + 0x1D + r1);
+    g_elem_parts.tile     = (fn_elem_part)(f + 0x2A + r2);
+}
+
+// A LIVE unit only (the caller checks the live list): the standing-tile part walks the grid with the unit's tile and keeps a counter on the Character.
+bool read_element_parts(const void* chr, uint32_t st[2], uint32_t tl[2]) {
+    st[0] = st[1] = tl[0] = tl[1] = 0;
+    elem_parts_resolve();
+    if (!g_elem_parts.statuses || !g_elem_parts.tile || !chr) return false;
+    __try {
+        g_elem_parts.statuses(chr, st);
+        uint32_t tmp[2] = { 0, 0 };
+        const uint32_t* r = (const uint32_t*)g_elem_parts.tile(chr, tmp);
+        if (r) { tl[0] = r[0]; tl[1] = r[1]; }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        st[0] = st[1] = tl[0] = tl[1] = 0;
         return false;
     }
 }
@@ -888,6 +965,15 @@ void note_ident(uint32_t i) {
     g.cat_key[i] = 0;
     g.cat_key_ok[i] = read_ident(g.cats[i], g.cat_key[i]);
 }
+// A DEAD UNIT PARKED OFF THE BOARD, ON ITS WAY OUT OF THE LIVE LIST (0.1.132, room 6XFV, turn 18: "cat 26: in_battle 1|0"). The game moves a unit that died to (-5000,-5000) at
+// once, and takes it out of the character list only when its death has finished playing -- a number of FRAMES, so the faster peer (6 ms frames against 17) had already dropped
+// the summoned toad at the boundary the slower one still listed it at. The state hash and the host's board digest count such a unit as gone: what both peers agree on is that
+// it died, not on which frame its corpse was cleared.
+bool parked_dead(const void* chr) {
+    if (!chr) return false;
+    CatState st{};
+    return read_cat_state(chr, st, false) && st.dead && off_board(st);
+}
 bool entry_is(uint32_t j, const void* ptr) {
     if (j >= g.cat_count || g.cats[j] != ptr) return false;
     if (!g.cat_key_ok[j]) return true;                       // no key was readable: the address is all there is
@@ -953,6 +1039,8 @@ uint32_t snapshot_departed(const bool still_in[kMaxCats]) {
     return left;
 }
 
+uint32_t g_deep_hashed[kMaxCats] = {};     // the deep digest each unit was hashed with (the log of a mismatch; 0.1.176: printed in the state table)
+
 void dump_cat_states(const char* why) {
     log_line("LOCKSTEP", "cat state table (%s):", why);
 
@@ -971,9 +1059,9 @@ void dump_cat_states(const char* why) {
             log_line("LOCKSTEP", "  cat %2u  <unreadable>", i);
             continue;
         }
-        log_line("LOCKSTEP", "  cat %2u  hp=%d/%d shield=%d tile=(%d,%d) face=(%d,%d) elem=%08X:%08X%s%s%s%s",
+        log_line("LOCKSTEP", "  cat %2u  hp=%d/%d shield=%d tile=(%d,%d) face=(%d,%d) elem=%08X:%08X deep=%08X%s%s%s%s",
                  i, st.hp, st.maxhp, st.shield, st.tx, st.ty, st.fx, st.fy,
-                 st.e0, st.e1,
+                 st.e0, st.e1, i < kMaxCats ? g_deep_hashed[i] : 0u,
                  st.dead ? " DEAD" : "", st.linked ? "" : " [unlinked]",
                  st.elems ? "" : " [no-elem]",
                  (have_membership && !still_in[i]) ? " [GONE -- no longer in the live list]" : "");
@@ -1338,7 +1426,7 @@ void snapshot_cats(void* turn_control) {
         // interleaved, so each player's cats are adjacent in the roster and the
         // log is readable by eye.
         uint32_t P   = net_peer_count();
-        uint32_t pos = net_peer_pos();
+        uint32_t pos = net_peer_rank();               // an even split over the players PRESENT: the rank, not the seat
         if (P == 0) {
             // No PEERS yet. Claim nothing rather than guess: claiming
             // everything would have two peers driving the same cat, and
@@ -1365,6 +1453,7 @@ void snapshot_cats(void* turn_control) {
         uint8_t  order[kMaxCats] = {};
         uint8_t  note[kMaxCats]  = {};
         bool     has_note[kMaxCats] = {};
+        memset(g.derived_unit, 0, sizeof(g.derived_unit));
         // The save id of each cat, indexed by the cat's own index. This is the ONE
         // ordering key that is identical on both peers without anyone having to agree
         // on anything: it is read out of the cat itself, at the moment the split runs.
@@ -1412,7 +1501,7 @@ void snapshot_cats(void* turn_control) {
                             for (uint32_t j = 0; j < pn && j < 16; ++j) {
                                 uint64_t id = 0;
                                 if (mem_read((const uint8_t*)pd + j * 8, &id, 8) && id && !lockstep_owner_pos(id, known)) {
-                                    const int so = session_cat_owner(id);
+                                    const int so = session_cat_owner_any(id);
                                     lockstep_note_owner(id, so >= 0 ? (uint8_t)so : 0);
                                 }
                             }
@@ -1426,7 +1515,7 @@ void snapshot_cats(void* turn_control) {
                                         in_party = true;
                                 }
                                 if (!in_party && !lockstep_owner_pos(id, known)) {
-                                    const int so = session_cat_owner(id);
+                                    const int so = session_cat_owner_any(id);
                                     lockstep_note_owner(id, so >= 0 ? (uint8_t)so : 1);
                                 }
                             }
@@ -1488,6 +1577,7 @@ void snapshot_cats(void* turn_control) {
                             // slightly different point.  It has no own save id, so keep
                             // it after the real cats in its owner's block.
                             id_of[order[k]] = UINT64_MAX;
+                            g.derived_unit[order[k]] = true;
                             has_note[order[k]] = true;
                             ++noted;
                             log_line("LOCKSTEP", "derived human cat %u attributed to owner %u "
@@ -1510,6 +1600,7 @@ void snapshot_cats(void* turn_control) {
                             if (has_note[order[k]]) continue;
                             note[order[k]] = 0;
                             id_of[order[k]] = UINT64_MAX;
+                            g.derived_unit[order[k]] = true;
                         }
                         log_line("LOCKSTEP", "ownership retained for %u known human cat(s);"
                                              " assigning %u unresolved friendly unit(s) to host",
@@ -1603,7 +1694,7 @@ void snapshot_cats(void* turn_control) {
         if (!lockstep_owner_pos(id, owner_pos)) {
             // Setup IDs already carry an absolute namespace.  The fallback
             // also keeps the two-player legacy path usable between battles.
-            if (session_cat_owner(id)>=0) owner_pos = (uint8_t)session_cat_owner(id);
+            if (session_cat_owner_any(id)>=0) owner_pos = (uint8_t)session_cat_owner_any(id);
             else if (net_peer_count() == 2)
                 owner_pos = g.local_cat[i] ? net_peer_pos() : (net_peer_pos() ? 0 : 1);
         }
@@ -1911,6 +2002,33 @@ void verify_control() {
         // here, and a check that fires on correct behaviour would be worse than
         // the silence it replaces.
         if (g.summon[i]) continue;
+
+        // A DERIVED UNIT (see derived_unit) that the peers do not agree on -- claimed by nobody or by several -- goes to the host, on every peer alike: the same rule
+        // runs on each side, so the lists, the claims and local_cat end up the same everywhere without another message.
+        if (g.derived_unit[i] && claims[i] != 1) {
+            const uint8_t heir = ids[0];                          // the room's first member: the host
+            const unsigned was = claims[i];
+            for (uint8_t a = 0; a < count; ++a) {
+                ControlMsg& c = g.peer_control[ids[a]];
+                uint8_t w = 0;
+                for (uint8_t j = 0; j < c.count; ++j) {          // out of every list ...
+                    if (c.cats[j] == i) continue;
+                    c.cats[w] = c.cats[j]; c.fp[w] = c.fp[j]; ++w;
+                }
+                c.count = w;
+                if (ids[a] == heir && c.count < 32) {            // ... and into the host's, in index order
+                    uint8_t at = c.count;
+                    while (at > 0 && c.cats[at - 1] > i) { c.cats[at] = c.cats[at - 1]; c.fp[at] = c.fp[at - 1]; --at; }
+                    c.cats[at] = (uint8_t)i; c.fp[at] = g.cat_fp[i];
+                    ++c.count;
+                }
+            }
+            claims[i] = 1;
+            owner[i] = heir;
+            g.local_cat[i] = net_self() == heir;
+            log_line("LOCKSTEP", "derived unit %u: the peers did not agree who owns it (%u claim(s)) -- it goes to the host (peer %u)", i, was, (unsigned)heir);
+            continue;
+        }
 
         if (claims[i] > 1) {
             char why[192];
@@ -2376,12 +2494,21 @@ HashMsg build_hash(void* turn_control) {
         bool still_h[kMaxCats];
         const uint8_t memb =
             snapshot_membership(g.snapped_list, live_h, still_h, appeared_h) ? 1 : 0;
-        // Hashed too: a peer that can read membership and one that cannot are
-        // computing different things, and that must not pass as agreement.
-        sh = fnv1a(&memb, sizeof(memb), sh);
+        // THE MEMBERSHIP FLAG ITSELF IS NOT HASHED (0.1.189, sim 51). It was, "so a peer that can read membership and one that cannot do not pass as
+        // agreement" -- but every unit's in_battle byte below already carries what membership decides, so the flag only added a difference no unit
+        // has: DESKTOP-EHII33I's room (11-04 22:51, battle f03cd271, 3 players) disagreed at turns 0 and 1 with all 30 rows and every deep digest
+        // identical on both sides, and halted. A peer that cannot read the live list says so, once per battle.
+        if (!memb) {
+            static uint64_t said = 0;
+            if (said != g.battles.current) {
+                said = g.battles.current;
+                log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! turn %u: the battle's live list could not be read for the state hash (list %p) -- departures are judged by the parked-dead test alone this battle",
+                             (unsigned)h.turn, g.snapped_list);
+            }
+        }
 
         for (uint32_t i = 0; i < g.cat_count; ++i) {
-            const bool present = !memb || still_h[i];
+            const bool present = (!memb || still_h[i]) && !parked_dead(g.cats[i]);      // 0.1.132: a dead unit parked off the board is gone already
             const uint8_t in_battle = present ? 1 : 0;
             sh = fnv1a(&in_battle, sizeof(in_battle), sh);
 
@@ -2424,6 +2551,16 @@ HashMsg build_hash(void* turn_control) {
             sh = fnv1a(&st.e0,    sizeof(st.e0),    sh);
             sh = fnv1a(&st.e1,    sizeof(st.e1),    sh);
             sh = fnv1a(&st.elems, sizeof(st.elems), sh);
+            // PROTO 113 / SIM 44: the unit's DEEP state (mgmp_unitstate) -- its statuses and passives, abilities, gear and stats. A client has put its copy right
+            // toward the host's at this boundary already (usync_after_board), so what still differs here is a difference the repair could not settle.
+            // A DEAD UNIT'S DEEP STATE IS NOT HASHED (0.1.176): the board's digest leaves it out (board_unit_digest), so no repair ever looks at it, and a corpse sheds its
+            // statuses at a frame-timed moment -- rooms df6c / e688 (11-04, 0.1.174) halted with "0 cat rows differ" on corpses still lying on the board.
+            {
+                static UnitDeep dd;
+                const uint32_t deep = (!st.dead && unitstate_read(g.cats[i], dd)) ? unitstate_digest(dd) : 0;
+                sh = fnv1a(&deep, sizeof(deep), sh);
+                g_deep_hashed[i] = deep;
+            }
         }
         h.state_hash = sh;
         g.hashed_count = g.cat_count;
@@ -2531,9 +2668,26 @@ void compare_state_dump(const StateDumpMsg& m) {
     log_line("LOCKSTEP", "STATE DIFF at turn %u (this peer | the peer), %u cats "
                          "compared:", m.turn, n);
 
-    uint32_t differ = 0, unrepairable = 0, first_unrep = 0xFFFFu;
+    uint32_t differ = 0, unrepairable = 0, first_unrep = 0xFFFFu, elem_only_rows = 0;
     char unrep_why[160] = {};
+    // 0.1.160: which units are still in the live list -- the element sources below are game calls, made for those only
+    uint32_t live_now = 0, appeared_now = 0;
+    bool still_in_now[kMaxCats];
+    const bool have_live = snapshot_membership(g.snapped_list, live_now, still_in_now, appeared_now);
     char diff_summary[400] = {};
+    // A non-player unit on a tile with another non-player unit, on either game (see State::stack_turn).
+    auto stacked = [&](const CatState* rows, uint32_t i) {
+        const CatState& r = rows[i];
+        if (off_board(r) || r.dead || (i < g.cat_count && g.human_cat[i])) return false;
+        for (uint32_t j = 0; j < n; ++j) {
+            if (j == i || (j < g.cat_count && g.human_cat[j])) continue;
+            const CatState& o = rows[j];
+            if (!off_board(o) && !o.dead && o.tx == r.tx && o.ty == r.ty) return true;
+        }
+        return false;
+    };
+    bool all_stack = true;      // every differing row is a stacked / one-sided non-player unit, or a player's cat off only in hit points or shield
+    bool any_stack = false;
     for (uint32_t i = 0; i < n; ++i) {
         const CatState& a = g.hashed[i];
         const CatState& b = theirs[i];
@@ -2579,11 +2733,65 @@ void compare_state_dump(const StateDumpMsg& m) {
         }
 
         if (!line[0]) continue;
+        // 0.1.190: a unit gone from BOTH games' live lists is not hashed past its membership byte; its fields are freed memory (KD8E test: 'cat 37 tile (-5000,-5000)|(8,0)',
+        // the slot reused by a new object on each side) -- not a difference
+        if (!a.in_battle && !b.in_battle && a.readable == b.readable) continue;
         ++differ;
         log_line_lvl(LogLevel::Error, "LOCKSTEP", "  cat %2u %s", i, line);
+        if ((a.e0 != b.e0 || a.e1 != b.e1) && have_live && i < g.cat_count && i < kMaxCats && still_in_now[i] && g.cats[i] && a.in_battle && !off_board(a)) {
+            // 0.1.160: where THIS game's elements of the unit come from now (the peer's log -- PEERLOG -- holds its own line): the source that differs is the cause
+            uint32_t st[2] = {}, tl[2] = {}, all[2] = {};
+            const bool parts = read_element_parts(g.cats[i], st, tl);
+            const bool whole = read_affecting_elements(g.cats[i], all);
+            const void* tobj = nullptr;
+            uint8_t flying = 0xFF, dead = 0xFF;
+            if (mem_read((const uint8_t*)g.cats[i] + kChar_TObj, &tobj, sizeof(tobj)) && tobj) mem_read((const uint8_t*)tobj + 0x63, &flying, 1);
+            mem_read((const uint8_t*)g.cats[i] + kChar_Dead, &dead, 1);
+            if (parts && whole)
+                log_line_lvl(LogLevel::Error, "LOCKSTEP", "    cat %2u elements on THIS game now: %08X:%08X = statuses/passives %08X:%08X | standing tile (%d,%d) %08X:%08X | gear %08X:%08X | "
+                             "flying %u, dead %u (grass 0x10, metal 0x400, water 0x8, fire 0x4, electric 0x2, blood 0x4000; elem1: greater/lesser water 0x10/0x20)",
+                             i, all[0], all[1], st[0], st[1], a.tx, a.ty, tl[0], tl[1], all[0] & ~(st[0] | tl[0]), all[1] & ~(st[1] | tl[1]), (unsigned)flying, (unsigned)dead);
+            else
+                log_line_lvl(LogLevel::Warn, "LOCKSTEP", "    cat %2u: its element sources could not be read on this game", i);
+            {   // 0.1.161: the tile objects that list holds (rebuilt by the call above in a room: T_TileList), with each one's class, elements and tall flags
+                const uint8_t* c = (const uint8_t*)g.cats[i];
+                int64_t key = 0; uint32_t guard = 0, cap = 0, cnt = 0; const void* data = nullptr; const void* board = nullptr; int64_t ver = 0;
+                mem_read(c + 0xE58, &key, 8); mem_read(c + 0xEBC, &guard, 4);
+                mem_read(c + 0xE90, &cap, 4); mem_read(c + 0xE94, &cnt, 4); mem_read(c + 0xE98, &data, 8);
+                if (mem_read(c + 0x80, &board, 8) && board) mem_read((const uint8_t*)board + 0xA0, &ver, 8);
+                char objs[700] = {}; int w = 0;
+                for (uint32_t k = 0; k < cnt && k < 12 && data && w >= 0 && w < (int)sizeof(objs) - 90; ++k) {
+                    const void* o = nullptr;
+                    if (!mem_read((const uint8_t*)data + k * 8, &o, 8) || !o) continue;
+                    uint32_t em[2] = {}; uint8_t tall = 0, tall2 = 0; char cls[64] = "?";
+                    mem_read((const uint8_t*)o + 0x130, em, 8); mem_read((const uint8_t*)o + 0xB0, &tall, 1); mem_read((const uint8_t*)o + 0xB2, &tall2, 1);
+                    rtti_class_name(o, cls, sizeof(cls));
+                    w += _snprintf_s(objs + w, sizeof(objs) - w, _TRUNCATE, " [%s %08X:%08X tall %u/%u]", cls, em[0], em[1], (unsigned)tall, (unsigned)tall2);
+                }
+                log_line_lvl(LogLevel::Error, "LOCKSTEP", "    cat %2u tile objects on THIS game: key %lld, board element version %lld%s, guard %u, %u object(s):%s", i, (long long)key, (long long)ver,
+                             key == ver ? "" : " (the list is OLDER than the board)", guard, cnt, objs[0] ? objs : " none");
+            }
+        }
         {   // what the host's board puts right: hit points, shield, tile, the dead flag, presence; for a PLAYER's cat not the max hp (an input). Elements (statuses, gear), link and readability: nothing does.
             const bool human = i < g.cat_count && g.human_cat[i];
-            const bool no = a.e0 != b.e0 || a.e1 != b.e1 || a.elems != b.elems || a.linked != b.linked || a.readable != b.readable || (human && a.maxhp != b.maxhp);
+            // A UNIT THAT IS ON THE BOARD ON ONE GAME AND GONE ON THE OTHER (0.1.139, room 4GHK: a coin a NailFlurry knocked on one game was picked up on the
+            // other -- "cat 46: elem0 00000400|00000000 elems 1|0 tile (5,2)|(-5000,-5000)" halted at once). Its elements, link and readability differ only
+            // because it is there on one side: the host's board makes or takes off such a unit (proto 98) and the game gives a made unit its own elements.
+            // Not a player's cat (the board does not make those).
+            const bool presence_only = !human && (off_board(a) != off_board(b) || a.dead != b.dead || a.in_battle != b.in_battle);
+            const bool stack_row = !human && (presence_only || stacked(g.hashed, i) || stacked(theirs, i));
+            const bool human_soft = human && a.maxhp == b.maxhp && a.dead == b.dead && a.tx == b.tx && a.ty == b.ty && a.e0 == b.e0 && a.e1 == b.e1 &&
+                                    a.elems == b.elems && a.linked == b.linked && a.readable == b.readable && a.in_battle == b.in_battle;   // hit points / shield only
+            if (stack_row) any_stack = true;
+            if (!stack_row && !human_soft) all_stack = false;
+            // 0.1.160: ONLY the elements differ (room EWDZ: a cat's grass, everything else of it equal on both games). Elements come from the tile it stands on and
+            // its statuses; the two games can update one of those at a different moment around a boundary. Not "unrepairable" at once: the debounce waits one
+            // boundary -- the next one agrees (HEALED) or halts as before.
+            const bool elem_only = (a.e0 != b.e0 || a.e1 != b.e1) && a.hp == b.hp && a.shield == b.shield && a.maxhp == b.maxhp && a.dead == b.dead && a.tx == b.tx && a.ty == b.ty &&
+                                   a.elems == b.elems && a.linked == b.linked && a.readable == b.readable && a.in_battle == b.in_battle;
+            if (elem_only) ++elem_only_rows;
+            // 0.1.176: a player's max hp is no longer "unrepairable" at once -- the unit-state repair writes the host's (rooms 57b9/f048/d167 halted on "maxhp 32|28" the moment it was seen)
+            const bool no = !presence_only && !stack_row && !elem_only && (a.e0 != b.e0 || a.e1 != b.e1 || a.elems != b.elems || a.linked != b.linked || a.readable != b.readable);
             if (no) { ++unrepairable; if (first_unrep == 0xFFFFu) { first_unrep = i; _snprintf_s(unrep_why, sizeof(unrep_why), _TRUNCATE, "cat %u%s:%s", i, human ? " (a player's)" : "", line); } }
         }
         {   // the first few, on the one REPORT line
@@ -2608,6 +2816,16 @@ void compare_state_dump(const StateDumpMsg& m) {
     }
     log_line_lvl(LogLevel::Error, "LOCKSTEP", "!! DESYNC REPORT battle %016llx turn %u diff: %u of %u cat row(s) differ, %u of them NOT repairable by the host's board%s%s", (unsigned long long)g.battles.current, m.turn, differ, n,
                  unrepairable, diff_summary[0] ? " --" : "", diff_summary);
+    if (differ && all_stack && any_stack && !unrepairable) {
+        g.stack_turn = m.turn;
+        ++g.stack_streak;
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! DESYNC REPORT battle %016llx turn %u: every difference is a pile of non-player units (stacked on one tile, or there on one game only) "
+                     "or a player's hit points -- the HOST'S board decides them at every boundary, not halting (%u of %u in a row)",
+                     (unsigned long long)g.battles.current, m.turn, g.stack_streak, tune::kStackMaxStreak);
+    }
+    if (elem_only_rows && !unrepairable && g.debounce_turn == m.turn && !g.halted)
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! DESYNC REPORT battle %016llx turn %u: %u unit(s) differ ONLY in their elements (the lines above split this game's into statuses, tile and gear) -- "
+                     "the debounce waits for turn %u: it heals if the two games agree there, and halts if not", (unsigned long long)g.battles.current, m.turn, elem_only_rows, m.turn + 1);
     if (unrepairable && g.debounce_turn == m.turn && !g.halted) {
         // THE DEBOUNCE ENDS HERE (2026-10-04, b521766e: a player's summon differed in hit points and tile, the board does not repair a player's cat, so the next turn was played on a diverged
         // state and halted on the stream anyway). Waiting a boundary only helps what the board repairs.
@@ -2765,7 +2983,9 @@ void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
     if (config().net_desync_halt) {
         const bool state_only = rng_ok && queue_ok;
         const bool repeat = g.debounce_turn != ~0u && mine.turn == g.debounce_turn + 1;
-        const bool lenient = tune::kDesyncDebounce && state_only && !repeat;
+        // the previous mismatch was a pile the host's board decides (State::stack_turn): it does not count toward two in a row, up to kStackMaxStreak boundaries
+        const bool pile = repeat && g.stack_turn == g.debounce_turn && g.stack_streak < tune::kStackMaxStreak;
+        const bool lenient = tune::kDesyncDebounce && state_only && (!repeat || pile);
         // ONE LINE PER MISMATCH, whatever happens next, in a fixed shape a script can collect: it is what a debounced desync leaves behind to be fixed later.
         log_line_lvl(LogLevel::Error, "LOCKSTEP", "!! DESYNC REPORT battle %016llx turn %u kind=%s action=%s (#%u this battle): %s",
                      (unsigned long long)g.battles.current, mine.turn, state_only ? "state" : (!rng_ok && !queue_ok ? "rng+queue" : (!rng_ok ? "rng" : "queue")),
@@ -2776,6 +2996,8 @@ void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
                     state_only ? "state" : "rng/queue", lenient ? "debounced" : "halted");
         raise_desync_notice(note);
         if (lenient) {
+            if (pile) log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! turn %u disagrees again right after the pile of turn %u -- still the host's board's to put right (%u of %u in a row), NOT halting",
+                                   mine.turn, g.stack_turn, g.stack_streak, tune::kStackMaxStreak);
             g.debounce_turn = mine.turn;
             ++g.debounced;
             ++g.stats.desyncs;
@@ -2842,6 +3064,7 @@ void report_pair(const HashMsg& mine, const HashMsg& theirs, uint8_t peer) {
             g.dump_sent = false;      // a later mismatch of this battle gets its own table exchange
             g.dump_seen = false;
         }
+        g.stack_streak = 0;           // a pile the board put right: the next one starts its own count
         if (g.diverged) {
             g.diverged = false;
             log_line("LOCKSTEP", "   ^^ TRANSIENT: the turn-%u mismatch has"
@@ -2998,6 +3221,7 @@ void lockstep_init() {
 
     g.active  = true;
     g.halted  = false;
+    g_prebattle = false;
     if (!rejoin_in_battle) {
         g.snapped = false;
         // Turn numbering is per battle and the HASH messages are keyed on it.
@@ -3047,6 +3271,8 @@ void lockstep_init() {
     g.diverged          = false;
     g.debounce_turn     = ~0u;
     g.debounced         = 0;
+    g.stack_turn        = ~0u;
+    g.stack_streak      = 0;
     g.desync_noticed    = false;
     g.bs = State::BStats{};
     g.trail_n = 0;
@@ -3557,6 +3783,11 @@ void lockstep_pump() {
                 mapvote_on_message(m.from, m.nodevote);
                 break;
 
+            // 0.1.118 (proto 107): a frame of another player's microphone (mgmp_voice). Not battle-gated: people talk wherever they are.
+            case MSG_VOICE:
+                voice_on_message(m.from, m.voice);
+                break;
+
             case MSG_DEEP:
                 deep_on_peer(m.from, m.deep);
                 break;
@@ -3736,13 +3967,45 @@ void lockstep_pump() {
 // Defined just below, after its first caller.
 static void apply_remote(const ActionMsg& msg, const void* actor, void* out);
 
+// A DECISION A PASSIVE MAKES (0.1.122, room YPKP: the disorder 'Scatological' = `MoveAndUseAbilityEachTurnBeginIfPossible EatShit`). The ability such a passive uses is made by the PASSIVE: it is in none of
+// the cat's slots, and Character::FindAbility -- which walks move / attack / bonus / the spell list only (0x118C40) -- cannot find it by name either, so the receiving peer halted ("cat 11 slot 255:0
+// (gon 'EatShit') is empty on this peer"; the 0.1.35 fix by name never worked). But the receiving game runs the same passive at the same turn begin: its OWN brain for that cat makes the very same decision
+// (the cat's disorder is in the cat image both peers hold). It is read from the game's own result before the wire's decision replaces it, remembered for the turn, and taken when the wire's decision names
+// the same ability. A decision no slot ability can be (a click on a cat that is not ours can only choose a slot ability) is what is remembered.
+struct ForcedSeen { const void* actor = nullptr; uint32_t turn = 0; const void* ability = nullptr; ULONGLONG at = 0; };
+static ForcedSeen g_forced[8];
+static void forced_note(const void* actor, const void* out) {
+    TurnAction cur{};
+    if (!actor || !mem_read(out, &cur, sizeof(cur)) || cur.type != TA_Ability || !cur.ability) return;
+    if (ability_slot_of(actor, cur.ability).kind != SLOT_UNKNOWN) return;
+    ForcedSeen* at = nullptr;
+    for (ForcedSeen& f : g_forced) if (f.actor == actor) { at = &f; break; }
+    if (!at) { ULONGLONG oldest = ~0ull; for (ForcedSeen& f : g_forced) if (f.at < oldest) { oldest = f.at; at = &f; } }
+    if (at->actor != actor || at->ability != cur.ability || at->turn != g.turn) {
+        char gon[64] = {};
+        ability_gon_name(cur.ability, gon, sizeof(gon));
+        log_line("LOCKSTEP", "this game's own brain for a cat made a decision no slot holds ('%s', target (%d,%d)) -- remembered for turn %u: it is the passive's own ability, the owner's matching decision can use it",
+                 gon[0] ? gon : "?", cur.target_x, cur.target_y, g.turn);
+    }
+    at->actor = actor; at->turn = g.turn; at->ability = cur.ability; at->at = GetTickCount64();
+}
+static void* forced_peek(const void* actor, const char* gon) {
+    for (const ForcedSeen& f : g_forced) {
+        if (f.actor != actor || !f.ability || f.turn != g.turn) continue;
+        char got[64] = {};
+        if (gon && gon[0] && ability_gon_name(f.ability, got, sizeof(got)) && strcmp(got, gon) == 0) return (void*)f.ability;
+    }
+    return nullptr;
+}
+constexpr ULONGLONG kForcedHoldMs = 4000;
+
 bool lockstep_roll_resolve(uint8_t site, double chance, double luck, bool local) {
     if (!g.active || g.halted || !g.snapped || net_peer_count() < 2) return local;
     const uint64_t battle = g.battles.current;
     if (!battle) return local;
     static uint64_t s_battle = 0;
-    static uint32_t s_seq[8] = {};
-    if (s_battle != battle) { s_battle = battle; memset(s_seq, 0, sizeof(s_seq)); }
+    static uint32_t s_seq[8] = {}, s_gen = ~0u;
+    if (s_battle != battle || s_gen != g_battle_gen) { s_battle = battle; s_gen = g_battle_gen; memset(s_seq, 0, sizeof(s_seq)); }
     const uint32_t seq = ++s_seq[site & 7];
     if (net_role() == NetRole::Host) {
         RollMsg m{};
@@ -3785,6 +4048,15 @@ bool lockstep_fill_choice(void* brain, void* out) {
         // Freeze both peers rather than let one run on. Forcing type=1 parks
         // the game in its normal "waiting for a decision" state, which is a
         // far kinder failure than a crash or a silently diverged battle.
+        if (g.halt_pass_turns) {
+            // ... except once the auto-finish has killed everything and the fight still stands (room YPKP, 17 sweeps of "0 enemies alive"): the turn that is parked here is what keeps the game from seeing
+            // the fight is won, so the turn is ended -- nothing else happens in it.
+            TurnAction pass{};
+            memset(&pass, 0, sizeof(pass));
+            pass.type = TA_EndTurn;
+            mem_write(out, &pass, sizeof(pass));
+            return true;
+        }
         uint32_t none = TA_None;
         mem_write(out, &none, sizeof(none));
         return true;
@@ -3925,12 +4197,21 @@ static void send_own_decision(uint8_t cat, const void* actor, const TurnAction& 
             // learned of it (2026-10-03: the client's cat 16 ended turn 13 facing (1,0), the host's read (0,1), and facing decides backstab damage). The end of the turn is the
             // one point where the facing is final, so it rides on the end-turn message, whose direction was always (0,0).
             int32_t fx = 0, fy = 0;
-            if (mem_read((const uint8_t*)actor + kChar_Facing, &fx, sizeof(fx)) && mem_read((const uint8_t*)actor + kChar_Facing + 4, &fy, sizeof(fy)) &&
-                fx >= -1 && fx <= 1 && fy >= -1 && fy <= 1 && (fx || fy)) { msg.dx = fx; msg.dy = fy; }
+            bool have_face = mem_read((const uint8_t*)actor + kChar_Facing, &fx, sizeof(fx)) && mem_read((const uint8_t*)actor + kChar_Facing + 4, &fy, sizeof(fy));
+            // Inside Brain::UpdateDecision the aim preview may have turned the cat this frame, and its put-back restores what the frame began with: THAT is the facing this cat
+            // keeps here, so it is the one sent (room VTC9: a facing that differs between the peers is in no hash and changes enemy AI choices through the backstab test).
+            if (g_pf.have && g_pf.ch == (const uint8_t*)actor) { fx = g_pf.fx; fy = g_pf.fy; have_face = true; }
+            if (have_face && fx >= -1 && fx <= 1 && fy >= -1 && fy <= 1 && (fx || fy)) { msg.dx = fx; msg.dy = fy; }
         }
         msg.b30 = a.tail[0x30 - 0x28];
         msg.b31 = a.tail[0x31 - 0x28];
-        msg.chain = chain_now();   // where this turn's chain of actions stands on the owner's game (see the chain position above pend_peek)
+        msg.chain = chain_now();
+        {   // proto 112: the facing this cat has on its owner's game as it decides (the aim preview's put-back value when it turned the cat this frame)
+            int32_t ox = 0, oy = 0;
+            bool have = mem_read((const uint8_t*)actor + kChar_Facing, &ox, sizeof(ox)) && mem_read((const uint8_t*)actor + kChar_Facing + 4, &oy, sizeof(oy));
+            if (g_pf.have && g_pf.ch == (const uint8_t*)actor) { ox = g_pf.fx; oy = g_pf.fy; have = true; }
+            if (have && ox >= -1 && ox <= 1 && oy >= -1 && oy <= 1 && (ox || oy)) { msg.fx = (int8_t)ox; msg.fy = (int8_t)oy; }
+        }   // where this turn's chain of actions stands on the owner's game (see the chain position above pend_peek)
 
         if (a.type == TA_Ability) {
             AbilitySlot slot = ability_slot_of(actor, a.ability);
@@ -3985,10 +4266,21 @@ static bool lockstep_fill_choice_peer(void* brain, void* out, uint8_t cat, const
     // cat we do not own: a stray click produces a decision that we replace
     // here, so it can never reach QueueDecision.
     ActionMsg msg{};
+    forced_note(actor, out);               // what the game's own brain decided for this cat, before the owner's decision replaces it (a passive's forced one, see forced_peek)
     if (!pend_peek(cat, msg)) {
         uint32_t none = TA_None;
         mem_write(out, &none, sizeof(none));
         return true;                       // nothing yet -- keep waiting, free
+    }
+    // THE OWNER DECIDED IT AT ANOTHER TURN (room 5A4F: the owner's turn 6 was this peer's turn 3) -- the two games gave the cat its turn at different places in the round. Applied
+    // as before (holding it would stop this battle: the cat's turn is here now), and said once, so the log names the turn the orders parted at (proto 111 keeps them together).
+    if (msg.turn != g.turn) {
+        static uint64_t s_battle = 0; static uint32_t s_turn = ~0u; static uint8_t s_cat = 0xFF;
+        if (s_battle != g.battles.current || s_turn != g.turn || s_cat != cat) {
+            s_battle = g.battles.current; s_turn = g.turn; s_cat = cat;
+            log_line_lvl(LogLevel::Error, "TURNQ", "!! cat %u's decision ('%s') was made at turn %u of its owner's game and this peer is at turn %u -- the turn orders differ",
+                         (unsigned)cat, msg.gon[0] ? msg.gon : (msg.type == TA_EndTurn ? "end turn" : "-"), (unsigned)msg.turn, (unsigned)g.turn);
+        }
     }
     // THE CHAIN POSITION: not before this peer's turn has run as many actions as the owner's had when it decided (a reaction chain still running
     // here goes on until then, exactly as it did there).
@@ -4016,6 +4308,21 @@ static bool lockstep_fill_choice_peer(void* brain, void* out, uint8_t cat, const
         }
         g_chain_hold_cat = 0xFF;
     }
+    // THE OWNER'S DECISION NAMES AN ABILITY IN NO SLOT: this game's own brain has to have made it too (forced_peek); wait for it a few seconds before the peer's decision is given up as unresolvable.
+    if (msg.type == TA_Ability && msg.slot_kind == SLOT_UNKNOWN && msg.gon[0] && !ability_by_gon_name(actor, msg.gon) && !forced_peek(actor, msg.gon)) {
+        static uint8_t s_wait_cat = 0xFF; static uint32_t s_wait_turn = 0; static ULONGLONG s_wait_since = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (s_wait_cat != cat || s_wait_turn != g.turn) {
+            s_wait_cat = cat; s_wait_turn = g.turn; s_wait_since = now;
+            log_line("LOCKSTEP", "cat %u's decision ('%s') names an ability in no slot: waiting for this game's own passive to make it too (up to %llu ms)", (unsigned)cat, msg.gon, (unsigned long long)kForcedHoldMs);
+        }
+        if (now - s_wait_since < kForcedHoldMs) {
+            uint32_t none = TA_None;
+            mem_write(out, &none, sizeof(none));
+            return true;
+        }
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! cat %u: this game's own brain never made the decision '%s' (waited %llu ms) -- the owner's decision cannot be applied", (unsigned)cat, msg.gon, (unsigned long long)(now - s_wait_since));
+    }
     pend_take(cat, msg);
     apply_remote(msg, actor, out);
     return true;
@@ -4028,6 +4335,25 @@ static bool lockstep_fill_choice_peer(void* brain, void* out, uint8_t cat, const
 // did. Everything below -- the slot resolution, the GON cross-check, the halt
 // on a mismatch -- has to be identical for both, because a replayed decision is
 // exactly as authoritative as a live one.
+// THE OWNER'S FACING ON THIS PEER'S COPY OF THE CAT (proto 72 for the end turn; proto 112 before every action): through Character::Face, with the aim-preview
+// put-back pointed at it as well (this runs inside Brain::UpdateDecision, whose put-back would otherwise restore the facing it began with).
+static void take_owner_facing(uint8_t cat, const void* actor, int32_t want_x, int32_t want_y, const char* when) {
+    if (!actor || !(want_x || want_y) || want_x < -1 || want_x > 1 || want_y < -1 || want_y > 1) return;
+    int32_t fx = 0, fy = 0;
+    mem_read((const uint8_t*)actor + kChar_Facing, &fx, sizeof(fx)); mem_read((const uint8_t*)actor + kChar_Facing + 4, &fy, sizeof(fy));
+    if (g_pf.have && g_pf.ch == (uint8_t*)actor) {
+        if ((g_pf.fx != want_x || g_pf.fy != want_y) && fx == want_x && fy == want_y)
+            log_line("LOCKSTEP", "cat %u %s facing (%d,%d) -- the aim preview had turned it there this frame; its put-back would have restored (%d,%d): the owner's facing kept",
+                     (unsigned)cat, when, want_x, want_y, g_pf.fx, g_pf.fy);
+        g_pf.fx = want_x; g_pf.fy = want_y;
+    }
+    face_pend_set((uint8_t*)actor, want_x, want_y);
+    if (fx != want_x || fy != want_y) {
+        const bool via_face = turn_cat_via_face((void*)actor, want_x, want_y);
+        log_line("LOCKSTEP", "cat %u %s facing (%d,%d) -- this peer had (%d,%d): the owner's facing taken (%s)", (unsigned)cat, when, want_x, want_y, fx, fy, via_face ? "Character::Face" : "field write");
+    }
+}
+
 static ActionMsg   g_remote_wait{};           // the last remote decision handed to the brain, until the game applies it
 static bool        g_remote_wait_on = false;
 static const void* g_remote_wait_actor = nullptr;
@@ -4050,20 +4376,30 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     a.type     = msg.type;
     a.target_x = msg.tx; a.target_y = msg.ty;
     a.dir_x    = msg.dx; a.dir_y    = msg.dy;
+    if (msg.type == TA_Ability && (msg.fx || msg.fy))
+        take_owner_facing(cat, actor, msg.fx, msg.fy, "acts");   // proto 112: what the cat faces on its owner's game as this action starts (RunningJab, backstabs)
     if (msg.type == TA_EndTurn) {
         // The owner's final facing (see the send side): put it on this peer's copy of the cat before the turn ends, and give the action the (0,0) direction an end turn always had.
         a.dir_x = 0; a.dir_y = 0;
         if (actor && (msg.dx || msg.dy) && msg.dx >= -1 && msg.dx <= 1 && msg.dy >= -1 && msg.dy <= 1) {
             int32_t fx = 0, fy = 0;
             mem_read((const uint8_t*)actor + kChar_Facing, &fx, sizeof(fx)); mem_read((const uint8_t*)actor + kChar_Facing + 4, &fy, sizeof(fy));
+            // This runs INSIDE Brain::UpdateDecision (the decision is filled from there), and the aim-preview put-back at its end restores the facing it saw when it began: left alone it would
+            // undo the owner's facing at once (2026-10-03: the client logged "facing taken" and still read the old facing a turn later, halting on a backstab). The owner's value is the one to
+            // keep -- ALSO when the field already holds it (room VTC9, 2026-10-25): the preview of this very frame can have turned the cat to exactly the owner's direction, the comparison below
+            // then saw nothing to do, and the put-back restored the old facing. The host's copy of the client's tank kept (0,1) where its owner had (-1,0) -- facing is in no hash -- and two
+            // turns later an enemy CopBot weighed its backstab differently on the two games and attacked a different cat.
+            if (g_pf.have && g_pf.ch == (uint8_t*)actor) {
+                if ((g_pf.fx != msg.dx || g_pf.fy != msg.dy) && fx == msg.dx && fy == msg.dy)
+                    log_line("LOCKSTEP", "cat %u ends its turn facing (%d,%d) -- the aim preview had turned it there this frame; its put-back would have restored (%d,%d): the owner's facing kept",
+                             (unsigned)cat, msg.dx, msg.dy, g_pf.fx, g_pf.fy);
+                g_pf.fx = msg.dx; g_pf.fy = msg.dy;
+            }
+            face_pend_set((uint8_t*)actor, msg.dx, msg.dy);
             if (fx != msg.dx || fy != msg.dy) {
                 // Turn the cat the way the game does -- Character::Face writes the facing AND plays the turn animation. Writing the field alone (what this did until 2026-10-03) left the logic right and
                 // the sprite looking the old way on this peer. Every game caller passes (dir, 0, 0). The field is written afterwards only if Face did not leave it as asked.
                 const bool via_face = turn_cat_via_face((void*)actor, msg.dx, msg.dy);
-                // This runs INSIDE Brain::UpdateDecision (the decision is filled from there), and the aim-preview put-back at its end restores the facing it saw when it began: left alone it would
-                // undo this write at once (2026-10-03: the client logged "facing taken" and still read the old facing a turn later, halting on a backstab). The new value is the one to keep.
-                if (g_pf.have && g_pf.ch == (uint8_t*)actor) { g_pf.fx = msg.dx; g_pf.fy = msg.dy; }
-                face_pend_set((uint8_t*)actor, msg.dx, msg.dy);
                 log_line("LOCKSTEP", "cat %u ends its turn facing (%d,%d) -- this peer had (%d,%d): the owner's facing taken (%s)", (unsigned)cat, msg.dx, msg.dy, fx, fy, via_face ? "Character::Face" : "field write");
             }
         }
@@ -4077,8 +4413,9 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
         AbilitySlot slot{ msg.slot_kind, msg.slot_index };
         a.ability = ability_from_slot(actor, slot);
         if (!a.ability && slot.kind == SLOT_UNKNOWN && msg.gon[0]) {
-            a.ability = ability_by_gon_name(actor, msg.gon);          // an ability in no slot (a disorder's): by its GON name, among all of the cat's abilities
-            log_line("LOCKSTEP", "cat %u's '%s' is in no slot -- %s by its name", (unsigned)cat, msg.gon, a.ability ? "found" : "NOT found");
+            a.ability = ability_by_gon_name(actor, msg.gon);          // an ability in no slot: by its GON name, among the abilities of move / attack / bonus / the spell list
+            if (!a.ability) a.ability = forced_peek(actor, msg.gon);  // a passive's own ability (a disorder's): the one this game's own brain made the same decision with
+            log_line("LOCKSTEP", "cat %u's '%s' is in no slot -- %s", (unsigned)cat, msg.gon, a.ability ? "found (by its name, or in this game's own decision)" : "NOT found");
         }
         if (!a.ability) {
             char why[192];
@@ -4382,6 +4719,14 @@ void adopt_new_cats(bool even_if_halted = false) {
         const uint8_t src     = g.actor ? cat_index_of(g.actor) : kNoCat;
         const bool    inherits = g.human_cat[i] && src != kNoCat && g.human_cat[src];
         g.local_cat[i] = inherits && g.local_cat[src];
+        // A PLAYER-BRAINED SUMMON WITH NO HUMAN ACTOR (a Fetus the boss's attack made mid-battle: room NTQZ 2026-10-25, "neither player can control the minion"): local_cat
+        // stayed false on BOTH peers, so each peer took it for the other's and its turn waited for ever. It goes to the host, on both peers alike -- the host decides
+        // for it, the decision travels by the roster index like any other cat's.
+        bool to_host = false;
+        if (g.human_cat[i] && !inherits) {
+            uint8_t pids[kMaxPeers] = {};
+            if (net_peer_count() > 0 && net_peer_ids(pids, kMaxPeers)) { g.local_cat[i] = net_self() == pids[0]; to_host = true; }
+        }
 
         ++g.cat_count;                     // the next iteration indexes past this one
 
@@ -4392,11 +4737,13 @@ void adopt_new_cats(bool even_if_halted = false) {
             log_line("LOCKSTEP", "roster index %u added mid-battle (brain %s): owned by %s, "
                                  "inherited from cat %u (the applied action's actor)",
                      i, bcls, g.local_cat[i] ? "THIS peer" : "the peer", (unsigned)src);
+        else if (to_host)
+            log_line("LOCKSTEP", "roster index %u added mid-battle with a PLAYER brain (%s) and no attributable owner (actor %s) -- it goes to the host (%s)",
+                     i, bcls, src == kNoCat ? "not in the roster" : "not a human cat", g.local_cat[i] ? "THIS peer" : "the peer");
         else
             log_line_lvl(LogLevel::Warn, "LOCKSTEP",
                          "!! roster index %u added mid-battle with a PLAYER brain (%s) and no "
-                         "attributable owner (actor %s) -- both peers will drive it locally, "
-                         "which diverges on its first move. Known gap in summon ownership.",
+                         "attributable owner (actor %s) and no peer list -- nobody drives it.",
                          i, bcls, src == kNoCat ? "not in the roster" : "not a human cat");
     }
 }
@@ -4611,12 +4958,13 @@ void log_battle_stats(const char* why, bool halted) {
     uint32_t rlc = 0, rlm = 0, rll = 0, dpc = 0, dpm = 0;
     rngl_stats(rlc, rlm, rll); deep_stats(dpc, dpm);
     log_line("BATTLE", "SUMMARY-SYNC (%s) battle %016llx role=%s sim=%u proto=%u: turns %u in %llu s | hashes agreed %u, mismatched %u, debounced %u, %s | board: applied %u, with repairs %u, late %u, "
-                       "units rewritten %u moved %u replaced %u spawned %u trimmed %u, stuck %u, unmatched %u, the build itself differed in %u unit(s) | audit: %s%u cat(s) compared, %u differ | unlock queries: %u action(s) compared, %u differ | rng ledger: %u action(s) compared, %u differ (%u between actions) | derived values: %u turn(s) compared, %u differ | board waits: %llu ms in all, longest %u ms, %u over 100 ms | board digests: %u agreed, %u full board(s) asked for%s, %u boundary(ies) the host was already past",
+                       "units rewritten %u moved %u replaced %u spawned %u trimmed %u, stuck %u, unmatched %u, the build itself differed in %u unit(s) | audit: %s%u cat(s) compared, %u differ | unlock queries: %u action(s) compared, %u differ | rng ledger: %u action(s) compared, %u differ (%u between actions) | derived values: %u turn(s) compared, %u differ | board waits: %llu ms in all, longest %u ms, %u over 100 ms | board digests: %u agreed, %u full board(s) asked for%s, %u boundary(ies) the host was already past | turn queue: %u boundary(ies) differed from the host's, %u put in its order | unit deep state: %u unit(s) differed, %u put right, %u record(s) late | roster entries renumbered to the host's: %u",
              why, (unsigned long long)g.battles.current, net_role() == NetRole::Host ? "host" : "client", (unsigned)tune::kSimRevision, (unsigned)kProtoVersion,
              (unsigned)g.turn, (unsigned long long)(g.bs.t0 ? (GetTickCount64() - g.bs.t0) / 1000 : 0), g.bs.agreed, g.bs.mismatched, g.debounced, halted || g.halted || g.halted_in_battle ? "HALTED" : "completed",
              g.bs.board_applied, g.bs.board_differed, g.bs.board_late, g.bs.rewritten, g.bs.moved, g.bs.replaced, g.bs.spawned, g.bs.trimmed, g.bs.stuck, g.bs.bad, g.bs.turn0_differed,
              g.bs.audit_done ? "" : "(not completed) ", g.bs.audit_cats, g.bs.audit_differ, uqc, uqm, rlc, rlm, rll, dpc, dpm,
-             (unsigned long long)g.bs.board_wait_ms, g.bs.board_wait_max, g.bs.board_waits_slow, g.bs.board_sum_agreed, g.bs.board_asked, g.bs.board_stream_asked ? " (then streamed)" : "", g.bs.board_skipped);
+             (unsigned long long)g.bs.board_wait_ms, g.bs.board_wait_max, g.bs.board_waits_slow, g.bs.board_sum_agreed, g.bs.board_asked, g.bs.board_stream_asked ? " (then streamed)" : "", g.bs.board_skipped,
+             g.bs.queue_differed, g.bs.queue_reordered, g.bs.usync_units, g.bs.usync_repaired, g.bs.usync_late, g.bs.renumbered);
 }
 } // namespace
 
@@ -4673,6 +5021,120 @@ void lockstep_dev_arm_stat_repair() {
     log_line_lvl(LogLevel::Warn, "STATS", "!! EXPERIMENT ARMED: from now on this peer's board writes a player's cat's stats and max hp too, and the cats it touches are watched");
 }
 // A player's cat of this peer's own to experiment on: the first roster cat that is a player's and local, else any player's. Null when there is none.
+int lockstep_equip_named(void* chr, const char* name, int32_t durability, int32_t aux) {
+    if (!chr || !name || !name[0]) return -10;
+    const uint8_t* cd = nullptr;
+    if (!mem_read((const uint8_t*)chr + kChar_CatData, &cd, sizeof(cd)) || !cd) return -11;
+    uint64_t before[5] = {};
+    for (int k = 0; k < 5; ++k) mem_read(cd + kCatData_Items + k * 0x60, &before[k], 8);
+    AeState st; st.on = true; st.durability = durability; st.aux = aux; st.str_aux = "";
+    int slot = -1;
+    const int r = autoequip_call(chr, (void*)cd, name, before, st, slot);
+    return r == 1 ? slot : (r == 0 ? -1 : r - 20);
+}
+
+// THE ITEM OF ANOTHER NAME (0.1.192; yuge's room 11-05, battle c5cadcada64b584d: the client swapped its cat's Star for a PetrifiedPoop on the gear page AFTER the host had
+// entered the node and built the battle with the Star -- 'item 4 is PetrifiedPoop here, Star on the host', unrepairable, a halt at turn 1).
+static uint8_t* inventory_object() {
+    const uintptr_t f = addr_of_call(C_EquipSwap);
+    uint8_t op[3] = {}; int32_t rel = 0;
+    if (!f || !mem_read((const void*)(f + 0x51), op, 3) || op[0] != 0x48 || op[1] != 0x8B || op[2] != 0x1D || !mem_read((const void*)(f + 0x54), &rel, 4)) return nullptr;
+    uint8_t* inv = nullptr;
+    mem_read((const void*)(f + 0x58 + (intptr_t)rel), &inv, 8);
+    return inv;
+}
+// An item of that name in an inventory container (an id -> Item map: list head +0x08, node {next, prev, id +0x10, Item +0x18 (name +0x08)}). 0 when there is none.
+static uint64_t container_item_id(const uint8_t* cont, const char* name) {
+    const uint8_t* head = nullptr; const uint8_t* p = nullptr;
+    if (!cont || !mem_read(cont + 8, &head, 8) || !head || !mem_read(head, &p, 8)) return 0;
+    for (int guard = 0; p && p != head && guard < 4096; ++guard) {
+        char nm[64] = {};
+        if (mem_read_std_string(p + 0x18 + 0x08, nm, sizeof(nm)) && strcmp(nm, name) == 0) { uint64_t id = 0; mem_read(p + 0x18, &id, 8); return id; }
+        if (!mem_read(p, &p, 8)) break;
+    }
+    return 0;
+}
+static int swap_item_call(void* chr, void* cd, const char* name, int32_t dur, int32_t aux, uint64_t take_id, uint8_t* inv, bool own, uint64_t old_id) {
+    const uintptr_t mk = addr_of_call(C_ItemMake), sw = addr_of_call(C_EquipSwap), changed = addr_of_call(C_CharItemsChanged), rm = addr_of_call(C_InvRemove);
+    const uintptr_t sctor = addr_of_call(C_StrFromCStr), sdtor = addr_of_call(C_GameStrDtor);
+    if (!mk || !sw || !changed || !rm || !sctor || !sdtor) return -2;
+    __try {
+        alignas(16) uint8_t str[32];
+        alignas(16) uint8_t item[0x60];
+        memset(str, 0, sizeof(str)); memset(item, 0, sizeof(item));
+        ((void* (__fastcall*)(void*, const char*))sctor)(str, name);
+        ((void* (__fastcall*)(void*, void*, void*))mk)(nullptr, item, str);       // the name by value: the callee frees it
+        if (take_id) *(uint64_t*)item = take_id;                                    // the backpack's item of that name is the one moved into the slot (the swap takes it out by id)
+        *(int32_t*)(item + 0x48) = dur; *(int32_t*)(item + 0x4C) = aux;
+        ((bool (__fastcall*)(void*, void*, int))sw)(cd, item, 0);                   // the old item goes into the backpack
+        ((void (__fastcall*)(void*))sdtor)(item + 0x08);
+        ((void (__fastcall*)(void*))sdtor)(item + 0x28);
+        if (!own && inv && old_id && old_id != ~0ull) ((void (__fastcall*)(void*, const void*))rm)(inv + 0x38, &old_id);   // not this player's item: out of its backpack again
+        ((void (__fastcall*)(void*))changed)(chr);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int lockstep_swap_item_named(void* chr, uint32_t slot, const char* name, int32_t durability, int32_t aux, bool own) {
+    if (!chr || !name || !name[0] || slot >= 5) return -10;
+    uint8_t* cd = nullptr;
+    if (!mem_read((const uint8_t*)chr + kChar_CatData, &cd, sizeof(cd)) || !cd) return -11;
+    uint8_t* inv = inventory_object();
+    if (!inv) return -12;
+    uint64_t old_id = 0;
+    mem_read(cd + kCatData_Items + slot * 0x60, &old_id, 8);
+    const uint64_t take = own ? container_item_id(inv + 0x38, name) : 0;
+    const int r = swap_item_call(chr, cd, name, durability, aux, take, inv, own, old_id);
+    char now[64] = {};
+    mem_read_std_string(cd + kCatData_Items + slot * 0x60 + 0x08, now, sizeof(now));
+    log_line_lvl(LogLevel::Warn, "USYNC", "item slot %u: '%s' swapped in the game's way (%s%s) -- the slot now holds '%s'", slot, name,
+                 own ? "this player's cat: " : "not this player's cat: the old item left its backpack again",
+                 own ? (take ? "the backpack's own one was taken, the old one went into the backpack" : "none in the backpack, a new one was made; the old one went into the backpack") : "",
+                 now);
+    if (r != 1) return r;
+    return strcmp(now, name) == 0 ? 1 : 0;
+}
+
+int lockstep_unit_index(const void* chr) {
+    if (!chr || !g.snapped) return -1;
+    const uint8_t i = cat_index_of(chr);
+    return i == kNoCat ? -1 : (int)i;
+}
+
+namespace { bool dev_queue_last(uint32_t u); bool dev_queue_drop(uint32_t u); }
+bool lockstep_dev_queue_last(uint32_t u) { return g.snapped && dev_queue_last(u); }
+bool lockstep_dev_queue_drop(uint32_t u) { return g.snapped && dev_queue_drop(u); }
+
+bool lockstep_dev_roster_rotate(uint32_t a, uint32_t b, uint32_t c) {
+    if (!g.snapped || a >= g.cat_count || b >= g.cat_count || c >= g.cat_count || a == b || b == c || a == c) return false;
+    for (uint32_t i : { a, b, c }) if (g.human_cat[i] || g.derived_unit[i] || !g.cats[i]) return false;
+    auto rot = [&](auto& arr) { auto t = arr[c]; arr[c] = arr[b]; arr[b] = arr[a]; arr[a] = t; };
+    rot(g.cats); rot(g.cat_key); rot(g.cat_key_ok); rot(g.fresh_left); rot(g.summon);
+    log_line_lvl(LogLevel::Warn, "LOCKSTEP", "dev on THIS game only: roster entries %u -> %u -> %u -> %u rotated (the host's board must renumber them)", a, b, c, a);
+    return true;
+}
+
+uint32_t lockstep_dev_unitprobe(bool deep) {
+    const void* list = resolve_char_list(g.tc);
+    uint32_t n = 0; const void* const* data = nullptr;
+    if (!list || !mem_read((const uint8_t*)list + kList_Count, &n, 4) || !mem_read((const uint8_t*)list + kList_Data, &data, 8) || !data || n > kMaxCats) {
+        log_line("UNITPROBE", "!! no live battle list");
+        return 0;
+    }
+    log_line("UNITPROBE", "==== %u unit(s) in the live list (turn %u, battle %016llx)", n, g.turn, (unsigned long long)g.battles.current);
+    for (uint32_t i = 0; i < n; ++i) {
+        const void* c = nullptr;
+        if (!mem_read(data + i, &c, 8) || !c) continue;
+        const uint8_t ri = cat_index_of(c);
+        unitprobe_log(ri == kNoCat ? 1000 + i : ri, c, deep);
+    }
+    return n;
+}
+
+const void* lockstep_dev_unit(uint32_t index) {
+    if (!g.snapped || index >= g.cat_count || !g.cats[index] || !entry_is(index, g.cats[index])) return nullptr;
+    return g.cats[index];
+}
+
 const void* lockstep_dev_player_cat() {
     if (!g.snapped) return nullptr;
     const void* any = nullptr;
@@ -4998,11 +5460,11 @@ static void halt_finish_pump() {
     if (!tune::kHaltAutoFinish || !(g.halted || host_over) || !g.snapped || g.battles.current == kNoBattle) return;
     static uint64_t s_battle = 0;
     static ULONGLONG s_next = 0;
-    static uint32_t s_sweeps = 0, s_hit_total = 0;
+    static uint32_t s_sweeps = 0, s_hit_total = 0, s_empty = 0, s_gen = ~0u;
     static bool s_done = false;
     const ULONGLONG now = GetTickCount64();
-    if (s_battle != g.battles.current) {
-        s_battle = g.battles.current; s_next = now + (host_over ? 0 : tune::kHaltFinishEveryMs); s_sweeps = s_hit_total = 0; s_done = false;
+    if (s_battle != g.battles.current || s_gen != g_battle_gen) {
+        s_battle = g.battles.current; s_gen = g_battle_gen; s_next = now + (host_over ? 0 : tune::kHaltFinishEveryMs); s_sweeps = s_hit_total = s_empty = 0; s_done = false; g.halt_pass_turns = false;
         if (host_over && !lockstep_fight_up()) { s_done = true; return; }      // it ended here too, in time: nothing to finish
         if (host_over && lockstep_fight_up()) {
             log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! the host's fight of battle %016llx has been over for %llu ms and this peer's is still up -- finishing it here (every enemy still standing is struck down)",
@@ -5020,6 +5482,7 @@ static void halt_finish_pump() {
         // snapshots the next battle). Lifted here, on each peer when its own fight is over. The shared stream is put where both peers derive it from the battle's identity: the two had drifted apart, which is what
         // halted the battle, and the node-entry hash compares the stream.
         g.halted = false;
+        g.halt_pass_turns = false;
         g.stats.halted = false;
         g.halt_reason[0] = 0;
         g.halt_cleared_for = g.battles.current;
@@ -5053,6 +5516,12 @@ static void halt_finish_pump() {
         if (mem_write((uint8_t*)chr + kChar_HP, &zero, 4)) ++hit;
     }
     ++s_sweeps; s_hit_total += hit;
+    if (g.halted && alive == 0 && s_sweeps >= 2) {
+        if (++s_empty >= 2 && !g.halt_pass_turns) {
+            g.halt_pass_turns = true;
+            log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH: no enemy is left and the fight is still up -- the parked turn is ended so the game can see it is won");
+        }
+    } else if (alive) s_empty = 0;
     if (s_sweeps <= 30 || hit) log_line_lvl(LogLevel::Warn, "HALT", "HALT AUTO-FINISH sweep %u: %u enem%s alive, hp 0 written to %u (the game's own death handling takes them); %u unit(s) adopted since the last sweep, roster %u", s_sweeps, alive, alive == 1 ? "y" : "ies", hit, g.cat_count - roster_before, g.cat_count);
 }
 
@@ -5305,16 +5774,30 @@ bool board_move_unit(const void* chr, int32_t x, int32_t y) {
 // HOST: capture and send. The chunks are kept for a peer that joins this battle later (lockstep_catchup).
 // ONE UNIT'S ROW OF THE BOARD, as the host sends it -- and, since proto 98, as a client reads its own board at the same boundary to take the digest the host's is compared with
 // (board_local_matches). One function for both, so the two sides can only ever describe a unit the same way.
-void board_fill(uint32_t i, bool have_memb, const bool* still_n, BoardUnit& u) {
+// proto 115: a unit that is not a player's cat and carries cat data (Character+0x88) -- a summon's golem, a clone, a CustomEnemyCat. A client that has to make one makes it
+// from the host's cat data (ucat_fetch), not by its definition name.
+static bool cat_data_unit(uint32_t i) {
+    const void* cat = nullptr;
+    return i < g.cat_count && !g.human_cat[i] && g.cats[i] && mem_read((const uint8_t*)g.cats[i] + kChar_CatData, &cat, sizeof(cat)) && cat;
+}
+
+void board_fill(uint32_t i, bool have_memb, const bool* still_n, BoardUnit& u, UnitDeep* rec = nullptr) {
     u = BoardUnit{};
     u.index = (uint8_t)i;
-    if ((have_memb && !still_n[i]) || !g.cats[i]) { u.flags = kBoardGone; return; }
+    if (rec) *rec = UnitDeep{};
+    if ((have_memb && !still_n[i]) || !g.cats[i] || parked_dead(g.cats[i])) { u.flags = kBoardGone; return; }     // 0.1.132: dead and parked off the board = gone (see parked_dead)
+    {   // proto 113: the unit's deep state, as one digest (the record itself for the host to keep)
+        static UnitDeep scratch;
+        UnitDeep& d = rec ? *rec : scratch;
+        u.deep = unitstate_read(g.cats[i], d) ? unitstate_digest(d) : 0;
+    }
     CatState st{};
     read_cat_state(g.cats[i], st, false);       // plain reads: the elements the call would add are not part of the board
     u.ident = board_ident(g.cats[i]);
     u.hp = st.hp; u.shield = st.shield; u.maxhp = st.maxhp;
     u.flags = (uint8_t)((st.dead ? kBoardDead : 0) | (st.linked ? kBoardLinked : 0) | (g.human_cat[i] ? kBoardHuman : 0) | (unit_is_champion(g.cats[i]) ? kBoardChampion : 0)
-                           | (!st.dead && unit_is_removed(g.cats[i]) ? kBoardRemoved : 0));       // taken off the board, not dead: a client holding it alive takes it off too
+                           | (!st.dead && unit_is_removed(g.cats[i]) ? kBoardRemoved : 0)        // taken off the board, not dead: a client holding it alive takes it off too
+                           | (cat_data_unit(i) ? kBoardCatData : 0));                              // proto 115: made from cat data (not in the digest)
     if (g.human_cat[i]) {                          // proto 77: a player's stats ride along (the experiment, and the record)
         for (int k = 0; k < 7; ++k) mem_read((const uint8_t*)g.cats[i] + 0x5BC + k * 4, &u.stat[k], 4);
         mem_read((const uint8_t*)g.cats[i] + 0x5E8, &u.stat_bonus, 4);
@@ -5326,8 +5809,361 @@ void board_fill(uint32_t i, bool have_memb, const bool* still_n, BoardUnit& u) {
     mem_read((const uint8_t*)g.cats[i] + kChar_InitA, &u.key_a, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitB, &u.key_b, 4); mem_read((const uint8_t*)g.cats[i] + kChar_Speed, &u.speed, 4); mem_read((const uint8_t*)g.cats[i] + kChar_InitBase, &u.init_base, 4);
 }
 
+// THE ROUND'S TURN QUEUE (proto 111, see MSG_TURNQUEUE): the entries of TurnControl+0x118 after the current one (+0x128; from the first when the current is the list head),
+// with their kind (+0x10) and, for a character (+0x18), its roster index. False when the list cannot be read or is longer than a message carries.
+struct QueueView {
+    uint8_t* head = nullptr;
+    uint8_t* cur = nullptr;
+    uint8_t  cur_unit = kTurnQueueNoUnit;
+    uint32_t n = 0;
+    uint8_t* node[kTurnQueueMax] = {};
+    uint8_t  kind[kTurnQueueMax] = {};
+    uint8_t  unit[kTurnQueueMax] = {};
+};
+static bool queue_view(QueueView& v) {
+    v = QueueView{};
+    if (!g.tc) return false;
+    uint64_t size = 0;
+    if (!mem_read((uint8_t*)g.tc + 0x118, &v.head, 8) || !v.head || !mem_read((uint8_t*)g.tc + 0x120, &size, 8) || !mem_read((uint8_t*)g.tc + 0x128, &v.cur, 8) || !v.cur || size > 4096) return false;
+    auto unit_of = [](uint8_t* p, uint8_t& kind) -> uint8_t {
+        uint32_t k = 0; void* c = nullptr;
+        if (!mem_read(p + 0x10, &k, 4) || !mem_read(p + 0x18, &c, 8)) { kind = 0xFF; return kTurnQueueNoUnit; }
+        kind = (uint8_t)(k > 0xFE ? 0xFE : k);
+        // 0.1.177: an entry of another kind than 0 names its unit too when it carries a roster character -- kind 1 is a unit's bonus turn (BeginTurn(TurnKind 1)), kind 4 an
+        // end-of-round extra turn; room 31d0 (11-04): the host's round held five kind-1 entries, the client's three, and a Clot took a bonus turn on the host only.
+        if (k == 7 || !c) return kTurnQueueNoUnit;
+        const uint8_t i = cat_index_of(c);
+        return i == kNoCat ? kTurnQueueNoUnit : i;
+    };
+    if (v.cur != v.head) { uint8_t k = 0; v.cur_unit = unit_of(v.cur, k); }
+    uint8_t* p = nullptr;
+    if (!mem_read(v.cur, &p, 8)) return false;
+    for (uint64_t guard = 0; p && p != v.head; ++guard) {
+        if (guard > size || v.n >= kTurnQueueMax) return false;
+        v.node[v.n] = p;
+        v.unit[v.n] = unit_of(p, v.kind[v.n]);
+        ++v.n;
+        if (!mem_read(p, &p, 8)) return false;
+    }
+    return p == v.head;
+}
+static void queue_text(const uint8_t* kind, const uint8_t* unit, uint32_t n, char* out, size_t cap) {
+    size_t w = 0;
+    out[0] = 0;
+    for (uint32_t i = 0; i < n && w + 12 < cap; ++i) {
+        const int r = unit[i] == kTurnQueueNoUnit ? _snprintf_s(out + w, cap - w, _TRUNCATE, "%s(k%u)", i ? " " : "", (unsigned)kind[i])
+                    : kind[i] == 0                 ? _snprintf_s(out + w, cap - w, _TRUNCATE, "%s%u", i ? " " : "", (unsigned)unit[i])
+                                                   : _snprintf_s(out + w, cap - w, _TRUNCATE, "%s%u(k%u)", i ? " " : "", (unsigned)unit[i], (unsigned)kind[i]);
+        if (r > 0) w += (size_t)r;
+    }
+}
+
+// HOST: this boundary's queue, before its board.
+static void queue_publish() {
+    static QueueView v;
+    if (!queue_view(v)) return;
+    static TurnQueueMsg m;
+    m = TurnQueueMsg{};
+    m.battle = g.battles.current; m.turn = g.turn; m.cur = v.cur_unit; m.n = (uint8_t)v.n;
+    for (uint32_t i = 0; i < v.n; ++i) { m.kind[i] = v.kind[i]; m.unit[i] = v.unit[i]; }
+    net_send_turnqueue(m);
+}
+
+// The game's call for a unit joining a round (TurnControl, mode 3: in front of the first remaining entry whose turn-order keys are lower). SEH: a POD-only frame.
+static bool queue_add_unit(uintptr_t fn, void* tc, void* chr) {
+    __try { ((void(__fastcall*)(void*, void*, int, void*))fn)(tc, chr, 3, nullptr); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// A kind of round-queue entry that is a unit's extra turn (not a regular one, not one NextTurn skips, not unreadable).
+static bool bonus_kind(uint8_t k) { return k != 0 && k != 7 && k < 0xFE; }
+
+// A bonus-turn entry for chr put at the end of this round, laid out as the game's own entries (AddToTurnOrder 0x1408E5520): kind +0x10, the character +0x18, the word
+// in front of the character +0x20, TurnControl's entry counter (+0x150, counted up) +0x28. The node is the game's operator new (0x30 bytes; the game frees it after the
+// turn), never mod memory. SEH: a POD-only frame.
+static bool queue_add_bonus(void* tc, uint8_t* head, void* chr, uint8_t kind) {
+    auto alloc = (void* (__fastcall*)(size_t))addr_of_call(C_GameStrAlloc);
+    if (!alloc || !tc || !head || !chr) return false;
+    __try {
+        uint8_t* n = (uint8_t*)alloc(0x30);
+        if (!n) return false;
+        uint8_t* last = *(uint8_t**)(head + 8);
+        uint64_t& seq = *(uint64_t*)((uint8_t*)tc + 0x150);
+        memset(n, 0, 0x30);
+        *(uint32_t*)(n + 0x10) = kind;
+        *(void**)(n + 0x18) = chr;
+        *(uint64_t*)(n + 0x20) = *(uint64_t*)((uint8_t*)chr - 8);
+        *(uint64_t*)(n + 0x28) = seq++;
+        *(uint8_t**)(n + 0) = head;
+        *(uint8_t**)(n + 8) = last;
+        *(uint8_t**)(last + 0) = n;
+        *(uint8_t**)(head + 8) = n;
+        ++*(uint64_t*)((uint8_t*)tc + 0x120);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// CLIENT: put the entries still to come in this round in the host's order. Only the characters both queues hold are moved, among the places characters hold here: an entry of
+// another kind keeps its place, and a unit the host's queue does not name keeps its own.
+static void queue_follow() {
+    static TurnQueueMsg hq;
+    static uint64_t s_said_missing = 0;
+    const uint64_t battle = g.battles.current;
+    bool have = net_host_turnqueue(battle, g.turn, hq);
+    for (const ULONGLONG t0 = GetTickCount64(); !have && GetTickCount64() - t0 < 200; ) { Sleep(2); have = net_host_turnqueue(battle, g.turn, hq); }
+    if (!have) {
+        if (s_said_missing != battle) { s_said_missing = battle; log_line_lvl(LogLevel::Warn, "TURNQ", "!! the host's turn queue of turn %u (battle %016llx) is not here -- this peer keeps its own order (said once per battle)", (unsigned)g.turn, (unsigned long long)battle); }
+        return;
+    }
+    static QueueView v;
+    if (!queue_view(v)) { log_line_lvl(LogLevel::Warn, "TURNQ", "!! this peer's turn queue could not be read at turn %u -- not compared", (unsigned)g.turn); return; }
+    bool same = v.n == hq.n && v.cur_unit == hq.cur;
+    for (uint32_t i = 0; same && i < v.n; ++i) same = v.kind[i] == hq.kind[i] && v.unit[i] == hq.unit[i];
+    if (same) return;
+    ++g.bs.queue_differed;
+    char here[400], host[400];
+    queue_text(v.kind, v.unit, v.n, here, sizeof(here));
+    queue_text(hq.kind, hq.unit, hq.n, host, sizeof(host));
+    if (v.cur_unit != hq.cur)
+        log_line_lvl(LogLevel::Warn, "TURNQ", "!! turn %u: the entry whose turn it is differs (unit %d here, %d on the host) -- the turn orders had already parted", (unsigned)g.turn,
+                     v.cur_unit == kTurnQueueNoUnit ? -1 : (int)v.cur_unit, hq.cur == kTurnQueueNoUnit ? -1 : (int)hq.cur);
+    uint16_t rank[256];
+    for (uint32_t u = 0; u < 256; ++u) rank[u] = 0xFFFF;
+    for (uint32_t i = 0; i < hq.n; ++i) if (hq.kind[i] == 0 && hq.unit[i] != kTurnQueueNoUnit && rank[hq.unit[i]] == 0xFFFF) rank[hq.unit[i]] = (uint16_t)i;
+    // A CHARACTER THE HOST'S ROUND DOES NOT HOLD (0.1.170, rooms AYVR/ER2C 2026-11-03: the same 24 units with the same keys at turn 0, and by turn 1 the client's
+    // round still held eight units the host's no longer did -- at turn 10 the client gave two of them a turn, the host gave it to a player's cat, and the battle
+    // halted). Its entry is marked the way the game marks an entry it skips (kind 7: NextTurn passes over it), so this round goes as the host's does; the next
+    // round is built from the keys, which the board keeps equal. Only when every character entry of the host's queue named its unit (no guessing).
+    {
+        bool host_named_all = true;
+        for (uint32_t i = 0; i < hq.n && host_named_all; ++i) if (hq.kind[i] == 0 && hq.unit[i] == kTurnQueueNoUnit) host_named_all = false;
+        uint32_t skipped = 0; char sk[200] = {}; int sw = 0;
+        for (uint32_t i = 0; host_named_all && i < v.n; ++i) {
+            if (v.kind[i] != 0 || v.unit[i] == kTurnQueueNoUnit || rank[v.unit[i]] != 0xFFFF || v.unit[i] == hq.cur) continue;
+            const uint32_t seven = 7;
+            if (!mem_write(v.node[i] + 0x10, &seven, 4)) continue;
+            v.kind[i] = 7;
+            ++skipped;
+            if (sw >= 0 && (size_t)sw < sizeof(sk) - 8) sw += _snprintf_s(sk + sw, sizeof(sk) - sw, _TRUNCATE, " %u", (unsigned)v.unit[i]);
+        }
+        if (skipped) {
+            ++g.bs.queue_reordered;
+            log_line_lvl(LogLevel::Warn, "TURNQ", "!! turn %u: %u unit(s) are in this round's queue here and not in the host's --%s -- their turns of this round are skipped, as on the host (here: %s | host: %s)",
+                         (unsigned)g.turn, skipped, sk, here, host);
+        }
+    }
+    // A UNIT IN THE HOST'S ROUND AND NOT IN THIS ONE (0.1.176; the latest 300 uploads: rooms aa20 / a3b5 / 3ff2 -- "the round's queue differs from the host's in what it holds"
+    // with the HOST holding units this peer's round did not, e.g. here "13 16 14 15" and the host "(k1) (k1) 13 19 18 16 24 14 (k1) (k1) 23 15 22 21 25"; the turn orders
+    // parted within a boundary or two and the stream or the state halted the battle). Each such unit standing alive on this board is put into this round with the
+    // game's own call for a unit joining a round (AddToTurnOrder, mode 3 -- the board's spawn uses it), which places it by its turn-order keys (the board has made them
+    // the host's); the exact-sequence pass below then puts the round in the host's order.
+    {
+        bool inq[256] = {};
+        for (uint32_t i = 0; i < v.n; ++i) if (v.kind[i] == 0 && v.unit[i] != kTurnQueueNoUnit) inq[v.unit[i]] = true;
+        if (v.cur_unit != kTurnQueueNoUnit) inq[v.cur_unit] = true;
+        const uintptr_t add = addr_of_call(C_TurnOrderAdd);
+        uint32_t added = 0; char ad[160] = {}; int aw = 0;
+        for (uint32_t i = 0; i < hq.n && add && g.tc; ++i) {
+            const uint8_t u = hq.unit[i];
+            if (hq.kind[i] != 0 || u == kTurnQueueNoUnit || inq[u] || u >= g.cat_count || !g.cats[u]) continue;
+            CatState s{};
+            if (parked_dead(g.cats[u]) || !read_cat_state(g.cats[u], s, false) || s.dead || s.hp <= 0 || !s.linked || off_board(s) || unit_is_removed(g.cats[u])) continue;
+            if (!queue_add_unit(add, g.tc, (void*)g.cats[u])) continue;
+            inq[u] = true; ++added;
+            if (aw >= 0 && (size_t)aw < sizeof(ad) - 8) aw += _snprintf_s(ad + aw, sizeof(ad) - aw, _TRUNCATE, " %u", (unsigned)u);
+        }
+        if (added) {
+            ++g.bs.queue_reordered;
+            log_line_lvl(LogLevel::Warn, "TURNQ", "!! turn %u: %u unit(s) are in the host's round and were not in this one --%s -- added to it the game's way (AddToTurnOrder) | here before: %s | host: %s",
+                         (unsigned)g.turn, added, ad, here, host);
+            if (!queue_view(v)) return;
+            queue_text(v.kind, v.unit, v.n, here, sizeof(here));
+        }
+    }
+    // BONUS TURNS (0.1.177, room 31d0 11-04, battle 31d0ea7d turn 25: "here: (k1) (k1) (k1) 7 9 37 ... | host: (k1) (k1) (k1) (k1) (k1) 7 9 37 ..." -- kind 1 is a unit's
+    // bonus turn; at turn 26 a Clot took one on the host and not here, ClotEvolve ran on one game only and the state halted the battle at turn 28). A bonus entry names
+    // its unit now, so it is paired by (kind, unit): one this round holds and the host's does not is marked skipped (kind 7, as above); one the host's holds for a unit
+    // standing alive here is added the game's way (queue_add_bonus). Only when every bonus entry of the host's queue named its unit.
+    {
+        bool named = true;
+        for (uint32_t i = 0; i < hq.n && named; ++i) if (bonus_kind(hq.kind[i]) && hq.unit[i] == kTurnQueueNoUnit) named = false;
+        if (named) {
+            static uint8_t want[256][8];                      // [unit][kind & 7]: the host's bonus entries not yet paired with one here
+            memset(want, 0, sizeof(want));
+            for (uint32_t i = 0; i < hq.n; ++i) if (bonus_kind(hq.kind[i]) && hq.kind[i] < 8 && want[hq.unit[i]][hq.kind[i]] < 0xFF) ++want[hq.unit[i]][hq.kind[i]];
+            uint32_t skipped = 0, added = 0; char sk[160] = {}, ad[160] = {}; int sw = 0, aw = 0;
+            for (uint32_t i = 0; i < v.n; ++i) {
+                if (!bonus_kind(v.kind[i]) || v.unit[i] == kTurnQueueNoUnit || v.kind[i] >= 8) continue;
+                if (want[v.unit[i]][v.kind[i]]) { --want[v.unit[i]][v.kind[i]]; continue; }
+                const uint32_t seven = 7;
+                if (!mem_write(v.node[i] + 0x10, &seven, 4)) continue;
+                if (sw >= 0 && (size_t)sw < sizeof(sk) - 12) sw += _snprintf_s(sk + sw, sizeof(sk) - sw, _TRUNCATE, " %u(k%u)", (unsigned)v.unit[i], (unsigned)v.kind[i]);
+                v.kind[i] = 7; ++skipped;
+            }
+            for (uint32_t u = 0; u < 256 && g.tc; ++u) for (uint8_t k = 1; k < 8; ++k) {
+                for (uint8_t left = want[u][k]; left; --left) {
+                    if (k == 7 || u >= g.cat_count || !g.cats[u]) break;
+                    CatState s{};
+                    if (parked_dead(g.cats[u]) || !read_cat_state(g.cats[u], s, false) || s.dead || s.hp <= 0 || !s.linked || off_board(s) || unit_is_removed(g.cats[u])) break;
+                    if (!queue_add_bonus(g.tc, v.head, (void*)g.cats[u], k)) break;
+                    ++added;
+                    if (aw >= 0 && (size_t)aw < sizeof(ad) - 12) aw += _snprintf_s(ad + aw, sizeof(ad) - aw, _TRUNCATE, " %u(k%u)", u, (unsigned)k);
+                }
+            }
+            if (skipped || added) {
+                ++g.bs.queue_reordered;
+                log_line_lvl(LogLevel::Warn, "TURNQ", "!! turn %u: this round's bonus turns differed from the host's -- %u skipped here (the host's round has no such entry):%s; %u added (the host's round has them):%s | here before: %s | host: %s",
+                             (unsigned)g.turn, skipped, skipped ? sk : " -", added, added ? ad : " -", here, host);
+                if (added) { if (!queue_view(v)) return; }
+                queue_text(v.kind, v.unit, v.n, here, sizeof(here));
+            }
+        }
+    }
+    // THE HOST'S EXACT SEQUENCE, NON-CHARACTER ENTRIES INCLUDED (0.1.174; rooms XNQ/FHJBHFA0 2026-11-04, battle fe3afc18: both rounds held "44 (k4) (k4) (k4) 16", the
+    // client's with 44 before the three kind-4 entries and the host's after them -- the reorder below moves characters only among the places characters hold, so it
+    // could not move 44 past them, said "nothing to move" at five boundaries in a row, and the client gave 44 its turn first: the stream parted, a halt at turn 54).
+    // When the two rounds hold the same entries -- a character by its unit, any other entry by its kind, paired in the order they come -- this round is relinked in the
+    // host's sequence as it is; the entries this peer alone holds and has marked skipped (kind 7, above) go last. Otherwise the reorder below, as before.
+    {
+        uint8_t* exact[kTurnQueueMax];
+        bool used[kTurnQueueMax] = {};
+        uint32_t ne = 0;
+        bool match = true;
+        for (uint32_t i = 0; i < hq.n && match; ++i) {
+            uint32_t j = 0;
+            for (; j < v.n; ++j) {
+                if (used[j] || v.kind[j] != hq.kind[i] || v.kind[j] == 0xFF) continue;
+                if ((hq.kind[i] == 0 || (hq.unit[i] != kTurnQueueNoUnit && v.unit[j] != kTurnQueueNoUnit)) && v.unit[j] != hq.unit[i]) continue;   // 0.1.177: a bonus turn by its unit
+                break;
+            }
+            if (j == v.n) { match = false; break; }
+            used[j] = true; exact[ne++] = v.node[j];
+        }
+        for (uint32_t j = 0; j < v.n && match; ++j) {
+            if (used[j]) continue;
+            if (v.kind[j] != 7) { match = false; break; }   // an entry the host's round does not hold, and not one this peer skips: not the same round
+            exact[ne++] = v.node[j];
+        }
+        if (match && ne == v.n) {
+            uint32_t moved = 0;
+            for (uint32_t i = 0; i < v.n; ++i) if (exact[i] != v.node[i]) ++moved;
+            if (!moved) return;                              // only the kind-7 marks above made the difference
+            uint8_t* prev = v.cur;
+            bool ok = true;
+            for (uint32_t i = 0; i < v.n && ok; ++i) { ok = mem_write(prev, &exact[i], 8) && mem_write(exact[i] + 8, &prev, 8); prev = exact[i]; }
+            ok = ok && mem_write(prev, &v.head, 8) && mem_write(v.head + 8, &prev, 8);
+            ++g.bs.queue_reordered;
+            log_line_lvl(ok ? LogLevel::Warn : LogLevel::Error, "TURNQ", "!! turn %u: this round's turn queue differed from the host's -- %s, every entry in the host's sequence (%u moved) | here: %s | host: %s",
+                         (unsigned)g.turn, ok ? "put in the host's order" : "COULD NOT BE REWRITTEN", moved, here, host);
+            return;
+        }
+    }
+    uint32_t pos[kTurnQueueMax], np = 0;
+    bool seen[256] = {};
+    for (uint32_t i = 0; i < v.n; ++i) {
+        if (v.kind[i] != 0 || v.unit[i] == kTurnQueueNoUnit || rank[v.unit[i]] == 0xFFFF) continue;
+        if (seen[v.unit[i]]) { log_line_lvl(LogLevel::Warn, "TURNQ", "!! turn %u: unit %u is in this peer's queue twice -- not reordered (here: %s | host: %s)", (unsigned)g.turn, (unsigned)v.unit[i], here, host); return; }
+        seen[v.unit[i]] = true;
+        pos[np++] = i;
+    }
+    // the characters at those places, in the host's order (insertion sort: a round holds a few dozen)
+    uint8_t* sorted[kTurnQueueMax];
+    uint8_t  su[kTurnQueueMax];
+    for (uint32_t k = 0; k < np; ++k) {
+        uint8_t* nd = v.node[pos[k]]; const uint8_t u = v.unit[pos[k]];
+        uint32_t j = k;
+        while (j > 0 && rank[su[j - 1]] > rank[u]) { sorted[j] = sorted[j - 1]; su[j] = su[j - 1]; --j; }
+        sorted[j] = nd; su[j] = u;
+    }
+    uint8_t* seq[kTurnQueueMax];
+    for (uint32_t i = 0; i < v.n; ++i) seq[i] = v.node[i];
+    uint32_t moved = 0;
+    for (uint32_t k = 0; k < np; ++k) { if (seq[pos[k]] != sorted[k]) ++moved; seq[pos[k]] = sorted[k]; }
+    if (!moved) {
+        log_line_lvl(LogLevel::Warn, "TURNQ", "!! turn %u: the round's queue differs from the host's in what it holds, not in its order -- nothing to move (here: %s | host: %s)", (unsigned)g.turn, here, host);
+        return;
+    }
+    // relink the run between the current entry (or the head) and the head in the new order
+    uint8_t* prev = v.cur;
+    bool ok = true;
+    for (uint32_t i = 0; i < v.n && ok; ++i) {
+        ok = mem_write(prev, &seq[i], 8) && mem_write(seq[i] + 8, &prev, 8);
+        prev = seq[i];
+    }
+    ok = ok && mem_write(prev, &v.head, 8) && mem_write(v.head + 8, &prev, 8);
+    ++g.bs.queue_reordered;
+    log_line_lvl(ok ? LogLevel::Warn : LogLevel::Error, "TURNQ", "!! turn %u: this round's turn queue differed from the host's -- %s (%u entr(ies) moved) | here: %s | host: %s", (unsigned)g.turn,
+                 ok ? "put in the host's order" : "COULD NOT BE REWRITTEN", moved, here, host);
+}
+
+// DEV (0.1.174): unit u's entry moved to the end of this round's queue, on this game only.
+bool dev_queue_last(uint32_t u) {
+    static QueueView v;
+    if (!queue_view(v)) return false;
+    uint32_t k = 0;
+    for (; k < v.n; ++k) if (v.kind[k] == 0 && v.unit[k] == u) break;
+    if (k >= v.n || k + 1 == v.n) return false;
+    uint8_t* nd = v.node[k]; uint8_t* next = nullptr; uint8_t* prev = nullptr; uint8_t* last = nullptr;
+    if (!mem_read(nd, &next, 8) || !mem_read(nd + 8, &prev, 8) || !mem_read(v.head + 8, &last, 8)) return false;
+    mem_write(prev, &next, 8); mem_write(next + 8, &prev, 8);                // unlink
+    mem_write(last, &nd, 8); mem_write(nd + 8, &last, 8); mem_write(nd, &v.head, 8); mem_write(v.head + 8, &nd, 8);   // link before the head
+    log_line_lvl(LogLevel::Warn, "TURNQ", "dev on THIS game only: unit %u moved to the end of this round's queue (the queue sync must put it back)", u);
+    return true;
+}
+
+// DEV (0.1.176): unit u's entry unlinked from this round's queue, on this game only.
+bool dev_queue_drop(uint32_t u) {
+    static QueueView v;
+    if (!queue_view(v)) return false;
+    uint32_t k = 0;
+    for (; k < v.n; ++k) if (v.kind[k] == 0 && v.unit[k] == u) break;
+    if (k >= v.n) return false;
+    uint8_t* nd = v.node[k]; uint8_t* next = nullptr; uint8_t* prev = nullptr; uint64_t size = 0;
+    if (!mem_read(nd, &next, 8) || !mem_read(nd + 8, &prev, 8) || !mem_read((uint8_t*)g.tc + 0x120, &size, 8) || !size) return false;
+    mem_write(prev, &next, 8); mem_write(next + 8, &prev, 8);
+    --size; mem_write((uint8_t*)g.tc + 0x120, &size, 8);
+    log_line_lvl(LogLevel::Warn, "TURNQ", "dev on THIS game only: unit %u taken out of this round's queue (the queue sync must put it back)", u);
+    return true;
+}
+
+// HOST (proto 115, 0.1.190): every unit made from cat data has its cat image kept for the battle -- serialized once per unit (again when its cat data is another object, and
+// from the battle's first boundary on), for a client that has to make that unit (MSG_UCATREQ, answered on the receive thread).
+static void ucat_keep_battle(bool have_memb, const bool* still) {
+    static uint64_t battle = 0;
+    static const void* kept_cat[kMaxCats] = {};
+    if (battle != g.battles.current || g.turn == 0) { battle = g.battles.current; memset(kept_cat, 0, sizeof(kept_cat)); }
+    uint32_t kept = 0, failed = 0, bytes = 0;
+    for (uint32_t i = 0; i < g.cat_count && i < kMaxCats; ++i) {
+        if ((have_memb && !still[i]) || !cat_data_unit(i)) continue;
+        void* cat = nullptr;
+        if (!mem_read((const uint8_t*)g.cats[i] + kChar_CatData, &cat, sizeof(cat)) || !cat || kept_cat[i] == cat) continue;
+        kept_cat[i] = cat;
+        int32_t key = 0; uint64_t id = 0;
+        mem_read((const uint8_t*)g.cats[i] + kChar_InitB, &key, 4);
+        mem_read((const uint8_t*)cat + kCatData_SaveId, &id, sizeof(id));
+        uint8_t* image = nullptr;
+        uint32_t n = 0;
+        {   // the serializer is the game's: the shared stream is put back after it, whatever it did
+            uint64_t* s = rng_global_stream(); uint64_t saved[4] = {};
+            const bool fenced = s && mem_read(s, saved, sizeof(saved));
+            n = serialize_cat(cat, &image);
+            if (fenced) mem_write(s, saved, sizeof(saved));
+        }
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t k = 0; k < n && image; ++k) { h ^= image[k]; h *= 1099511628211ULL; }
+        if (n && image && net_ucat_keep(g.battles.current, (uint8_t)i, key, id, image, n, h)) { ++kept; bytes += n; }
+        else ++failed;
+        char def[kBoardDefLen] = {};
+        unit_definition_name(g.cats[i], def, sizeof(def));
+        log_line("UCAT", "turn %u: unit %u ('%s', key %08x) is made from cat data (id %016llx) -- %s (%u bytes, hash %016llx)", (unsigned)g.turn, i, def, (unsigned)key,
+                 (unsigned long long)id, n && image ? "its image is kept for a client that has to make it" : "its image could NOT be taken", n, (unsigned long long)h);
+        free(image);
+    }
+    if (failed) log_line_lvl(LogLevel::Warn, "UCAT", "!! turn %u: %u unit image(s) kept (%u bytes), %u could not be taken", (unsigned)g.turn, kept, bytes, failed);
+}
+
 void board_publish() {
     if (g.cat_count == 0 || g.battles.current == kNoBattle) return;
+    queue_publish();      // proto 111: the round's queue goes first, so a client has it when the board (or its digest) is there
     uint32_t idx[kMaxCats];
     uint32_t total = 0;
     for (uint32_t i = 0; i < g.cat_count; ++i) idx[total++] = i;      // EVERY unit (proto 69): the players' cats carry their turn-order keys too, flagged kBoardHuman
@@ -5343,17 +6179,34 @@ void board_publish() {
 
     g.board_sent_n = 0;
     uint32_t first = 0;
+    static UnitDeep recs[kMaxCats];     // proto 113: every unit's deep record of this boundary, kept by the transport for a client that asks
     do {
         BoardMsg& m = g.board_sent[g.board_sent_n];
         m = BoardMsg{};
         m.battle = g.battles.current; m.turn = g.turn; m.cats = g.cat_count; m.total = total; m.first = first;
         memcpy(m.rng, rng, sizeof(rng));
         m.count = (uint8_t)((total - first) < kBoardChunk ? (total - first) : kBoardChunk);
-        for (uint32_t k = 0; k < m.count; ++k) board_fill(idx[first + k], have_memb, still_n, m.units[k]);
+        for (uint32_t k = 0; k < m.count; ++k) board_fill(idx[first + k], have_memb, still_n, m.units[k], &recs[idx[first + k]]);
         first += m.count;
         ++g.board_sent_n;
     } while (first < total && g.board_sent_n < sizeof(g.board_sent) / sizeof(g.board_sent[0]));
     g.board_sent_for = g.battles.current;
+    ucat_keep_battle(have_memb, still_n);    // proto 115: before the board goes out, so a client that asks finds the image
+    {   // proto 113: the records, encoded once (the transport owns them from here)
+        static uint8_t* blobs[kMaxCats];
+        static uint32_t lens[kMaxCats];
+        static uint8_t enc[16384];
+        const uint32_t n = g.cat_count < kMaxCats ? g.cat_count : kMaxCats;
+        for (uint32_t i = 0; i < n; ++i) {
+            blobs[i] = nullptr; lens[i] = 0;
+            if (!recs[i].ok) continue;
+            const uint32_t len = unitstate_encode(enc, sizeof(enc), g.battles.current, g.turn, (uint8_t)i, recs[i]);
+            if (!len) continue;
+            blobs[i] = (uint8_t*)malloc(len);
+            if (blobs[i]) { memcpy(blobs[i], enc, len); lens[i] = len; }
+        }
+        net_ustate_publish(g.battles.current, g.turn, blobs, lens, n);
+    }
 
     // PROTO 98: turn 0 goes out whole (the build itself differs often enough); every later boundary as one digest per unit, the chunks kept by the transport for a client
     // whose own board's digest differs (it asks; the answer comes from the receive thread) or that asked to be streamed.
@@ -5435,8 +6288,39 @@ void deep_boundary() {
 }
 
 // CLIENT: take the host's board over.
+// CLIENT (proto 115, 0.1.190): a new CatData built from the host's cat image of the unit the board names (asked for when it is not here yet, waited for briefly), not registered
+// anywhere -- the game's spawn copies it. Null with `why` when there is none.
+static void* ucat_fetch(uint64_t battle, const BoardUnit& u, const char*& why) {
+    why = nullptr;
+    static uint8_t frame[kMaxCatBytes + 128];      // 256 KB: not on the game thread's stack
+    uint32_t n = net_host_ucat(battle, u.index, u.key_b, frame, sizeof(frame));
+    if (!n) {
+        UcatReqMsg q{};
+        q.battle = battle; q.index = u.index; q.key = u.key_b;
+        if (!net_send_ucatreq(q)) { why = "the request could not be sent"; return nullptr; }
+        const ULONGLONG t0 = GetTickCount64();
+        while (!(n = net_host_ucat(battle, u.index, u.key_b, frame, sizeof(frame))) && GetTickCount64() - t0 < (ULONGLONG)tune::kBoardTurnWaitMs) Sleep(2);
+        board_wait_note(GetTickCount64() - t0);
+        if (!n) { why = "the host's cat data did not come in time"; return nullptr; }
+    }
+    UcatMsg m{};
+    if (!dec_ucat(frame, n, m)) { why = "the host's cat data was unreadable"; return nullptr; }
+    if (m.status != kUcatImage) { why = "the host keeps no cat data for it"; return nullptr; }
+    void* cat = nullptr;
+    {
+        uint64_t* s = rng_global_stream(); uint64_t saved[4] = {};
+        const bool fenced = s && mem_read(s, saved, sizeof(saved));
+        cat = catsync_cat_from_image(m.data, m.size, m.save_id);
+        if (fenced) mem_write(s, saved, sizeof(saved));
+    }
+    if (!cat) { why = "the host's cat data did not read into a cat here"; return nullptr; }
+    log_line("UCAT", "<- unit %u ('%s', key %08x): the host's cat data (%u bytes, hash %016llx, id %016llx) read into a cat here -- the unit is made from it",
+             (unsigned)u.index, u.def, (unsigned)u.key_b, m.size, (unsigned long long)m.hash, (unsigned long long)m.save_id);
+    return cat;
+}
+
 void board_apply(const BoardAssembled& b, bool quiet) {
-    uint32_t written = 0, moved = 0, same = 0, bad = 0, stuck = 0, deadnote = 0, keys_differ = 0, killed = 0, replaced = 0, spawned = 0, trimmed = 0;
+    uint32_t written = 0, moved = 0, same = 0, bad = 0, stuck = 0, deadnote = 0, keys_differ = 0, killed = 0, replaced = 0, spawned = 0, trimmed = 0, revived = 0;
     char said[16][200]; uint32_t nsaid = 0;
     auto say = [&](const char* fmt, ...) {
         if (nsaid >= 16) return;
@@ -5470,7 +6354,7 @@ void board_apply(const BoardAssembled& b, bool quiet) {
         return false;
     };
     // Make the host's unit: on its tile when free, else on the free tile nearest to it (the move pass puts it right once the unit standing there has moved on).
-    auto spawn_unit = [&](const BoardUnit& u, const char*& why) -> void* {
+    auto spawn_unit = [&](const BoardUnit& u, const char*& why, void* cat) -> void* {
         const void* like = nullptr;
         for (uint32_t j = 0; j < g.cat_count && !like; ++j) if (here_alive(j)) like = g.cats[j];
         int32_t w = 0, h = 0;
@@ -5485,8 +6369,53 @@ void board_apply(const BoardAssembled& b, bool quiet) {
             if (best == 0x7FFFFFFF) { why = "no free tile on the board"; return nullptr; }
         }
         const int32_t keys[3] = { u.key_a, u.key_b, u.init_base };      // the host's, so the unit takes the host's place in the turn order
-        return unit_spawn_at(g.tc, like, u.def, bx, by, keys, why);
+        return cat ? unit_spawn_catdata_at(g.tc, like, u.def, cat, bx, by, keys, why) : unit_spawn_at(g.tc, like, u.def, bx, by, keys, why);
     };
+
+    // THE HOST'S NUMBERING FIRST (0.1.174; your room 2026-11-03 23:00, battle f1fc5fd4): the two games made and lost units in another order (a coin picked up on one side only, a fly
+    // swarm made here alone, a Needlecat on the host), and a new unit taking a freed object's address was numbered 45 on one side and 46 on the other. From there one roster
+    // index named two different units: the board transformed, made and took off units by index at every boundary and the numbering never met again -- the state hash halted the
+    // battle at turn 9. Before anything is trimmed or made, an entry whose unit is not the host's unit of that index takes the entry here that IS it -- the same kind (Character+0x248)
+    // with the host's creation key (+0x958) or, failing that, on the host's tile -- provided that entry is not in its own right place. The two roster entries are swapped (the
+    // objects stay where the game has them); what is left past the host's roster afterwards is what this peer alone made, and the trim below takes it off.
+    {
+        const BoardUnit* hu[kMaxCats] = {};
+        for (uint32_t k = 0; k < b.total; ++k) if (b.unit[k].index < kMaxCats) hu[b.unit[k].index] = &b.unit[k];
+        auto host_live = [&](uint32_t i) { return i < b.cats && i < kMaxCats && hu[i] && !(hu[i]->flags & (kBoardHuman | kBoardGone | kBoardRemoved | kBoardDead)); };
+        auto fits = [&](uint32_t i, uint32_t j) {        // entry j here holds the host's unit i
+            return j < g.cat_count && g.cats[j] && here_present(j) && !g.human_cat[j] && !g.derived_unit[j] && board_ident(g.cats[j]) == hu[i]->ident;
+        };
+        auto in_place = [&](uint32_t j) { return host_live(j) && fits(j, j); };
+        uint32_t renumbered = 0;
+        const uint32_t span = g.cat_count < kMaxCats ? g.cat_count : kMaxCats;
+        for (uint32_t pass = 0; pass < 3; ++pass) {
+            uint32_t this_pass = 0;
+            for (uint32_t i = 0; i < b.cats && i < kMaxCats; ++i) {
+                if (!host_live(i) || g.human_cat[i] || (i < span && g.derived_unit[i]) || in_place(i)) continue;
+                uint32_t pick = ~0u;
+                bool by_key = false;
+                for (uint32_t j = 0; j < span; ++j) {                  // the host's creation key first, then the host's tile
+                    if (j == i || in_place(j) || !fits(i, j)) continue;
+                    uint32_t key = 0;
+                    if (read_ident(g.cats[j], key) && (int32_t)key == hu[i]->key_b) { pick = j; by_key = true; break; }
+                    CatState s{};
+                    if (pick == ~0u && read_cat_state(g.cats[j], s, false) && s.linked && s.tx == hu[i]->tx && s.ty == hu[i]->ty) pick = j;
+                }
+                if (pick == ~0u || i >= span) continue;
+                const uint32_t j = pick;
+                std::swap(g.cats[i], g.cats[j]); std::swap(g.cat_key[i], g.cat_key[j]); std::swap(g.cat_key_ok[i], g.cat_key_ok[j]);
+                std::swap(g.fresh_left[i], g.fresh_left[j]); std::swap(g.summon[i], g.summon[j]); std::swap(still_a[i], still_a[j]);
+                std::swap(g.local_cat[i], g.local_cat[j]); std::swap(g.human_cat[i], g.human_cat[j]); std::swap(g.derived_unit[i], g.derived_unit[j]);
+                ++this_pass; ++renumbered;
+                say("unit %u of the host (%08x) was entry %u here (matched by its %s) -- the roster entries were swapped to the host's numbering", i, hu[i]->ident, j, by_key ? "creation key" : "tile");
+            }
+            if (!this_pass) break;
+        }
+        if (renumbered) {
+            g.bs.renumbered += renumbered;
+            log_line_lvl(LogLevel::Warn, "BOARD", "!! turn %u: %u roster entr(ies) here held other units than the host's at the same index -- renumbered to the host's before the unit set is put right", (unsigned)b.turn, renumbered);
+        }
+    }
 
     if (g.cat_count > b.cats) {
         bool humans = false;
@@ -5552,7 +6481,12 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                 if (host_gone || !here_present(i)) {
                     ++gone_skipped;      // gone on the host, or gone here: the object is freed on that side, nothing of it is to be matched or touched
                     if (!host_gone) continue;
-                    if (here_present(i)) say("unit %u has left the host's battle and is still in this one -- left alone (the game removes it itself)", i);
+                    // 0.1.190: a player's unit the host has lost and this game holds ALIVE (the host's died and its body was cleared; here it never died) goes the game's way here
+                    // too -- Die, OnCorpsePop, Remove: its death events run as they ran on the host. A dead one here is left to the game, which clears its body itself.
+                    if (here_alive(i) && b.turn > 0) {
+                        if (unit_remove_game_way(const_cast<void*>(g.cats[i]))) { ++killed; say("unit %u (a player's) has left the host's battle and was alive here -- put through the game's own death and removal", i); }
+                        else { ++bad; say("unit %u (a player's) has left the host's battle and is alive here -- the game's removal failed", i); }
+                    } else if (here_present(i)) say("unit %u has left the host's battle and is still in this one -- left alone (the game removes it itself)", i);
                     continue;
                 }
             } else if (host_gone || host_removed) {
@@ -5573,14 +6507,21 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                     const bool host_on = (u.flags & kBoardLinked) && !(u.tx == kTileOffBoard && u.ty == kTileOffBoard);
                     if (!host_on || !u.def[0]) { ++bad; say("unit %u is gone here and alive on the host, which sent no %s -- not made", i, !u.def[0] ? "definition name" : "tile"); continue; }
                     const char* why = nullptr;
-                    void* made = spawn_unit(u, why);
+                    // 0.1.190 (proto 115): a unit the host made from cat data is made from THAT cat data (by its name it drew its own abilities: BABYGIRL's golem 11-04)
+                    const char* cwhy = nullptr;
+                    void* cat = (u.flags & kBoardCatData) ? ucat_fetch(b.battle, u, cwhy) : nullptr;
+                    void* made = spawn_unit(u, why, cat);
+                    const bool by_cat = made && cat;
+                    if (!made && cat) made = spawn_unit(u, why, nullptr);
                     if (!made) { ++bad; say("unit %u ('%s' on the host) is gone here and could not be made: %s", i, u.def, why ? why : "?"); continue; }
                     if (g.cats[i] && here_present(i)) retire_unit(g.cats[i]);
                     g.cats[i] = made;
                     note_ident(i);
                     if (i < kMaxCats) { still_a[i] = true; g.fresh_left[i] = State::kFreshTurns; }
                     ++spawned;
-                    say("unit %u was missing here and is now the host's '%s' (made with the game's spawn)", i, u.def);
+                    if (by_cat) say("unit %u was missing here and is now the host's '%s' (made from the host's cat data)", i, u.def);
+                    else if (u.flags & kBoardCatData) say("unit %u was missing here and is now the host's '%s' -- made by name, the host's cat data was not usable (%s)", i, u.def, cwhy ? cwhy : why ? why : "?");
+                    else say("unit %u was missing here and is now the host's '%s' (made with the game's spawn)", i, u.def);
                 }
             } else if (!here_present(i)) { ++gone_skipped; continue; }
             if (host_human != g.human_cat[i]) { ++bad; say("unit %u is a player's cat on one peer only (host %d, here %d) -- left alone", i, (int)host_human, (int)g.human_cat[i]); continue; }
@@ -5596,7 +6537,21 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                     ++bad; say("unit %u is another kind here (%08x '%s') than on the host (%08x '%s'%s) -- not replaceable, left alone", i, mine, here_def, u.ident, u.def, champ_same ? "" : ", champion state differs"); continue;
                 }
                 const char* why = nullptr;
-                void* made = unit_transform_to(const_cast<void*>(g.cats[i]), u.def, why);
+                void* made = nullptr;
+                bool by_cat = false;
+                if ((u.flags & kBoardCatData) && here_alive(i)) {
+                    // 0.1.190 (proto 115): the transform makes the host's kind by name (a CustomEnemyCat with one ability slot where the host's had six: room P9HG, three crashes).
+                    // The host's cat data is taken instead: this unit is taken off the board (its tile is the new one's) and the host's is made from that cat data.
+                    const char* cwhy = nullptr;
+                    void* cat = ucat_fetch(b.battle, u, cwhy);
+                    if (!cat) say("unit %u: the host's '%s' is made from cat data, which is not usable here (%s) -- the game's transform is used", i, u.def, cwhy ? cwhy : "?");
+                    else if (unit_remove_silent(const_cast<void*>(g.cats[i]))) {
+                        by_cat = true;
+                        made = spawn_unit(u, why, cat);
+                        if (!made) { ++bad; say("unit %u '%s' was taken off the board and the host's '%s' could not be made from its cat data: %s -- the next board makes it", i, here_def, u.def, why ? why : "?"); continue; }
+                    }
+                }
+                if (!by_cat) made = unit_transform_to(const_cast<void*>(g.cats[i]), u.def, why);
                 if (!made) { ++bad; say("unit %u '%s' could not be replaced by the host's '%s': %s", i, here_def, u.def, why ? why : "?"); continue; }
                 retire_unit(g.cats[i]);
                 g.cats[i] = made;
@@ -5606,21 +6561,24 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                 if (i < kMaxCats) still_a[i] = true;
                 mine = board_ident(made);
                 ++replaced;
-                say("unit %u was a '%s' and is now the host's '%s' (replaced by the game's transform; display key %08x%s)", i, here_def, u.def, mine, mine == u.ident ? "" : " -- STILL DIFFERENT from the host's");
+                say("unit %u was a '%s' and is now the host's '%s' (%s; display key %08x%s)", i, here_def, u.def, by_cat ? "made from the host's cat data" : "replaced by the game's transform",
+                    mine, mine == u.ident ? "" : " -- STILL DIFFERENT from the host's");
                 if (mine != u.ident) { ++bad; continue; }
             }
             {   // THE TURN-ORDER KEYS, for every unit (players' cats too): the next turn's order is a shuffle plus a sort on them
                 uint8_t* c = (uint8_t*)g.cats[i];
                 int32_t ka = 0, kb = 0, sp = 0, ib = 0;
                 mem_read(c + kChar_InitA, &ka, 4); mem_read(c + kChar_InitB, &kb, 4); mem_read(c + kChar_Speed, &sp, 4); mem_read(c + kChar_InitBase, &ib, 4);
-                if (ka != u.key_a || kb != u.key_b || ib != u.init_base) {
+                CatState ks{};
+                const bool both_dead = (u.flags & kBoardDead) && read_cat_state(g.cats[i], ks, false) && ks.dead;   // proto 115: a dead unit takes no turn (see board_unit_digest)
+                if (!both_dead && (ka != u.key_a || kb != u.key_b || ib != u.init_base)) {
                     ++keys_differ;
                     say("unit %u turn-order keys here %d/%d (speed %d, base %d), the host's %d/%d (speed %d, base %d) -- the host's taken", i, ka, kb, sp, ib, u.key_a, u.key_b, u.speed, u.init_base);
                     // the base first: +0x954 is derived from it, and the game recomputes it from it whenever the unit's stats are touched
                     mem_write(c + kChar_InitBase, &u.init_base, 4); mem_write(c + kChar_InitA, &u.key_a, 4); mem_write(c + kChar_InitB, &u.key_b, 4);
                     if (g.cat_key_ok[i]) g.cat_key[i] = (uint32_t)u.key_b;      // the entry's identity is its creation key: it follows the host's value
                     turn_queue_reposition(c, i);                                    // and its place in this round's queue follows the keys (it joined the round with this peer's own)
-                } else if (sp != u.speed) say("unit %u speed here %d, the host's %d (keys equal)", i, sp, u.speed);
+                } else if (!both_dead && sp != u.speed) say("unit %u speed here %d, the host's %d (keys equal)", i, sp, u.speed);
             }
             if (host_human) {
                 // DIAGNOSIS ONLY, nothing is overwritten: a player's cat is built on each peer from the same bytes and is NOT repaired here (its stats are inputs, and writing max hp
@@ -5771,7 +6729,35 @@ void board_apply(const BoardAssembled& b, bool quiet) {
                 if (!st.dead && (u.flags & kBoardDead) && b.turn > 0 && debug_apply_hit(g.cats[i], 1000000, st.tx, st.ty)) {
                     ++killed;        // dead on the host, alive here: the game's own death handling takes it from a lethal hit, as with a debug hit
                     say("unit %u is dead on the host and alive here -- killed (the game's death handling does the rest)", i);
-                } else if (host_human && !st.dead && (u.flags & kBoardDead)) say("a player's cat %u is dead on the host and alive here -- its hit points are written (%d), the game's own death handling takes it from there", i, u.hp);
+                } else if (host_human && !st.dead && (u.flags & kBoardDead)) {
+                    // 0.1.190: the game kills a unit at hp <= 0 when its shield (+0x4B4) and +0x4B8 are spent too (Character late_update 0x1401084C1); the host's dead cat's numbers are
+                    // written, a hit point count above 0 is not (a cat the host lost some other way still dies here), and the extra shield is emptied
+                    const int32_t zero = 0;
+                    if (u.hp > 0) mem_write(c + kChar_HP, &zero, 4);
+                    mem_write(c + kChar_Shield + 4, &zero, 4);
+                    // ... and the game's death runs NOW, with the per-frame death test's arguments: a frame later is after this boundary's hash (KD8E test: 'cat 35: dead 0|1')
+                    const bool died = unit_die(c);
+                    if (died) { ++killed; st.dead = 1; }
+                    say("a player's cat %u is dead on the host and alive here -- hit points %d and shield written, %s", i, u.hp > 0 ? 0 : u.hp,
+                        died ? "and it died the game's way (Character::Die)" : "the game's own death handling takes it from there");
+                } else if (host_human && st.dead && !(u.flags & kBoardDead)) {
+                    // 0.1.190: DEAD HERE, ALIVE ON THE HOST (room 5VUIE443, 11-04: a status the client lost let u23 die there and live on the host with 3 hp -- a halt, and the next
+                    // fights had 7 cats on one side and 6 on the other). The game's own revive brings it back -- Character::revive, what ReviveNextRound and the debug revive-all
+                    // call -- with the host's hit points; a body already taken off the board (removed) is not brought back.
+                    if (unit_is_removed(g.cats[i])) { ++bad; say("a player's cat %u is dead here and alive on the host (hp %d) -- its body is already off the board, it is not revived", i, u.hp); }
+                    else if (unit_revive(c, u.hp)) {
+                        ++revived;
+                        if (st.shield != u.shield) mem_write(c + kChar_Shield, &u.shield, 4);
+                        CatState now{};
+                        const bool host_on2 = (u.flags & kBoardLinked) && !(u.tx == kTileOffBoard && u.ty == kTileOffBoard);
+                        if (read_cat_state(g.cats[i], now, false)) {
+                            st = now;
+                            const bool on = now.linked && !(now.tx == kTileOffBoard && now.ty == kTileOffBoard);
+                            if (!on && host_on2 && !tile_taken(u.tx, u.ty) && board_move_unit(c, u.tx, u.ty) && read_cat_state(g.cats[i], now, false)) st = now;
+                        }
+                        say("a player's cat %u was dead here and is alive on the host -- revived the game's way (hp %d/%d, tile (%d,%d))", i, st.hp, st.maxhp, st.tx, st.ty);
+                    } else { ++bad; say("a player's cat %u is dead here and alive on the host (hp %d) -- the game's revive refused it", i, u.hp); }
+                }
                 else say("unit %u is %s here but %s on the host -- the flag is not rewritten", i, st.dead ? "dead" : "alive", (u.flags & kBoardDead) ? "dead" : "alive");
             }
             if (changed) { ++written; say("unit %u%s: hp %d/%d shield %d -> host's %d/%d shield %d", i, host_human ? " (a player's cat)" : "", st.hp, st.maxhp, st.shield, u.hp, host_human ? st.maxhp : u.maxhp, u.shield); }
@@ -5878,6 +6864,7 @@ void board_apply(const BoardAssembled& b, bool quiet) {
     const bool differed = written || moved || bad || stuck || deadnote || keys_differ || killed || replaced || spawned || trimmed;
     if (spawned || trimmed) log_line_lvl(LogLevel::Warn, "BOARD", "!! the unit set differed from the host's: %u unit(s) MADE here from the host's board, %u taken off the board here", spawned, trimmed);
     if (replaced) log_line_lvl(LogLevel::Warn, "BOARD", "!! %u unit(s) of another kind than the host's were REPLACED by the host's kind this boundary", replaced);
+    if (revived) log_line_lvl(LogLevel::Warn, "BOARD", "!! %u player's cat(s) dead here and alive on the host were REVIVED the game's way this boundary", revived);
     if (!quiet || differed) {
         log_line_lvl(quiet ? LogLevel::Warn : LogLevel::Info, "BOARD", "<- the host's board of turn %u applied (battle %016llx): %u unit(s), %u rewritten, %u moved, %u already equal, %u left alone (mismatch), %u not moved, %u life flag(s) differ (%u killed), %u unit(s) had other turn-order keys (the host's taken); stream %016llx -> %016llx (the host's)%s",
                      b.turn, (unsigned long long)b.battle, b.total, written, moved, same, bad, stuck, deadnote, killed, keys_differ, (unsigned long long)before, (unsigned long long)b.rng[0],
@@ -5888,6 +6875,55 @@ void board_apply(const BoardAssembled& b, bool quiet) {
 }
 
 // Once per battle, at its first turn boundary, before the first hash: the host publishes, a client waits for it and takes it over.
+// CLIENT, proto 113: the units whose deep state (mgmp_unitstate) differs from the host's board row at this boundary -- their records are asked for and each unit is put
+// right with the game's own functions. Bounded wait: the host answers from its receive thread, so this costs a round trip, and only at a boundary that differs.
+void usync_after_board(const BoardAssembled& b) {
+    static UnitDeep mine, host;
+    static uint8_t buf[16384];
+    UstateReqMsg q{};
+    q.battle = b.battle; q.turn = b.turn;
+    const uint32_t n = b.cats < g.cat_count ? b.cats : g.cat_count;
+    for (uint32_t i = 0; i < n && i < kBoardMax && q.n < kUstateReqMax; ++i) {
+        if (!b.have[i]) continue;
+        const BoardUnit& u = b.unit[i];
+        if ((u.flags & (kBoardGone | kBoardDead)) || !u.deep || !g.cats[i] || parked_dead(g.cats[i])) continue;
+        if (!unitstate_read(g.cats[i], mine) || unitstate_digest(mine) == u.deep) continue;
+        q.index[q.n++] = (uint8_t)i;
+    }
+    if (!q.n) return;
+    net_send_ustatereq(q);
+    const ULONGLONG t0 = GetTickCount64();
+    bool got[kUstateReqMax] = {};
+    uint32_t have = 0, repaired = 0;
+    while (have < q.n && GetTickCount64() - t0 < (ULONGLONG)tune::kBoardTurnWaitMs) {
+        for (uint32_t k = 0; k < q.n; ++k) {
+            if (got[k]) continue;
+            const uint32_t len = net_host_ustate(q.battle, q.turn, q.index[k], buf, sizeof(buf));
+            if (!len) continue;
+            got[k] = true; ++have;
+            uint64_t hb = 0; uint32_t ht = 0; uint8_t hi = 0;
+            if (!unitstate_decode(buf, len, hb, ht, hi, host) || hi != q.index[k]) { log_line_lvl(LogLevel::Warn, "USYNC", "!! the host's record of unit %u could not be read", (unsigned)q.index[k]); continue; }
+            void* chr = (void*)g.cats[hi];
+            if (!chr || !unitstate_read(chr, mine)) continue;
+            if (unitstate_repair(hi, chr, host, mine, hi < kMaxCats && g.human_cat[hi], hi < kMaxCats && g.local_cat[hi])) {
+                ++repaired;
+                // 0.1.190: the repair's recompute caps the hit points at the max hp the unit had THEN -- the board had just written the host's hit points (a unit the board
+                // made had 10 of 20 at the turn-2 hash, room KD8E test). They are the board's: written again where they moved.
+                const BoardUnit& bu = b.unit[hi];
+                CatState s{};
+                if (b.have[hi] && !(bu.flags & (kBoardGone | kBoardDead)) && read_cat_state(chr, s, false) && !s.dead && (s.hp != bu.hp || s.shield != bu.shield)) {
+                    mem_write((uint8_t*)chr + kChar_HP, &bu.hp, 4); mem_write((uint8_t*)chr + kChar_Shield, &bu.shield, 4);
+                    log_line_lvl(LogLevel::Warn, "USYNC", "!! unit %u: its repair's recompute moved the board's hit points (%d shield %d) -- the host's %d shield %d written again", (unsigned)hi, s.hp, s.shield, bu.hp, bu.shield);
+                }
+            }
+        }
+        if (have < q.n) Sleep(2);
+    }
+    board_wait_note(GetTickCount64() - t0);
+    g.bs.usync_units += q.n; g.bs.usync_repaired += repaired;
+    if (have < q.n) { g.bs.usync_late += q.n - have; log_line_lvl(LogLevel::Warn, "USYNC", "!! turn %u: %u of %u unit record(s) did not come from the host within %u ms -- those units keep this game's state", (unsigned)b.turn, q.n - have, (unsigned)q.n, (unsigned)tune::kBoardTurnWaitMs); }
+}
+
 void board_sync() {
     if (g.battles.current == kNoBattle) return;
     if (g.board_battle == g.battles.current && g.board_turn == g.turn) return;
@@ -5925,6 +6961,8 @@ void board_sync() {
         board_wait_note(GetTickCount64() - t0);
         if (first) log_line("BOARD", "the host's board arrived (waited %llu ms)", (unsigned long long)(GetTickCount64() - t0));
         board_apply(box, !first);
+        usync_after_board(box);
+        queue_follow();
         return;
     }
     if (past) {
@@ -5948,6 +6986,7 @@ void board_sync() {
         board_wait_note(GetTickCount64() - t0);
         ++g.bs.board_sum_agreed;
         g.bs.board_req_run = 0;
+        queue_follow();
         return;
     }
     // The boards differ: this boundary's full board, from the host's kept chunks.
@@ -5967,6 +7006,8 @@ void board_sync() {
         return;
     }
     board_apply(box, true);
+    usync_after_board(box);
+    queue_follow();
 }
 
 } // namespace
@@ -5983,6 +7024,7 @@ void lockstep_turn_boundary(void* turn_control) {
     listprobe_set_turn_control(turn_control);
 
     if (!g.active) return;
+    g_prebattle = false;                   // the first boundary after a build: the roster and the turn are this battle's from here on
     // the last chance to put the owner's final facing of the cat that just ended its turn in place, before the state is read, hashed and logged
     face_pend_apply("the turn boundary", nullptr);
     for (PendingFace& p : g_face_pend) p.on = false;
@@ -6032,6 +7074,8 @@ void lockstep_turn_boundary(void* turn_control) {
             g.diverged          = false;
             g.debounce_turn     = ~0u;
             g.debounced         = 0;
+            g.stack_turn        = ~0u;
+            g.stack_streak      = 0;
             g.desync_noticed    = false;
             g.halted_in_battle  = false;
             g.bs = State::BStats{};
@@ -6188,17 +7232,17 @@ uint64_t g_rs_key = 0;          // the first word of the last reseed (actor-turn
 uint64_t lockstep_reseed_key() { return g_rs_key; }
 
 void lockstep_reseed(const void* actor, int arg) {
-    if (!tune::kReseedPerTurn || !g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
+    if (!tune::kReseedPerTurn || !g.active || !(g.snapped || g_prebattle) || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
     uint64_t* s = rng_global_stream();
     if (!s) return;
     uint32_t idx = 0xFFFEu;                                   // the turn control's own start (the shuffle of the turn order)
     if (actor) {
         idx = 0xFFFFu;                                        // an actor outside the snapshot (a summon)
-        for (uint32_t i = 0; i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
+        for (uint32_t i = 0; !g_prebattle && i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
     }
     if (g.battles.current != g_rs_battle) { g_rs_battle = g.battles.current; g_rs_turn = ~0u; g_rs_logged = 0; g_rs_action_logged = 0; }
-    if (g.turn != g_rs_turn || idx != g_rs_idx) { g_rs_turn = g.turn; g_rs_idx = idx; g_rs_repeat = 0; } else ++g_rs_repeat;
-    uint64_t x = g.battles.current ^ 0x5253454544545552ull ^ ((uint64_t)g.turn * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^
+    if (cur_turn() != g_rs_turn || idx != g_rs_idx) { g_rs_turn = cur_turn(); g_rs_idx = idx; g_rs_repeat = 0; } else ++g_rs_repeat;
+    uint64_t x = g.battles.current ^ 0x5253454544545552ull ^ ((uint64_t)cur_turn() * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^
                  ((uint64_t)(uint32_t)arg * 0x165667B19E3779F9ull) ^ ((uint64_t)g_rs_repeat * 0xD6E8FEB86659FD93ull);
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
@@ -6206,12 +7250,12 @@ void lockstep_reseed(const void* actor, int arg) {
     mem_read(s, &before, sizeof(before));
     if (!mem_write(s, st, sizeof(st))) return;
     g_rs_key = st[0];
-    unlockq_flush(g.turn, g_rs_action);                       // what the last action's unlock checks and property reads were (a line only when there were some)
-    rngl_flush(g.turn, g_rs_action);                          // ... and the draws it made on the shared stream, by call site (compared with the other peer's)
+    unlockq_flush(cur_turn(), g_rs_action);                       // what the last action's unlock checks and property reads were (a line only when there were some)
+    rngl_flush(cur_turn(), g_rs_action);                          // ... and the draws it made on the shared stream, by call site (compared with the other peer's)
     g_rs_action = 0;                                          // a new actor-turn: its actions are numbered from 0
     if (g_rs_logged < 6) {
         ++g_rs_logged;
-        log_line("RESEED", "turn %u, %s %u: the shared stream %016llx -> %016llx (derived from battle, turn and actor: the same on every peer)%s", (unsigned)g.turn,
+        log_line("RESEED", "turn %u, %s %u: the shared stream %016llx -> %016llx (derived from battle, turn and actor: the same on every peer)%s", (unsigned)cur_turn(),
                  actor ? "actor" : "turn control", actor ? (unsigned)idx : 0u, (unsigned long long)before, (unsigned long long)st[0],
                  g_rs_logged == 6 ? " -- the rest of this battle is not logged" : "");
     }
@@ -6223,16 +7267,16 @@ void lockstep_reseed(const void* actor, int arg) {
 // peer only. So each applied action restarts the stream from (battle, turn, actor, the action's number in that actor-turn), which both peers know: what happens between two actions can no longer reach the next one.
 // The stream before the reseed is logged for the first actions of a battle on both peers, so the first drift shows up as two different numbers on the same line.
 void lockstep_reseed_action(const void* actor) {
-    if (!tune::kReseedPerTurn || !g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
+    if (!tune::kReseedPerTurn || !g.active || !(g.snapped || g_prebattle) || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
     uint64_t* s = rng_global_stream();
     if (!s) return;
     uint32_t idx = 0xFFFFu;                                   // an actor outside the snapshot (a summon)
-    for (uint32_t i = 0; i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
+    for (uint32_t i = 0; !g_prebattle && i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
     if (g.battles.current != g_rs_battle) { g_rs_battle = g.battles.current; g_rs_turn = ~0u; g_rs_logged = 0; g_rs_action_logged = 0; }
-    unlockq_flush(g.turn, g_rs_action);                       // ... and after each action
-    rngl_flush(g.turn, g_rs_action);
+    unlockq_flush(cur_turn(), g_rs_action);                       // ... and after each action
+    rngl_flush(cur_turn(), g_rs_action);
     const uint32_t n = ++g_rs_action;
-    uint64_t x = g.battles.current ^ 0x4143544E52534544ull ^ ((uint64_t)g.turn * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t)n * 0x165667B19E3779F9ull) ^
+    uint64_t x = g.battles.current ^ 0x4143544E52534544ull ^ ((uint64_t)cur_turn() * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t)n * 0x165667B19E3779F9ull) ^
                  ((uint64_t)g_rs_repeat * 0xD6E8FEB86659FD93ull);
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
@@ -6242,25 +7286,36 @@ void lockstep_reseed_action(const void* actor) {
     g_rs_key = st[0];
     if (g_rs_action_logged < 400) {
         ++g_rs_action_logged;
-        log_line("RESEED", "turn %u action %u of actor %u: the stream was %016llx, now %016llx", (unsigned)g.turn, (unsigned)n, idx == 0xFFFFu ? 0xFFFFu : (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
+        log_line("RESEED", "turn %u action %u of actor %u: the stream was %016llx, now %016llx", (unsigned)cur_turn(), (unsigned)n, idx == 0xFFFFu ? 0xFFFFu : (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
     }
 }
 
 bool lockstep_stream_for_pick(uint64_t salt, uint64_t* seed_out) {
-    if (!g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return false;
+    if (!g.active || !(g.snapped || g_prebattle) || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return false;
     if (!lockstep_fight_up()) return false;          // g.snapped outlives the fight (it stays on the map): a shop's or a reward's pick is the player's own
     uint64_t* s = rng_global_stream();
     if (!s) return false;
     static uint64_t battle = 0;
-    static uint32_t turn = ~0u, action = ~0u, actor = ~0u, nth = 0;
-    if (battle != g.battles.current || turn != g.turn || action != g_rs_action || actor != g_rs_idx) { battle = g.battles.current; turn = g.turn; action = g_rs_action; actor = g_rs_idx; nth = 0; }
+    static uint32_t turn = ~0u, action = ~0u, actor = ~0u, nth = 0, gen = ~0u;
+    if (battle != g.battles.current || gen != g_battle_gen || turn != cur_turn() || action != g_rs_action || actor != g_rs_idx) { battle = g.battles.current; gen = g_battle_gen; turn = cur_turn(); action = g_rs_action; actor = g_rs_idx; nth = 0; }
     ++nth;
-    uint64_t x = g.battles.current ^ 0x5049434B53414C54ull ^ (salt * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)g.turn * 0xC2B2AE3D27D4EB4Full) ^
+    uint64_t x = g.battles.current ^ 0x5049434B53414C54ull ^ (salt * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)cur_turn() * 0xC2B2AE3D27D4EB4Full) ^
                  ((uint64_t)g_rs_action * 0x165667B19E3779F9ull) ^ ((uint64_t)nth * 0xD6E8FEB86659FD93ull) ^ ((uint64_t)g_rs_idx * 0x27D4EB2F165667C5ull) ^ ((uint64_t)g_rs_repeat * 0x94D049BB133111EBull);
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
     if (!mem_write(s, st, sizeof(st))) return false;
     if (seed_out) *seed_out = st[0];
+    return true;
+}
+
+// A STATE FOR THE PRESENTATION STREAM (TLS+0x198) that both peers derive (0.1.125): the random-safe-square AOEs pick their squares with it, and it is meant to differ between machines. From the battle, the
+// turn, the action and the actor -- not from how many times the game asked (it asks again each frame for a preview), so every call of one action gets the same squares on every peer.
+bool lockstep_presentation_seed(uint64_t salt, uint64_t st[4]) {
+    if (!g.active || !(g.snapped || g_prebattle) || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return false;
+    if (!g_prebattle && !lockstep_fight_up()) return false;     // the battle-start window (0.1.127) is inside the battle too
+    uint64_t x = g.battles.current ^ 0x50524553454E5441ull ^ (salt * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)cur_turn() * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t)g_rs_action * 0x165667B19E3779F9ull) ^ ((uint64_t)g_rs_idx * 0x27D4EB2F165667C5ull);
+    for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
+    if (!(st[0] | st[1] | st[2] | st[3])) st[0] = 1;
     return true;
 }
 
@@ -6272,7 +7327,7 @@ bool lockstep_stream_for_pick(uint64_t salt, uint64_t* seed_out) {
 // through GetChoice inside the same call, so both peers pass here once per decision; the AI's decisions are made on both.
 // Seeded with the number the coming action will get (g_rs_action + 1) and a different constant, so it never repeats the apply's seed.
 void lockstep_reseed_decision(const void* brain, const void* out) {
-    if (!tune::kReseedPerTurn || !g.active || !g.snapped || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
+    if (!tune::kReseedPerTurn || !g.active || !(g.snapped || g_prebattle) || g.halted || g.battles.current == kNoBattle || !net_active() || net_peer_count() < 2) return;
     if (!brain || !out) return;
     uint32_t type = 0;
     if (!mem_read(out, &type, sizeof(type)) || type <= 1) return;
@@ -6281,9 +7336,9 @@ void lockstep_reseed_decision(const void* brain, const void* out) {
     const void* actor = nullptr;
     mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor));
     uint32_t idx = 0xFFFFu;
-    for (uint32_t i = 0; actor && i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
+    for (uint32_t i = 0; actor && !g_prebattle && i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
     if (g.battles.current != g_rs_battle) { g_rs_battle = g.battles.current; g_rs_turn = ~0u; g_rs_logged = 0; g_rs_action_logged = 0; }
-    uint64_t x = g.battles.current ^ 0x4445434953494F4Eull ^ ((uint64_t)g.turn * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^
+    uint64_t x = g.battles.current ^ 0x4445434953494F4Eull ^ ((uint64_t)cur_turn() * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)idx * 0xC2B2AE3D27D4EB4Full) ^
                  ((uint64_t)(g_rs_action + 1) * 0x165667B19E3779F9ull) ^ ((uint64_t)g_rs_repeat * 0xD6E8FEB86659FD93ull) ^ ((uint64_t)type << 56);
     uint64_t st[4];
     for (int i = 0; i < 4; ++i) st[i] = reseed_mix(x);
@@ -6296,8 +7351,19 @@ void lockstep_reseed_decision(const void* brain, const void* out) {
     if (logged < 200) {
         ++logged;
         log_line("RESEED", "turn %u decision (type %u) for action %u of actor %u: the stream was %016llx, now %016llx (before slot 52, OnAnyCharacterMakesDecision)",
-                 (unsigned)g.turn, (unsigned)type, (unsigned)(g_rs_action + 1), (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
+                 (unsigned)cur_turn(), (unsigned)type, (unsigned)(g_rs_action + 1), (unsigned)idx, (unsigned long long)before, (unsigned long long)st[0]);
     }
+}
+
+// THE BUILD OF A BATTLE (unlocks_battle_build; both peers pass it at the same logical point): opens the battle-start window above. The log line is the same text on both peers, with the numbers this peer
+// would have used before (turn, roster size, action counter) -- when they differ between the two logs, that is the stale state this window now ignores.
+void lockstep_battle_build_begin() {
+    ++g_battle_gen;
+    if (!g.active) return;
+    log_line("RESEED", "battle build: the battle-start window opens (battle %016llx; stale turn %u, roster %u cat(s), snapped %d, action counter %u) -- turn 0, no roster lookups and a fresh action count until the first turn boundary",
+             (unsigned long long)g.battles.current, (unsigned)g.turn, (unsigned)g.cat_count, g.snapped ? 1 : 0, (unsigned)g_rs_action);
+    g_prebattle = true;
+    g_rs_action = 0; g_rs_repeat = 0; g_rs_idx = ~0u; g_rs_turn = ~0u;
 }
 
 namespace {
@@ -6359,7 +7425,7 @@ void lockstep_action_trace(const void* actor, const void* turn_action) {
     char gon[48] = "-";
     if (a.type == TA_Ability && a.ability) ability_gon_name(a.ability, gon, sizeof(gon));
     uint32_t idx = 0xFFFFu;
-    for (uint32_t i = 0; i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
+    for (uint32_t i = 0; !g_prebattle && i < g.cat_count; ++i) if (entry_is(i, actor)) { idx = i; break; }
     // the game's live character list, to give each unit on the target tile its position in it
     uint32_t live_n = 0; const uint8_t* ldata = nullptr;
     const void* live[kMaxCats] = {};
@@ -6377,14 +7443,15 @@ void lockstep_action_trace(const void* actor, const void* turn_action) {
         w += _snprintf_s(tile + w, sizeof(tile) - w, _TRUNCATE, " [u%u live#%d hp %d sh %d%s]", i, pos, st.hp, st.shield, g.human_cat[i] ? " human" : "");
         ++units;
     }
-    _snprintf_s(g_tr_what, sizeof(g_tr_what), _TRUNCATE, "turn %u action %u actor u%u %s '%s' target (%d,%d) dir (%d,%d), %u unit(s) on the target tile:%s", (unsigned)g.turn, (unsigned)g_rs_action,
+    _snprintf_s(g_tr_what, sizeof(g_tr_what), _TRUNCATE, "turn %u action %u actor u%u %s '%s' target (%d,%d) dir (%d,%d), %u unit(s) on the target tile:%s", (unsigned)cur_turn(), (unsigned)g_rs_action,
                 idx == 0xFFFFu ? 0xFFFFu : (unsigned)idx, a.type == TA_Ability ? "ability" : a.type == TA_EndTurn ? "endturn" : "type?", gon, a.target_x, a.target_y, a.dir_x, a.dir_y, units, units ? tile : " none");
     trace_take();
     g_tr_have = true;
 }
 
 uint64_t lockstep_battle_id()  { return g.active ? g.battles.current : kNoBattle; }
-uint32_t lockstep_turn()       { return g.active ? g.turn : 0; }
+uint32_t lockstep_turn()       { return g.active ? cur_turn() : 0; }
+uint32_t lockstep_battle_gen() { return g_battle_gen; }
 bool     lockstep_local_actor(){ return g.active && g.snapped && g.local_actor; }
 
 void lockstep_reset_cat_owners() {
@@ -6603,6 +7670,7 @@ void lockstep_enter_battle(uint64_t seed0) {
 // control split (which opened the join barrier at once) and a halt that was lifted all stayed -- the client halted at turn 0 against the host's real hash of the new battle, and its auto-finish never ran.
 void lockstep_on_save_loaded() {
     Guard guard;
+    ++g_battle_gen;
     if (!g.active) return;
     const bool had = g.battles.current != kNoBattle || g.snapped;
     g.battles.forget_current();
@@ -6613,6 +7681,12 @@ void lockstep_on_save_loaded() {
     g.pend_head = 0; g.pend_count = 0;
     g.have_audit_peer = false;
     g.halt_cleared_for = 0;
+    // A HALT BELONGS TO THE BATTLE IT STOPPED, and a loaded save has none of it (0.1.122, room YPKP: after the halt both players restored the handshake save from before the event, and the restore was
+    // refused -- "checkpoint refused: battle lockstep halted" -- for good; only a restart of the game cleared it).
+    if (g.halted) {
+        g.halted = false; g.halt_pass_turns = false; g.stats.halted = false; g.halt_reason[0] = 0;
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "a save was loaded: the halt of the battle that was is lifted with it");
+    }
     g.board_battle = 0; g.board_turn = ~0u; g.board_sent_for = 0; g.board_sent_n = 0;
     g.sent_log_n = 0; g.sent_log_full = false;
     g.armed_hit = 0; g.dbg_n = 0; g.dbg_waiting = false;

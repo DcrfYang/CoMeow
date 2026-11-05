@@ -61,6 +61,7 @@ void* rngfix_clay(void* self, void* a, void* b, void* c, fn_rngfix_4 orig);
 // R013: every frame. In a room of two or more the AOE landing (sub_140096C20) treats an ability without visual_delay_but_simultaneous_damage as if it had it with 0 (the
 // damage of every tile at once, in tile order); out of one the game's own code is put back. A 13-byte patch of the one branch that reads the setting.
 void rngfix_simultaneous_aoe_tick();
+void rngfix_node_shift_tick();   // 0.1.128: EnterNode's Left-Shift "finish the node at once" shortcut is off in a room (on again outside)
 
 // "R001/P1" for a draw site (return RVA, as the ledger keys it) that the research flagged; nullptr otherwise.
 const char* rngfix_site_tag(uint32_t rva);

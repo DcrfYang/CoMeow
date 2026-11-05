@@ -21,6 +21,7 @@ bool loadable(const std::wstring& source, Bytes& out);
 // loadable() AND sqlite's quick_check. For MAKING a backup when snapshot() failed: a new backup is only worth keeping when it is sound, while an
 // old one is still handed over by loadable() (2026-10-10: 0.1.2 put the check into loadable() itself, which also refused existing backups).
 bool verified(const std::wstring& source, Bytes& out);
+const char* sql_last_error();   // why the last in_run failed (SQLite's own words), "" when it worked
 bool in_run(const std::wstring& source, bool& running);
 // True when this save's adventure has already ENTERED the map: files.trollengine_state's event count is
 // nonzero, OR properties.adventure_started is 1 (the count stays 0 until the first node resolves, so on
@@ -37,6 +38,7 @@ bool read_file_row(const std::wstring& source, const char* key, int& have, Bytes
 bool write_file_row(const std::wstring& target, const char* key, const Bytes& in);
 // require_run: the database must be a save that is in a run (on_adventure) -- every node save is. The two saves from before the map (mgmp_checkpoint kStagePrep / kStageReady) are not necessarily.
 bool restore(const std::wstring& target, const Bytes& bytes, bool require_run = true);
+const char* restore_note();     // what the last restore did to the progress properties (raised, added, refused) -- for the log
 // One `properties` row as text (integers and reals arrive as their decimal
 // spelling). have=false when the row is absent; a false RETURN means the
 // database itself could not be opened or read. Read-only, so it is safe on a

@@ -10,6 +10,7 @@
 #include "mgmp_addresses.h"
 #include "mgmp_catsync.h"
 #include "mgmp_i18n.h"
+#include "mgmp_menu.h"      // ui_error_popup (0.1.169)
 #include "mgmp_lockstep.h"
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
@@ -159,7 +160,15 @@ void record_write(const Boss& own) {
     wchar_t path[MAX_PATH]; char save[MAX_PATH * 3] = {};
     if (!record_path(path, MAX_PATH) || !live_save(save, sizeof(save))) { log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! the restore record could not be written (no save folder / live save known)"); return; }
     FILE* f = nullptr;
-    if (_wfopen_s(&f, path, L"wb") || !f) { log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! the restore record could not be written"); return; }
+    if (_wfopen_s(&f, path, L"wb") || !f) {
+        const unsigned long e = GetLastError();
+        log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! the restore record could not be written");
+        char p8[MAX_PATH * 3] = {}, text[1024];   // 0.1.169: the player is told
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, p8, sizeof(p8) - 1, nullptr, nullptr);
+        _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_WRITE), p8, e);
+        ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+        return;
+    }
     fprintf(f, "save=%s\nboss=%s\ncountdown=%d\ntimes=%d\ndiff=%d\npx_boss=%s\npx_times=%d\npx_diff=%d\n",
             save, own.name, own.countdown, own.times, own.diff, g.boss, g.times, g.diff);
     fclose(f);

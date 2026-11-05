@@ -106,7 +106,7 @@ void search_thread() {
             FD_SET(s, &rd);
             timeval tv{ 0, 50000 };
             if (select(0, &rd, nullptr, nullptr, &tv) <= 0) continue;
-            char buf[4096];
+            static char buf[65536];   // the largest datagram (4 KB until 0.1.182: an answer with a long room list would have been cut and then not parsed at all)
             sockaddr_in from{};
             int fl = sizeof(from);
             const int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (sockaddr*)&from, &fl);
@@ -116,6 +116,7 @@ void search_thread() {
             inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
             try {
                 const json j = json::parse(buf, buf + n, nullptr, false);
+                if (j.is_discarded()) { log_line_lvl(LogLevel::Warn, "LAN", "!! an answer from %s (%d bytes) is not JSON -- its rooms are not shown", ip, n); continue; }
                 if (!j.is_object() || j.value("t", "") != "here") continue;
                 const int port = j.value("port", 27700);
                 if (port < 1 || port > 65535 || !j.contains("rooms") || !j["rooms"].is_array()) continue;

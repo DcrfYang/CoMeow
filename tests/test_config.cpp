@@ -52,11 +52,24 @@ static const Config& load(const char* text) {
 
 static bool warned() { return config().parse_warnings[0] != 0; }
 
+// 0.1.188: an mgmp.json naming the official server by its address is moved to its name, in memory and in the file (the rest left as written)
+static void test_addr_migration() {
+    load("{ \"signal\": { \"enabled\": true, \"addr\": \"49.233.209.67\", \"port\": 27700 }, \"net\": { \"addr\": \"49.233.209.67\" } }");
+    check(!strcmp(config().signal_addr, "comeow.top"), "signal.addr = the official address becomes comeow.top");
+    wchar_t path[MAX_PATH]; swprintf_s(path, L"%s\\mgmp.json", g_dir);
+    std::ifstream in(path, std::ios::binary); std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(text.find("\"addr\": \"comeow.top\"") != std::string::npos, "and the file says comeow.top");
+    check(text.find("\"net\": { \"addr\": \"49.233.209.67\" }") != std::string::npos, "net.addr outside the signal object is left as written");
+    load("{ \"signal\": { \"addr\": \"192.168.1.5\" } }");
+    check(!strcmp(config().signal_addr, "192.168.1.5"), "another address is kept");
+}
+
 int main() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     swprintf_s(g_dir, L"%smgmp_test_config", tmp);
     CreateDirectoryW(g_dir, nullptr);
+    test_addr_migration();
 
     printf("-- where the trace log goes: the log folder beside the dll --\n");
     {

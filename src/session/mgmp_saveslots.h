@@ -112,7 +112,7 @@ void saveslots_auto_tick();                        // every frame: sees "a run w
 
 // RESTORE FROM A HANDSHAKE SAVE (2026-10-05). Every confirmed save of a multiplayer run is a whole copy of this player's slot (mgmp_checkpoint: <save dir>\\mgmp_handshake\\<id>\\<pairing>.N). The page lists
 // them per slot, newest first, and puts one back over its slot -- with the undo point first, like any load. The queue and its records are left as they are.
-constexpr int kSyncMax = 64;                           // listed per slot
+constexpr int kSyncMax = 100;                          // listed per slot (the queue of handshake saves is 100 long)
 struct SyncSave {
     int64_t  saved_at = 0;                             // unix seconds
     uint64_t run = 0, seq = 0;                         // the run and the node (seq) it was confirmed at

@@ -1,0 +1,490 @@
+#include "mgmp_unitstate.h"
+#include "mgmp_unitprobe.h"          // unit_rtti_name
+#include "mgmp_factory_names.generated.h"
+#include "mgmp_mem.h"
+#include "mgmp_log.h"
+#include "mgmp_addresses.h"
+#include "mgmp_resolve.h"
+#include "mgmp_ability.h"
+#include "mgmp_lockstep.h"
+#include "mgmp_rng.h"
+#include "mgmp_net.h"
+#include "mgmp_proto.h"
+
+#include <windows.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace mgmp {
+
+const uint16_t kUsCharOff[kUsCharInts] = {
+    0x350, 0x354, 0x358,                                    // faction (FactionConversion writes all three) -- the board's
+    0x4BC,                                                  // max hp (0.1.176: a player's differed -- rooms of 11-02/03, "cannot repair" halts)
+    0x4E8,                                                  // the initial max hp (a coin the board made here had 0x3FFFFFFF, the host's 20: room d33f, 11-04)
+    0x5A0, 0x5A4, 0x5A8, 0x5AC, 0x5B0, 0x5B4, 0x5B8,        // the seven stats' base
+    0x5BC, 0x5C0, 0x5C4, 0x5C8, 0x5CC, 0x5D0, 0x5D4,        // ... and current (str dex con int spd cha lck)
+    0x5D8, 0x5DC,                                           // initiative (+0x5DC the base -- the board's)
+    0x5E8,                                                  // the stat bonus
+    0xD10, 0xD18, 0xD1C, 0xD3C,                             // move points, mana, its maximum, moves used
+};
+
+namespace {
+
+constexpr uintptr_t kChar_Entity   = 0x18;
+constexpr uintptr_t kChar_PassiveDirty = 0xE50;   // Passive::Remove sets it: the unit's passive cache is rebuilt
+constexpr uintptr_t kEnt_CompCount = 0x24;
+constexpr uintptr_t kEnt_CompData  = 0x28;
+constexpr uintptr_t kComp_Enabled  = 0x0E, kComp_Destroyed = 0x0F, kComp_Alive = 0x10;
+constexpr uintptr_t kPas_Owner     = 0x38;
+constexpr uintptr_t kPas_Stacks    = 0x5C;
+constexpr uintptr_t kPas_Removed   = 0x75;
+constexpr int32_t   kTypePassive   = 1414, kTypeStatus = 1838;
+constexpr uint32_t  kMaxComps      = 512;
+
+// EVERY LISTED FIELD IS WRITTEN (0.1.176). Until then a field "compared only" (0x4E8, 0x5D8 ...) could never be settled: a coin the board made here kept 0x4E8 =
+// 0x3FFFFFFF against the host's 20, "STILL DIFFERS" at every boundary, and the turn hash disagreed (room d33f 2026-11-04) -- a digest field nothing repairs is a halt
+// waiting to happen.
+bool char_writes(uint32_t) { return true; }
+
+// --- the class of a component, cached by vtable ------------------------------------------------------------------------------------------
+struct VtInfo { const void* vt = nullptr; int16_t kind = -1; int32_t type = 0; char name[kUsNameLen] = {}; };   // kind: 0 other, 1 passive, 2 status
+VtInfo g_vt[1024];
+uint32_t g_vt_n = 0;
+SRWLOCK g_vt_lock = SRWLOCK_INIT;
+
+const int32_t* call_hierarchy(const void* comp, uint64_t& n) {
+    n = 0;
+    void* const* vt = nullptr;
+    if (!mem_read(comp, &vt, 8) || !vt) return nullptr;
+    void* fn = nullptr;
+    if (!mem_read(vt + 3, &fn, 8) || !fn) return nullptr;
+    const int32_t* arr = nullptr;
+    __try { arr = ((const int32_t*(__fastcall*)(const void*))fn)(comp); } __except (EXCEPTION_EXECUTE_HANDLER) { arr = nullptr; }
+    if (!arr || !mem_read((const uint8_t*)arr + 0x40, &n, 8) || n > 16) { n = 0; return nullptr; }
+    return arr;
+}
+int32_t call_type(const void* comp) {
+    void* const* vt = nullptr;
+    if (!mem_read(comp, &vt, 8) || !vt) return -1;
+    void* fn = nullptr;
+    if (!mem_read(vt + 1, &fn, 8) || !fn) return -1;
+    __try { return ((int32_t(__fastcall*)(const void*))fn)(comp); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+const VtInfo* class_of(const void* comp) {
+    const void* vt = nullptr;
+    if (!mem_read(comp, &vt, 8) || !vt) return nullptr;
+    AcquireSRWLockShared(&g_vt_lock);
+    for (uint32_t i = 0; i < g_vt_n; ++i) if (g_vt[i].vt == vt) { const VtInfo* r = &g_vt[i]; ReleaseSRWLockShared(&g_vt_lock); return r; }
+    ReleaseSRWLockShared(&g_vt_lock);
+    VtInfo v; v.vt = vt; v.kind = 0;
+    uint64_t n = 0;
+    if (const int32_t* h = call_hierarchy(comp, n)) {
+        int32_t ids[16] = {};
+        if (mem_read(h, ids, (size_t)n * 4))
+            for (uint64_t k = 0; k < n; ++k) { if (ids[k] == kTypePassive && v.kind < 1) v.kind = 1; if (ids[k] == kTypeStatus) v.kind = 2; }
+    }
+    v.type = call_type(comp);
+    unit_rtti_name(comp, v.name, sizeof(v.name));
+    AcquireSRWLockExclusive(&g_vt_lock);
+    const VtInfo* r = nullptr;
+    for (uint32_t i = 0; i < g_vt_n && !r; ++i) if (g_vt[i].vt == vt) r = &g_vt[i];
+    if (!r && g_vt_n < sizeof(g_vt) / sizeof(g_vt[0])) { g_vt[g_vt_n] = v; r = &g_vt[g_vt_n++]; }
+    ReleaseSRWLockExclusive(&g_vt_lock);
+    return r;
+}
+
+bool in_sorted(const char* const* list, size_t n, const char* name) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) { const size_t mid = (lo + hi) / 2; const int c = strcmp(list[mid], name); if (c == 0) return true; if (c < 0) lo = mid + 1; else hi = mid; }
+    return false;
+}
+
+// --- reading ---------------------------------------------------------------------------------------------------------------------------
+void read_passives(const void* chr, UnitDeep& d) {
+    const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
+    if (!mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return;
+    for (uint32_t i = 0; i < n && d.np < kUsPassives; ++i) {
+        const uint8_t* c = nullptr;
+        if (!mem_read(data + i, &c, 8) || !c) continue;
+        uint8_t fl[3] = {}, removed = 0;
+        const void* owner = nullptr;
+        if (!mem_read(c + kComp_Enabled, fl, 3) || fl[1] || !fl[2]) continue;        // destroyed, or not alive
+        if (!mem_read(c + kPas_Owner, &owner, 8) || owner != chr) continue;
+        const VtInfo* v = class_of(c);
+        if (!v || v->kind < 1) continue;
+        if (mem_read(c + kPas_Removed, &removed, 1) && removed) continue;
+        UsPassive& p = d.p[d.np++];
+        p.type = (uint16_t)v->type; p.status = v->kind == 2 ? 1 : 0;
+        mem_read(c + kPas_Stacks, &p.stacks, 4);
+        mem_read(c + 0x70, &p.f70, 4); mem_read(c + 0x74, &p.f74, 4); mem_read(c + 0x78, &p.f78, 4);
+        memcpy(p.name, v->name, sizeof(p.name));
+    }
+    // order-independent: sorted by type, then stacks (insertion sort, a unit has a few dozen)
+    for (uint32_t i = 1; i < d.np; ++i) {
+        UsPassive t = d.p[i]; uint32_t j = i;
+        while (j > 0 && (d.p[j - 1].type > t.type || (d.p[j - 1].type == t.type && d.p[j - 1].stacks > t.stacks))) { d.p[j] = d.p[j - 1]; --j; }
+        d.p[j] = t;
+    }
+}
+
+void read_ability(const void* a, uint8_t slot, UnitDeep& d) {
+    if (!a || d.na >= kUsAbilities) return;
+    UsAbility& s = d.a[d.na++];
+    s.slot = slot;
+    ability_gon_name(a, s.name, sizeof(s.name));
+    for (uint32_t k = 0; k < 14; ++k) mem_read((const uint8_t*)a + 0x34 + k * 4, &s.f[k], 4);
+    for (uint32_t k = 0; k < 15; ++k) mem_read((const uint8_t*)a + 0xC8 + k * 4, &s.f[14 + k], 4);
+    for (uint32_t k = kUsAbilTileFirst; k <= kUsAbilTileLast; ++k) s.f[k] = 0;      // the tile list: a heap pointer, not state (see kUsAbilTileFirst)
+}
+
+uint32_t fnv(uint32_t h, const void* p, size_t n) { const uint8_t* b = (const uint8_t*)p; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; } return h; }
+uint32_t fnv_s(uint32_t h, const char* s) { return fnv(h, s, strlen(s) + 1); }
+
+// --- the game's std::string, by value (the callee destroys it: a heap buffer must be the game's) --------------------------------------
+struct GameStr { union { char buf[16]; char* ptr; }; uint64_t size; uint64_t cap; };
+bool make_str(GameStr& s, const char* text) {
+    const size_t n = strlen(text);
+    memset(&s, 0, sizeof(s));
+    if (n <= 15) { memcpy(s.buf, text, n + 1); s.size = n; s.cap = 15; return true; }
+    auto alloc = (void* (__fastcall*)(size_t))addr_of_call(C_GameStrAlloc);
+    if (!alloc) return false;
+    size_t cap = n | 15; if (cap < 22) cap = 22;
+    void* p = nullptr;
+    __try { p = alloc(cap + 1); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!p) return false;
+    memcpy(p, text, n + 1);
+    s.ptr = (char*)p; s.size = n; s.cap = cap;
+    return true;
+}
+bool call_recompute(void* chr) {
+    const uintptr_t rc = addr_of_call(C_RecomputeStats);
+    if (!rc) return false;
+    __try { ((void(__fastcall*)(void*, void*, char))rc)(chr, nullptr, 1); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// The stack-change notification Passive's tick-down calls after it lowers +0x5C (vtable +0x558, rdx = the stacks taken off).
+bool call_stacks_down(void* passive, int32_t by) {
+    void* const* vt = nullptr;
+    if (!mem_read(passive, &vt, 8) || !vt) return false;
+    void* fn = nullptr;
+    if (!mem_read((const uint8_t*)vt + 0x558, &fn, 8) || !fn) return false;
+    __try { ((void(__fastcall*)(void*, int32_t))fn)(passive, by); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The live component of class `type` on `chr` holding `stacks` (the first of that class when stacks < 0).
+uint8_t* find_component(const void* chr, uint16_t type, int32_t stacks) {
+    const uint8_t* ent = nullptr; uint32_t n = 0; uint8_t* const* data = nullptr;
+    if (!mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return nullptr;
+    uint8_t* any = nullptr;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t* c = nullptr;
+        if (!mem_read(data + i, &c, 8) || !c) continue;
+        uint8_t fl[3] = {}, removed = 0; const void* owner = nullptr; int32_t st = 0;
+        if (!mem_read(c + kComp_Enabled, fl, 3) || fl[1] || !fl[2] || !mem_read(c + kPas_Owner, &owner, 8) || owner != chr) continue;
+        if (mem_read(c + kPas_Removed, &removed, 1) && removed) continue;
+        const VtInfo* v = class_of(c);
+        if (!v || v->kind < 1 || v->type != type) continue;
+        if (stacks < 0) return c;
+        if (mem_read(c + kPas_Stacks, &st, 4) && st == stacks) return c;
+        if (!any) any = c;
+    }
+    return stacks < 0 ? nullptr : any;
+}
+
+// --- the log of what the game gave and took (USTATUS) ----------------------------------------------------------------------------------
+volatile LONG g_note_lines = 0;
+constexpr LONG kNoteCap = 1500;
+uint32_t g_note_battle_gen = ~0u;
+
+} // namespace
+
+bool unitstate_read(const void* chr, UnitDeep& d) {
+    d = UnitDeep{};
+    if (!chr) return false;
+    read_passives(chr, d);
+    const void* p = nullptr;
+    if (mem_read((const uint8_t*)chr + kCharAbilMove, &p, 8)) read_ability(p, 0, d);
+    if (mem_read((const uint8_t*)chr + kCharAbilAttack, &p, 8)) read_ability(p, 1, d);
+    if (mem_read((const uint8_t*)chr + kCharAbilBonus, &p, 8)) read_ability(p, 2, d);
+    uint32_t sc = 0; const void* const* sd = nullptr;
+    if (mem_read((const uint8_t*)chr + kCharSpellCount, &sc, 4) && mem_read((const uint8_t*)chr + kCharSpellData, &sd, 8) && sd && sc <= 64)
+        for (uint32_t i = 0; i < sc; ++i) if (mem_read(sd + i, &p, 8)) read_ability(p, (uint8_t)(3 + i), d);
+    const uint8_t* cd = nullptr;
+    if (mem_read((const uint8_t*)chr + kChar_CatData, &cd, 8) && cd) {
+        d.items = 1;
+        for (uint32_t k = 0; k < kUsItems; ++k) {
+            const uint8_t* s = cd + kCatData_Items + k * 0x60;
+            mem_read_std_string(s + 0x08, d.it[k].name, sizeof(d.it[k].name));
+            mem_read(s + 0x48, &d.it[k].dur, 4); mem_read(s + 0x4C, &d.it[k].aux, 4);
+        }
+    }
+    for (uint32_t k = 0; k < kUsCharInts; ++k) mem_read((const uint8_t*)chr + kUsCharOff[k], &d.c[k], 4);
+    d.ok = 1;
+    return true;
+}
+
+uint32_t unitstate_digest(const UnitDeep& d) {
+    if (!d.ok) return 0;
+    uint32_t h = 2166136261u;
+    h = fnv(h, &d.np, 1);
+    // A PASSIVE'S +0x70/+0x74/+0x78 FLAGS ARE NOT HASHED (0.1.180; room PQ5X 11-04, battle 30564d89: "the digests differ, no field does", the client's repair changed
+    // nothing and re-read the host's digest a moment later, the turn hash disagreed again, halted at turn 2). They change at frame-timed moments, no repair writes them
+    // and the diff did not show them -- a digest field nothing repairs is a halt waiting to happen (the rule of 0.1.176). Hashing them also made the digest depend on
+    // the order of two entries of one type and one stack count. What is hashed of a passive now is its type, status bit and stacks; the flags still travel in the
+    // record and the diff names them.
+    for (uint32_t i = 0; i < d.np; ++i) { const UsPassive& p = d.p[i]; h = fnv(h, &p.type, 2); h = fnv(h, &p.status, 1); h = fnv(h, &p.stacks, 4); }
+    h = fnv(h, &d.na, 1);
+    for (uint32_t i = 0; i < d.na; ++i) { const UsAbility& a = d.a[i]; h = fnv(h, &a.slot, 1); h = fnv_s(h, a.name); h = fnv(h, a.f, sizeof(a.f)); }
+    h = fnv(h, &d.items, 1);
+    if (d.items) for (uint32_t k = 0; k < kUsItems; ++k) { h = fnv_s(h, d.it[k].name); h = fnv(h, &d.it[k].dur, 4); h = fnv(h, &d.it[k].aux, 4); }
+    h = fnv(h, d.c, sizeof(d.c));
+    return h ? h : 1u;
+}
+
+uint32_t unitstate_encode(uint8_t* buf, uint32_t cap, uint64_t battle, uint32_t turn, uint8_t index, const UnitDeep& d) {
+    Writer w(buf, cap);
+    w.u8v(MSG_USTATE); w.u64v(battle); w.u32v(turn); w.u8v(index); w.u8v(d.ok);
+    w.u8v(d.np);
+    for (uint32_t i = 0; i < d.np; ++i) { const UsPassive& p = d.p[i]; w.raw(&p.type, 2); w.u8v(p.status); w.i32v(p.stacks); w.u32v(p.f70); w.u32v(p.f74); w.u32v(p.f78); w.str(p.name); }
+    w.u8v(d.na);
+    for (uint32_t i = 0; i < d.na; ++i) { const UsAbility& a = d.a[i]; w.u8v(a.slot); w.str(a.name); for (uint32_t k = 0; k < kUsAbilInts; ++k) w.i32v(a.f[k]); }
+    w.u8v(d.items);
+    if (d.items) for (uint32_t k = 0; k < kUsItems; ++k) { w.str(d.it[k].name); w.i32v(d.it[k].dur); w.i32v(d.it[k].aux); }
+    for (uint32_t k = 0; k < kUsCharInts; ++k) w.i32v(d.c[k]);
+    return w.ok ? w.len : 0;
+}
+
+bool unitstate_decode(const uint8_t* buf, uint32_t n, uint64_t& battle, uint32_t& turn, uint8_t& index, UnitDeep& d) {
+    d = UnitDeep{};
+    Reader r(buf, n);
+    if (r.u8v() != MSG_USTATE) return false;
+    battle = r.u64v(); turn = r.u32v(); index = r.u8v(); d.ok = r.u8v();
+    d.np = r.u8v();
+    if (!r.ok || d.np > kUsPassives) return false;
+    for (uint32_t i = 0; i < d.np; ++i) { UsPassive& p = d.p[i]; r.raw(&p.type, 2); p.status = r.u8v(); p.stacks = r.i32v(); p.f70 = r.u32v(); p.f74 = r.u32v(); p.f78 = r.u32v(); r.str(p.name, sizeof(p.name)); }
+    d.na = r.u8v();
+    if (!r.ok || d.na > kUsAbilities) return false;
+    for (uint32_t i = 0; i < d.na; ++i) { UsAbility& a = d.a[i]; a.slot = r.u8v(); r.str(a.name, sizeof(a.name)); for (uint32_t k = 0; k < kUsAbilInts; ++k) a.f[k] = r.i32v(); }
+    d.items = r.u8v();
+    if (d.items) for (uint32_t k = 0; k < kUsItems; ++k) { r.str(d.it[k].name, sizeof(d.it[k].name)); d.it[k].dur = r.i32v(); d.it[k].aux = r.i32v(); }
+    for (uint32_t k = 0; k < kUsCharInts; ++k) d.c[k] = r.i32v();
+    return r.ok && r.pos == r.len;
+}
+
+void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& mine, const char* when) {
+    char line[900]; int w = 0;
+    auto put = [&](const char* fmt, auto... a) { if (w < (int)sizeof(line) - 80) w += _snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, fmt, a...); };
+    line[0] = 0;
+    // passives: what each side holds that the other does not (by type, stacks); a pair alike in both whose flags differ is named too (not hashed since 0.1.180)
+    bool used_m[kUsPassives] = {};
+    for (uint32_t i = 0; i < host.np; ++i) {
+        bool found = false;
+        for (uint32_t j = 0; j < mine.np && !found; ++j) if (!used_m[j] && mine.p[j].type == host.p[i].type && mine.p[j].stacks == host.p[i].stacks) {
+            used_m[j] = found = true;
+            const UsPassive& a = host.p[i]; const UsPassive& b = mine.p[j];
+            if (a.f70 != b.f70 || a.f74 != b.f74 || a.f78 != b.f78) put(" %s flags %X/%X/%X|%X/%X/%X (not hashed)", a.name, a.f70, a.f74, a.f78, b.f70, b.f74, b.f78);
+        }
+        if (!found) {
+            uint32_t j = 0; for (; j < mine.np; ++j) if (!used_m[j] && mine.p[j].type == host.p[i].type) break;
+            if (j < mine.np) { used_m[j] = true; put(" %s %d|%d", host.p[i].name, host.p[i].stacks, mine.p[j].stacks); }
+            else put(" +%s(%d) host only", host.p[i].name, host.p[i].stacks);
+        }
+    }
+    for (uint32_t j = 0; j < mine.np; ++j) if (!used_m[j]) put(" -%s(%d) here only", mine.p[j].name, mine.p[j].stacks);
+    for (uint32_t i = 0; i < host.na || i < mine.na; ++i) {
+        const UsAbility* a = i < host.na ? &host.a[i] : nullptr; const UsAbility* b = i < mine.na ? &mine.a[i] : nullptr;
+        if (!a || !b) { put(" ability %u '%s'|'%s'", i, a ? a->name : "-", b ? b->name : "-"); continue; }
+        if (strcmp(a->name, b->name) != 0) { put(" ability slot %u '%s'|'%s'", (unsigned)a->slot, a->name, b->name); continue; }
+        for (uint32_t k = 0; k < kUsAbilInts; ++k) if (a->f[k] != b->f[k]) put(" %s+%X %d|%d", a->name, k < 14 ? 0x34 + k * 4 : 0xC8 + (k - 14) * 4, a->f[k], b->f[k]);
+    }
+    if (host.items != mine.items) put(" item slots %u|%u", host.items, mine.items);
+    else if (host.items) for (uint32_t k = 0; k < kUsItems; ++k) {
+        const UsItem& a = host.it[k]; const UsItem& b = mine.it[k];
+        if (strcmp(a.name, b.name) != 0) put(" item %u '%s'|'%s'", k, a.name, b.name);
+        else if (a.dur != b.dur || a.aux != b.aux) put(" item %u %s durability %d|%d aux %d|%d", k, a.name, a.dur, b.dur, a.aux, b.aux);
+    }
+    for (uint32_t k = 0; k < kUsCharInts; ++k) if (host.c[k] != mine.c[k]) put(" +%X %d|%d", (unsigned)kUsCharOff[k], host.c[k], mine.c[k]);
+    log_line_lvl(LogLevel::Warn, "USYNC", "!! unit %u %s (host|here):%s", (unsigned)index, when, w ? line : " (the digests differ, no field does -- the reading itself)");
+}
+
+uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const UnitDeep& mine) {
+    if (!chr || !host.ok) return 0;
+    unitstate_log_diff(index, host, mine, "differs from the host's");
+    uint64_t* stream = rng_global_stream();
+    uint64_t saved[4] = {};
+    if (stream) mem_read(stream, saved, sizeof(saved));
+    uint32_t changed = 0, failed = 0;
+    char done[700]; int w = 0; done[0] = 0;
+    auto put = [&](const char* fmt, auto... a) { if (w < (int)sizeof(done) - 80) w += _snprintf_s(done + w, sizeof(done) - w, _TRUNCATE, fmt, a...); };
+
+    // 1. passives and statuses, type by type
+    bool used_m[kUsPassives] = {}, used_h[kUsPassives] = {};
+    for (uint32_t i = 0; i < host.np; ++i)            // exact pairs first
+        for (uint32_t j = 0; j < mine.np; ++j)
+            if (!used_m[j] && mine.p[j].type == host.p[i].type && mine.p[j].stacks == host.p[i].stacks) { used_m[j] = used_h[i] = true; break; }
+    for (uint32_t i = 0; i < host.np; ++i) {
+        if (used_h[i]) continue;
+        const UsPassive& hp = host.p[i];
+        uint32_t j = 0; for (; j < mine.np; ++j) if (!used_m[j] && mine.p[j].type == hp.type) break;
+        if (j < mine.np) {                            // the same passive, other stacks
+            used_m[j] = used_h[i] = true;
+            uint8_t* c = find_component(chr, hp.type, mine.p[j].stacks);
+            if (c && mem_write(c + kPas_Stacks, &hp.stacks, 4)) {
+                if (hp.stacks < mine.p[j].stacks) call_stacks_down(c, mine.p[j].stacks - hp.stacks);
+                ++changed; put(" %s stacks %d->%d", hp.name, mine.p[j].stacks, hp.stacks);
+            } else { ++failed; put(" !%s stacks not written", hp.name); }
+            continue;
+        }
+        // the host's alone: made by the game's own factory, by its class name (only a name the factory knows)
+        used_h[i] = true;
+        const bool as_status = hp.status && in_sorted(kStatusFactoryNames, sizeof(kStatusFactoryNames) / sizeof(kStatusFactoryNames[0]), hp.name);
+        const bool as_passive = !as_status && in_sorted(kPassiveFactoryNames, sizeof(kPassiveFactoryNames) / sizeof(kPassiveFactoryNames[0]), hp.name);
+        if (!as_status && !as_passive) { ++failed; put(" !+%s (no factory makes it)", hp.name); continue; }
+        GameStr s;
+        if (!make_str(s, hp.name)) { ++failed; put(" !+%s (string)", hp.name); continue; }
+        void* made = as_status ? hooks_call_apply_status(&s, chr, hp.stacks > 0 ? hp.stacks : 1) : hooks_call_add_passive(&s, chr, hp.stacks > 0 ? hp.stacks : 1);
+        if (made) {
+            int32_t st = 0;
+            if (mem_read((uint8_t*)made + kPas_Stacks, &st, 4) && st != hp.stacks) mem_write((uint8_t*)made + kPas_Stacks, &hp.stacks, 4);
+            ++changed; put(" +%s(%d) via %s", hp.name, hp.stacks, as_status ? "ApplyStatus" : "AddPassive");
+        } else { ++failed; put(" !+%s (the factory made nothing)", hp.name); }
+    }
+    for (uint32_t j = 0; j < mine.np; ++j) {          // this game's alone: removed the game's way
+        if (used_m[j]) continue;
+        uint8_t* c = find_component(chr, mine.p[j].type, mine.p[j].stacks);
+        if (c && hooks_call_passive_remove(c)) { ++changed; put(" -%s(%d)", mine.p[j].name, mine.p[j].stacks); }
+        else { ++failed; put(" !-%s not removed", mine.p[j].name); }
+    }
+
+    // 2. abilities: the same ability in the same slot takes the host's fields; another ability is reported
+    for (uint32_t i = 0; i < host.na && i < mine.na; ++i) {
+        const UsAbility& a = host.a[i]; const UsAbility& b = mine.a[i];
+        if (a.slot != b.slot || strcmp(a.name, b.name) != 0) { ++failed; put(" !ability slot %u is '%s' here, '%s' on the host", (unsigned)a.slot, b.name, a.name); continue; }
+        if (memcmp(a.f, b.f, sizeof(a.f)) == 0) continue;
+        const void* ab = nullptr;
+        if (a.slot == 0) mem_read((const uint8_t*)chr + kCharAbilMove, &ab, 8);
+        else if (a.slot == 1) mem_read((const uint8_t*)chr + kCharAbilAttack, &ab, 8);
+        else if (a.slot == 2) mem_read((const uint8_t*)chr + kCharAbilBonus, &ab, 8);
+        else { uint32_t sc = 0; const void* const* sd = nullptr;
+               if (mem_read((const uint8_t*)chr + kCharSpellCount, &sc, 4) && mem_read((const uint8_t*)chr + kCharSpellData, &sd, 8) && sd && (uint32_t)(a.slot - 3) < sc) mem_read(sd + (a.slot - 3), &ab, 8); }
+        char now[kUsNameLen] = {};
+        if (!ab || !ability_gon_name(ab, now, sizeof(now)) || strcmp(now, a.name) != 0) { ++failed; put(" !%s not found to write", a.name); continue; }
+        for (uint32_t k = 0; k < kUsAbilInts; ++k)
+            if (a.f[k] != b.f[k] && (k < kUsAbilTileFirst || k > kUsAbilTileLast)) mem_write((uint8_t*)ab + (k < 14 ? 0x34 + k * 4 : 0xC8 + (k - 14) * 4), &a.f[k], 4);
+        ++changed; put(" %s fields", a.name);
+    }
+    if (host.na != mine.na) { ++failed; put(" !%u ability slot(s) here, %u on the host", (unsigned)mine.na, (unsigned)host.na); }
+
+    // 3. gear: the same item takes the host's durability and aux
+    if (host.items && mine.items) {
+        const uint8_t* cd = nullptr;
+        mem_read((const uint8_t*)chr + kChar_CatData, &cd, 8);
+        for (uint32_t k = 0; k < kUsItems && cd; ++k) {
+            const UsItem& a = host.it[k]; const UsItem& b = mine.it[k];
+            // 0.1.176: the host's slot holds an item and this one is empty (room 57da 11-03: a consumable 'cm_Heal' the owner then used -- "slot is empty on this peer", a halt).
+            // It is made and equipped the game's way (Item::make + equip_if_slot_free + items_changed, as the EQUIP message does), with the host's durability and aux.
+            if (a.name[0] && !b.name[0]) {
+                const int slot = lockstep_equip_named(chr, a.name, a.dur, a.aux);
+                if (slot >= 0) { ++changed; put(" +item '%s' (slot %d here, %u on the host)", a.name, slot, k); }
+                else { ++failed; put(" !item '%s' could not be equipped here (%d)", a.name, slot); }
+                continue;
+            }
+            if (strcmp(a.name, b.name) != 0) { ++failed; put(" !item %u is '%s' here, '%s' on the host", k, b.name, a.name); continue; }
+            if (a.dur == b.dur && a.aux == b.aux) continue;
+            uint8_t* s = (uint8_t*)cd + kCatData_Items + k * 0x60;
+            mem_write(s + 0x48, &a.dur, 4); mem_write(s + 0x4C, &a.aux, 4);
+            ++changed; put(" %s durability %d->%d aux %d->%d", a.name, b.dur, a.dur, b.aux, a.aux);
+        }
+    }
+
+    if (changed) {
+        const uint8_t one = 1;
+        mem_write((uint8_t*)chr + kChar_PassiveDirty, &one, 1);
+        call_recompute(chr);
+    }
+    // 4. the numbers, AFTER the recompute (0.1.176): what the recompute derived from inputs that now agree is left alone; whatever still differs takes the host's value
+    {
+        int32_t now[kUsCharInts] = {};
+        for (uint32_t k = 0; k < kUsCharInts; ++k) mem_read((const uint8_t*)chr + kUsCharOff[k], &now[k], 4);
+        for (uint32_t k = 0; k < kUsCharInts; ++k)
+            if (char_writes(k) && host.c[k] != now[k] && mem_write((uint8_t*)chr + kUsCharOff[k], &host.c[k], 4)) { ++changed; put(" +%X %d->%d", (unsigned)kUsCharOff[k], now[k], host.c[k]); }
+    }
+    if (stream) mem_write(stream, saved, sizeof(saved));         // whatever a factory drew is the host's to draw: the stream stays where the board put it
+    UnitDeep after;
+    unitstate_read(chr, after);
+    const bool settled = unitstate_digest(after) == unitstate_digest(host);
+    log_line_lvl(settled ? LogLevel::Info : LogLevel::Warn, "USYNC", "%s unit %u put right toward the host's: %u change(s), %u not repairable --%s%s", settled ? "" : "!!", (unsigned)index, changed, failed,
+                 w ? done : " nothing", settled ? " -- now the same as the host's" : " -- STILL DIFFERS");
+    if (!settled) unitstate_log_diff(index, host, after, "after the repair");
+    return changed;
+}
+
+// --- the hooks' notes --------------------------------------------------------------------------------------------------------------
+void unitstate_battle_reset() { InterlockedExchange(&g_note_lines, 0); }
+
+void unitstate_note_apply(bool status, const char* name, const void* target, int32_t stacks, const void* source, uint32_t ra, const void* made) {
+    if (!lockstep_in_battle()) return;
+    const uint32_t gen = lockstep_battle_gen();
+    if (gen != g_note_battle_gen) { g_note_battle_gen = gen; InterlockedExchange(&g_note_lines, 0); }
+    if (InterlockedIncrement(&g_note_lines) > kNoteCap) return;
+    const int ti = lockstep_unit_index(target), si = source ? lockstep_unit_index(source) : -1;
+    int32_t now = 0;
+    if (made) mem_read((const uint8_t*)made + kPas_Stacks, &now, 4);
+    log_line("USTATUS", "turn %u: %s %s(%d) -> unit %d%s%s (from unit %d) at rva %06X -- %s, stacks now %d", lockstep_turn(), status ? "status" : "passive", name, stacks, ti,
+             ti < 0 ? " (not in the roster)" : "", "", si, ra, made ? "made" : "NOT made", now);
+}
+
+void unitstate_note_remove(const void* passive, uint32_t ra) {
+    if (!lockstep_in_battle() || !passive) return;
+    const void* owner = nullptr;
+    mem_read((const uint8_t*)passive + kPas_Owner, &owner, 8);
+    const VtInfo* v = class_of(passive);
+    if (!v || v->kind < 1) return;
+    if (InterlockedIncrement(&g_note_lines) > kNoteCap) return;
+    int32_t st = 0; mem_read((const uint8_t*)passive + kPas_Stacks, &st, 4);
+    log_line("USTATUS", "turn %u: %s %s removed from unit %d at rva %06X (stacks %d)", lockstep_turn(), v->kind == 2 ? "status" : "passive", v->name, lockstep_unit_index(owner), ra, st);
+}
+
+// DEV (harness `usdev ...`): a deliberate difference on THIS game only, on its first local player cat -- the test of the unit-state repair.
+//   status NAME N | passive NAME N | remove NAME | stacks NAME N | field 0xOFF VALUE | durability SLOT VALUE
+bool unitstate_dev(const char* cmd) {
+    void* chr = (void*)lockstep_dev_player_cat();
+    if (!chr || !cmd) { log_line("USYNC", "dev: no player cat"); return false; }
+    char op[32] = {}, a1[64] = {}; long long v = 0;
+    const int n = sscanf_s(cmd, "%31s %63s %lld", op, (unsigned)sizeof(op), a1, (unsigned)sizeof(a1), &v);
+    if (n < 2) return false;
+    bool ok = false;
+    if (!strcmp(op, "status") || !strcmp(op, "passive")) {
+        GameStr s;
+        if (make_str(s, a1)) ok = (!strcmp(op, "status") ? hooks_call_apply_status(&s, chr, v > 0 ? (int32_t)v : 1) : hooks_call_add_passive(&s, chr, v > 0 ? (int32_t)v : 1)) != nullptr;
+    } else if (!strcmp(op, "remove") || !strcmp(op, "stacks")) {
+        UnitDeep d; unitstate_read(chr, d);
+        for (uint32_t i = 0; i < d.np && !ok; ++i) if (!strcmp(d.p[i].name, a1)) {
+            uint8_t* c = find_component(chr, d.p[i].type, d.p[i].stacks);
+            if (!c) break;
+            if (!strcmp(op, "remove")) ok = hooks_call_passive_remove(c);
+            else { const int32_t st = (int32_t)v; ok = mem_write(c + kPas_Stacks, &st, 4); }
+        }
+    } else if (!strcmp(op, "field")) {
+        const uint32_t off = (uint32_t)strtoul(a1, nullptr, 0); const int32_t val = (int32_t)v;
+        ok = off < 0x1000 && mem_write((uint8_t*)chr + off, &val, 4);
+    } else if (!strcmp(op, "rotate")) {
+        unsigned a = 0, b = 0, c = 0;
+        ok = sscanf_s(cmd, "%*s %u %u %u", &a, &b, &c) == 3 && lockstep_dev_roster_rotate(a, b, c);
+    } else if (!strcmp(op, "qdrop")) {
+        ok = lockstep_dev_queue_drop((uint32_t)atoi(a1));
+    } else if (!strcmp(op, "equip")) {
+        const int slot = lockstep_equip_named(chr, a1, -1, 0);
+        ok = slot >= 0;
+    } else if (!strcmp(op, "qlast")) {
+        ok = lockstep_dev_queue_last((uint32_t)atoi(a1));
+    } else if (!strcmp(op, "durability")) {
+        const uint8_t* cd = nullptr; const uint32_t k = (uint32_t)atoi(a1); const int32_t val = (int32_t)v;
+        ok = k < kUsItems && mem_read((const uint8_t*)chr + kChar_CatData, &cd, 8) && cd && mem_write((uint8_t*)cd + kCatData_Items + k * 0x60 + 0x48, &val, 4);
+    }
+    log_line_lvl(LogLevel::Warn, "USYNC", "dev on THIS game only, unit %d: %s -> %s", lockstep_unit_index(chr), cmd, ok ? "done" : "FAILED");
+    return ok;
+}
+
+} // namespace mgmp

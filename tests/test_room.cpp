@@ -12,6 +12,7 @@ using namespace mgmp;
 static unsigned checks = 0;
 #define CHECK(x) do { ++checks; if(!(x)) { printf("FAIL line %d: %s\n", __LINE__, #x); exit(1); } } while(0)
 
+namespace mgmp { int chat_notes = 0; void chat_local_note(const char*) { ++chat_notes; } }
 namespace {
 // lobby
 SignalPeer lobby[8]; uint32_t lobby_n = 0;
@@ -93,6 +94,10 @@ bool housecoop_holds_solo() { return false; }
 void housecoop_hold_reason(char* out, size_t cap) { if (out && cap) out[0] = 0; }   // 0.1.86+: the links this test never has
 NetRole net_role() { return NetRole::None; }
 uint32_t perf_link_slow_ms(uint8_t*) { return 0; }
+uint32_t perf_clock_x100() { return 100; }          // 0.1.159: the clock check (mgmp_perf)
+bool perf_clock_abnormal() { return false; }
+bool perf_peer_clock(uint8_t, uint32_t* x) { if (x) *x = 0; return false; }
+uint64_t perf_ref_now_ms() { return 0; }
 const char* signal_room_transport() { return ""; }
 int signal_reach() { return 0; }
 bool upnp_double_nat() { return false; }
@@ -102,6 +107,7 @@ uintptr_t addr_of_data(DataSym d) { return d == D_MewDirectorPtr ? (uintptr_t)&d
 bool mem_read(const void* src, void* dst, size_t n) { memcpy(dst, src, n); return true; }
 const Config& config() { static Config c; return c; }
 void log_line(const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
+void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }   // 0.1.159: tick_clock
 namespace checkpoint_io {
 bool read_property(const std::wstring& path, const char* key, bool& have, std::string& out) {
     auto it = saves.find(path); have = false;
@@ -113,6 +119,8 @@ bool read_property(const std::wstring& path, const char* key, bool& have, std::s
 }
 
 int main() {
+    // 0.1.149: the special-mark notice at the chapter page is a toast AND a line in this player's own chat history
+    { room_say_marks("[mark] text"); CHECK(toast_text() == "[mark] text" && chat_notes == 1); room_say_marks(""); CHECK(chat_notes == 1); }
     director_ptr = director;
     void* hp = house; memcpy(director + 0x5A8, &hp, 8);
     saves[L"boss.sav"] = { "hitler3", "0" };

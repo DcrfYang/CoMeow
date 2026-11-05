@@ -1,4 +1,5 @@
 #include "mgmp_logupload.h"
+#include "mgmp_server_addr.h"   // comeow.top: the address when the name does not resolve
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -100,7 +101,8 @@ SOCKET dial(const char* host, uint16_t port) {
     addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP;
     char ps[8]; _snprintf_s(ps, sizeof(ps), _TRUNCATE, "%u", (unsigned)port);
     addrinfo* res = nullptr;
-    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return INVALID_SOCKET;
+    if ((getaddrinfo(host, ps, &hints, &res) != 0 || !res) && (!official_fallback(host) || getaddrinfo(official_fallback(host), ps, &hints, &res) != 0 || !res))
+        return INVALID_SOCKET;
     SOCKET s = INVALID_SOCKET;
     for (addrinfo* a = res; a && s == INVALID_SOCKET; a = a->ai_next) {
         SOCKET c = socket(a->ai_family, a->ai_socktype, a->ai_protocol);

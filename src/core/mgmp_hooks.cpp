@@ -58,8 +58,10 @@
 #include "mgmp_storage_diag.h"
 #include "mgmp_areagate.h"
 #include "mgmp_indepevt.h"
+#include "mgmp_gameconsole.h"   // the game's own debug console: which object it is (0.1.150)
 #include "mgmp_perf.h"
 #include "mgmp_unlocks.h"
+#include "mgmp_progressguard.h"
 #include "mgmp_leave.h"
 #include "mgmp_page.h"
 #include "mgmp_abandon.h"
@@ -69,6 +71,7 @@
 #include "mgmp_checkpoint.h"
 #include "mgmp_listprobe.h"    // RE instrument; tune::kRosterProbe
 #include "mgmp_menu.h"
+#include "mgmp_i18n.h"        // tr: the House-cat popup (0.1.185)
 #include "mgmp_roster.h"       // the run editor; config debug.roster_shrink
 #include "mgmp_rng.h"
 #include "mgmp_rngfix.h"
@@ -84,7 +87,9 @@
 #include "MinHook.h"
 #include "mgmp_souljar.h"
 #include "mgmp_gains.h"        // 0.1.83: a cat's battle gains go to its owner
+#include "mgmp_teamlist.h"     // 0.1.139: the whole team where the game reads "the party"
 #include "mgmp_dmgfence.h"     // 0.1.83: R001, every damage instance on a stream of its own
+#include "mgmp_unitstate.h"    // 0.1.173: the status/passive factories logged, and called by the unit-state repair
 
 #include <cstdio>
 #include <cstring>
@@ -330,10 +335,30 @@ void* __fastcall h_GetChoice(void* self, void* out) {
     return ret;
 }
 
+// AN ACTION NO DECISION ASKED FOR (0.1.171, room 5LZM 2026-11-03): right after the host's cat picked up a coin, both clients ran a basic attack of that cat
+// that went through no ApplyAction (the decision queue) -- the host did not, and the battle halted two turns later. Which effect calls DoAction on its own is
+// not known yet; such a call now logs the return addresses of its stack (image-relative), so the next log names the caller.
+static thread_local int t_apply_depth = 0;
 void __fastcall h_DoAction(void* self, void* ta, unsigned char flag) {
     Who    w(self, "char");
     TaDump d(ta);
     log_line("DOACTION", "%s flag=%u %s", w.text, (unsigned)flag, d.text);
+    if (t_apply_depth == 0 && lockstep_active()) {
+        static LONG s_said = 0;
+        uint32_t type = 0;
+        if (mem_read(ta, &type, sizeof(type)) && type == TA_Ability && InterlockedIncrement(&s_said) <= 60) {
+            void* fr[14] = {};
+            const USHORT n = CaptureStackBackTrace(1, 14, fr, nullptr);
+            static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+            char line[400] = {}; int wpos = 0;
+            for (USHORT i = 0; i < n && wpos >= 0 && (size_t)wpos < sizeof(line) - 20; ++i) {
+                const uintptr_t a = (uintptr_t)fr[i];
+                wpos += (a >= base && a < base + 0x2000000) ? _snprintf_s(line + wpos, sizeof(line) - wpos, _TRUNCATE, " %llX", (unsigned long long)(a - base))
+                                                           : _snprintf_s(line + wpos, sizeof(line) - wpos, _TRUNCATE, " ?%llX", (unsigned long long)a);
+            }
+            log_line_lvl(LogLevel::Warn, "DOACTION", "!! an ability action outside the decision queue (no ApplyAction) -- called from:%s", line);
+        }
+    }
     lockstep_action_trace(self, ta);           // who stands on the target tile, in which order of the live list -- and, at the next action, what this one changed
     o_DoAction(self, ta, flag);
 }
@@ -511,7 +536,9 @@ void __fastcall h_ApplyAction(void* self, void* ta) {
     if (lockstep_active()) lockstep_on_applied(ta, current_actor(self));
 
     rng_ledger_phase(true);       // the draws the game's own apply makes are one record (the RNG ledger, mgmp_diag), the ones between actions another
+    ++t_apply_depth;
     o_ApplyAction(self, ta);
+    --t_apply_depth;
     rng_ledger_phase(false);
 }
 
@@ -938,6 +965,7 @@ void __fastcall h_EventUpdate(void* self) {
     // injecting here is at the same point in the frame rather than ahead of the
     // screen's own bookkeeping.
     choice_on_event_update(self);
+    unlocks_host_flags_poll();     // 0.1.121: the host's live map flags reach the clients while an event is up
     // ...and the node hash's second sample point. After the choice tick so that
     // an injected choice has already happened: the name at WorldEvent+0x1A10 is
     // written by init and does not change, but sampling last keeps this hook's
@@ -1044,6 +1072,13 @@ EquipmentGate checked_equipment_gate(void* self) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return EquipmentGate::Unreadable; }
 }
 void __fastcall h_EquipmentClick(void* self) {
+    // 0.1.192: THE HOST IS ALREADY IN THE NEXT NODE (yuge 11-05: a swap on the gear page after the host had built the battle with the old gear -- an item of
+    // another name in a slot, a halt at turn 1). The gear this battle is built with is the gear the host has; a change now would only split the two games.
+    if (net_active() && net_peer_count() >= 2 && net_role() == NetRole::Client && follow_host_ahead()) {
+        room_say_gear_locked();
+        log_line_lvl(LogLevel::Warn, "SETUP", "gear click refused: the host has entered the next node already -- the battle is built with the gear as it was");
+        return;
+    }
     const auto result=checked_equipment_gate(self);
     if(result!=EquipmentGate::Allow){
         if(result==EquipmentGate::MainStory) room_say_story_only_host();
@@ -1065,6 +1100,7 @@ void __fastcall h_TryAbandon(void* self) {
 // 2026-10-01): this player's clones go back to their originals, then the per-run state of every module is reset.
 static void run_settled(const char* how, bool was_shared) {
     log_stage("%s: the native end of the run returned (shared run: %s)", how, was_shared ? "yes" : "no");
+    catsync_marks_run_summary(how);      // 0.1.149: the run's chapter checks and the marks they gave, before the run's per-run state is reset
     lockstep_log_battle_summary(how);
     catsync_log_snapshot("after the native settlement, before the merge");
     catsync_log_audit("after the native settlement, before the merge");
@@ -1099,6 +1135,7 @@ static void run_settled(const char* how, bool was_shared) {
         if (tune::kLocalSetup)
             log_line("SETUP", "run settled in-session; chapter barrier re-armed for the next chapter");
     }
+    catsync_settle_done(how);       // 0.1.145: also when the run ended alone (no catsync_forget above)
     housecoop_after_settlement();   // a helper of a co-op house boss gets its own house boss values back
     log_stage("%s: finished -- per-run state reset, the next run starts clean", how);
 }
@@ -1172,14 +1209,15 @@ void __fastcall h_EndRunDefeat(void* self) {
 // side afterwards (see mgmp_roster.cpp).
 
 // "A new cat joins" (gain_cat_familiar). Every peer runs it (the client follows the host's choice); in a room the cat it makes is then moved to the
-// same shared id on every peer and noted as the host's (catsync_on_gained_cat). The old ui.block_new_cats switch is gone (2026-10-21).
+// same shared id on every peer and noted as the host's (catsync_on_gained_cat). 0.1.146: in a player's OWN random event only that peer runs it, and the cat is that player's. The old ui.block_new_cats switch is gone (2026-10-21).
 void* __fastcall h_GainCat(void* ctx, void* arg) {
     const bool room = multiplayer_live();
     const uint64_t before = room ? catsync_id_counter() : 0;
     void* r = o_GainCat(ctx, arg);
     if (room) {
-        catsync_on_gained_cat(before, "event: a new cat joins");
-        if (net_role() == NetRole::Host) catsync_publish("a new cat joined the run", true, true);
+        const bool own = indepevt_in_own_event();     // 0.1.146: this player's own random event -- the cat is this player's, and this player publishes it
+        catsync_on_gained_cat(before, own ? "event: a new cat joins (this player's own event)" : "event: a new cat joins");
+        if (own || net_role() == NetRole::Host) catsync_publish("a new cat joined the run", true, true);
     }
     return r;
 }
@@ -1323,9 +1361,65 @@ fn_ev_handler o_EvSetup = nullptr;
 uint64_t __fastcall h_EvSetup(void* a, void* b, void* c) {
     unlocks_event_roll();
     indepevt_ctor_begin(a, b);       // experimental: the pool draw inside decides whether this event is the player's own (mgmp_indepevt)
+    unlocks_event_ctor(true);        // 0.1.167: the event's difficulty row is the host's (T_Difficulty)
     const uint64_t r = o_EvSetup(a, b, c);
+    unlocks_event_ctor(false);
     indepevt_ctor_end(a);
     return r;
+}
+// THE DIFFICULTY INDEX (0.1.167, sim 41; see T_Difficulty). rcx the director, dl "count the increase_difficulty items" (passed on whole); the answer in eax.
+// The game's own answer always runs; in a room the shared callers get the host's (mgmp_unlocks: unlocks_difficulty).
+typedef int32_t (__fastcall* fn_difficulty)(void* director, uint64_t with_items);
+fn_difficulty o_Difficulty = nullptr;
+int32_t __fastcall h_Difficulty(void* director, uint64_t with_items) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uint32_t ra = (uint32_t)((uintptr_t)_ReturnAddress() - base);
+    const int32_t own = o_Difficulty(director, with_items);
+    return unlocks_difficulty(ra, own);
+}
+// THE TAG COUNT (0.1.170, sim 43; see T_TagCount). rcx the director, rdx the tag (a std::string taken by value: the original destroys it, passed on as it is).
+typedef int32_t (__fastcall* fn_tagcount)(void* director, void* tag);
+fn_tagcount o_TagCount = nullptr;
+int32_t __fastcall h_TagCount(void* director, void* tag) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uint32_t ra = (uint32_t)((uintptr_t)_ReturnAddress() - base);
+    const int32_t own = o_TagCount(director, tag);
+    return unlocks_tag_count(ra, own);
+}
+// THE STATUS AND PASSIVE FACTORIES, AND THE REMOVAL (0.1.173; see T_ApplyStatus). The name is a std::string taken BY VALUE -- the original destroys it, so it is read first.
+// Eight arguments for the status factory: it reads the four stack slots (source's default, p5, p6 and the two bools, `[rbp+0x67..0x7f]`).
+typedef void* (__fastcall* fn_apply_status)(void* name, void* target, int32_t stacks, void* source, void* p5, void* p6, uint64_t b7, uint64_t b8);
+typedef void* (__fastcall* fn_add_passive)(void* name, void* target, int32_t stacks, uint64_t a4);
+typedef void  (__fastcall* fn_passive_remove)(void* passive);
+fn_apply_status   o_ApplyStatus = nullptr;
+fn_add_passive    o_AddPassive = nullptr;
+fn_passive_remove o_PassiveRemove = nullptr;
+void* __fastcall h_ApplyStatus(void* name, void* target, int32_t stacks, void* source, void* p5, void* p6, uint64_t b7, uint64_t b8) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uint32_t ra = (uint32_t)((uintptr_t)_ReturnAddress() - base);
+    char nm[64] = {};
+    const bool want = lockstep_in_battle();
+    if (want) mem_read_std_string(name, nm, sizeof(nm));
+    void* r = o_ApplyStatus(name, target, stacks, source, p5, p6, b7, b8);
+    if (want) unitstate_note_apply(true, nm, target, stacks, source, ra, r);
+    return r;
+}
+void* __fastcall h_AddPassive(void* name, void* target, int32_t stacks, uint64_t a4) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uint32_t ra = (uint32_t)((uintptr_t)_ReturnAddress() - base);
+    char nm[64] = {};
+    const bool want = lockstep_in_battle();
+    if (want) mem_read_std_string(name, nm, sizeof(nm));
+    void* r = o_AddPassive(name, target, stacks, a4);
+    if (want) unitstate_note_apply(false, nm, target, stacks, nullptr, ra, r);
+    return r;
+}
+void __fastcall h_PassiveRemove(void* passive) {
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const uint32_t ra = (uint32_t)((uintptr_t)_ReturnAddress() - base);
+    uint8_t removed = 1;
+    if (lockstep_in_battle() && passive && mem_read((const uint8_t*)passive + 0x75, &removed, 1) && !removed) unitstate_note_remove(passive, ra);
+    o_PassiveRemove(passive);
 }
 // The event pool draw (sub_1403968E0, returns the out string). Two of its callers are looked at -- an event node's draw (EnterNode lambda_5)
 // and a constructor given "random": with the experimental own random events on, the drawn event decides whether the player's own cats take
@@ -1411,6 +1505,64 @@ uint64_t __fastcall h_AbilityPay(void* ability, void* b, void* c, void* d) {
     CoinShield shield(ability, "paid and cast");
     return o_AbilityPay(ability, b, c, d);
 }
+// THE WHOLE TEAM WHERE THE GAME ASKS FOR "THE PARTY" (0.1.139, mgmp_teamlist.h). For the callers mgmp_teamlist names, the party list is pointed at
+// the list it composes (every player's cats, or this player's own) for that one call and put back right after; the game's own code builds the
+// result from it. Not in a player's own random event (its party is already its own), not in solo play.
+typedef void* (__fastcall* fn_party_cats)(void* director, void* out);
+fn_party_cats o_PartyCats = nullptr;
+// A PARTY LIST NAMING A CAT THIS SAVE DOES NOT HAVE (0.1.170, 2026-11-03, a client that loaded its save in a room: the party said dc5, the registry had no dc5):
+// the game's list builder (0x1403B2F30) pushes CatData::by_id's null as it is, and the next caller read null+0x9B0 while the chapter map was generated. The
+// out vector is {u32 capacity, u32 count, CatData** data}; nulls are taken out so no caller ever sees one.
+static void party_cats_drop_nulls(void* out) {
+    uint32_t n = 0; void** data = nullptr;
+    if (!out || !mem_read((uint8_t*)out + 4, &n, 4) || !n || n > 64 || !mem_read((uint8_t*)out + 8, &data, 8) || !data) return;
+    void* v[64] = {};
+    if (!mem_read(data, v, n * sizeof(void*))) return;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; ++i) if (v[i]) v[k++] = v[i];
+    if (k == n) return;
+    if (mem_write(data, v, k * sizeof(void*)) && mem_write((uint8_t*)out + 4, &k, 4)) {
+        static ULONGLONG s_said = 0;
+        if (GetTickCount64() - s_said > 5000) { s_said = GetTickCount64(); log_line_lvl(LogLevel::Error, "TEAMLIST", "!! the party list named %u cat(s) this save does not have -- left out of the list the game reads (%u remain)", n - k, k); }
+    }
+}
+static void* party_cats_inner(void* director, void* out, uintptr_t ret);
+void* __fastcall h_PartyCats(void* director, void* out) {
+    void* r = party_cats_inner(director, out, (uintptr_t)_ReturnAddress());   // the GAME's call site: teamlist_use is keyed on it
+    party_cats_drop_nulls(out);
+    return r;
+}
+static void* party_cats_inner(void* director, void* out, uintptr_t ret) {
+    if (!director || !net_active() || net_peer_count() < 2) return o_PartyCats(director, out);
+    static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+    const char* what = nullptr;
+    const TeamUse use = teamlist_use((uint32_t)(ret - base), unlocks_in_build(), &what);
+    if (use == TeamUse::Off || indepevt_own_node(follow_here_seed())) return o_PartyCats(director, out);
+    uint8_t* d = (uint8_t*)director;
+    uint32_t pn = 0, fn = 0; uint64_t* pd = nullptr; uint64_t* fd = nullptr;
+    if (!mem_read(d + kDir_CatIdCount, &pn, 4) || !mem_read(d + kDir_CatIdData, &pd, 8) ||
+        !mem_read(d + kDir_CatFamiliars + 4, &fn, 4) || !mem_read(d + kDir_CatFamiliars + 8, &fd, 8) || pn > 32 || fn > 32 || (pn && !pd) || (fn && !fd))
+        return o_PartyCats(director, out);
+    uint64_t party[32] = {}, fam[32] = {};
+    if ((pn && !mem_read(pd, party, pn * 8)) || (fn && !mem_read(fd, fam, fn * 8))) return o_PartyCats(director, out);
+    static uint64_t team[64];
+    const uint32_t n = teamlist_compose(use, party, pn, fam, fn, net_peer_pos(), &lockstep_owner_pos, team, 64);
+    if (!n) {
+        log_line("TEAMLIST", "%s: no cat for the %s list (party %u, familiars %u) -- the game's own party list is used", what ? what : "?", use == TeamUse::Own ? "own" : "whole-team", pn, fn);
+        return o_PartyCats(director, out);
+    }
+    char line[400] = {}; int w = 0;
+    for (uint32_t i = 0; i < n && w >= 0 && (size_t)w < sizeof(line) - 20; ++i) w += _snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, " %llx", (unsigned long long)team[i]);
+    log_line("TEAMLIST", "%s: %s %u cat(s) [%s ] instead of the party list's %u (familiars %u)", what ? what : "?",
+             use == TeamUse::Own ? "this player's own" : "every player's", n, line, pn, fn);
+    uint64_t* team_ptr = team;
+    mem_write(d + kDir_CatIdCount, &n, 4);
+    mem_write(d + kDir_CatIdData, &team_ptr, 8);
+    void* r = o_PartyCats(director, out);
+    mem_write(d + kDir_CatIdData, &pd, 8);                      // the party list as it was, before anything else reads it
+    mem_write(d + kDir_CatIdCount, &pn, 4);
+    return r;
+}
 // "A random element of this vector" (sub_1400AB770, 41 callers). Only the call that picks an event's SUBJECT cat is taken over (the instruction after that call is kRet_EventSubject): the
 // candidates are sorted by cat id and the draw indexes the sorted list, so both peers name the same cat even when their party lists are in another order (the client's own cats come first).
 typedef void* (__fastcall* fn_pick_random)(void* vec, void* stream);
@@ -1438,9 +1590,9 @@ void __fastcall h_PropSetInt(void* name, int value) {
     char key[96] = {};
     if (name && mem_read_std_string(name, key, sizeof(key)))
         storage_diag_property_set(key, value);
-    unlocks_property_set(name, value);
+    const int store = unlocks_property_set(name, value);           // 0.1.124: inside a window the number stored is this save's own, never the host's answer
     if (choice_story_event_block_active()) { choice_story_event_blocked("a save property counter (increment/decrement_legacy_counter)"); return; }
-    o_PropSetInt(name, value);
+    o_PropSetInt(name, store);
 }
 
 // THE EVENT RESULTS THAT CHANGE THE SAVE (2026-10-04). A story event's choice is the host's; the client replays it with the game's own commit, and the game runs the option's result script on the client's own save too:
@@ -1474,11 +1626,175 @@ uint64_t __fastcall h_AlliesScramble(void* passive, void* b, void* c, void* d) {
     }
     return o_AlliesScramble(passive, b, c, d);
 }
+// THE RANDOM-SAFE-SQUARE AOE (0.1.125; see T_AoeTiles): the presentation stream (TLS+0x198) picks the squares, so it is set to a state every peer derives and put back after the call. Only the two modes that
+// use it (ability+0xF4 = 0x12 all_except_random, 0x13 all_except_random_empty) are touched.
+typedef uint64_t (__fastcall* fn_aoe_tiles)(void* ability, uint64_t b, uint64_t c, uint64_t d);
+fn_aoe_tiles o_AoeTiles = nullptr;
+uint64_t __fastcall h_AoeTiles(void* ability, uint64_t b, uint64_t c, uint64_t d) {
+    uint32_t mode = 0;
+    uint64_t saved[4] = {}, st[4] = {};
+    uint64_t* ps = nullptr;
+    bool fenced = false;
+    if (ability && mem_read((const uint8_t*)ability + 0xF4, &mode, sizeof(mode)) && (mode == 0x12 || mode == 0x13)) {
+        char gon[64] = {};
+        uint64_t salt = 0x414F4554494C45ull;
+        if (ability_gon_name(ability, gon, sizeof(gon))) for (const char* p = gon; *p; ++p) salt = (salt ^ (uint8_t)*p) * 1099511628211ull;
+        char** tls = (char**)__readgsqword(0x58);
+        if (tls && tls[0] && lockstep_presentation_seed(salt, st)) {
+            ps = (uint64_t*)(tls[0] + 0x198);
+            fenced = mem_read(ps, saved, sizeof(saved)) && mem_write(ps, st, sizeof(st));
+            static int said = 0;
+            if (fenced && said < 40) { ++said; log_line("RNGFIX", "the random safe squares of '%s' (mode %#x) are picked from a stream both peers derive (%016llx), not from the presentation stream", gon[0] ? gon : "?", mode, (unsigned long long)st[0]); }
+        }
+    }
+    const uint64_t r = o_AoeTiles(ability, b, c, d);
+    if (fenced) mem_write(ps, saved, sizeof(saved));
+    return r;
+}
+// THE TERMINATOR'S MINION SPOTS (0.1.128; see T_T3Spawns): the same fence as the safe squares above, for the one other place the presentation stream decides something on the board.
+// The effect reads only rcx; the other three registers are passed through untouched.
+typedef void (__fastcall* fn_t3_spawns)(void* a, void* b, void* c, void* d);
+fn_t3_spawns o_T3Spawns = nullptr;
+void __fastcall h_T3Spawns(void* a, void* b, void* c, void* d) {
+    uint64_t saved[4] = {}, st[4] = {};
+    uint64_t* ps = nullptr;
+    bool fenced = false;
+    char** tls = (char**)__readgsqword(0x58);
+    if (tls && tls[0] && lockstep_presentation_seed(0x54334849544C4552ull /* "T3HITLER" */, st)) {
+        ps = (uint64_t*)(tls[0] + 0x198);
+        fenced = mem_read(ps, saved, sizeof(saved)) && mem_write(ps, st, sizeof(st));
+        if (fenced) log_line("RNGFIX", "the Terminator's minion spots (T3HitlerTriggerInitialSpawns) are shuffled with a stream both peers derive (%016llx), not with the presentation stream", (unsigned long long)st[0]);
+    }
+    o_T3Spawns(a, b, c, d);
+    if (fenced) mem_write(ps, saved, sizeof(saved));
+}
+// THE CLASS COMPLETION MARKS (0.1.131; see T_ClassCompletion; 0.1.147: the solo-cat and same-class marks follow the room's rule, mgmp_completion_rule.h): the game's check runs with THIS player's own cats in the party list (catsync_completion_begin), and the
+// records it keeps (progression+0x768, 0x58 each) are counted before and after, for the log.
+typedef void (__fastcall* fn_class_completion)(void* progression, void* event, void* c, void* d);
+fn_class_completion o_ClassCompletion = nullptr;
+void __fastcall h_ClassCompletion(void* progression, void* event, void* c, void* d) {
+    char ev[64] = "?";
+    if (event) mem_read_std_string(event, ev, sizeof(ev));
+    auto records = [&]() -> long long {
+        uint64_t b = 0, e = 0;
+        if (!progression || !mem_read((const uint8_t*)progression + 0x768, &b, 8) || !mem_read((const uint8_t*)progression + 0x770, &e, 8) || e < b) return -1;
+        return (long long)((e - b) / 0x58);
+    };
+    const bool hard = (uint8_t)(uintptr_t)c != 0;                       // r8b: the path the chapter was cleared on
+    log_line("COMPLETION", "the game's class check is called: chapter '%s', hard path %s, %s", ev, hard ? "yes" : "no", multiplayer_live() ? "in a room" : "no room");
+    const long long r0 = records();
+    catsync_marks_before(progression);
+    const bool swapped = catsync_completion_begin(ev);
+    o_ClassCompletion(progression, event, c, d);
+    if (swapped) catsync_completion_end();
+    const long long r1 = records();
+    log_line("COMPLETION", "event '%s': the game's class check is done -- %lld class/chapter record(s) before, %lld after%s", ev, r0, r1, swapped ? " (this player's own cats counted)" : "");
+    catsync_marks_after(progression, ev, hard, swapped);
+}
+// THE TILE OBJECTS UNDER A UNIT, REBUILT AT EVERY QUERY IN A ROOM (0.1.161, sim 37; see T_TileList). The game's own function takes the Character only
+// (rcx; rdx/r8 are written before any read) and returns &Character+0xE90. Its cache key (+0xE58) is cleared before the call -- not while the unit's re-entry
+// guard (+0xEBC) is held: the standing-tile walk holds it while it iterates the list, and its inner call must return that same list.
+constexpr uintptr_t kChar_TileKey = 0xE58, kChar_TileGuard = 0xEBC;
+typedef void* (__fastcall* fn_tile_list)(void* chr);
+fn_tile_list o_TileList = nullptr;
+static void tile_list_fresh(void* chr) {
+    __try {
+        if (*(const volatile uint32_t*)((uint8_t*)chr + kChar_TileGuard) == 0) *(volatile int64_t*)((uint8_t*)chr + kChar_TileKey) = -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+void* __fastcall h_TileList(void* chr) {
+    if (chr && lockstep_active()) tile_list_fresh(chr);
+    return o_TileList(chr);
+}
+// THE GAME'S DEBUG CONSOLE (0.1.150; see T_ConsoleEvent): only remembers which object the console is; the original runs untouched.
+typedef void (__fastcall* fn_console_event)(void* console, void* event);
+fn_console_event o_ConsoleEvent = nullptr;
+void __fastcall h_ConsoleEvent(void* console, void* event) {
+    gameconsole_note(console);
+    o_ConsoleEvent(console, event);
+}
+// SKILL SHARE WITH THE WHOLE TEAM (0.1.136; see T_SkillShareStage). Every cat the build spawns is recorded (per level object); at the SkillShare stage, in a room, the cats
+// spawned from the familiar list -- not in the builder's vector -- are added to that vector for the call (a buffer from the game's allocator, the builder's three
+// pointers put back right after), so the game's own rule shares with and from every player's cats. The same lists on every peer: the same result everywhere.
+static void* g_ss_level = nullptr;
+static void* g_ss_spawned[32] = {};
+static uint32_t g_ss_n = 0;
+typedef void* (__fastcall* fn_cat_spawn)(void* level, void* b, void* c, void* catdata, void* e);
+fn_cat_spawn o_CatSpawn = nullptr;
+void* __fastcall h_CatSpawn(void* level, void* b, void* c, void* catdata, void* e) {
+    void* ch = o_CatSpawn(level, b, c, catdata, e);
+    if (ch) {
+        if (level != g_ss_level) { g_ss_level = level; g_ss_n = 0; }     // another level: what was recorded belonged to a battle that is over
+        if (g_ss_n < 32) g_ss_spawned[g_ss_n++] = ch;
+    }
+    return ch;
+}
+static void ss_describe(const void* ch, char* out, size_t cap) {
+    const void* cat = nullptr; uint64_t id = 0; char a[40] = "?", b[40] = "?";
+    if (ch && mem_read((const uint8_t*)ch + 0x88, &cat, sizeof(cat)) && cat) {
+        mem_read((const uint8_t*)cat + 0xC48, &id, sizeof(id));
+        mem_read_std_string((const uint8_t*)cat + 0x910, a, sizeof(a));
+        mem_read_std_string((const uint8_t*)cat + 0x938, b, sizeof(b));
+    }
+    _snprintf_s(out, cap, _TRUNCATE, "%llx[%s,%s]", (unsigned long long)id, a, b);
+}
+static void* skillshare_stage(void* builder, void* (__fastcall* orig)(void*)) {
+    void* r = nullptr;
+    bool own_stage = false;
+    const uint32_t recorded = g_ss_n;
+    g_ss_n = 0;
+    const bool room = net_active() && net_peer_count() >= 2;
+    uint8_t* vec = builder ? (uint8_t*)builder + 0xD0 : nullptr;
+    uint8_t *first = nullptr, *last = nullptr, *end = nullptr;
+    if (!room || !vec || !recorded || !mem_read(vec, &first, 8) || !mem_read(vec + 8, &last, 8) || !mem_read(vec + 16, &end, 8) || last < first || (last - first) % 16 || (last - first) / 16 > 32) {
+        return orig(builder);
+    }
+    const uint32_t n = (uint32_t)((last - first) / 16);
+    void* party[32] = {};
+    for (uint32_t i = 0; i < n; ++i) mem_read(first + i * 16, &party[i], 8);
+    void* extra[32] = {}; uint32_t m = 0;
+    for (uint32_t k = 0; k < recorded && n + m < 32; ++k) {
+        void* ch = g_ss_spawned[k];
+        bool in = false;
+        for (uint32_t i = 0; i < n; ++i) if (party[i] == ch) in = true;
+        const void* cat = nullptr; uint64_t id = 0;
+        const bool session = mem_read((const uint8_t*)ch + 0x88, &cat, sizeof(cat)) && cat && mem_read((const uint8_t*)cat + 0xC48, &id, sizeof(id)) && id >= 0x70000000ull && id < 0x80000000ull;
+        if (!in && session) extra[m++] = ch;                       // a player's cat from the familiar list
+    }
+    static uint8_t* s_buf = nullptr;                               // the game's memory, kept for the next build (the builder never owns it: its pointers are put back)
+    if (!s_buf) { if (auto alloc = (void* (__fastcall*)(size_t))addr_of_call(C_GameStrAlloc)) { __try { s_buf = (uint8_t*)alloc(32 * 16); } __except (EXCEPTION_EXECUTE_HANDLER) { s_buf = nullptr; } } }
+    if (!m || !s_buf) {
+        if (m) log_line_lvl(LogLevel::Warn, "SKILLSHARE", "!! %u familiar cat(s) could not join the SkillShare stage (no buffer) -- the game's own stage runs", m);
+        return orig(builder);
+    }
+    memset(s_buf, 0, 32 * 16);
+    memcpy(s_buf, first, (size_t)n * 16);
+    for (uint32_t k = 0; k < m; ++k) memcpy(s_buf + (n + k) * 16, &extra[k], 8);
+    uint8_t* nl = s_buf + (n + m) * 16; uint8_t* ne = s_buf + 32 * 16;
+    char who[700]; int w = 0; who[0] = 0;
+    for (uint32_t i = 0; i < n + m && w >= 0 && (size_t)w < sizeof(who) - 90; ++i) {
+        char one[100]; ss_describe(i < n ? party[i] : extra[i - n], one, sizeof(one));
+        w += _snprintf_s(who + w, sizeof(who) - w, _TRUNCATE, "%s%s%s", i ? " " : "", i < n ? "" : "+", one);
+    }
+    if (mem_write(vec, &s_buf, 8) && mem_write(vec + 8, &nl, 8) && mem_write(vec + 16, &ne, 8)) {
+        log_line("SKILLSHARE", "the SkillShare stage runs over the whole team: %u party cat(s) and %u from the familiar list (+) -- [id[passive,passive]] %s", n, m, who);
+        __try { r = orig(builder); } __except (EXCEPTION_EXECUTE_HANDLER) { log_line_lvl(LogLevel::Error, "SKILLSHARE", "!! the SkillShare stage faulted with the whole team"); }
+    } else {
+        log_line_lvl(LogLevel::Warn, "SKILLSHARE", "!! the builder's vector could not be written -- the game's own stage runs");
+        own_stage = true;
+    }
+    mem_write(vec, &first, 8); mem_write(vec + 8, &last, 8); mem_write(vec + 16, &end, 8);
+    uint8_t* chk = nullptr;
+    if (!mem_read(vec, &chk, 8) || chk != first) log_line_lvl(LogLevel::Error, "SKILLSHARE", "!! the builder's vector was not put back");
+    else if (own_stage) r = orig(builder);                         // the vector is the builder's own again: the stage as the game has it
+    return r;
+}
 typedef void (__fastcall* fn_res_ResSetLegacyToken)(void*, void*, void*, void*);
 fn_res_ResSetLegacyToken o_ResSetLegacyToken = nullptr;
 void __fastcall h_ResSetLegacyToken(void* a, void* b, void* c, void* d) {
     if (choice_story_event_block_active()) { choice_story_event_blocked("set_legacy_token"); return; }
     o_ResSetLegacyToken(a, b, c, d);
+    unlocks_send_host_flags("a legacy token", true);           // it writes mapflag_<token>
 }
 typedef void (__fastcall* fn_res_ResUnlockItemQuest)(void*, void*, void*, void*);
 fn_res_ResUnlockItemQuest o_ResUnlockItemQuest = nullptr;
@@ -1492,6 +1808,7 @@ void __fastcall h_ResAdventureUnlock(void* a, void* b, void* c, void* d) {
     if (choice_story_event_block_active()) { choice_story_event_blocked("trigger_adventure_unlock"); return; }
     RoomStreamFence fence;   // the House progression it runs may draw (see RoomStreamFence)
     o_ResAdventureUnlock(a, b, c, d);
+    unlocks_send_host_flags("an adventure unlock", true);      // the host's flags changed: the clients' next page of this event is built from them
 }
 // A QUEST COMPLETED IN A SHARED BATTLE (2026-10-16). The CompleteItemQuest battle effect (0x1405CA6D0: ScaldingOrb's moon-boss one-shot, BlackShard
 // killing the coven, the Nuke) calls House::complete_item_quest directly, and the shared battle runs it on EVERY peer: the host's cat finished the
@@ -1755,6 +2072,22 @@ __declspec(noinline) void* __fastcall h_InvInsert(void* inv, void* item, int32_t
     if (souljar_drop_skip(item, loc, (uintptr_t)_ReturnAddress())) return nullptr;
     // 0.1.83: an item another player's cat produced in a battle goes to that player's inventory, not this one (none of these callers uses the result)
     if (gains_insert_skip(item, loc, (uintptr_t)_ReturnAddress())) return nullptr;
+    // 0.1.139: loc 3 (a cat's slot lock took the item off it) goes to the backpack only for a cat in the party list -- in a room the host's cats. Its owner's backpack instead.
+    if (loc == 3 && net_active() && net_peer_count() >= 2) {
+        int32_t new_loc = loc; bool skip = false;
+        if (teamlist_insert(loc, arg, net_peer_pos(), &lockstep_owner_pos, new_loc, skip)) {
+            static uint32_t said = 0;
+            if (said < 100) {
+                ++said;
+                char name[64] = "?";
+                if (item) mem_read_std_string((const uint8_t*)item + 0x08, name, sizeof(name));   // +0x08: the item's gon name
+                log_line("TEAMLIST", "item '%s' taken off cat %016llx by a slot lock: %s", name, (unsigned long long)arg,
+                         skip ? "another player's cat -- not put into this player's inventory (its owner's game keeps it)" : "this player's own cat -- into this player's backpack");
+            }
+            if (skip) return nullptr;
+            loc = new_loc;
+        }
+    }
     void* frames[8] = {};
     const USHORT nf = RtlCaptureStackBackTrace(1, 8, frames, nullptr);   // [0] = the game's call site (this detour is jumped to, not called)
     ItemInsertNote note;
@@ -1779,6 +2112,84 @@ void* __fastcall h_CatById(void* registry, uint64_t id) {
     if (souljar_cat_lookup(registry, id, (uintptr_t)_ReturnAddress(), o_CatById, out)) return out;
     return o_CatById(registry, id);
 }
+
+// THE HOUSE NAMES A CAT THAT CANNOT BE LOADED (0.1.185). 11-04 18:27-18:29, two players of one room, each twice: back home after leaving the room, the House
+// scene's loader (0x1401E6D60) built a cat entity here for every cat the saved House names, CatData::by_id (0x1400D7220) came back null for one of them and
+// is_kitten read through it (0x140942DC1 -- the cat's passives at +0x910). Every return home crashed, the save could not be played. The entity now takes the
+// game's own -1 ("a new cat") instead: the lost cat stays lost, the House opens, the player is told and the log names the id.
+// The signature is complete: the function reads rcx, rdx and r8 only (its r9 home slot at rbp+0x108 is a local), and nobody reads its return value.
+using fn_housecat_t = void* (__fastcall*)(void*, int64_t, void*);
+fn_housecat_t o_HouseCatInit = nullptr;
+static bool housecat_lookup(void* registry, uint64_t id, void*& cat) {
+    cat = nullptr;
+    if (!o_CatById || !registry) return false;
+    __try { cat = o_CatById(registry, id); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { cat = nullptr; return false; }
+}
+// A NULL CAT'S LIST (0.1.187). 0x1400C8060(field, out) starts by zeroing `out` (a 16-byte vector) and returns it; a field pointer below 64 KB is a null cat's
+// +0x9B0 (the caller 0x1403B3150 adds 0x9B0 to each party CatData* without a check) -- the empty list is returned instead of reading through it.
+using fn_catfieldlist_t = void* (__fastcall*)(void*, void*);
+fn_catfieldlist_t o_CatFieldList = nullptr;
+void* __fastcall h_CatFieldList(void* field, void* out) {
+    if ((uintptr_t)field < 0x10000 && out) {
+        memset(out, 0, 16);
+        static ULONGLONG s_said = 0;
+        if (GetTickCount64() - s_said > 5000) {
+            s_said = GetTickCount64();
+            static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
+            log_line_lvl(LogLevel::Error, "TEAMLIST", "!! a cat list was read through a null cat (field %p, called from %X) -- an empty list instead of a crash",
+                         field, (unsigned)((uintptr_t)_ReturnAddress() - base));
+        }
+        return out;
+    }
+    return o_CatFieldList(field, out);
+}
+
+// A SUMMON BUILT FROM CAT DATA (0.1.189; BABYGIRL's room 11-04, battle 2ed7b4cd: FleshGolem's golem drew its abilities from the pool of unlocked abilities,
+// and a client answered those checks from its own save -- 93 of 108 by UNLOCKSRC -- so the two golems had different spells, a halt nothing could repair). On a
+// client in a room the builder runs inside the host's unlock lists, as the shared treasure roll does. Four register arguments are passed through (it reads rcx
+// only; its home slots are its locals).
+using fn_summoncat_t = void* (__fastcall*)(void*, void*, void*, void*);
+fn_summoncat_t o_SummonCatBuild = nullptr;
+void* __fastcall h_SummonCatBuild(void* a, void* b, void* c, void* d) {
+    const bool force = net_active() && net_peer_count() >= 2 && net_role() == NetRole::Client;
+    if (force) unlocks_force_host_lists(true);
+    void* r = o_SummonCatBuild(a, b, c, d);
+    if (force) unlocks_force_host_lists(false);
+    return r;
+}
+
+// THE BACKPACK'S CAT SELECTOR (0.1.192, see T_CatSelectorInit): a party id the save cannot load is taken out of the party list before the selector walks it.
+using fn_catselect_t = void* (__fastcall*)(void*, int64_t);
+fn_catselect_t o_CatSelectorInit = nullptr;
+void* __fastcall h_CatSelectorInit(void* self, int64_t arg) {
+    uint64_t gone[8] = {};
+    const unsigned n = catsync_purge_missing_party("the backpack screen opens", gone, 8);
+    if (n) {
+        char ids[160] = {}; int w = 0;
+        for (unsigned i = 0; i < n && i < 8; ++i) w += _snprintf_s(ids + w, sizeof(ids) - w, _TRUNCATE, "%s%llx", i ? ", " : "", (unsigned long long)gone[i]);
+        char text[1200];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_PARTY_MISSING), n, ids);
+        ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+    }
+    return o_CatSelectorInit(self, arg);
+}
+
+void* __fastcall h_HouseCatInit(void* ent, int64_t id, void* tmpl) {
+    if (id != -1) {
+        const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+        const uint8_t* dir = nullptr; void* registry = nullptr; void* cat = nullptr;
+        if (at && mem_read((const void*)at, &dir, sizeof(dir)) && dir && mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) && registry &&
+            housecat_lookup(registry, (uint64_t)id, cat) && !cat) {
+            log_line_lvl(LogLevel::Error, "HOUSECAT", "!! the House names cat %016llx and no cat with that id can be loaded -- the game would crash on it (is_kitten through a null cat); "
+                         "the entity takes the game's 'new cat' (-1) instead", (unsigned long long)id);
+            char text[400];
+            _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_HOUSE_CAT), (unsigned long long)id);
+            ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+            return o_HouseCatInit(ent, -1, nullptr);
+        }
+    }
+    return o_HouseCatInit(ent, id, tmpl);
+}
 void* __fastcall h_ItemCollect(void* inv, void* out, uint64_t mode, void* r9, uint64_t a5) {
     static const uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
     const uintptr_t ra = (uintptr_t)_ReturnAddress() - base;
@@ -1795,7 +2206,7 @@ void* __fastcall h_BuildProps(void* self) { void* r = o_BuildProps(self); unlock
 fn_stage o_BuildParty = nullptr;
 void* __fastcall h_BuildParty(void* self) { void* r = o_BuildParty(self); souljar_on_party_built(); unlocks_build_stage_end("party"); return r; }
 fn_stage o_BuildAllies = nullptr;
-void* __fastcall h_BuildAllies(void* self) { void* r = o_BuildAllies(self); unlocks_build_stage_end("allies"); return r; }
+void* __fastcall h_BuildAllies(void* self) { void* r = skillshare_stage(self, o_BuildAllies); unlocks_build_stage_end("allies"); return r; }      // 0.1.136: SkillShare over the whole team in a room
 // THE EXTRA STAGE TAKES THE WAVE AS ITS SECOND ARGUMENT (2026-10-11, measured: a single-player battle with no enemies at all). 0x14035E5E0 begins
 // `mov r12d, edx` and spawns only the level objects whose wave byte (+6) equals it; both callers pass it (the build: `inc edx; mov [rdi+0x194], edx`,
 // Level's per-frame update the same). This hook used to be declared with `self` alone and worked by luck -- it called the original first, so rdx
@@ -1803,9 +2214,57 @@ void* __fastcall h_BuildAllies(void* self) { void* r = o_BuildAllies(self); unlo
 // and the battle was built without its enemies (the game then counts it as won). The wave is passed on explicitly now.
 typedef void* (__fastcall* fn_extra_stage)(void* self, int32_t wave);
 fn_extra_stage o_BuildExtra = nullptr;
+// THE CREATOR'S CLONE SPOTS, 4 -> 9 IN A ROOM (0.1.165). TheCreator_SpawnCloneTeam spawns one clone per FinalBossCloneSpot tile (special_tile_tag, shuffled
+// with the battle stream); finalboss.lvl places 4 (spawn 2094, wave 0: the extra stage). The level's tag_location build (sub_14035E930, 0x14035FEDF) keeps
+// them in level+0xF0 -- an unordered_map<std::string, TileList> (FNV-1a; its list head at +8, size at +0x10; node: next, prev, the key at +0x10, the
+// TileList at +0x30). After the extra stage, in a room, a list holding exactly the 4-tile line gets 5 more (mgmp_teamlist: teamlist_creator_spots) with
+// the game's own append (C_TagSpotAdd, its allocator). Every peer builds the same level, so every peer adds the same tiles in the same order; the
+// shuffle and the cat draws stay on the battle stream. More spots than cats: the spawn handler finds no cat left for a spot and skips it (0x1407A3A22).
+// The tiles are relative to the level's origin (the stage subtracts [data+0x3C]/[+0x40]), so the shape is checked, not the file's coordinates.
+static void creator_spots_extend(void* level) {
+    static bool warned = false;
+    if (!level || !net_active() || net_peer_count() < 2) return;
+    uint8_t* map = (uint8_t*)level + 0xF0;
+    uint8_t* head = nullptr; uint64_t size = 0;
+    if (!mem_read(map + 8, &head, 8) || !mem_read(map + 0x10, &size, 8) || !head || size > 4096) return;
+    uint8_t* node = nullptr;
+    if (!mem_read(head, &node, 8)) return;
+    uint8_t* list = nullptr;
+    for (uint64_t i = 0; node && node != head && i < size; ++i) {
+        char key[48] = {};
+        if (mem_read_std_string(node + 0x10, key, sizeof(key)) && !strcmp(key, "FinalBossCloneSpot")) { list = node + 0x30; break; }
+        if (!mem_read(node, &node, 8)) return;
+    }
+    if (!list) return;                                          // not The Creator's level
+    uint32_t n = 0; int32_t* data = nullptr;
+    int32_t xy[2 * 16] = {};
+    if (!mem_read(list + 4, &n, 4) || !mem_read(list + 8, &data, 8) || n > 16 || (n && (!data || !mem_read(data, xy, n * 8)))) return;
+    int32_t add[2 * 5] = {};
+    const uint32_t k = teamlist_creator_spots(xy, n, add, 5);
+    if (!k) {
+        log_line("CREATOR", "clone spots: %u tile(s), not the 4-tile line -- left as they are", n);
+        return;
+    }
+    const uintptr_t fn = addr_of_call(C_TagSpotAdd);
+    if (!fn) {
+        if (!warned) log_line_lvl(LogLevel::Warn, "CREATOR", "!! the tile-list append was not found -- The Creator keeps its 4 clone spots");
+        warned = true;
+        return;
+    }
+    typedef bool (__fastcall* fn_tag_add)(void* list, const int32_t* tile);
+    char line[160] = {}; int w = 0;
+    for (uint32_t i = 0; i < k; ++i) {
+        const bool added = ((fn_tag_add)fn)(list, add + 2 * i);
+        if (w >= 0 && (size_t)w < sizeof(line) - 20) w += _snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, " (%d,%d)%s", add[2 * i], add[2 * i + 1], added ? "" : "=dup");
+    }
+    uint32_t now = 0;
+    mem_read(list + 4, &now, 4);
+    log_line("CREATOR", "clone spots: (%d,%d) (%d,%d) (%d,%d) (%d,%d) +%s -> %u tiles", xy[0], xy[1], xy[2], xy[3], xy[4], xy[5], xy[6], xy[7], line, now);
+}
 void* __fastcall h_BuildExtra(void* self, int32_t wave) {
     if (!unlocks_in_build()) return rngfix_wave(self, wave, o_BuildExtra);   // R270: Level's per-frame update spawning the level's next wave (and every solo build)
     void* r = o_BuildExtra(self, wave);
+    creator_spots_extend(self);
     unlocks_build_stage_end("extra");
     return r;
 }
@@ -1830,7 +2289,7 @@ void** __fastcall h_SpawnSort(void** first, void** last) {
 }
 
 void __fastcall h_GenerateMap(void* self) {
-    setup_on_generate_map();
+    setup_on_generate_map(self);
     o_GenerateMap(self);
 }
 
@@ -1964,6 +2423,7 @@ void __fastcall h_SaveSelUpdate(void* self) {
 void* __fastcall h_MewDirInit(void* self, void* name) {
     // 0.1.55: whatever node opened it, a load is not part of it -- the load reads the House (house_gold ...) through the property getter
     unlocks_window_close("a save is being loaded");
+    unlocks_flagguard_reset();                                      // 0.1.123: another save, another set of map flags
     void* r = nullptr;
     if (const void* sub = savefile_redirect_load()) r = o_MewDirInit(self, (void*)sub);
     else                                              r = o_MewDirInit(self, name);
@@ -2017,8 +2477,10 @@ void __fastcall h_FrameBegin(void* self) {
     checkpoint_tick();
     setup_tick();
     unlocks_tick();
+    progressguard_tick();        // 0.1.130: the save file's progress floored against what this player had when the room began (PROGRESS)
     choice_story_guard_tick();   // a client's House surviving kaiju, kept through the host's story event
     treasure_tick();             // the experimental shared chest: the item granted to this player is taken
+    rngfix_node_shift_tick();         // 0.1.128: in a room, holding Left Shift no longer makes EnterNode skip the node on this peer only
     rngfix_simultaneous_aoe_tick();   // R013: in a room an AOE applies all its tiles' damage at once (the landing order no longer depends on frame timing)
 
 
@@ -2156,6 +2618,22 @@ const Binding kBindings[] = {
     { T_AbilityPay,     (void*)&h_AbilityPay,     (void**)&o_AbilityPay },
     { T_AlliesScramble, (void*)&h_AlliesScramble, (void**)&o_AlliesScramble },
     { T_NodeClick,      (void*)&h_NodeClick,      (void**)&o_NodeClick },
+    { T_AoeTiles,       (void*)&h_AoeTiles,       (void**)&o_AoeTiles },
+    { T_T3Spawns,       (void*)&h_T3Spawns,       (void**)&o_T3Spawns },
+    { T_ClassCompletion, (void*)&h_ClassCompletion, (void**)&o_ClassCompletion },
+    { T_CatSpawn,        (void*)&h_CatSpawn,        (void**)&o_CatSpawn },
+    { T_PartyCats,       (void*)&h_PartyCats,       (void**)&o_PartyCats },
+    { T_ConsoleEvent,    (void*)&h_ConsoleEvent,    (void**)&o_ConsoleEvent },
+    { T_TileList,        (void*)&h_TileList,        (void**)&o_TileList },
+    { T_Difficulty,      (void*)&h_Difficulty,      (void**)&o_Difficulty },
+    { T_TagCount,        (void*)&h_TagCount,        (void**)&o_TagCount },
+    { T_ApplyStatus,     (void*)&h_ApplyStatus,     (void**)&o_ApplyStatus },
+    { T_AddPassive,      (void*)&h_AddPassive,      (void**)&o_AddPassive },
+    { T_PassiveRemove,   (void*)&h_PassiveRemove,   (void**)&o_PassiveRemove },
+    { T_HouseCatInit,    (void*)&h_HouseCatInit,    (void**)&o_HouseCatInit },
+    { T_CatFieldList,    (void*)&h_CatFieldList,    (void**)&o_CatFieldList },
+    { T_SummonCatBuild,  (void*)&h_SummonCatBuild,  (void**)&o_SummonCatBuild },
+    { T_CatSelectorInit, (void*)&h_CatSelectorInit, (void**)&o_CatSelectorInit },
     { T_ResDejaVu, (void*)&h_ResDejaVu, (void**)&o_ResDejaVu },
     { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
     { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },
@@ -2255,6 +2733,9 @@ bool install_one(const Binding& b, bool announce_off) {
 }
 
 } // namespace
+
+// the game's own property setter, for the map-flag guard (mgmp_unlocks): the trampoline, so the answers of the hook above are not involved
+void hooks_prop_set_int(void* name, int value) { if (o_PropSetInt) o_PropSetInt(name, value); }
 
 bool hooks_verify_module(uintptr_t base, char* err, size_t err_size) {
     g_base = base;
@@ -2371,6 +2852,21 @@ bool hooks_is_live(int target) {
 void hooks_uninstall() {
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
+}
+
+// THE GAME'S OWN FACTORIES, FOR THE UNIT-STATE REPAIR (0.1.173). Through the hooks' originals (nothing of ours is logged for a repair -- mgmp_unitstate logs it), with the
+// status factory's arguments as the console's `status NAME N` passes them (no source, nulls, false, true). SEH: POD-only frames.
+void* hooks_call_apply_status(void* name, void* target, int32_t stacks) {
+    if (!o_ApplyStatus) return nullptr;
+    __try { return o_ApplyStatus(name, target, stacks, nullptr, nullptr, nullptr, 0, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+void* hooks_call_add_passive(void* name, void* target, int32_t stacks) {
+    if (!o_AddPassive) return nullptr;
+    __try { return o_AddPassive(name, target, stacks, 0); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+bool hooks_call_passive_remove(void* passive) {
+    if (!o_PassiveRemove || !passive) return false;
+    __try { o_PassiveRemove(passive); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 } // namespace mgmp

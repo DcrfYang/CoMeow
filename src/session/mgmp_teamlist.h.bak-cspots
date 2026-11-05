@@ -1,0 +1,39 @@
+// mgmp_teamlist.h -- THE WHOLE TEAM WHERE THE GAME ASKS FOR "THE PARTY" (0.1.139, 2026-10-28).
+//
+// In a room the director's party list (+0x5BC/+0x5C0) is the room's shared layout -- the host's cats; every other player's cats sit in the
+// familiar list (+0x644/+0x648). The game's own "the party" therefore meant "the host's cats" wherever it read only that list
+// (0x1403B2F30, MewDirector: the party as CatData*). Measured in room VTC9 (2026-10-25): Baphomet's `party_damage 10` took 10 from each of
+// the host's three cats and none from the client's four, on both games. Same root cause as SkillShare (0.1.136) and the class marks (0.1.131).
+//
+// The detour of 0x1403B2F30 looks at who called it (the return address) and, in a room, hands that caller another list for that one call:
+//   * ALL -- every player's cats of the run (party + familiars, sorted by id: the same list on every peer): the shared events' party effects
+//     (party_heal/damage/status_next_fight/permanent_stats/injury/heal_injury/heal_disorder/gain_disorder_from_pool/random_mutation,
+//     make_old all), the battle start's ChanceToAmbush roll (CamoHat), and the equipped items' global passives of the battle build;
+//     since 0.1.164 also The Creator's clone team (catdata teamclone: one random cat per FinalBossCloneSpot, 4 in its level).
+//   * OWN -- this player's own cats: `level_up all`. Each player levels its own cats; before this the game made one level-up per HOST cat
+//     and a client re-pointed each to its own lowest cat (mgmp_choice), so a client with more cats than the host left some unlevelled.
+// Not touched: anything else, a player's own random event (exp_indep_events: its party is already that player's), solo play.
+//
+// Also here: Inventory::insert_item's loc 3 (an item a cat's slot lock took off it, 0x1400C3A00) goes to the backpack only when that cat is in
+// the party list, and is dropped otherwise -- a client's own cats lost such items, and a client took the host's cats' items into its own
+// backpack. In a room: this player's own cat -> its backpack (loc 0); another player's -> nothing here (its owner's game keeps it).
+#pragma once
+#include <cstdint>
+
+namespace mgmp {
+
+enum class TeamUse : uint8_t { Off, All, Own };
+
+// What a call of 0x1403B2F30 returning to `rva` (relative to the image) gets in a room. `in_build`: inside the battle build (0x35AAF0).
+TeamUse teamlist_use(uint32_t rva, bool in_build, const char** what);
+
+// The list for `use`: the party then the familiars, each id once (0 skipped). ALL: sorted by id. OWN: only the ids `owner` places at `self`,
+// sorted by id. Returns the count written to `out` (at most `cap`); 0 = nothing usable (the caller then leaves the game's list alone).
+using TeamOwnerFn = bool (*)(uint64_t id, uint8_t& pos);
+uint32_t teamlist_compose(TeamUse use, const uint64_t* party, uint32_t party_n, const uint64_t* fam, uint32_t fam_n,
+                          uint8_t self, TeamOwnerFn owner, uint64_t* out, uint32_t cap);
+
+// Inventory::insert_item in a room. Returns false: the game's own way. True: `skip` -- put nothing into this inventory; otherwise insert at `new_loc`.
+bool teamlist_insert(int32_t loc, int64_t arg, uint8_t self, TeamOwnerFn owner, int32_t& new_loc, bool& skip);
+
+} // namespace mgmp

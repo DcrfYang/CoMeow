@@ -44,6 +44,8 @@ void indepevt_on_host_event(uint8_t from, uint32_t seed_lo, uint32_t name_hash);
 bool indepevt_own_node(uint64_t seed);
 // true: this WorldEvent is this player's own -- no choice is published or replayed.
 bool indepevt_is_own(const void* world_event);
+// true: the event up on this node is this player's own (0.1.146: a cat it brings in is this player's -- catsync_on_gained_cat).
+bool indepevt_in_own_event();
 // Every frame the event screen updates (mgmp_choice). In an own event it also keeps the next event's difficulty bonus (MewDirector+0x6D0,
 // `next_event_bonus`) at what it was when the event came up, on every peer: the next event must be the same everywhere.
 void indepevt_on_event_frame(const void* world_event);

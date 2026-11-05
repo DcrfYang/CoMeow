@@ -684,6 +684,7 @@ bool net_send_choice(const ChoiceMsg& message) {
     return env.send_ok;
 }
 uint64_t follow_here_seed() { return env.node; }
+bool follow_host_ahead() { return false; }
 bool lockstep_cat_owner(uint64_t save_id, uint64_t seed, uint8_t& owner) {
     owner = kNoPeer;
     for (const auto& entry : env.owners) {

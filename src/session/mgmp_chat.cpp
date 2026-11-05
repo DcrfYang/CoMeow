@@ -75,6 +75,24 @@ bool chat_submit(const char* text) {
     return true;
 }
 
+void chat_system_line(const char* text) {
+    ChatMsg m;
+    clean(text, m.text, sizeof(m.text));
+    if (!m.text[0]) return;
+    strncpy_s(m.name, sizeof(m.name), "CoMeow", _TRUNCATE);
+    keep(m.name, m.text, false);
+    log_line("CHAT", "%s: %s", m.name, m.text);
+    if (net_active() && net_peer_count() >= 2) net_send_chat(m);
+}
+
+void chat_local_note(const char* text) {
+    ChatMsg m;
+    clean(text, m.text, sizeof(m.text));
+    if (!m.text[0]) return;
+    keep("CoMeow", m.text, false);
+    log_line("CHAT", "CoMeow (local): %s", m.text);
+}
+
 bool chat_submit_emote(int pick) {
     Emote e;
     e.pick = pick;

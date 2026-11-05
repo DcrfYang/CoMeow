@@ -17,6 +17,7 @@
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
+#include "mgmp_perf.h"          // perf_peer_latency_ms: the wait for the host's draw follows the link (0.1.163)
 #include "mgmp_room.h"
 #include "mgmp_roster.h"
 #include "mgmp_session.h"
@@ -67,7 +68,12 @@ State g;
 
 // THE HOST'S DRAW, as the receive thread leaves it for the game thread: (low 32 bits of the node seed << 32) | hash of the event name. One 64-bit word, so it is read whole.
 std::atomic<uint64_t> g_host_draw{0};
-constexpr ULONGLONG kNameWaitMs = 800;           // a client's node draw waits this long for the host's name
+constexpr ULONGLONG kNameWaitMs = 800;           // a client's node draw waits at least this long for the host's name
+constexpr ULONGLONG kNameWaitMaxMs = 4000;       // ... and at most this long (0.1.163: 2 x the round trip to the host + 600 ms in between)
+// 0.1.163: a node whose host draw did not come in time -- watched for a while, so a late draw that differs is said
+uint32_t  g_late_lo = 0, g_late_hash = 0;
+char      g_late_name[64] = {};
+ULONGLONG g_late_at = 0;
 uint32_t seed_lo32(uint64_t seed) { return (uint32_t)seed ? (uint32_t)seed : 1u; }
 
 typedef void* (__fastcall* fn_str_assign)(void* s, const char* p, size_t n);
@@ -211,12 +217,22 @@ void align_with_host(void* out_name, char (&name)[64]) {
     const uint64_t seed = follow_here_seed();
     if (!seed) return;
     const uint32_t lo = seed_lo32(seed);
+    // 0.1.163: how long to wait follows the link to the host (18 logs in a day timed out at a fixed 800 ms with round trips of 100-500 ms and more)
+    ULONGLONG wait = kNameWaitMs;
+    uint32_t rtt = 0; bool via = false;
+    if (perf_peer_latency_ms(kHostPeer, &rtt, &via)) {
+        const ULONGLONG w = (ULONGLONG)rtt * 2 + 600;
+        wait = w < kNameWaitMs ? kNameWaitMs : (w > kNameWaitMaxMs ? kNameWaitMaxMs : w);
+    }
     const ULONGLONG t0 = GetTickCount64();
-    while ((uint32_t)(g_host_draw.load() >> 32) != lo && GetTickCount64() - t0 < kNameWaitMs) Sleep(5);
+    while ((uint32_t)(g_host_draw.load() >> 32) != lo && GetTickCount64() - t0 < wait) Sleep(5);
     const uint64_t got = g_host_draw.load();
     if ((uint32_t)(got >> 32) != lo) {
-        log_line_lvl(LogLevel::Warn, "INDEPEVT", "!! the host's drawn event for node %016llx did not arrive within %llu ms -- this peer keeps its own draw '%s'",
-                     (unsigned long long)seed, (unsigned long long)kNameWaitMs, name);
+        log_line_lvl(LogLevel::Warn, "INDEPEVT", "!! the host's drawn event for node %016llx did not arrive within %llu ms (round trip to the host %u ms) -- this peer keeps its own draw '%s'; "
+                     "if it comes later and differs, that is logged",
+                     (unsigned long long)seed, (unsigned long long)wait, rtt, name);
+        g_late_lo = lo; g_late_hash = event_class_hash(name); g_late_at = GetTickCount64();
+        strncpy_s(g_late_name, sizeof(g_late_name), name, _TRUNCATE);
         return;
     }
     const uint32_t hh = (uint32_t)got;
@@ -296,6 +312,8 @@ bool indepevt_is_own(const void* world_event) {
     return world_event && world_event == g.own_we && g.own_seed && g.own_seed == follow_here_seed() && room_on();
 }
 
+bool indepevt_in_own_event() { return g.own_we && g.own_seed && g.own_seed == follow_here_seed() && room_on(); }
+
 bool indepevt_suppress(const void* world_event, const char* what) {
     if (!indepevt_is_own(world_event)) return false;
     uint32_t bit = 0;
@@ -320,9 +338,25 @@ void indepevt_on_event_frame(const void* world_event) {
 void indepevt_tick() {
     if (!net_active()) {
         if (g.own_we || g.node_seed || g.hold_seed) g = State{};
+        g_late_lo = 0;
         return;
     }
     const ULONGLONG now = GetTickCount64();
+    if (g_late_lo) {   // 0.1.163: the host's draw of a node this peer did not wait long enough for
+        const uint64_t got = g_host_draw.load();
+        if ((uint32_t)(got >> 32) == g_late_lo) {
+            const uint32_t hh = (uint32_t)got;
+            if (hh == g_late_hash)
+                log_line("INDEPEVT", "the host's drawn event came %llu ms after the wait: the same as this peer's '%s'", (unsigned long long)(now - g_late_at), g_late_name);
+            else {
+                const char* hn = event_name_by_hash(hh);
+                log_line_lvl(LogLevel::Error, "INDEPEVT", "!! the host's drawn event came %llu ms after the wait and DIFFERS: the host drew '%s', this peer kept '%s'%s",
+                             (unsigned long long)(now - g_late_at), hn ? hn : "?", g_late_name,
+                             (hn && !(is_own_class(hn) && is_own_class(g_late_name))) ? " -- a shared event ran on different draws: what follows may not match" : " -- both are the players' own events: harmless");
+            }
+            g_late_lo = 0;
+        } else if (now - g_late_at > 60000) g_late_lo = 0;
+    }
     // the own event's screen is gone (no update for a moment): a last look at the bonus, then the guard ends
     if (g.bonus_guard && now - g.own_frame_ms > 500) { bonus_check("after the event"); g.bonus_guard = false; }
     if (net_role() == NetRole::Host) {

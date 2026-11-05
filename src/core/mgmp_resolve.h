@@ -53,6 +53,7 @@ enum DataSym : int {
     D_CatIdCounter,
     D_CatRegister,
     D_AbandonFunctionVtable,
+    D_TextsObject,           // the game's text table (the `this` of C_TextsGet): a global OBJECT, taken from the `lea r15,[rip+X]` in Character's name setup (0.1.117)
     D_COUNT
 };
 uintptr_t addr_of_data(DataSym d);

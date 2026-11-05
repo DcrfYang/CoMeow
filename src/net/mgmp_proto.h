@@ -73,7 +73,7 @@ namespace mgmp {
 // 39: fresh sessions pre-sync the host's serialized chapter_map row into the client's
 //     save before load (departure-ready saves carry two different generated maps,
 //     which the first node boundary refused to certify).
-constexpr uint32_t kProtoVersion = 106;  // 106 MSG_NODEVOTE (the map: every player clicks the next node first, the host's pick is entered when all have; each player's pick is shown beside the node), 105 MSG_PING carries the sender's own round trip to each member it hears from (the room panel's latency: a client adds the host's figure to its own for the path to another client, which is the path their messages take), 104 MSG_PING carries a request/reply with the sender's frame statistics (mgmp_perf: the PERF log line tells a slow link from a slow game), 103 CHAPTER kChapterEventName (the host tells the clients the hash of the event its node drew, so a client whose draw differs and where either event follows the host is put on the host's event: the shared effects must run on every peer), 102 HELLO rules bit 3 = the host's ui.exp_indep_events (each player's own random events) and CHAPTER kChapterEventDone (a client is done with its own event on a node: the host waits for it before it leaves), 101 MSG_TREASURE kTreasureLuck (the host's party luck, sent as it enters a treasure node: every peer rolls the shared chest with it -- the chest's luck is the difficulty's bonus plus THIS peer's party, and a client's party is its own cats), 100 MSG_SOULCAT (the cat a Soul Jar holds, published by the jar's owner at every battle build so every peer summons the same ghost; a soul jar a cat drops goes to its owner's inventory only), 99 CHAPTER kChapterFlags: a client reports its map flags to the host whenever they change, so the host can warn before leading it into an area it has not unlocked (mgmp_areagate), 98 a later turn's BOARD travels as one digest per unit (MSG_BOARDSUM) and in full only when a client asks (MSG_BOARDREQ); DEEP and RNGL send a summary and their detail only after a difference; a UQD of no query is short, 97 ACTION carries its chain position (the count of actions this turn had run on the owner's game when it decided), 96 a cat an event brings into the run moves to the same session id on every peer (session_gained_id; HELLO rules bit 0 ui.block_new_cats is gone), 95 HELLO carries the host's enemy health/armor multiplier (ui.enemy_scale, in halves: 4 = x2 .. 16 = x8), 94 MSG_HOUSECOOP (experimental house boss co-op: the warehouse statuses, the vote, the go) and HELLO rules bit 2 = the host's ui.exp_house_coop; bit 1 is now ui.exp_treasure, 93 the battle's per-message caps raised (2026-10-18 audit): spawn order 8->100, weather names 4->16, class names 16->32, DEEP units 64->254, AUDIT cats 8->16, 92 UNLOCKS carries up to 100 entries per director queue plus each queue's true length (a client never hides what the host could not send), 91 UNLOCKS carries up to 16 entries per director queue (was 6: a party with seven carried followers lost them all on the client), 90 MSG_TREASURE (experimental shared treasure: the host keeps the ledger of who took which of the chest's items) and HELLO rules bit 1 = the host's ui.experimental, 89 MSG_EQUIP carries the owner's item state (durability +0x48, aux +0x4C, str_aux +0x28): the other peers no longer make a fresh item whose init drew from the shared stream, 88 MSG_DRAW kDrawEraseAt (the eraser takes out the part of a line inside its circle, not the whole line), 87 MSG_DRAW (the drawing board: a player's lines over the map or the battle, relayed to every screen), 86 positions are SEATS: the host first, then the players by their persistent id (a CHECKPOINT config lists its peers in that order, no longer by ascending id; net_set_seat_order), so a session cat id, an owner note and a journal name no longer depend on who connected first, 85 MSG_EQUIP (the consumable a cat's backpack auto-equipped, decided on its owner's peer from the owner's inventory and taken by every other peer), 84 84 BOARD units carry their mana (Character+0xD18): the host's is taken, a thief's teleport was refused on the client for want of it, 83 83 BOARD units carry their faction (Character+0x350, what FactionConversion writes) and their captured-follower slot (+0xC4, set by CaptureFamiliar) -- the persuasion device's capture went through on the host only, 82 MSG_SETTING (the host's combat speed, which every other player's game then uses), 81 MSG_CHAT (a line of text typed by one player, shown on every screen), 80 MSG_RNGL (each peer's per-action ledger of the draws it made on the shared stream, by call site) and MSG_DEEP (each peer's per-turn digest of every unit's derived values: stats, speed, turn-order keys), 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 58 UNLOCKS carries the locked_bosses list too, 59 UNLOCKS carries the order the host's battle will spawn its party in, 60 UNLOCKS carries the level the host's battle picked, 61 BOARD carries the host's battle board and simulation stream, 62 UNLOCKS carries the host's queue of returning enemies, 63 ... and the other two queues of the director the battle build consumes, 64 ... and its list of active global modifiers (weather), 65 the modifiers move to MSG_WEATHER (weather only), 66 MSG_WEATHER carries the director's queued battle-start spawns (name + number), 67 MSG_WEATHER is gone: UNLOCKS carries the director's weather names with the level, 68 ... and with the start of EVERY battle build (build_info), not only the level pick, 69 BOARD covers EVERY unit (players too) and carries its turn-order keys (Character+0x954 / +0x958 / speed), 70 ... and the initiative base +0x5DC the first key is recomputed from, 71 BOARD is published at EVERY turn boundary (carries the turn), 72 the end-turn action carries the cat's final facing (a manual turn after the move is no action) and MSG_ROLL (the host decides a chance roll whose odds differ between peers), 73 a player is known by two ids in the save handshake (Steam id + install fingerprint), 74 a checkpoint OFFER may carry mode 4 (the save is on the map and its journal holds nothing to recover it with) so the save-selection panel can say so; a build that only knows modes 0..3 drops such an offer, 75 BOARD units carry the DEFINITION name of their kind (Character+0x240 -> +0x88) and a champion flag, so a peer holding another kind at that index can have it replaced by the game's own transform; chunks shrink from 16 to 8 units to stay inside the send buffer, 79 MSG_UQD (each peer's per-action digest of the unlock queries a battle made, compared on arrival) and MSG_PROPS (the host's whole save-property table, chunked), 78 UNLOCKS carries the class names of the host's save (the list the game's ability pools are built from), 77 BOARD units of a player's cat (kBoardHuman) carry the seven stats and the stat bonus (the layer-2 experiment of repairing a player's stats), 76 a checkpoint OFFER carries every confirmed save of the run (length-prefixed, up to kCheckpointCandidates) and a flags byte per save (kCheckpointAfterBoss: taken right after the chapter boss), and MSG_PEERLOG: on a desync or a halt each peer sends the tail of its own log, so the one log a player uploads holds both sides
+constexpr uint32_t kProtoVersion = 115;  // 115 BOARD units flag a unit made from cat data (kBoardCatData) and MSG_UCATREQ / MSG_UCAT carry that cat data to a client that has to make the unit (a summon's golem, The Creator's clones, a CustomEnemyCat: made by name they drew other abilities), 114 MSG_USTATE carries a unit's max hp too (mgmp_unitstate: every listed number is written by the repair), 113 BOARD units carry the digest of their deep state (statuses, passives, abilities, gear, stats -- mgmp_unitstate) and MSG_USTATEREQ / MSG_USTATE carry a unit's whole record to a client whose copy differs, 112 UNLOCKS carries the host's trigger_extra_event / increase_event_difficulty counts (T_TagCount: UltraVision3000 drew extra events on the host only, room DJVE), 111 MSG_TURNQUEUE (the host's turn queue of the round at every boundary: a client puts its remaining entries in the host's order, rooms 5A4F/KD8E), 110 UNLOCKS carries the host's difficulty index (T_Difficulty): the battle build's champion/elite budget and a shared event's difficulty are the host's on every peer (room 86N5), 109 MSG_PING carries the sender's clock rate against the system's interrupt time (x100) and whether it is judged abnormal (a speed tool hooked into a game, room WZJS: x12.75), 108 the new-cat events (CatOrgy, ExtraLife) are each player's own with ui.exp_indep_events, and the cat that joins in a player's own event is that player's (session_gained_id_of its seat; the other peers create it from its owner's cat push), 107 MSG_VOICE (experimental voice chat: a 40 ms frame of one player's microphone, IMA ADPCM, relayed to every other player) and HELLO rules bit 4 = the host's ui.exp_voice, 106 MSG_NODEVOTE (the map: every player clicks the next node first, the host's pick is entered when all have; each player's pick is shown beside the node), 105 MSG_PING carries the sender's own round trip to each member it hears from (the room panel's latency: a client adds the host's figure to its own for the path to another client, which is the path their messages take), 104 MSG_PING carries a request/reply with the sender's frame statistics (mgmp_perf: the PERF log line tells a slow link from a slow game), 103 CHAPTER kChapterEventName (the host tells the clients the hash of the event its node drew, so a client whose draw differs and where either event follows the host is put on the host's event: the shared effects must run on every peer), 102 HELLO rules bit 3 = the host's ui.exp_indep_events (each player's own random events) and CHAPTER kChapterEventDone (a client is done with its own event on a node: the host waits for it before it leaves), 101 MSG_TREASURE kTreasureLuck (the host's party luck, sent as it enters a treasure node: every peer rolls the shared chest with it -- the chest's luck is the difficulty's bonus plus THIS peer's party, and a client's party is its own cats), 100 MSG_SOULCAT (the cat a Soul Jar holds, published by the jar's owner at every battle build so every peer summons the same ghost; a soul jar a cat drops goes to its owner's inventory only), 99 CHAPTER kChapterFlags: a client reports its map flags to the host whenever they change, so the host can warn before leading it into an area it has not unlocked (mgmp_areagate), 98 a later turn's BOARD travels as one digest per unit (MSG_BOARDSUM) and in full only when a client asks (MSG_BOARDREQ); DEEP and RNGL send a summary and their detail only after a difference; a UQD of no query is short, 97 ACTION carries its chain position (the count of actions this turn had run on the owner's game when it decided), 96 a cat an event brings into the run moves to the same session id on every peer (session_gained_id; HELLO rules bit 0 ui.block_new_cats is gone), 95 HELLO carries the host's enemy health/armor multiplier (ui.enemy_scale, in halves: 4 = x2 .. 16 = x8), 94 MSG_HOUSECOOP (experimental house boss co-op: the warehouse statuses, the vote, the go) and HELLO rules bit 2 = the host's ui.exp_house_coop; bit 1 is now ui.exp_treasure, 93 the battle's per-message caps raised (2026-10-18 audit): spawn order 8->100, weather names 4->16, class names 16->32, DEEP units 64->254, AUDIT cats 8->16, 92 UNLOCKS carries up to 100 entries per director queue plus each queue's true length (a client never hides what the host could not send), 91 UNLOCKS carries up to 16 entries per director queue (was 6: a party with seven carried followers lost them all on the client), 90 MSG_TREASURE (experimental shared treasure: the host keeps the ledger of who took which of the chest's items) and HELLO rules bit 1 = the host's ui.experimental, 89 MSG_EQUIP carries the owner's item state (durability +0x48, aux +0x4C, str_aux +0x28): the other peers no longer make a fresh item whose init drew from the shared stream, 88 MSG_DRAW kDrawEraseAt (the eraser takes out the part of a line inside its circle, not the whole line), 87 MSG_DRAW (the drawing board: a player's lines over the map or the battle, relayed to every screen), 86 positions are SEATS: the host first, then the players by their persistent id (a CHECKPOINT config lists its peers in that order, no longer by ascending id; net_set_seat_order), so a session cat id, an owner note and a journal name no longer depend on who connected first, 85 MSG_EQUIP (the consumable a cat's backpack auto-equipped, decided on its owner's peer from the owner's inventory and taken by every other peer), 84 84 BOARD units carry their mana (Character+0xD18): the host's is taken, a thief's teleport was refused on the client for want of it, 83 83 BOARD units carry their faction (Character+0x350, what FactionConversion writes) and their captured-follower slot (+0xC4, set by CaptureFamiliar) -- the persuasion device's capture went through on the host only, 82 MSG_SETTING (the host's combat speed, which every other player's game then uses), 81 MSG_CHAT (a line of text typed by one player, shown on every screen), 80 MSG_RNGL (each peer's per-action ledger of the draws it made on the shared stream, by call site) and MSG_DEEP (each peer's per-turn digest of every unit's derived values: stats, speed, turn-order keys), 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 58 UNLOCKS carries the locked_bosses list too, 59 UNLOCKS carries the order the host's battle will spawn its party in, 60 UNLOCKS carries the level the host's battle picked, 61 BOARD carries the host's battle board and simulation stream, 62 UNLOCKS carries the host's queue of returning enemies, 63 ... and the other two queues of the director the battle build consumes, 64 ... and its list of active global modifiers (weather), 65 the modifiers move to MSG_WEATHER (weather only), 66 MSG_WEATHER carries the director's queued battle-start spawns (name + number), 67 MSG_WEATHER is gone: UNLOCKS carries the director's weather names with the level, 68 ... and with the start of EVERY battle build (build_info), not only the level pick, 69 BOARD covers EVERY unit (players too) and carries its turn-order keys (Character+0x954 / +0x958 / speed), 70 ... and the initiative base +0x5DC the first key is recomputed from, 71 BOARD is published at EVERY turn boundary (carries the turn), 72 the end-turn action carries the cat's final facing (a manual turn after the move is no action) and MSG_ROLL (the host decides a chance roll whose odds differ between peers), 73 a player is known by two ids in the save handshake (Steam id + install fingerprint), 74 a checkpoint OFFER may carry mode 4 (the save is on the map and its journal holds nothing to recover it with) so the save-selection panel can say so; a build that only knows modes 0..3 drops such an offer, 75 BOARD units carry the DEFINITION name of their kind (Character+0x240 -> +0x88) and a champion flag, so a peer holding another kind at that index can have it replaced by the game's own transform; chunks shrink from 16 to 8 units to stay inside the send buffer, 79 MSG_UQD (each peer's per-action digest of the unlock queries a battle made, compared on arrival) and MSG_PROPS (the host's whole save-property table, chunked), 78 UNLOCKS carries the class names of the host's save (the list the game's ability pools are built from), 77 BOARD units of a player's cat (kBoardHuman) carry the seven stats and the stat bonus (the layer-2 experiment of repairing a player's stats), 76 a checkpoint OFFER carries every confirmed save of the run (length-prefixed, up to kCheckpointCandidates) and a flags byte per save (kCheckpointAfterBoss: taken right after the chapter boss), and MSG_PEERLOG: on a desync or a halt each peer sends the tail of its own log, so the one log a player uploads holds both sides
 
 // A frame's payload may not exceed this. RUNSTATE (phase 5) is the only message
 // that will ever approach it; everything in phase 4 is under 128 bytes.
@@ -176,8 +176,18 @@ constexpr uint8_t kSetupMaxCats = kPartyMaxCats * kMaxPeers;
 // every peer, and on a client one that may belong to a real cat of its House. In a room it is moved to one of these ids on every peer alike (the
 // k-th cat gained in the run: slot kGainedSlot0 + k of the HOST's session namespace). It is the host's cat; see catsync_on_gained_cat.
 constexpr uint32_t kGainedSlot0 = 25, kGainedSlots = 8;
-inline uint64_t session_gained_id(uint32_t k) { return 0x70000000ull + kGainedSlot0 + k; }
-inline bool session_is_gained(uint64_t id) { return id >= 0x70000000ull + kGainedSlot0 && id < 0x70000000ull + kGainedSlot0 + kGainedSlots; }
+// 0.1.146 (proto 108): a cat that joins in a player's OWN random event (mgmp_indepevt) is that player's -- slot kGainedSlot0 + k of ITS seat's namespace
+// (0x7p000019 + k). A cat every peer's event brings in alike is the host's, seat 0, as before.
+inline uint64_t session_gained_id_of(uint32_t seat, uint32_t k) { return 0x70000000ull + ((uint64_t)seat << 24) + kGainedSlot0 + k; }
+inline uint64_t session_gained_id(uint32_t k) { return session_gained_id_of(0, k); }
+inline int session_gained_owner(uint64_t id) {
+    for (unsigned p = 0; p < kMaxPeers; ++p) {
+        const uint64_t base = 0x70000000ull + (uint64_t(p) << 24) + kGainedSlot0;
+        if (id >= base && id < base + kGainedSlots) return int(p);
+    }
+    return -1;
+}
+inline bool session_is_gained(uint64_t id) { return session_gained_owner(id) >= 0; }
 inline int session_cat_owner(uint64_t id) {
     for (unsigned p=0;p<kMaxPeers;++p) {
         const uint64_t base=0x70000000ull + (uint64_t(p)<<24);
@@ -185,6 +195,8 @@ inline int session_cat_owner(uint64_t id) {
     }
     return -1;
 }
+// The seat an id names: a clone slot (session_cat_owner) or a gained-cat slot (session_gained_owner); -1 for neither. (0.1.146)
+inline int session_cat_owner_any(uint64_t id) { const int p = session_cat_owner(id); return p >= 0 ? p : session_gained_owner(id); }
 constexpr uint8_t MSG_CHAPTER = 24;
 constexpr uint8_t MSG_CHECKPOINT = 25; // node-boundary save proposal/ack/commit and slot identity
 // The chapter map's node seeds, host -> clients (proto 54). Two peers generate the same map STRUCTURE (node count, types) but, when their saves differ, not
@@ -264,6 +276,13 @@ struct UnlocksMsg {
     // whose save lists other classes drew from another pool (2026-10-04, b521766e: a boss's spell differed, its speed and max hp with it, the turn order after it). 255 = not sent.
     uint8_t  n_classes[2] = { 255, 255 };
     char     classes[2][kClassMax][kClassLen] = {};
+    // proto 110: the host's difficulty index (T_Difficulty with items: increase_difficulty items + the house boss's), -1 = not read. Every peer's battle build
+    // and shared event take it, so the champions, elites and boss health of a battle are the host's (room 86N5: a TomTom was a champion on the host only).
+    int8_t   difficulty = -1;
+    // proto 112: the host's counts of two item tags (T_TagCount): `trigger_extra_event` (how many more events an event node chains) and `increase_event_difficulty`
+    // (a shared event's difficulty). -1 = not read. A client's EnterNode and WorldEvent take them (room DJVE: UltraVision3000 on the host's cat).
+    int8_t   extra_events = -1;
+    int8_t   event_difficulty = -1;
 };
 constexpr uint8_t kChapterReady = 0;
 constexpr uint8_t kChapterSelect = 1;
@@ -487,6 +506,29 @@ struct Writer {
         raw(s, (uint32_t)n);
     }
 };
+
+// THE SENDERS' BUFFERS (0.1.182). Every net_send_* in mgmp_net.cpp encodes into one of these. A message whose encoding is longer is NOT SENT AT ALL -- enc_* returns
+// 0, net_send_* returns false, and most callers do not look -- so a buffer must hold the message at every limit of its struct, not only at its usual size (MSG_CATS: 8
+// cats with 13-character Chinese names took 522 bytes of a 512-byte buffer). tests/test_wire_sizes.cpp fills each message to its limits and checks it fits here.
+constexpr uint32_t kSendSmall     = 512;    // MGMP_SEND_WITH, the hello/action/welcome/refuse _to variants, RNGL
+constexpr uint32_t kSendEnterNode = 1024;
+constexpr uint32_t kSendCats      = 1024;
+constexpr uint32_t kSendChat      = 320;
+constexpr uint32_t kSendDraw      = 320;
+constexpr uint32_t kSendEquip     = 160;
+constexpr uint32_t kSendTreasure  = 160;
+constexpr uint32_t kSendHouseCoop = 96;
+constexpr uint32_t kSendUqd       = 128;
+constexpr uint32_t kSendPing      = 96;
+constexpr uint32_t kSendSetting   = 16;
+constexpr uint32_t kSendRoll      = 64;
+constexpr uint32_t kSendBoardReq  = 32;
+constexpr uint32_t kSendPeers     = 64;
+constexpr uint32_t kSendRefuseFull = 128;
+constexpr uint32_t kSendDeep      = 2048;
+constexpr uint32_t kSendProps     = 1024;
+constexpr uint32_t kSendBoard     = 1536;
+constexpr uint32_t kSendUnlocks   = 16384;
 
 struct Reader {
     const uint8_t* buf;
@@ -749,6 +791,10 @@ struct ActionMsg {
     // decided. A reaction chain that runs on in real time until the next decision is applied (the Destroyer's pulse, 2026-10-20) is cut at the
     // same place on every peer: the others hand the decision over only when their own count reaches this. 0xFFFFFFFF = not known.
     uint32_t chain      = 0xFFFFFFFFu;
+    // THE OWNER'S FACING WHEN IT DECIDED (proto 112, room 5LZM 2026-11-03). A click on a tile between two actions turns the cat with no action, so mid-turn the
+    // copies faced elsewhere (the end turn alone carried the facing, since proto 72); the Monk passive RunningJab (StatusOnEndMove -> ForceAttack) attacks what
+    // the cat faces at the end of each move, and it hit an enemy on the clients only -- deaths, spawns, a halt. (0,0) = not known.
+    int8_t   fx = 0, fy = 0;
 };
 
 // Exchanged at every turn boundary. Cheap because the game is turn-based.
@@ -1378,6 +1424,10 @@ struct PingMsg {
     uint8_t  n_rtt = 0;
     uint8_t  rtt_peer[kMaxPeers] = {};
     uint32_t rtt_ms[kMaxPeers] = {};
+    // proto 109: the sender's clock (QueryPerformanceCounter / GetTickCount) against the system's interrupt time, x100 (100 = right; 0 = not measured yet),
+    // and whether the sender judges it abnormal (two windows in a row off by more than 20 %)
+    uint32_t clock_x100 = 0;
+    uint8_t  clock_bad = 0;
 };
 inline uint32_t enc_ping(uint8_t* p, uint32_t cap, const PingMsg& m) {
     if (m.kind > 1 || m.n_rtt > kMaxPeers) return 0;
@@ -1386,6 +1436,7 @@ inline uint32_t enc_ping(uint8_t* p, uint32_t cap, const PingMsg& m) {
     w.u32v(m.frames); w.u32v(m.avg_x10); w.u32v(m.max_ms); w.u32v(m.slow); w.u32v(m.mod_max_x10);
     w.u8v(m.n_rtt);
     for (uint8_t i = 0; i < m.n_rtt; ++i) { w.u8v(m.rtt_peer[i]); w.u32v(m.rtt_ms[i]); }
+    w.u32v(m.clock_x100); w.u8v(m.clock_bad ? 1 : 0);
     return w.ok ? w.len : 0;
 }
 inline bool dec_ping(Reader& r, PingMsg& m) {
@@ -1394,7 +1445,8 @@ inline bool dec_ping(Reader& r, PingMsg& m) {
     m.n_rtt = r.u8v();
     if (!r.ok || m.n_rtt > kMaxPeers) return false;
     for (uint8_t i = 0; i < m.n_rtt; ++i) { m.rtt_peer[i] = r.u8v(); m.rtt_ms[i] = r.u32v(); if (m.rtt_peer[i] >= kMaxPeers) return false; }
-    return r.ok && r.pos == r.len && m.kind <= 1;
+    m.clock_x100 = r.u32v(); m.clock_bad = r.u8v();
+    return r.ok && r.pos == r.len && m.kind <= 1 && m.clock_bad <= 1;
 }
 
 // MSG_EQUIP (proto 85): the item a cat's Backpack (passive AutoEquipConsumables) put into its free slot after a consumable was used up. The game picks it AT RANDOM FROM THE PLAYER'S OWN INVENTORY, so
@@ -1740,6 +1792,7 @@ inline uint32_t enc_action(uint8_t* p, uint32_t cap, const ActionMsg& a) {
     w.i32v(a.tx); w.i32v(a.ty); w.i32v(a.dx); w.i32v(a.dy);
     w.str(a.gon);
     w.u32v(a.chain);
+    w.u8v((uint8_t)a.fx); w.u8v((uint8_t)a.fy);   // proto 112
     return w.ok ? w.len : 0;
 }
 
@@ -1809,7 +1862,9 @@ constexpr uint8_t  MSG_BOARD = 36;
 constexpr uint32_t kBoardChunk = 8;       // units per message (16 until proto 75, when each unit gained a name of up to kBoardDefLen bytes)
 constexpr uint32_t kBoardDefLen = 40;     // the longest definition name a unit row carries (with its NUL); a longer name travels as empty and the unit is never replaced
 constexpr uint32_t kBoardMax = 254;       // the roster cap (kMaxCats in mgmp_lockstep)
-constexpr uint8_t  kBoardDead = 1, kBoardLinked = 2, kBoardHuman = 4, kBoardGone = 8, kBoardChampion = 16, kBoardRemoved = 32;   // kBoardHuman: a player's cat on the host -- only its turn-order keys are meant to be taken over; kBoardGone: the unit has left the host's live list (its object is freed: NOTHING in the unit's row is state, and a peer must not read or write it)
+constexpr uint8_t  kBoardDead = 1, kBoardLinked = 2, kBoardHuman = 4, kBoardGone = 8, kBoardChampion = 16, kBoardRemoved = 32;
+// proto 115: the unit carries cat data (Character+0x88: a summon's golem, a clone, a CustomEnemyCat). Not in the digest. A client that has to MAKE such a unit asks for that cat data (MSG_UCATREQ).
+constexpr uint8_t  kBoardCatData = 64;   // kBoardHuman: a player's cat on the host -- only its turn-order keys are meant to be taken over; kBoardGone: the unit has left the host's live list (its object is freed: NOTHING in the unit's row is state, and a peer must not read or write it)
 struct BoardUnit {
     uint8_t  index = 0;      // the unit's index in the battle roster (the roster order is the same on every peer)
     uint32_t ident = 0;      // hash of the unit's kind (Character+0x248, the authored type name)
@@ -1835,6 +1890,9 @@ struct BoardUnit {
     int32_t  carried = -1;
     // proto 84: the unit's mana (Character+0xD18). Not in the turn hash; an ability's cost is checked against it, so a peer with less refuses an action its owner could take.
     int32_t  mana = 0;
+    // proto 113: the digest of the unit's DEEP state (mgmp_unitstate: its statuses and passives, abilities, gear, stats). 0 = not read. A client whose own differs asks for
+    // the unit's record (MSG_USTATEREQ) and puts its copy right with the game's own functions.
+    uint32_t deep = 0;
 };
 struct BoardMsg {
     uint64_t battle = 0;     // the battle id (the node seed both peers share)
@@ -1874,6 +1932,7 @@ inline uint32_t enc_board(uint8_t* p, uint32_t cap, const BoardMsg& m) {
         w.i32v(u.tx); w.i32v(u.ty); w.i32v(u.fx); w.i32v(u.fy); w.i32v(u.key_a); w.i32v(u.key_b); w.i32v(u.speed); w.i32v(u.init_base);
         w.i32v(u.faction); w.i32v(u.carried);   // proto 83
         w.i32v(u.mana);                          // proto 84
+        w.u32v(u.deep);                          // proto 113
         w.str(u.def);
         if (u.flags & kBoardHuman) { for (int k = 0; k < 7; ++k) w.i32v(u.stat[k]); w.i32v(u.stat_bonus); }
     }
@@ -1889,6 +1948,7 @@ inline bool dec_board(Reader& r, BoardMsg& m) {
         u.tx = r.i32v(); u.ty = r.i32v(); u.fx = r.i32v(); u.fy = r.i32v(); u.key_a = r.i32v(); u.key_b = r.i32v(); u.speed = r.i32v(); u.init_base = r.i32v();
         u.faction = r.i32v(); u.carried = r.i32v();   // proto 83
         u.mana = r.i32v();                            // proto 84
+        u.deep = r.u32v();                            // proto 113
         r.str(u.def, kBoardDefLen);
         for (int k = 0; k < 7; ++k) u.stat[k] = 0;
         u.stat_bonus = 0;
@@ -1918,10 +1978,40 @@ inline uint32_t board_unit_digest(const BoardUnit& u) {
     mix(u.ident); mix((uint32_t)u.hp); mix((uint32_t)u.shield);
     if (!human) mix((uint32_t)u.maxhp);
     mix((uint32_t)u.tx); mix((uint32_t)u.ty);
-    mix((uint32_t)u.key_a); mix((uint32_t)u.key_b); mix((uint32_t)u.init_base);
+    // proto 115: a dead unit's turn-order keys are not compared -- it takes no turn, and its speed after death followed whatever its last statuses did (a cat the board
+    // killed had speed 1 here and 2 on the host: the keys were 'repaired' at every boundary and the host streamed its whole board for nothing)
+    if (!dead) { mix((uint32_t)u.key_a); mix((uint32_t)u.key_b); mix((uint32_t)u.init_base); }
     if (human) mix((uint32_t)u.mana);
     else if (!dead) { mix((uint32_t)u.mana); mix((uint32_t)u.faction); }
+    if (!dead) mix(u.deep);                                // proto 113: put right by the unit-state repair (mgmp_unitstate) after the board
     return h ? h : 1u;
+}
+
+// THE DEEP STATE OF A UNIT (proto 113, mgmp_unitstate). A client whose unit's deep digest differs from the host's board row asks for the unit's whole record; the host answers
+// from the records it took at that boundary, on its receive thread (like MSG_BOARDREQ). MSG_USTATE's payload is written and read by mgmp_unitstate (unitstate_encode).
+constexpr uint8_t  MSG_USTATEREQ = 56;
+constexpr uint8_t  MSG_USTATE    = 57;
+constexpr uint32_t kUstateReqMax = 64;
+struct UstateReqMsg {
+    uint64_t battle = 0;
+    uint32_t turn = 0;
+    uint8_t  n = 0;
+    uint8_t  index[kUstateReqMax] = {};
+};
+inline uint32_t enc_ustatereq(uint8_t* p, uint32_t cap, const UstateReqMsg& m) {
+    if (m.n > kUstateReqMax) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_USTATEREQ); w.u64v(m.battle); w.u32v(m.turn); w.u8v(m.n);
+    for (uint32_t i = 0; i < m.n; ++i) w.u8v(m.index[i]);
+    return w.ok ? w.len : 0;
+}
+inline bool dec_ustatereq(const uint8_t* p, uint32_t n, UstateReqMsg& m) {
+    Reader r(p, n);
+    if (r.u8v() != MSG_USTATEREQ) return false;
+    m.battle = r.u64v(); m.turn = r.u32v(); m.n = r.u8v();
+    if (!r.ok || m.n > kUstateReqMax) return false;
+    for (uint32_t i = 0; i < m.n; ++i) m.index[i] = r.u8v();
+    return r.ok && r.pos == r.len;
 }
 
 constexpr uint8_t MSG_BOARDSUM = 50;
@@ -1966,6 +2056,92 @@ inline uint32_t enc_boardreq(uint8_t* p, uint32_t cap, const BoardReqMsg& m) {
 inline bool dec_boardreq(Reader& r, BoardReqMsg& m) {
     m.battle = r.u64v(); m.turn = r.u32v(); m.flags = r.u8v();
     return r.ok && r.pos == r.len && m.battle != 0 && !(m.flags & ~kBoardReqStream);
+}
+
+// THE ROUND'S TURN QUEUE (proto 111, rooms 5A4F and KD8E, 2026-11-02). The keys the order is sorted on (+0x954/+0x958) were the host's on every peer, and the order still
+// differed: the round is sorted when it is BUILT, and the host's first round was built while a player's cat still had its key from before its stats were computed (so it came
+// after three enemies there and before them on the client). At turn 3 the client gave the cat its turn, took the owner's decisions of turn 6 for it, and the battle halted.
+// So at every boundary the host sends the round's queue itself -- every entry after the current one (TurnControl+0x118 list, +0x128 current), as its kind and, for a
+// character, its roster index -- and a client puts its own remaining entries in the host's order (mgmp_lockstep: queue_follow). Sent before the board of the boundary.
+constexpr uint8_t MSG_TURNQUEUE = 55;
+constexpr uint32_t kTurnQueueMax = 254;
+constexpr uint8_t kTurnQueueNoUnit = 0xFF;   // an entry that is no character, or a character that is not in the roster
+struct TurnQueueMsg {
+    uint64_t battle = 0;
+    uint32_t turn = 0;                  // the boundary (the board's numbering)
+    uint8_t  cur = kTurnQueueNoUnit;    // the roster index of the current entry (kTurnQueueNoUnit: the list head, before the round's first turn)
+    uint8_t  n = 0;                     // entries after the current one
+    uint8_t  kind[kTurnQueueMax] = {};  // the entry's kind (+0x10; 0 = a character)
+    uint8_t  unit[kTurnQueueMax] = {};  // its roster index, kTurnQueueNoUnit where there is none
+};
+inline uint32_t enc_turnqueue(uint8_t* p, uint32_t cap, const TurnQueueMsg& m) {
+    if (!m.battle || m.n > kTurnQueueMax) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_TURNQUEUE); w.u64v(m.battle); w.u32v(m.turn); w.u8v(m.cur); w.u8v(m.n);
+    for (uint32_t i = 0; i < m.n; ++i) { w.u8v(m.kind[i]); w.u8v(m.unit[i]); }
+    return w.ok ? w.len : 0;
+}
+inline bool dec_turnqueue(Reader& r, TurnQueueMsg& m) {
+    m.battle = r.u64v(); m.turn = r.u32v(); m.cur = r.u8v(); m.n = r.u8v();
+    if (!r.ok || !m.battle || m.n > kTurnQueueMax) return false;
+    for (uint32_t i = 0; i < m.n; ++i) { m.kind[i] = r.u8v(); m.unit[i] = r.u8v(); }
+    return r.ok && r.pos == r.len;
+}
+
+// A UNIT MADE FROM CAT DATA (proto 115, 0.1.190). The game makes a summon's golem (FleshGolem), The Creator's clones, a CustomEnemyCat ... from a CatData it builds (the
+// spawn effect 0x1407A2BA0 -> SpawnCharacterWithCatData 0x1407ACFD0): the unit's abilities, passives and stats come from that cat data, which was drawn from the builder's
+// pools. A client whose board must MAKE such a unit (it is missing or dead here, or another kind) made it by its definition name until now -- with cat data of its own
+// drawing, so its abilities were not the host's ('Counter NeedleShot CPR Metabolize' against 'Rally Counter BurgeoningBarrier Pestilence', BABYGIRL 11-04). Now it asks
+// for the host's cat data and makes the unit from it, as the game's summon does. The host keeps every such unit's cat image of the battle (serialized at its board's
+// boundary) and answers on the receive thread.
+//   MSG_UCATREQ  client -> host: battle, roster index, the unit's creation key (Character+0x958, the board's key_b)
+//   MSG_UCAT     host -> that client: the same three, the cat data's save id (CatData+0xC48), and status kUcatImage (`data` is the image) or kUcatNone (the host holds no such unit)
+constexpr uint8_t MSG_UCATREQ = 58;
+constexpr uint8_t MSG_UCAT    = 59;
+constexpr uint8_t kUcatImage = 1, kUcatNone = 2;
+struct UcatReqMsg { uint64_t battle = 0; uint8_t index = 0; int32_t key = 0; };
+struct UcatMsg {
+    uint64_t battle = 0;
+    uint8_t  index = 0;
+    int32_t  key = 0;
+    uint64_t save_id = 0;
+    uint8_t  status = 0;
+    uint32_t size = 0;
+    uint64_t hash = 0;
+    const uint8_t* data = nullptr;   // encode: borrowed; decode: points INTO the decoded buffer
+};
+inline uint32_t enc_ucatreq(uint8_t* p, uint32_t cap, const UcatReqMsg& m) {
+    if (!m.battle || m.index >= kBoardMax) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_UCATREQ); w.u64v(m.battle); w.u8v(m.index); w.i32v(m.key);
+    return w.ok ? w.len : 0;
+}
+inline bool dec_ucatreq(const uint8_t* p, uint32_t n, UcatReqMsg& m) {
+    Reader r(p, n);
+    if (r.u8v() != MSG_UCATREQ) return false;
+    m.battle = r.u64v(); m.index = r.u8v(); m.key = r.i32v();
+    return r.ok && r.pos == r.len && m.battle && m.index < kBoardMax;
+}
+inline uint32_t ucat_frame_size(const UcatMsg& m) { return m.size + 64; }
+inline uint32_t enc_ucat(uint8_t* p, uint32_t cap, const UcatMsg& m) {
+    if (!m.battle || m.index >= kBoardMax) return 0;
+    if (m.status == kUcatImage) { if (!m.data || !m.size || m.size > kMaxCatBytes) return 0; }
+    else if (m.status != kUcatNone || m.size) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_UCAT); w.u64v(m.battle); w.u8v(m.index); w.i32v(m.key); w.u64v(m.save_id); w.u8v(m.status); w.u32v(m.size); w.u64v(m.hash);
+    if (m.size) w.raw(m.data, m.size);
+    return w.ok ? w.len : 0;
+}
+inline bool dec_ucat(const uint8_t* p, uint32_t n, UcatMsg& m) {
+    Reader r(p, n);
+    m.data = nullptr;
+    if (r.u8v() != MSG_UCAT) return false;
+    m.battle = r.u64v(); m.index = r.u8v(); m.key = r.i32v(); m.save_id = r.u64v(); m.status = r.u8v(); m.size = r.u32v(); m.hash = r.u64v();
+    if (!r.ok || !m.battle || m.index >= kBoardMax) return false;
+    if (m.status == kUcatNone) return m.size == 0 && r.pos == r.len;
+    if (m.status != kUcatImage || m.size == 0 || m.size > kMaxCatBytes || r.pos + m.size != r.len) return false;
+    m.data = r.buf + r.pos;
+    return true;
 }
 
 // MSG_SOULCAT (proto 100, 2026-10-22: "the client crashed after the host's Soul Jar went off"). A filled Soul Jar (SoulJar_Full, aux_is_catid) keeps
@@ -2036,6 +2212,41 @@ inline bool dec_nodevote(Reader& r, NodeVoteMsg& m) {
     return r.ok && r.pos == r.len && m.on <= 1 && m.index < 4096;
 }
 
+// MSG_VOICE (proto 107, 2026-10-26: experimental voice chat, ui.exp_voice -- the HOST's setting, HELLO rules bit 4). One frame of one player's microphone: 16 kHz mono, 640 samples (40 ms)
+// as IMA ADPCM (4 bits a sample, mgmp_voicecodec.h). Authored by the speaker, relayed by the host to the other clients. A frame is self-contained: `pred` is its first sample and `index`
+// the codec's step index there, so a frame that is late or missing costs nothing to the next one.
+//   `seq`      counts the sender's frames (a gap = frames that did not come: only for the log)
+//   `pred`     the first sample of the frame, exact
+//   `index`    the ADPCM step index at the first sample, 0..88
+//   `samples`  how many samples the frame decodes to (640 as sent; the receiver takes up to kVoiceMaxSamples)
+//   `len`      the bytes of `data` (samples / 2 at least)
+constexpr uint8_t  MSG_VOICE = 54;
+constexpr uint32_t kVoiceMaxBytes = 336, kVoiceMaxSamples = 700;
+struct VoiceMsg {
+    uint16_t seq = 0;
+    int16_t  pred = 0;
+    uint8_t  index = 0;
+    uint16_t samples = 0;
+    uint16_t len = 0;
+    uint8_t  data[kVoiceMaxBytes] = {};
+};
+inline bool voice_msg_valid(const VoiceMsg& m) {
+    return m.index <= 88 && m.samples >= 2 && m.samples <= kVoiceMaxSamples && m.len <= kVoiceMaxBytes && (uint32_t)m.samples / 2 <= m.len;
+}
+inline uint32_t enc_voice(uint8_t* p, uint32_t cap, const VoiceMsg& m) {
+    if (!voice_msg_valid(m)) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_VOICE); w.raw(&m.seq, 2); w.raw(&m.pred, 2); w.u8v(m.index); w.raw(&m.samples, 2); w.raw(&m.len, 2);
+    w.raw(m.data, m.len);
+    return w.ok ? w.len : 0;
+}
+inline bool dec_voice(Reader& r, VoiceMsg& m) {
+    r.raw(&m.seq, 2); r.raw(&m.pred, 2); m.index = r.u8v(); r.raw(&m.samples, 2); r.raw(&m.len, 2);
+    if (!r.ok || m.len > kVoiceMaxBytes) return false;
+    r.raw(m.data, m.len);
+    return r.ok && r.pos == r.len && voice_msg_valid(m);
+}
+
 inline bool valid_unlocks(const UnlocksMsg& m) {
     return m.epoch != 0 && m.n_abilities <= 32 && m.n_passives <= 32 && m.n_items <= 128 && m.n_levels <= 8 && m.n_bosses <= 8 && m.n_events <= 64 && m.n_spawn <= kSpawnMax && m.n_level_name < sizeof(m.level_name) && m.n_pending[0] <= kPendingMax && m.n_pending[1] <= kPendingMax && m.n_pending[2] <= kPendingMax && m.n_weather <= kWeatherNames;
 }
@@ -2067,6 +2278,8 @@ inline uint32_t enc_unlocks(uint8_t* p, uint32_t cap, const UnlocksMsg& m) {
             for (uint8_t k = 0; k < len; ++k) w.u8v((uint8_t)m.classes[f][i][k]);
         }
     }
+    w.u8v((uint8_t)m.difficulty);      // proto 110
+    w.u8v((uint8_t)m.extra_events); w.u8v((uint8_t)m.event_difficulty);   // proto 112
     return w.ok ? w.len : 0;
 }
 inline bool dec_unlocks(Reader& r, UnlocksMsg& m) {
@@ -2105,6 +2318,8 @@ inline bool dec_unlocks(Reader& r, UnlocksMsg& m) {
             m.classes[f][i][len] = 0;
         }
     }
+    m.difficulty = (int8_t)r.u8v();
+    m.extra_events = (int8_t)r.u8v(); m.event_difficulty = (int8_t)r.u8v();   // proto 112
     return r.ok && r.pos == r.len && valid_unlocks(m);
 }
 
@@ -2617,6 +2832,12 @@ inline bool dec_action(Reader& r, ActionMsg& a) {
     r.str(a.gon, sizeof(a.gon));
     a.chain = 0xFFFFFFFFu;
     if (r.ok && r.pos < r.len) a.chain = r.u32v();
+    a.fx = 0; a.fy = 0;
+    if (r.ok && r.pos < r.len) {   // proto 112: exactly two bytes, or none (a sender before 112); anything else is a cut frame
+        if (r.pos + 2 != r.len) return false;
+        a.fx = (int8_t)r.u8v(); a.fy = (int8_t)r.u8v();
+    }
+    if (a.fx < -1 || a.fx > 1 || a.fy < -1 || a.fy > 1) { a.fx = 0; a.fy = 0; }
     // Reject anything that is not a real decision at the edge. Types 6 and 7
     // are locally generated; if one ever arrives, the sender is broken and
     // applying it would double-fire a reaction on this peer.
@@ -2919,6 +3140,12 @@ inline const char* msg_name(uint8_t t) {
         case MSG_BOARDREQ:  return "BOARDREQ";
         case MSG_SOULCAT:   return "SOULCAT";
         case MSG_NODEVOTE:  return "NODEVOTE";
+        case MSG_VOICE:     return "VOICE";
+        case MSG_TURNQUEUE: return "TURNQUEUE";
+        case MSG_USTATEREQ: return "USTATEREQ";
+        case MSG_USTATE:    return "USTATE";
+        case MSG_UCATREQ:   return "UCATREQ";
+        case MSG_UCAT:      return "UCAT";
         case MSG_HOSTLEFT: return "HOSTLEFT";
         case MSG_PAGE:     return "PAGE";
         case MSG_CATS:     return "CATS";

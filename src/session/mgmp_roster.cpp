@@ -1038,19 +1038,46 @@ void roster_setup_set_ready(bool ready) {
     g_setup_ready=ready;
     if(!ready)roster_party_swap_reset();
 }
-bool roster_setup_install_shared(const uint64_t* ids,uint32_t count,const char* why) {
+// The gained cats (0x70000019+) in the run's party / familiar lists as they are now, in list order (party first). (0.1.145)
+static uint32_t gained_in_lists(uint32_t* out,uint32_t cap) {
+    uintptr_t dir=0;uint32_t n=0;
+    if(!mem_read((void*)addr_of_data(D_MewDirectorPtr),&dir,8)||!dir)return 0;
+    const uintptr_t offsets[]={kDir_CatIdCap,kDir_CatFamiliars};
+    for(uintptr_t off:offsets){
+        uint32_t count=0;uintptr_t data=0;uint64_t ids[16]{};
+        if(!mem_read((uint8_t*)dir+off+4,&count,4)||count>16||!mem_read((uint8_t*)dir+off+8,&data,8)||(count&&!data)||(count&&!mem_read((void*)data,ids,count*8)))continue;
+        for(uint32_t i=0;i<count&&n<cap;++i){
+            if(!session_is_gained(ids[i]))continue;
+            bool dup=false;for(uint32_t j=0;j<n;++j)if(out[j]==(uint32_t)ids[i])dup=true;
+            if(!dup)out[n++]=(uint32_t)ids[i];
+        }
+    }
+    // 0.1.151: in id order. A client's save may hold its local view (its own cats in the party) and the host's the shared layout, so the list order differs between
+    // peers -- the order the battle roster is built in must not.
+    for(uint32_t i=1;i<n;++i)for(uint32_t j=i;j>0&&out[j]<out[j-1];--j){const uint32_t t=out[j];out[j]=out[j-1];out[j-1]=t;}
+    return n;
+}
+bool roster_setup_install_shared(const uint64_t* ids,uint32_t count,const char* why,bool keep_gained) {
     if(!ids || count>16)return false;
     uint32_t party[4]{},fam[16]{},pn=0,fn=0,owned[kMaxPeers]{};
     for(unsigned i=0;i<count;++i) {
         const int owner=session_cat_owner(ids[i]);
-        if(owner<0 || owner>=net_peer_count() || ++owned[owner]>4)return false;
+        if(owner<0 || owner>=net_seat_span() || ++owned[owner]>4)return false;
         for(unsigned j=0;j<i;++j)if(ids[i]==ids[j])return false;
         if(owner==0)party[pn++]=(uint32_t)ids[i];else fam[fn++]=(uint32_t)ids[i];
     }
-    for(unsigned p=0;p<net_peer_count();++p)if(!owned[p])return false;
+    for(unsigned p=0;p<net_seat_span()&&p<kMaxPeers;++p){uint8_t here=0;if(net_seat_peer((uint8_t)p,here)&&!owned[p])return false;}      // every player PRESENT brings cats; a seat that has left need not
+    // 0.1.145: a RESUMED run keeps the cats an event brought into it (the setup messages carry clone slots 1..4 only). Every peer restored the same
+    // certified save, so every peer finds the same gained cats in the same order and appends them after the clones, each noted with its seat (0.1.146).
+    uint32_t gained[kGainedSlots]{},gn=0;
+    if(keep_gained){gn=gained_in_lists(gained,kGainedSlots);for(uint32_t i=0;i<gn&&fn<16;++i)fam[fn++]=gained[i];}
     if(!replace_three(party,pn,fam,fn))return false;
     for(unsigned i=0;i<count;++i)lockstep_note_owner(ids[i],(uint8_t)session_cat_owner(ids[i]));
-    log_line("ROSTER","shared roster installed: %u host cats + %u client cats (%s)",pn,fn,why);
+    catsync_note_departure(ids,count);      // 0.1.147: who brought what -- the solo-cat / same-class marks count it
+    for(uint32_t i=0;i<gn;++i){const int s=session_gained_owner(gained[i]);lockstep_note_owner(gained[i],(uint8_t)(s>=0?s:0));catsync_gained_seen(gained[i]);}
+    log_line("ROSTER","shared roster installed: %u host cats + %u client cats%s (%s)",pn,fn-gn,gn?" + gained cat(s) kept from the saved lists":"",why);
+    if(gn){char t[160]{};int o=0;for(uint32_t i=0;i<gn&&o<140;++i)o+=_snprintf_s(t+o,sizeof(t)-o,_TRUNCATE," %x",gained[i]);
+        log_line("ROSTER","  gained cat(s) kept in the familiar list:%s",t);}
     return true;
 }
 
@@ -1350,13 +1377,13 @@ static bool swap_capture() {
         for(unsigned j=0;j<i;++j)if(all[i]==all[j])return false;
         uint8_t owner=kNoPeer;
         if(!lockstep_owner_pos(all[i],owner)) {
-            const int encoded=session_cat_owner(all[i]);
-            if(encoded>=0 && encoded<net_peer_count())owner=(uint8_t)encoded;
+            const int encoded=session_cat_owner_any(all[i]);
+            if(encoded>=0 && encoded<net_seat_span())owner=(uint8_t)encoded;
             else if(bootstrap)owner=i<pn?0:1;
             else if(all[i]<0x70000000u)owner=0;     // a cat the game brought in during the run: the host's
             else return false;
         }
-        if(owner>=net_peer_count())return false;
+        if(owner>=net_seat_span())return false;        // a SEAT (the id carries it): above the count of the players present once a lower seat has left
         owners[i]=owner;
         if(owner==0){if(spn>=4)return false;shared_party[spn++]=all[i];}else shared_fam[sfn++]=all[i];
         if(owner==net_peer_pos())local[ln++]=all[i];else other[on++]=all[i];
@@ -1420,10 +1447,10 @@ static void swap_learn_new(const uint32_t* live, uint32_t nlive) {
         const uint32_t id = added[i];
         uint8_t owner = kNoPeer;
         if (!lockstep_owner_pos(id, owner)) {
-            const int enc = session_cat_owner(id);
+            const int enc = session_cat_owner_any(id);
             owner = enc >= 0 ? (uint8_t)enc : (id < 0x70000000u ? 0 : kNoPeer);
         }
-        if (owner >= net_peer_count()) continue;
+        if (owner >= net_seat_span()) continue;
         if (g_swap.pn + g_swap.fn >= kSwapIds) break;
         // the shared layout: the host's cats in the party while it has room, everyone else's (and an overflowing host cat) in the familiars
         if (owner == 0 && g_swap.pn < 4) g_swap.party_before[g_swap.pn++] = id;
@@ -1621,11 +1648,11 @@ bool roster_normalize_shared(const char* why) {
         if (dup) continue;
         uint8_t owner = kNoPeer;
         if (!lockstep_owner_pos(all[i], owner)) {
-            const int encoded = session_cat_owner(all[i]);
+            const int encoded = session_cat_owner_any(all[i]);
             if (encoded >= 0) owner = (uint8_t)encoded;
         }
         if (owner == kNoPeer && all[i] < 0x70000000u) owner = 0;        // a cat the game brought in during the run: the host's
-        if (owner >= net_peer_count()) refuse = "a cat with no known owner";
+        if (owner >= net_seat_span()) refuse = "a cat with no known owner";
         else if (owner == 0) { if (npn >= 4) refuse = "more than four host cats"; else party[npn++] = all[i]; }
         else fam[nfn++] = all[i];
     }
@@ -1683,12 +1710,12 @@ template <class F> static int prune_lists(F foreign, const char* why) {
 }
 
 int roster_leave_prune(uint8_t keep_pos, const char* why) {
-    return prune_lists([&](uint32_t id) { const int o = session_cat_owner(id); return o >= 0 && o != (int)keep_pos; }, why);
+    return prune_lists([&](uint32_t id) { const int o = session_cat_owner_any(id); return o >= 0 && o != (int)keep_pos; }, why);
 }
 
 // A PLAYER DROPPED OUT OF A ROOM THAT GOES ON (2026-10-05): the cats of the positions in `mask` (bit p = position p) leave this peer's run; everybody else's stay.
 int roster_drop_positions(uint32_t mask, const char* why) {
-    return prune_lists([&](uint32_t id) { const int o = session_cat_owner(id); return o >= 0 && o < 32 && ((mask >> o) & 1u); }, why);
+    return prune_lists([&](uint32_t id) { const int o = session_cat_owner_any(id); return o >= 0 && o < 32 && ((mask >> o) & 1u); }, why);
 }
 
 // THE HOST DECIDES WHICH CATS ARE IN THE RUN (2026-09-29). Measured Host3/Client2:
@@ -1702,9 +1729,9 @@ int roster_drop_positions(uint32_t mask, const char* why) {
 static uint8_t shared_owner(uint32_t id) {
     uint8_t owner = kNoPeer;
     if (!lockstep_owner_pos(id, owner)) {
-        const int encoded = session_cat_owner(id);
+        const int encoded = session_cat_owner_any(id);                      // a clone's seat, or the seat whose event brought the cat in (0.1.146)
         if (encoded >= 0) owner = (uint8_t)encoded;
-        else if (id < 0x70000000u || session_is_gained(id)) owner = 0;      // a cat the game brought in (an event) -- the host's
+        else if (id < 0x70000000u) owner = 0;                                // an ordinary id the game brought in -- the host's
     }
     return owner;
 }
@@ -1720,7 +1747,7 @@ bool roster_adopt_host_shared(const uint64_t* cats, uint32_t cn, const uint64_t*
         const uint8_t owner = shared_owner((uint32_t)fam[i]);
         // A familiar is normally a client's cat. A HOST cat the game filed there because the party was already full (a gained cat)
         // is fine too -- only a host cat with a session id has no business in the familiars.
-        if (owner >= net_peer_count() || (owner == 0 && fam[i] >= 0x70000000ull && !session_is_gained(fam[i]))) refuse = "a familiar not owned by a client";
+        if (owner >= net_seat_span() || (owner == 0 && fam[i] >= 0x70000000ull && !session_is_gained(fam[i]))) refuse = "a familiar not owned by a client";
         else fams[nfn++] = (uint32_t)fam[i];
     }
     for (uint32_t i = 0; i < cn && !refuse; ++i) {

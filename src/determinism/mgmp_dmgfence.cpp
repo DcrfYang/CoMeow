@@ -26,6 +26,7 @@ using fn8 = void* (__fastcall*)(void*, void*, void*, void*, void*, void*, void*,
 fn8 g_orig = nullptr;
 
 uint64_t g_battle = 0, g_key = 0;
+uint32_t g_gen = ~0u;
 std::unordered_map<uint64_t, uint32_t> g_n;    // (attacker, target) -> instances so far in this action
 uint64_t g_calls = 0, g_drew = 0;
 uint32_t g_logged = 0;
@@ -47,7 +48,7 @@ void* __fastcall detour(void* target, void* dmg, void* c, void* d, void* e, void
     if (!s) return g_orig(target, dmg, c, d, e, f, g, h);
     const uint64_t battle = lockstep_battle_id();
     const uint64_t key = lockstep_reseed_key();
-    if (battle != g_battle) { g_battle = battle; g_key = ~0ull; g_calls = g_drew = 0; g_logged = 0; }
+    if (battle != g_battle || g_gen != lockstep_battle_gen()) { g_battle = battle; g_gen = lockstep_battle_gen(); g_key = ~0ull; g_calls = g_drew = 0; g_logged = 0; g_n.clear(); }
     if (key != g_key) { g_key = key; g_n.clear(); }
     const void* src = nullptr;
     if (dmg) {

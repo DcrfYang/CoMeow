@@ -26,6 +26,8 @@
 #include "mgmp_log.h"
 #include "mgmp_addresses.h"  // kRva_MewDirectorPtr / kDir_* -- the run, for the probe's
                              // "where is the party" scan (the map screen held no such field)
+#include "mgmp_resolve.h"    // addr_of_call(C_MapNodeBlocked): can the client's party marker walk to the host's party node
+#include "mgmp_mapvote.h"    // mapvote_node_world: the map's direction for follow_unstick_marker
 #include "mgmp_rng.h"        // rng_global_stream / rng_original_randfloat -- the
                              // per-peer node perturbation, see follow_perturb_after_enter
 
@@ -60,6 +62,15 @@ constexpr uintptr_t kNode_Type = 0x138;
 // One field, six readings, and it is the only difference between the two maps that matches
 // "this node is behind us". See follow_mark_node_consumed.
 constexpr uintptr_t kNode_Consumed = 0x168;
+
+// THE TWO INSTANT NODES (0.1.120). EnterNode's furniture-box (14) and food-box (15) branches finish the node IN THE SAME CALL (RVA 392fc0, the node-finish routine): they roll their reward and
+// then consume the node the PARTY MARKER STANDS ON (marker+0x50), refresh every node and clear MapScreen+0x1E8. Every other node (battle, event, shop, chest) opens a screen, and the finish
+// runs when that screen closes -- long after the party has walked there. The host's click walks first and enters on arrival, so its marker is on the node; the client enters at once, from the
+// host's message, while its marker still stands on the PREVIOUS node: the finish consumed and refreshed the wrong node, and from then on the client could not click the next one (the room
+// B9KU / KD8E food box, node 16 then node 12: every food box since the map vote, none in the 0.1.4 logs where the client's own click had started the walk first).
+constexpr uint32_t kNodeType_FurnitureBox = 14;
+constexpr uint32_t kNodeType_FoodBox      = 15;
+uint64_t s_instant_walk_ms = 6000;      // how long the entry waits for the party to arrive before it is entered anyway
 
 // MapNode::str_to_type, in enum order. 1 and 18 are three-character names whose
 // string constants IDA did not render; they are not battle types and nothing
@@ -114,6 +125,9 @@ struct State {
         uint64_t words[4] = {};
         uint64_t at    = 0;         // tick the host's choice arrived
         bool     held  = false;     // ...and whether we have said we are holding
+        bool     walking = false;   // an instant node (food box, furniture box): the party was sent to it and the entry waits for the arrival (0.1.120)
+        bool     walk_marked = false; // ...and the consumed byte was set meanwhile (so the arrival does not enter the node itself) and must be put back
+        uint64_t walk_at = 0;       // ...tick the walk began
         NodeSnapshot snapshot;
         EnterNodeMsg message;
     };
@@ -323,8 +337,8 @@ bool follow_hold_state(NetMsg& m) {
         // Host relays owner-authored cat edits with the original transport ID.
         // These are independent of its node snapshot, so hand them to catsync.
         if(m.type==MSG_CATDATA && setup_has_shared_roster() && setup_runtime_ready()) {
-            uint8_t ids[kMaxPeers]{};const int owner=session_cat_owner(m.catdata.id);
-            if(owner>0 && owner<net_peer_count() && net_peer_ids(ids,kMaxPeers) && ids[owner]==m.from)
+            uint8_t holder=kNoPeer;const int owner=session_cat_owner_any(m.catdata.id);     // 0.1.146: a client's gained cat too
+            if(owner>0 && owner<net_seat_span() && net_seat_peer((uint8_t)owner,holder) && holder==m.from)      // the connection that holds the owner's SEAT
                 return false;
         }
 #endif
@@ -532,6 +546,8 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     }
 #endif
     if (!net_active()) return true;
+    // 0.1.146: the host builds the node from the cats it holds -- one that arrived since the last map tick (another player's gained cat) is taken first
+    if (!g.is_client) catsync_apply_pending("the host is about to enter a node");
 
     // --- the client: swallow it ------------------------------------------
     //
@@ -730,6 +746,7 @@ bool follow_current_node(uint32_t& index) {
 // CHOICE, so the lock would only buy a lock-ordering hazard against the module
 // that wants the value. See remember_node for the other half of that argument.
 uint64_t follow_here_seed() { return g.have_here ? g.here_seed : 0; }
+bool follow_host_ahead() { return g.pending_count != 0; }
 uint32_t follow_here_type() { return g.have_here ? g.here_type : 0; }
 
 // --- where the run is standing, read from the GAME rather than remembered ----
@@ -819,6 +836,41 @@ bool follow_arrived_unentered(void* map, uint32_t& index) {
     index = at;
     return true;
 }
+
+void follow_test_set_instant_walk_ms(uint64_t ms) { s_instant_walk_ms = ms; }
+
+// A NODE THE PARTY STANDS ON, NEVER ENTERED, IN A RUN PLAYED ALONE (0.1.126; the final boss, room ZK9F). The host's click on the node after the boss was HELD (the checkpoint barrier: the other player had left), the
+// party walked there anyway, and the save kept it standing on a node that was never entered. A run the mod started (its cats are session clones) is then dead in single player too: the game's own click on the
+// node the party stands on only clears the selection, and nothing else leads on. The recovery the room has for the host (follow_arrived_unentered) is gated on a live room; this is the same test for a peer that is
+// alone: the party stands still on an unconsumed playable node, the map is ready, nothing is selected, and it has stayed so for kSoloRecoverMs -- the game's own EnterNode is then run for it, once.
+static uint64_t s_solo_recover_ms = 1500;
+struct SoloStrand { void* map = nullptr; void* node = nullptr; uint64_t seed = 0; ULONGLONG since = 0; bool done = false; };
+static SoloStrand s_solo;
+static void* follow_solo_stranded(void* map_screen) {
+    if (net_active() || !map_screen || g.faulted) { s_solo = SoloStrand{}; return nullptr; }
+    void *marker = nullptr, *at = nullptr, *moving = nullptr, *selected = nullptr;
+    if (!follow_marker(map_screen, marker, at, moving, selected) || !at || moving || (selected && selected != at)) { s_solo = SoloStrand{}; return nullptr; }
+    uint32_t idx = 0;
+    if (!index_of_node(map_screen, at, idx)) { s_solo = SoloStrand{}; return nullptr; }
+    const uint32_t type = node_type(at);
+    uint8_t consumed = 1;
+    if (type < 3 || type > 16 || !mem_read((const uint8_t*)at + kNode_Consumed, &consumed, 1) || consumed) { s_solo = SoloStrand{}; return nullptr; }
+    const uint64_t seed = node_seed0(at);
+    const ULONGLONG now = GetTickCount64();
+    if (s_solo.map != map_screen || s_solo.node != at || s_solo.seed != seed) { s_solo = SoloStrand{ map_screen, at, seed, now, false }; return nullptr; }
+    if (s_solo.done || now - s_solo.since < s_solo_recover_ms) return nullptr;
+    // only a run the mod made: its party holds session clones (0x70.. / 0x71.. ids); a run of the plain game is not touched
+    uint64_t ids[32] = {};
+    const uint32_t n = catsync_run_cat_list(ids, 32);
+    bool session = false;
+    for (uint32_t i = 0; i < n; ++i) if (ids[i] >= 0x70000000ull && ids[i] < 0x80000000ull) session = true;
+    if (!session) return nullptr;
+    s_solo.done = true;
+    log_line_lvl(LogLevel::Warn, "FOLLOW", "recovering a node this party stands on and never entered, alone: node %u (%s), seed=%016llX -- the game's own entry is run for it now", idx, node_type_name(type), (unsigned long long)seed);
+    return at;
+}
+
+void follow_test_set_solo_recover_ms(uint64_t ms) { s_solo_recover_ms = ms; s_solo = SoloStrand{}; }
 
 void follow_request_jump(uint32_t index) {
     if (!config().dev_tools) return;                   // developer tool: edits the run
@@ -961,6 +1013,7 @@ void follow_on_message(const EnterNodeMsg& m) {
     // either way.
     p.at    = GetTickCount64();
     p.held  = false;
+    p.walking = p.walk_marked = false; p.walk_at = 0;
     log_line("FOLLOW", "<- host entered node %u/%u (%s) seed0=%016llx%s",
              m.index, m.node_count, node_type_name(m.type),
              (unsigned long long)m.seed0,
@@ -1201,6 +1254,105 @@ static unsigned cascade_consume_empty_neighbours(void* node, unsigned depth) {
     return marked;
 }
 
+// A PARTY LEFT A NODE BEHIND (0.1.141; room F499, and the alley food box before it). The party marker stands on a node from which NOTHING unfinished can
+// be walked to, while a node next to it is done -- the party should be standing there: its walk there never happened (a client entered the node ahead of its
+// icon, an own event, a selection the game dropped). The game has no way out of it: a done node cannot be clicked, the node after it is not next to the party,
+// and every later save keeps the party there, so the run is stuck in single player too. Here, on the map, standing still for a moment: when the game's own
+// walk test (C_MapNodeBlocked) finds no unfinished node reachable from where the party stands, the done neighbours are tried -- each by putting the marker
+// on it for the test and back -- and the party is put on the one that leads on, the one furthest along the map (from the start node towards the boss) and
+// ahead of where it stands. Not on a client in a room: there the host's party node decides (align_party_marker). Once per standing.
+namespace {
+struct Unstick { void* map = nullptr; void* at = nullptr; ULONGLONG since = 0; bool looked = false; } s_unstick;
+constexpr ULONGLONG kUnstickMs = 1500;
+using fn_node_blocked = bool(__fastcall*)(void* marker, void* node);
+
+// The map's direction: from its start node towards its boss, in the map layer; false when it does not read (then nothing is moved).
+struct MapDir { float sx = 0, sy = 0, dx = 0, dy = 0; };
+bool map_direction(void* map, MapDir& d) {
+    float sx = 0, sy = 0, bx = 0, by = 0;
+    bool have_s = false, have_b = false;
+    uint32_t count = 0; void* data = nullptr;
+    if (!read_nodes(map, count, data)) return false;
+    for (uint32_t i = 0; i < count && i < 64; ++i) {
+        void* node = node_at(map, i);
+        const uint32_t t = node_type(node);
+        if (!have_s && t == 2) have_s = mapvote_node_world(node, sx, sy);
+        if (!have_b && t == 8) have_b = mapvote_node_world(node, bx, by);
+    }
+    if (!have_s || !have_b || (bx - sx) * (bx - sx) + (by - sy) * (by - sy) < 1.0f) return false;
+    d.sx = sx; d.sy = sy; d.dx = bx - sx; d.dy = by - sy;
+    return true;
+}
+// How far `to` lies ahead of `from` along the map's direction (> 0: ahead); -1e30 when a position does not read.
+float ahead_of(const MapDir& d, void* from, void* to) {
+    float fx = 0, fy = 0, tx = 0, ty = 0;
+    if (!mapvote_node_world(from, fx, fy) || !mapvote_node_world(to, tx, ty)) return -1e30f;
+    return (tx - fx) * d.dx + (ty - fy) * d.dy;
+}
+// The unfinished nodes linked to `from` and ahead of it that the game would let the party walk to from there (the marker stands on `from` for the test).
+uint32_t leads_on(void* marker, void* from, const MapDir& d, fn_node_blocked blocked) {
+    uint32_t links = 0; uintptr_t ldata = 0;
+    if (!mem_read((const uint8_t*)from + kNode_LinkCount, &links, sizeof(links)) || !mem_read((const uint8_t*)from + kNode_LinkData, &ldata, sizeof(ldata)) || !ldata || links > 64) return 0;
+    void* was = nullptr;
+    if (!mem_read((const uint8_t*)marker + kMarker_AtNode, &was, sizeof(was))) return 0;
+    if (from != was && !mem_write((uint8_t*)marker + kMarker_AtNode, &from, sizeof(from))) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < links; ++i) {
+        void* next = nullptr;
+        if (!mem_read((const void*)(ldata + i * sizeof(void*)), &next, sizeof(next)) || !next || next == from) continue;
+        if (node_type(next) <= 2) continue;                                   // none / ?1 / the chapter's start
+        uint8_t consumed = 1;
+        if (!mem_read((const uint8_t*)next + kNode_Consumed, &consumed, 1) || consumed) continue;
+        if (ahead_of(d, from, next) <= 0) continue;
+        bool b = false;
+        if (blocked) { __try { b = blocked(marker, next); } __except (EXCEPTION_EXECUTE_HANDLER) { b = false; } }
+        if (!b) ++n;
+    }
+    if (from != was) mem_write((uint8_t*)marker + kMarker_AtNode, &was, sizeof(was));
+    return n;
+}
+} // namespace
+
+static void follow_unstick_marker(void* map) {
+    if (!map || g.faulted || (net_active() && g.is_client)) { s_unstick = Unstick{}; return; }
+    void *marker = nullptr, *at = nullptr, *moving = nullptr, *selected = nullptr;
+    if (!follow_marker(map, marker, at, moving, selected) || !marker || !at || moving || selected) { s_unstick = Unstick{}; return; }
+    const ULONGLONG now = GetTickCount64();
+    if (s_unstick.map != map || s_unstick.at != at) { s_unstick = Unstick{ map, at, now, false }; return; }
+    if (s_unstick.looked || now - s_unstick.since < kUnstickMs) return;
+    s_unstick.looked = true;
+    uint8_t at_done = 0;
+    if (!mem_read((const uint8_t*)at + kNode_Consumed, &at_done, 1) || !at_done) return;   // standing on an unfinished node: follow_solo_stranded's case
+    uint32_t at_idx = 0;
+    if (!index_of_node(map, at, at_idx)) return;
+    MapDir d;
+    if (!map_direction(map, d)) return;                                       // no direction: nothing is judged
+    const fn_node_blocked blocked = (fn_node_blocked)addr_of_call(C_MapNodeBlocked);   // closed areas only; null = not used
+    if (leads_on(marker, at, d, blocked)) return;                             // something ahead can be walked to: not stuck
+    uint32_t links = 0; uintptr_t ldata = 0;
+    if (!mem_read((const uint8_t*)at + kNode_LinkCount, &links, sizeof(links)) || !mem_read((const uint8_t*)at + kNode_LinkData, &ldata, sizeof(ldata)) || !ldata || links > 64) return;
+    void* best = nullptr; float best_p = 0; uint32_t best_r = 0;
+    for (uint32_t i = 0; i < links; ++i) {
+        void* next = nullptr;
+        if (!mem_read((const void*)(ldata + i * sizeof(void*)), &next, sizeof(next)) || !next || next == at) continue;
+        uint8_t consumed = 0;
+        if (!mem_read((const uint8_t*)next + kNode_Consumed, &consumed, 1) || !consumed) continue;
+        const float p = ahead_of(d, at, next);
+        if (p <= 0) continue;                                                 // behind the party: never walked back to
+        const uint32_t r = leads_on(marker, next, d, blocked);
+        if (!r) continue;
+        if (!best || p > best_p) { best = next; best_p = p; best_r = r; }
+    }
+    uint32_t best_idx = 0;
+    if (!best || !index_of_node(map, best, best_idx)) {
+        log_line_lvl(LogLevel::Warn, "FOLLOW", "!! the party on node %u has no unfinished node ahead of it, and no done node ahead of it leads on -- left as it is (the end of a chapter looks like this)", at_idx);
+        return;
+    }
+    if (!mem_write((uint8_t*)marker + kMarker_AtNode, &best, sizeof(best))) return;
+    log_line_lvl(LogLevel::Warn, "FOLLOW", "!! UNSTUCK: the party stood on node %u with no unfinished node ahead of it, while node %u ahead of it is done -- "
+                 "the party is put on node %u (%u unfinished node(s) ahead from there)%s", at_idx, best_idx, best_idx, best_r, net_active() ? " [host]" : " [alone]");
+}
+
 void follow_mark_node_consumed(void* node) {
     if (!tune::kNodeConsumeMark || !g.on || !g.is_client || !node) return;
 
@@ -1289,6 +1441,25 @@ void follow_move_marker_to(void* node) {
         return;
     }
     if (cur == node) return;                 // already selected; Click would do nothing either
+    void* standing = nullptr;
+    if (mem_read((const uint8_t*)marker + kMarker_AtNode, &standing, sizeof(standing)) && standing == node) return;   // the party is there: selecting its own node only clears the selection
+
+    // THE LAST WALK NEVER HAPPENED (0.1.139, room F499). The previous followed node is still only SELECTED (the marker never set off: this player was on
+    // its own event there while the host went on), and the next one is selected over it now. From the node before, the next node is no walk: the game
+    // clears the selection, the party stays a node behind for good, and every later save keeps it there -- the boss node, reachable only from the last
+    // node, could not be clicked even after a restore. The marker is put on the node it was sent to first, so this walk starts where the party really is.
+    void* moving_now = nullptr;
+    if (cur && cur != standing && mem_read((const uint8_t*)marker + kMarker_MovingTo, &moving_now, sizeof(moving_now)) && !moving_now) {
+        uint32_t cur_idx = 0, at_idx = 0;
+        if (index_of_node(g.map, cur, cur_idx)) {
+            const bool at_known = standing && index_of_node(g.map, standing, at_idx);
+            if (mem_write((uint8_t*)marker + kMarker_AtNode, &cur, sizeof(cur))) {
+                standing = cur;
+                log_line_lvl(LogLevel::Warn, "FOLLOW", "!! marker: the walk to node %u never started (the party still stood on node %d) -- the party is put on node %u before it walks to node %u",
+                             cur_idx, at_known ? (int)at_idx : -1, cur_idx, idx);
+            }
+        }
+    }
 
     if (!mem_write((uint8_t*)marker + kMarker_Selected, &node, sizeof(node))) {
         log_line("FOLLOW", "marker: +0x%X is not writable -- marker not moved",
@@ -1426,6 +1597,7 @@ struct SeedSync {
     MapSeedNode node[kMapSeedsMaxNodes] = {};
     uint32_t applied_epoch = 0;
     void*    applied_map = nullptr;
+    int32_t  party_at = -1;                  // the node the host's party stands on (kFlagPartyHere in its publication), -1 = not said
     void*    reported_map = nullptr;         // the map this client has sent its flags for
     void*    waiting_map = nullptr;
     ULONGLONG waiting_since = 0;
@@ -1438,6 +1610,9 @@ struct SeedSync {
 } ss;
 constexpr ULONGLONG kSeedWaitMs = tune::kSeedWaitMs;
 constexpr uintptr_t kNodeFlagsDword = 0x168;
+// THE HOST'S PARTY NODE RIDES ON THE PUBLICATION (0.1.139, room F499). A bit no MapNode+0x168 dword has (consumed is bit 0, the lock/hidden bytes are
+// +0x169..+0x16B with small values): the host sets it on the node its marker stands on, the client takes it off before anything is compared or written.
+constexpr uint32_t kFlagPartyHere = 0x80000000u;
 
 } // namespace
 
@@ -1460,7 +1635,7 @@ void follow_on_mapseeds(uint8_t from, const MapSeedsMsg& m) {
     }
     if (from != kHostPeer || m.kind != kMapSeedsFromHost) return;
     if (m.epoch != ss.epoch) {                            // a new publication replaces the old one
-        ss.epoch = m.epoch; ss.total = m.total; ss.got = 0;
+        ss.epoch = m.epoch; ss.total = m.total; ss.got = 0; ss.party_at = -1;
         memset(ss.have, 0, sizeof(ss.have));
     }
     if (m.total != ss.total) return;
@@ -1469,6 +1644,7 @@ void follow_on_mapseeds(uint8_t from, const MapSeedsMsg& m) {
         if (at >= kMapSeedsMaxNodes) return;
         if (!ss.have[at]) { ss.have[at] = true; ++ss.got; }
         ss.node[at] = m.nodes[i];
+        if (ss.node[at].flags & kFlagPartyHere) { ss.party_at = (int32_t)at; ss.node[at].flags &= ~kFlagPartyHere; }
     }
 }
 
@@ -1476,8 +1652,19 @@ namespace {
 
 bool read_flags(void* node, uint32_t& v) { return node && mem_read((const uint8_t*)node + kNodeFlagsDword, &v, sizeof(v)); }
 
+// The node this map's party marker stands on, while it stands (not walking, no other node selected); nullptr otherwise.
+void* marker_standing(void* map) {
+    void *marker = nullptr, *at = nullptr, *moving = nullptr, *selected = nullptr;
+    if (!map || !mem_read((const uint8_t*)map + kMap_Marker, &marker, sizeof(marker)) || !marker ||
+        !mem_read((const uint8_t*)marker + kMarker_AtNode, &at, sizeof(at)) || !at ||
+        !mem_read((const uint8_t*)marker + kMarker_MovingTo, &moving, sizeof(moving)) || moving ||
+        !mem_read((const uint8_t*)marker + kMarker_Selected, &selected, sizeof(selected)) || (selected && selected != at)) return nullptr;
+    return at;
+}
+
 // Sends this map's per-node data in chunks. `seeds` false: only types and flags (a client's report).
 bool send_map(void* map, uint32_t count, uint8_t kind, uint32_t epoch, const uint32_t* flags_override) {
+    void* party = kind == kMapSeedsFromHost ? marker_standing(map) : nullptr;
     for (uint32_t first = 0; first < count; first += kMapSeedsChunk) {
         MapSeedsMsg m{};
         m.kind = kind; m.epoch = epoch; m.total = count; m.first = first;
@@ -1489,10 +1676,38 @@ bool send_map(void* map, uint32_t count, uint8_t kind, uint32_t epoch, const uin
             if (kind == kMapSeedsFromHost && !mem_read((const uint8_t*)node + kNode_Seed, m.nodes[i].seed, sizeof(m.nodes[i].seed))) return false;
             m.nodes[i].type = (uint8_t)node_type(node);
             m.nodes[i].flags = flags_override ? flags_override[first + i] : fl;
+            if (party && node == party) m.nodes[i].flags |= kFlagPartyHere;
         }
         if (!net_send_mapseeds(m)) return false;
     }
     return true;
+}
+
+// THE CLIENT'S PARTY MARKER STANDS WHERE THE HOST'S DOES (0.1.139, room F499). A client enters a node the host entered at once (follow) and only
+// SELECTS it on its marker; the icon walks there when the map runs again. A save taken in between -- the checkpoint is staged the moment the map is
+// back, right after a node -- keeps the party on the node BEFORE. Restored, the client's game had the party one node behind: the boss node, reachable
+// only from the last node, was not clickable at all (no click reached the vote), while the host's could be clicked. Here, after the host's map is
+// adopted: a marker standing elsewhere is sent there -- walked, the game's own way, when it can walk there; put there when it cannot.
+void align_party_marker(void* map, int32_t want_idx) {
+    if (want_idx < 0) return;
+    void* want = node_at(map, (uint32_t)want_idx);
+    void *marker = nullptr, *at = nullptr, *moving = nullptr, *selected = nullptr;
+    if (!want || !mem_read((const uint8_t*)map + kMap_Marker, &marker, sizeof(marker)) || !marker ||
+        !mem_read((const uint8_t*)marker + kMarker_AtNode, &at, sizeof(at)) ||
+        !mem_read((const uint8_t*)marker + kMarker_MovingTo, &moving, sizeof(moving)) ||
+        !mem_read((const uint8_t*)marker + kMarker_Selected, &selected, sizeof(selected))) return;
+    if (at == want || moving == want) return;                               // there, or walking there
+    if (moving) return;                                                     // walking somewhere else: the next publication looks again
+    uint32_t at_idx = 0xFFFFFFFFu;
+    if (at) index_of_node(map, at, at_idx);
+    // PUT THERE, NOT WALKED (0.1.142, room L37K). 0.1.139 selected the node when C_MapNodeBlocked said it could be walked to -- but that test does not
+    // look at where the party stands, and the game never walks to a done node: the selection was dropped, the party stayed a node behind and the boss
+    // could not be clicked, the same as before. A pending selection of it is no better (it is what stranded F499). The marker is put on the node.
+    void* none = nullptr;
+    mem_write((uint8_t*)marker + kMarker_AtNode, &want, sizeof(want));
+    mem_write((uint8_t*)marker + kMarker_Selected, &none, sizeof(none));
+    log_line_lvl(LogLevel::Warn, "FOLLOW", "!! the party marker stood on node %d here%s, the host's party on node %d -- the marker is put on it",
+                 at_idx == 0xFFFFFFFFu ? -1 : (int)at_idx, selected == want ? " (that node only selected, never walked to)" : "", want_idx);
 }
 
 // True when this map may be reported to the checkpoint now.
@@ -1558,6 +1773,7 @@ bool map_seed_sync(void* map) {
         }
         log_line_lvl(LogLevel::Warn, "FOLLOW", "ADOPTED the host's map: %u of %u node seed(s) and %u node flag word(s) were overwritten "
                                               "(same node count and types) -- the maps now agree", seeds_changed, count, flags_changed);
+        align_party_marker(map, ss.party_at);
         return true;
     }
     // The host's seeds have not (all) arrived: wait for them, a few seconds at most.
@@ -1608,6 +1824,8 @@ void* follow_map_update(void* map_screen) {
     // and never during a battle.
     roster_tick();
     catsync_leave_tick();                  // after a room was left: the other players' cats go, here between nodes (no session needed)
+    if (void* stranded = follow_solo_stranded(map_screen)) return stranded;     // 0.1.126: a node the party stands on and never entered, in a run played alone
+    follow_unstick_marker(map_screen);                                          // 0.1.141: a party left a node behind (solo, or the host)
 
     if (g.on) roster_party_swap_on_map();
     roster_party_tick();
@@ -1853,6 +2071,33 @@ void* follow_map_update(void* map_screen) {
         log_line("FOLLOW", "!! node %u is '%s' here but '%s' on the host --"
                            " entering anyway, the seed matched",
                  p.index, node_type_name(type), node_type_name(p.type));
+
+    // AN INSTANT NODE IS ENTERED WHEN THE PARTY HAS ARRIVED, as the host's is (0.1.120; see kNodeType_FoodBox). Until then the entry stays queued: the marker is sent to the node (the game walks
+    // it), and the node's consumed byte is set so that the arrival does not call EnterNode on its own. Whatever the marker does not read as (no marker, no arrival within the time), the old
+    // behaviour -- enter at once -- is what happens, so this can only delay, never lose, an entry.
+    if (g.is_client && (type == kNodeType_FurnitureBox || type == kNodeType_FoodBox)) {
+        void *marker = nullptr, *at = nullptr, *moving = nullptr, *sel = nullptr;
+        const bool read = follow_marker(map_screen, marker, at, moving, sel);
+        const bool arrived = read && at == node && !moving;
+        if (read && !arrived) {
+            const uint64_t now = GetTickCount64();
+            if (!p.walking) {
+                p.walking = true; p.walk_at = now;
+                uint8_t consumed = 1;
+                if (!follow_node_consumed(node) && mem_write((uint8_t*)node + kNode_Consumed, &consumed, 1)) p.walk_marked = true;
+                follow_move_marker_to(node);
+                log_line("FOLLOW", "node %u (%s) is an instant node: the party walks there first and the node is entered when it has arrived (the game finishes it for the node the party stands on)",
+                         p.index, node_type_name(type));
+            }
+            if (now - p.walk_at < s_instant_walk_ms) return nullptr;
+            log_line_lvl(LogLevel::Warn, "FOLLOW", "!! node %u (%s): the party has not arrived after %llu ms -- entering it now", p.index, node_type_name(type), (unsigned long long)(now - p.walk_at));
+        }
+        if (p.walking) {
+            if (p.walk_marked) { const uint8_t zero = 0; mem_write((uint8_t*)node + kNode_Consumed, &zero, 1); p.walk_marked = false; }   // EnterNode runs as it always did: the finish consumes the node
+            if (arrived) log_line("FOLLOW", "node %u (%s): the party has arrived after %llu ms -- entering it", p.index, node_type_name(type), (unsigned long long)(GetTickCount64() - p.walk_at));
+            p.walking = false;
+        }
+    }
 
     const uint32_t entering = p.index;
 

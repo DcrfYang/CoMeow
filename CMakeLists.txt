@@ -76,6 +76,7 @@ add_library(mgmp SHARED
     src/session/mgmp_checkpoint_io.cpp
     src/session/mgmp_setup.cpp
     src/session/mgmp_unlocks.cpp
+    src/session/mgmp_progressguard.cpp
     src/session/mgmp_diag.cpp
     src/session/mgmp_storage_diag.cpp
     src/session/mgmp_draw.cpp
@@ -86,13 +87,18 @@ add_library(mgmp SHARED
     src/session/mgmp_perf.cpp
     src/session/mgmp_souljar.cpp
     src/session/mgmp_gains.cpp
+    src/session/mgmp_teamlist.cpp
     src/session/mgmp_mapvote.cpp
     src/determinism/mgmp_dmgfence.cpp
     src/session/mgmp_chat.cpp
+    src/session/mgmp_urgent.cpp
     src/session/mgmp_emote.cpp
     src/session/mgmp_leave.cpp
     src/session/mgmp_listprobe.cpp
     src/session/mgmp_spawntest.cpp
+    src/session/mgmp_unitprobe.cpp
+    src/session/mgmp_unitstate.cpp
+    src/ui/mgmp_imeui.cpp
     src/session/mgmp_catsync.cpp
     src/session/mgmp_invsync.cpp
     src/session/mgmp_runhist.cpp
@@ -108,6 +114,7 @@ add_library(mgmp SHARED
     src/core/mgmp_savemirror.cpp
     src/ui/mgmp_uitest.cpp
     src/session/mgmp_saveslots.cpp
+    src/session/mgmp_sqlite.c
     # Dear ImGui, compiled straight into mgmp.dll -- same rule as minhook and
     # stb_image: the payload runs inside the game's process and cannot pull in
     # a second DLL that would have to be shipped and found beside it.
@@ -145,7 +152,7 @@ target_include_directories(mgmp PRIVATE
     # their directory prefix so this one entry covers both.
     third_party/imgui
 )
-target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32)
+target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32 winmm)
 
 add_executable(mgmp_loader loader/mgmp_loader.cpp res/mgmp_loader.rc)
 target_compile_definitions(mgmp_loader PRIVATE _CRT_SECURE_NO_WARNINGS)

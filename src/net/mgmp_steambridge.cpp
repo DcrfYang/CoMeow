@@ -2,6 +2,7 @@
 
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <string>
 
 #include <cstdio>
 #include <cstring>
@@ -89,6 +90,15 @@ bool resolve_all() {
 constexpr int kStateConnecting = 1, kStateConnected = 3, kStateClosedByPeer = 4, kStateProblem = 5;
 constexpr int kSendReliableNoNagle = 8 | 1;          // k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_NoNagle
 constexpr int kCfgCallbackStatusChanged = 201;
+// A LINK IS WAITED FOR, NOT CLOSED (0.1.184; 2026-11-04 room 5TMX: "Timeout; remote problem. Rx age server 10.9s" on BOTH ends -- the relay route between them
+// failed for ten seconds and Steam's default TimeoutConnected (10 s) ended the run). The user's rule: when the other end cannot be reached, wait for it. A
+// connection now gives up only after a day of silence, and its send buffer holds a long outage's worth of messages (the pump also keeps a refused chunk).
+constexpr int kCfgTimeoutConnected = 25;             // k_ESteamNetworkingConfig_TimeoutConnected (ms)
+constexpr int kCfgSendBufferSize   = 9;              // k_ESteamNetworkingConfig_SendBufferSize (bytes)
+constexpr int kCfgInt32            = 1;              // k_ESteamNetworkingConfig_Int32
+constexpr int kWaitTimeoutMs       = 24 * 3600 * 1000;
+constexpr int kSendBufferBytes     = 32 * 1024 * 1024;
+constexpr int kCfgCount            = 3;              // the callback, the timeout, the send buffer
 constexpr int kVirtualPort = 27;                     // our own; mgmp_steamtest uses 0
 constexpr int kVirtualPortRev = 28;                  // the joiner's listen port for a host-initiated (reverse) call
 constexpr ULONGLONG kOutDialMs = 20000;
@@ -106,6 +116,8 @@ struct Entry {
     bool     closing = false;
     bool     rev_in = false;    // the joiner side of a host-initiated (reverse) call
     bool     out = false;       // the host side of a host-initiated call
+    std::string pend;           // bytes Steam refused (its send buffer full): sent before anything more is read from TCP (0.1.184)
+    ULONGLONG   pend_since = 0;
 };
 Entry g_e[kMaxEntries];
 
@@ -149,7 +161,27 @@ volatile LONG g_want_listen = 0;
 volatile LONG g_game_port = 0;
 uint32_t g_listen_h = 0;
 uint64_t g_me = 0;
-unsigned char g_cfg[32];
+alignas(8) unsigned char g_cfg[16 * kCfgCount];       // SteamNetworkingConfigValue_t[kCfgCount]: {int32 value, int32 type, 8-byte union}
+
+// With the waiting options; a Steam that refuses them (an invalid handle back) gets the callback alone -- the old behaviour, never no connection at all.
+uint32_t connect_opts(const void* ident, int port) {
+    uint32_t h = A.connect(A.sockets, ident, port, kCfgCount, g_cfg);
+    if (!h) { log_line("STEAMNET", "!! Steam refused the waiting options for a call -- calling with its default timeout"); h = A.connect(A.sockets, ident, port, 1, g_cfg); }
+    return h;
+}
+uint32_t listen_opts(int port) {
+    uint32_t h = A.listen(A.sockets, port, kCfgCount, g_cfg);
+    if (!h) { log_line("STEAMNET", "!! Steam refused the waiting options for a listen socket -- listening with its default timeout"); h = A.listen(A.sockets, port, 1, g_cfg); }
+    return h;
+}
+
+void cfg_int32(int slot, int value, int v) {
+    unsigned char* e = g_cfg + 16 * slot;
+    memset(e, 0, 16);
+    memcpy(e, &value, 4);
+    const int type = kCfgInt32; memcpy(e + 4, &type, 4);
+    memcpy(e + 8, &v, 4);
+}
 
 SOCKET make_nodelay(SOCKET s) {
     BOOL on = TRUE;
@@ -297,13 +329,30 @@ void pump_entry(int i) {
     }
 }
 
+// A chunk Steam refused with 25 (k_EResultLimitExceeded: its send buffer is full -- a big transfer, or a peer that cannot be reached and acknowledges nothing).
+// It is kept and sent before this entry's TCP is read again: the game's link writer then waits on a full loopback socket, and nothing is lost or closed.
+// Until 0.1.184 the pump waited one second and then closed the link.
+bool flush_pend(Entry& e) {
+    if (e.pend.empty()) return true;
+    const int res = A.send(A.sockets, e.h, e.pend.data(), (uint32_t)e.pend.size(), kSendReliableNoNagle, nullptr);
+    if (res == 25) return false;
+    if (res != 1) { log_line("STEAMNET", "!! send on connection %u failed (%d)", e.h, res); e.closing = true; return false; }
+    if (GetTickCount64() - e.pend_since > 2000) log_line("STEAMNET", "connection %u: Steam takes messages again after %llu ms with its send buffer full", e.h, (unsigned long long)(GetTickCount64() - e.pend_since));
+    e.pend.clear();
+    return true;
+}
+
 // TCP -> Steam for every entry that has bytes waiting.
 void pump_tcp() {
     fd_set rd;
     FD_ZERO(&rd);
     int n = 0;
-    for (int i = 0; i < kMaxEntries; ++i)
-        if (g_e[i].used && g_e[i].connected && !g_e[i].closing && g_e[i].s != INVALID_SOCKET) { FD_SET(g_e[i].s, &rd); ++n; }
+    for (int i = 0; i < kMaxEntries; ++i) {
+        Entry& e = g_e[i];
+        if (!e.used || !e.connected || e.closing || e.s == INVALID_SOCKET) continue;
+        if (!flush_pend(e)) continue;                    // still refused: this entry's TCP is not read until it goes
+        FD_SET(e.s, &rd); ++n;
+    }
     if (!n) { Sleep(4); return; }
     timeval tv{ 0, 4000 };
     if (select(0, &rd, nullptr, nullptr, &tv) <= 0) return;
@@ -313,12 +362,14 @@ void pump_tcp() {
         if (!e.used || e.s == INVALID_SOCKET || !FD_ISSET(e.s, &rd)) continue;
         const int r = recv(e.s, buf, sizeof(buf), 0);
         if (r <= 0) { e.closing = true; continue; }
-        // 25 = k_EResultLimitExceeded: Steam's send buffer is full for a moment (a big transfer). Wait for it rather than lose bytes.
-        int res = A.send(A.sockets, e.h, buf, (uint32_t)r, kSendReliableNoNagle, nullptr);
-        for (int tries = 0; res == 25 && tries < 500; ++tries) {
-            Sleep(2);
-            A.run_callbacks(A.sockets);
-            res = A.send(A.sockets, e.h, buf, (uint32_t)r, kSendReliableNoNagle, nullptr);
+        // 25 = k_EResultLimitExceeded: Steam's send buffer is full. The chunk is kept (see flush_pend) -- never dropped, the link never closed for it.
+        const int res = A.send(A.sockets, e.h, buf, (uint32_t)r, kSendReliableNoNagle, nullptr);
+        if (res == 25) {
+            e.pend.assign(buf, (size_t)r);
+            e.pend_since = GetTickCount64();
+            static ULONGLONG said = 0;
+            if (GetTickCount64() - said > 10000) { said = GetTickCount64(); log_line("STEAMNET", "connection %u: Steam's send buffer is full (the other end acknowledges nothing) -- holding the messages and waiting", e.h); }
+            continue;
         }
         if (res != 1) { log_line("STEAMNET", "!! send on connection %u failed (%d)", e.h, res); e.closing = true; }
     }
@@ -339,7 +390,7 @@ void handle_dial_request() {
         if (slot < 0 || !loopback_pair(a, b)) { g_req.why = 3; InterlockedExchange(&g_req.state, 4); return; }
         alignas(8) unsigned char ident[256] = {};
         A.set_id64(ident, g_req.id);
-        const uint32_t h = A.connect(A.sockets, ident, kVirtualPort, 1, g_cfg);
+        const uint32_t h = connect_opts(ident, kVirtualPort);
         if (!h) { closesocket(a); closesocket(b); g_req.why = 3; InterlockedExchange(&g_req.state, 4); return; }
         g_e[slot].used = true; g_e[slot].h = h; g_e[slot].s = b; g_e[slot].dial = true;
         g_req.entry = slot; g_req.caller_end = a;
@@ -464,7 +515,7 @@ void handle_out() {
         if (local == INVALID_SOCKET) { log_line("STEAMNET", "!! the host-initiated call: the game's own port %u did not answer", (unsigned)port); InterlockedExchange(&g_out.state, 0); return; }
         alignas(8) unsigned char ident[256] = {};
         A.set_id64(ident, g_out.id);
-        const uint32_t h = A.connect(A.sockets, ident, kVirtualPortRev, 1, g_cfg);
+        const uint32_t h = connect_opts(ident, kVirtualPortRev);
         if (!h) { closesocket(local); InterlockedExchange(&g_out.state, 0); return; }
         g_e[slot].used = true; g_e[slot].h = h; g_e[slot].s = local; g_e[slot].out = true;
         g_out.entry = slot; g_out.since = GetTickCount64();
@@ -490,6 +541,8 @@ DWORD WINAPI worker(LPVOID) {
     A.relay_init(A.utils);
     memset(g_cfg, 0, sizeof(g_cfg));
     A.cfg_setptr(g_cfg, kCfgCallbackStatusChanged, (void*)&on_status);
+    cfg_int32(1, kCfgTimeoutConnected, kWaitTimeoutMs);
+    cfg_int32(2, kCfgSendBufferSize, kSendBufferBytes);
     InterlockedExchange(&g_ready, 1);
     log_line("STEAMNET", "Steam networking is ready: this account is %llu", (unsigned long long)g_me);
 
@@ -497,7 +550,7 @@ DWORD WINAPI worker(LPVOID) {
         // listen socket follows the host_start / host_stop wishes
         const bool want = InterlockedCompareExchange(&g_want_listen, 0, 0) != 0;
         if (want && !g_listen_h) {
-            g_listen_h = A.listen(A.sockets, kVirtualPort, 1, g_cfg);
+            g_listen_h = listen_opts(kVirtualPort);
             log_line("STEAMNET", "listening for Steam peers on virtual port %d (handle %u) -- status: %s", kVirtualPort, g_listen_h, g_status_line);
         } else if (!want && g_listen_h) {
             A.close_listen(A.sockets, g_listen_h);
@@ -508,7 +561,7 @@ DWORD WINAPI worker(LPVOID) {
 
         {   // the joiner's reverse listen socket follows client_listen_start / stop
             const bool want2 = InterlockedCompareExchange(&g_want_listen2, 0, 0) != 0;
-            if (want2 && !g_listen2_h) { g_listen2_h = A.listen(A.sockets, kVirtualPortRev, 1, g_cfg); log_line("STEAMNET", "listening for the host's call on virtual port %d (handle %u)", kVirtualPortRev, g_listen2_h); }
+            if (want2 && !g_listen2_h) { g_listen2_h = listen_opts(kVirtualPortRev); log_line("STEAMNET", "listening for the host's call on virtual port %d (handle %u)", kVirtualPortRev, g_listen2_h); }
             else if (!want2 && g_listen2_h) { A.close_listen(A.sockets, g_listen2_h); g_listen2_h = 0; log_line("STEAMNET", "no longer listening for the host's call"); }
         }
         A.run_callbacks(A.sockets);

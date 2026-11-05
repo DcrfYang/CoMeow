@@ -27,6 +27,7 @@
 #include "mgmp_resolve.h"     // addr_of_call: TempHideMouseCursor (the drawing board's pointer)
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
+#include "mgmp_server_addr.h"   // is_official_server: the relay warning
 #include "mgmp_net.h"
 #include "mgmp_saveslots.h"
 #include "mgmp_roomhist.h"
@@ -37,6 +38,8 @@
 #include "mgmp_page.h"
 #include "mgmp_perf.h"       // the room panel's latency line
 #include "mgmp_mapvote.h"     // the players' picks of the next map node
+#include "mgmp_gametext.h"    // the game's own text (class names)
+#include "mgmp_voice.h"       // voice chat: the room panel's microphone and sound buttons
 #include "mgmp_follow.h"      // follow_on_map: the paws only while the map ticks
 #include "mgmp_abandon.h"
 #include "mgmp_room.h"
@@ -50,6 +53,7 @@
 #include "mgmp_upnp.h"
 #include "mgmp_steambridge.h"
 #include "mgmp_logupload.h"
+#include "mgmp_urgent.h"      // 0.1.186: the server's urgent fix notice
 #include "mgmp_prevrun.h"
 #include "mgmp_treasure.h"
 #include "mgmp_housecoop.h"
@@ -251,7 +255,7 @@ struct Menu {
     float panel_h     = 520;          // its height on the stage, learned from the last frame
     float panel_t     = 0;            // 0 folded .. 1 out
     double joined_at  = 0;
-    SignalRoom rooms[32];
+    SignalRoom rooms[kSignalMaxRooms];
     SignalPeer peers[8];
 
     // --- the lobby: the room list and, on a page of its own, the form that creates a room ---
@@ -483,6 +487,21 @@ bool overlay_window_begin(const char* id, ImVec2 pos, ImVec2 size, bool focus = 
     return open;
 }
 
+// THE CARET AND THE BOX BEING TYPED IN (0.1.162, a player's suggestion: "a blinking cursor showing which box I am typing in"). ImGui draws a blinking caret in
+// ImGuiCol_InputTextCursor, which the style (StyleColorsDark) sets to its WHITE text colour, 1 px wide -- on the cream paper of these boxes it was invisible. The
+// boxes now push an ink-coloured caret, thicker with the font, and the box that has the keyboard gets a green outline. Blinking is ImGui's own (io.DeltaTime).
+struct PaperCaret {
+    float saved;
+    explicit PaperCaret(float font) : saved(ImGui::GetStyle().InputTextCursorSize) {
+        ImGui::GetStyle().InputTextCursorSize = font * 0.07f > 2.0f ? font * 0.07f : 2.0f;
+        ImGui::PushStyleColor(ImGuiCol_InputTextCursor, ImVec4(0.12f, 0.12f, 0.11f, 1.0f));
+    }
+    ~PaperCaret() { ImGui::PopStyleColor(); ImGui::GetStyle().InputTextCursorSize = saved; }
+};
+void paper_focus_outline(ImVec2 a, ImVec2 b) {
+    ImGui::GetWindowDrawList()->AddRect(ImVec2(a.x - 2.0f, a.y - 2.0f), ImVec2(b.x + 2.0f, b.y + 2.0f), kGreen, 3.0f, 0, 3.0f);
+}
+
 // InputText in paper colours.
 bool paper_input(const char* id, ImVec2 a, ImVec2 b, char* buf, size_t cap, const char* hint, float font,
                  ImGuiInputTextFlags flags = 0) {
@@ -498,7 +517,12 @@ bool paper_input(const char* id, ImVec2 a, ImVec2 b, char* buf, size_t cap, cons
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, pad > 1 ? pad : 1));
     ImGui::PushFont(g.font ? g.font : ImGui::GetFont(), font);
     ImGui::SetNextItemWidth(b.x - a.x);
-    const bool changed = ImGui::InputTextWithHint(id, hint, buf, cap, flags);
+    bool changed = false;
+    {
+        PaperCaret caret(font);
+        changed = ImGui::InputTextWithHint(id, hint, buf, cap, flags);
+    }
+    if (ImGui::IsItemActive()) paper_focus_outline(a, ImVec2(b.x, ImGui::GetItemRectMax().y));
     if (ImGui::IsItemHovered() || ImGui::IsItemActive()) g.hovering_button = true;
     ImGui::PopFont();
     ImGui::PopStyleVar(3);
@@ -589,8 +613,13 @@ bool paper_multiline(const char* id, ImVec2 a, ImVec2 b, char* buf, size_t cap, 
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
     ImGui::PushFont(g.font ? g.font : ImGui::GetFont(), font);
-    const bool changed = ImGui::InputTextMultiline(id, buf, cap, ImVec2(b.x - a.x, b.y - a.y), ImGuiInputTextFlags_None);
+    bool changed = false;
+    {
+        PaperCaret caret(font);
+        changed = ImGui::InputTextMultiline(id, buf, cap, ImVec2(b.x - a.x, b.y - a.y), ImGuiInputTextFlags_None);
+    }
     const bool active = ImGui::IsItemActive();
+    if (active) paper_focus_outline(a, b);
     if (ImGui::IsItemHovered() || active) g.hovering_button = true;
     if (!buf[0] && !active)
         wrap_text(ImGui::GetWindowDrawList(), a.x + 12.0f, a.y + 9.0f, (b.x - a.x) - 24.0f, font * 0.85f, font * 1.15f,
@@ -997,7 +1026,7 @@ void draw_create_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H,
         else             _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%s", tr(Tx::TR_RELAY));
         if (paper_button("tr_relay", ImVec2(X(630), Y(y)), ImVec2(X(W - 50), Y(y + 52)), lbl, 22 * k, relay_ok && !busy && !g.relay_warn, eff == 3 ? Tone::Good : Tone::Normal)) {
             // The project's own server is small: say so before the server is chosen as the carrier
-            if (strncmp(signal_server(), "49.233.209.67:", 14) == 0) g.relay_warn = true;
+            if (is_official_server(signal_server())) g.relay_warn = true;
             else g.transport = 3;
         }
         char hint[400] = {};
@@ -1143,17 +1172,17 @@ void draw_multi_window(const View& v) {
 
     const float lx0 = X(50), lx1 = X(W - 50), ly0 = Y(204), ly1 = Y(H - 140);
     rough_rect(dl, ImVec2(lx0, ly0), ImVec2(lx1, ly1), IM_COL32(255, 255, 250, 70), kInk, 2.2f, 91, 1.2f);
-    const uint32_t total = signal_rooms(g.rooms, 32);
+    const uint32_t total = signal_rooms(g.rooms, kSignalMaxRooms);
     // The rows that match the search: open rooms first, locked ones after them (the server sends them that way
     // already; sorting here as well keeps the list right whatever sent it).
     // THE ROOMS JOINED WITHIN A DAY, AND THE ROOMS OF THEIR HOSTS, come first (and are highlighted); inside each group the open rooms are before the locked ones.
-    uint32_t order[32]; bool recent[32] = {}; uint32_t n = 0;
-    for (uint32_t i = 0; i < total && i < 32; ++i) recent[i] = roomhist_recent(g.rooms[i].id, g.rooms[i].host);
+    uint32_t order[kSignalMaxRooms]; bool recent[kSignalMaxRooms] = {}; uint32_t n = 0;
+    for (uint32_t i = 0; i < total && i < kSignalMaxRooms; ++i) recent[i] = roomhist_recent(g.rooms[i].id, g.rooms[i].host);
     // a room whose players have started (locked) comes after every room that can be joined
     for (int lk = 0; lk < 2; ++lk)
     for (int grp = 0; grp < 2; ++grp)
         for (int pass = 0; pass < 2; ++pass)
-            for (uint32_t i = 0; i < total && i < 32; ++i)
+            for (uint32_t i = 0; i < total && i < kSignalMaxRooms; ++i)
                 if (g.rooms[i].locked == (lk == 1) && recent[i] == (grp == 0) && g.rooms[i].pw == (pass == 1) &&
                     (contains_ci(g.rooms[i].name, g.search) || contains_ci(g.rooms[i].host, g.search) || contains_ci(g.rooms[i].id, g.search)))
                     order[n++] = i;
@@ -1358,7 +1387,8 @@ void draw_cat_card(ImDrawList* dl, ImVec2 p, float k, float w, const CatBrief& c
         dl->AddCircleFilled(ImVec2(p.x + 8 * k, cy + 9 * k), 6.0f * k, cc, 12);
     }
     dl->AddCircle(ImVec2(p.x + 8 * k, cy + 9 * k), 6.0f * k, kInk, 12, 1.4f);
-    text_at(dl, ImVec2(p.x + 18 * k, cy), 17 * k, kInk, tr_class(cat.klass));
+    const char* class_name = gametext_class_name(cat.klass);                 // the game's own word for the class, in the language / language pack the player runs (0.1.117)
+    text_at(dl, ImVec2(p.x + 18 * k, cy), 17 * k, kInk, class_name ? class_name : tr_class(cat.klass));
     if (!full) {
         char hp[16];
         _snprintf_s(hp, sizeof(hp), _TRUNCATE, "%d", cat.hp);
@@ -1375,6 +1405,30 @@ void draw_cat_cards(ImDrawList* dl, ImVec2 p, float k, float w, const CatBrief* 
         draw_cat_card(dl, ImVec2(p.x + i * (cw + gap), p.y), k, cw, cats[i]);
 }
 
+// --- voice chat (0.1.118): the two buttons' pictures, drawn with lines so they need no asset ---
+void draw_mic_icon(ImDrawList* dl, ImVec2 c, float r, bool on, bool talking) {
+    const ImU32 col = on ? kInk : kGrey;
+    dl->AddRectFilled(ImVec2(c.x - r * 0.30f, c.y - r * 0.95f), ImVec2(c.x + r * 0.30f, c.y + r * 0.10f), col, r * 0.30f);
+    dl->PathArcTo(ImVec2(c.x, c.y - r * 0.05f), r * 0.62f, 0.0f, 3.14159f, 18);
+    dl->PathStroke(col, ImDrawFlags_None, r * 0.16f);
+    dl->AddLine(ImVec2(c.x, c.y + r * 0.57f), ImVec2(c.x, c.y + r * 0.92f), col, r * 0.16f);
+    dl->AddLine(ImVec2(c.x - r * 0.38f, c.y + r * 0.92f), ImVec2(c.x + r * 0.38f, c.y + r * 0.92f), col, r * 0.16f);
+    if (!on) dl->AddLine(ImVec2(c.x - r * 0.95f, c.y - r * 0.95f), ImVec2(c.x + r * 0.95f, c.y + r * 0.95f), kRed, r * 0.20f);
+    else if (talking) dl->AddCircleFilled(ImVec2(c.x + r * 0.85f, c.y - r * 0.80f), r * 0.24f, kGreen, 12);
+}
+void draw_speaker_icon(ImDrawList* dl, ImVec2 c, float r, bool on, ImU32 wave_col = 0) {
+    const ImU32 col = on ? kInk : kGrey;
+    dl->AddRectFilled(ImVec2(c.x - r * 0.95f, c.y - r * 0.30f), ImVec2(c.x - r * 0.45f, c.y + r * 0.30f), col);
+    dl->AddQuadFilled(ImVec2(c.x - r * 0.45f, c.y - r * 0.30f), ImVec2(c.x + r * 0.10f, c.y - r * 0.80f), ImVec2(c.x + r * 0.10f, c.y + r * 0.80f), ImVec2(c.x - r * 0.45f, c.y + r * 0.30f), col);
+    if (on) {
+        const ImU32 wc = wave_col ? wave_col : col;
+        dl->PathArcTo(ImVec2(c.x + r * 0.10f, c.y), r * 0.50f, -0.85f, 0.85f, 10); dl->PathStroke(wc, ImDrawFlags_None, r * 0.15f);
+        dl->PathArcTo(ImVec2(c.x + r * 0.10f, c.y), r * 0.90f, -0.85f, 0.85f, 12); dl->PathStroke(wc, ImDrawFlags_None, r * 0.15f);
+    } else {
+        dl->AddLine(ImVec2(c.x - r * 0.95f, c.y - r * 0.95f), ImVec2(c.x + r * 0.95f, c.y + r * 0.95f), kRed, r * 0.20f);
+    }
+}
+
 void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_out, bool compact) {
     const float k = v.k;
     const bool host = _stricmp(signal_role(), "host") == 0;
@@ -1383,8 +1437,8 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
     // The room's display name: the server's list when it still has us in it,
     // else the name this peer typed or clicked on the way in.
     const char* room_label = g.room_name[0] ? g.room_name : signal_room();
-    SignalRoom rooms[32];
-    const uint32_t nr = signal_rooms(rooms, 32);
+    SignalRoom rooms[kSignalMaxRooms];
+    const uint32_t nr = signal_rooms(rooms, kSignalMaxRooms);
     uint32_t cap = 0;
     for (uint32_t i = 0; i < nr; ++i)
         if (strcmp(rooms[i].id, signal_room()) == 0) {
@@ -1442,6 +1496,8 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
         char nm[80];
         _snprintf_s(nm, sizeof(nm), _TRUNCATE, "%s%s", p.name, is_me ? tr(Tx::YOU_SUFFIX) : "");
         text_at(dl, ImVec2(name_x, y + 2 * k), 28 * k, kInk, nm);
+        if (voice_available() && (is_me ? voice_self_speaking() : voice_peer_speaking(peer_for_row(i))))        // 0.1.118: this player is talking
+            draw_speaker_icon(dl, ImVec2(name_x + text_size(28 * k, nm).x + 22 * k, y + 16 * k), 11 * k, true, kGreen);
 
         // WHAT that player is looking at -- which a connection state cannot say. Resolved by handing out
         // the session's ids to the rows that are not us, in ascending order: both lists start at the
@@ -1453,8 +1509,20 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
                 text_at(dl, ImVec2(name_x, y + 42 * k), 24 * k, kAmber, tr(Tx::AWAY_BOSS));
             else if (pg != PageState::Unknown)
                 text_at(dl, ImVec2(name_x, y + 42 * k), 24 * k, kInkSoft, page_name(pg));
-            else if (!is_me)
-                text_at(dl, ImVec2(name_x, y + 42 * k), 24 * k, kGrey, tr(Tx::UNKNOWN));
+            else if (!is_me) {
+                // "unknown" says nothing. A player the host has refused for its version is told in words; one that has no game link at all after some seconds (it is in the
+                // lobby's list, not in the session) says that. Anything else stays "unknown" (a screen the mod does not tell).
+                static ULONGLONG s_nolink_since[8] = {};
+                const uint8_t pid = peer_for_row(i);
+                const bool no_link = pid == 0xFF;
+                if (i < 8) { if (!no_link) s_nolink_since[i] = 0; else if (!s_nolink_since[i]) s_nolink_since[i] = GetTickCount64(); }
+                if (!no_link && session_peer_refused(pid))
+                    text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kRed, tr(Tx::ROW_VER_REFUSED));
+                else if (no_link && i < 8 && s_nolink_since[i] && GetTickCount64() - s_nolink_since[i] > 8000)
+                    text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kAmber, tr(Tx::ROW_NO_LINK));
+                else
+                    text_at(dl, ImVec2(name_x, y + 42 * k), 24 * k, kGrey, tr(Tx::UNKNOWN));
+            }
         }
         // 0.1.85: this player's round trip to that one (mgmp_perf's 2 s ping; between two clients it is the path through the host, the one their messages take)
         if (!is_me && !away) {
@@ -1497,6 +1565,54 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
 
     // (The notice that the host's game port is closed to the outside, with the router-forwarding advice, is gone for good (2026-10-04): it misled -- the server relay and Steam carry a room without the port.)
 
+    // VOICE CHAT (0.1.118, experimental, the host's setting): a microphone and a sound button, both off until the player turns them on.
+    if (voice_available()) {
+        y += 4 * k;
+        const float gap = 12 * k, bw = (w - gap) * 0.5f, bh = 56 * k;
+        const bool mic = voice_mic_on(), snd = voice_sound_on();
+        const ImVec2 m0(o.x, y), m1(o.x + bw, y + bh), s0(o.x + bw + gap, y), s1(o.x + w, y + bh);
+        if (paper_button("voice_mic", ImVec2(m0.x + 46 * k, m0.y), m1, tr(Tx::V_MIC), 24 * k, true, mic ? Tone::Good : Tone::Normal, mic)) voice_set_mic(!mic);
+        draw_mic_icon(dl, ImVec2(m0.x + 26 * k, m0.y + bh * 0.5f), 17 * k, mic, voice_self_speaking());
+        if (paper_button("voice_snd", ImVec2(s0.x + 46 * k, s0.y), s1, tr(Tx::V_SOUND), 24 * k, true, snd ? Tone::Good : Tone::Normal, snd)) voice_set_sound(!snd);
+        draw_speaker_icon(dl, ImVec2(s0.x + 24 * k, s0.y + bh * 0.5f), 17 * k, snd);
+        y += bh + 12 * k;
+        // THE VOLUME (0.1.133): 0 .. 200 % in steps of 10, the other players' voices; live while dragged, written to mgmp.json (ui.voice_volume) when let go.
+        {
+            static bool s_drag = false;
+            if (!s_drag && voice_volume() != (int)config().voice_volume) voice_set_volume(config().voice_volume);
+            const int cur = config().voice_volume;
+            char head[96];
+            _snprintf_s(head, sizeof(head), _TRUNCATE, "%s:  %d%%", tr(Tx::V_VOLUME), cur);
+            text_at(dl, ImVec2(o.x, y), 22 * k, snd ? kInk : kInkSoft, head);
+            y += 34 * k;
+            const float tx0 = o.x + 14 * k, tx1 = o.x + w - 14 * k, ty = y + 14 * k;
+            const int steps = 20;
+            dl->AddLine(ImVec2(tx0, ty), ImVec2(tx1, ty), kInk, 3 * k);
+            for (int i = 0; i <= steps; i += 5) {
+                const float x = tx0 + (tx1 - tx0) * i / steps;
+                dl->AddLine(ImVec2(x, ty - 8 * k), ImVec2(x, ty + 8 * k), i == 10 ? kInk : kInkSoft, 2 * k);
+            }
+            ImGui::SetCursorScreenPos(ImVec2(tx0 - 14 * k, ty - 20 * k));
+            ImGui::InvisibleButton("##voice_volume", ImVec2(tx1 - tx0 + 28 * k, 40 * k));
+            const bool hov = ImGui::IsItemHovered();
+            if (hov) g.hovering_button = true;
+            if (ImGui::IsItemActive() && tx1 > tx0) {
+                float f = (ImGui::GetIO().MousePos.x - tx0) / (tx1 - tx0);
+                f = f < 0 ? 0 : f > 1 ? 1 : f;
+                const int want = (int)(f * steps + 0.5f) * 10;
+                if (want != (int)config().voice_volume) { config_set_voice_volume(want, false); voice_set_volume(want); }
+                s_drag = true;
+            } else if (s_drag) {
+                s_drag = false;
+                const bool saved = config_set_voice_volume(config().voice_volume, true);
+                log_line("MENU", "ui.voice_volume = %u%% (%s)", (unsigned)config().voice_volume, saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+            }
+            const float kx = tx0 + (tx1 - tx0) * (config().voice_volume / 10) / (float)steps;
+            rough_rect(dl, ImVec2(kx - 10 * k, ty - 16 * k), ImVec2(kx + 10 * k, ty + 16 * k), hov || s_drag ? kPaperHi : IM_COL32(255, 255, 250, 230), kInk, 2.4f, 361, 1.2f);
+            y = ty + 30 * k;
+        }
+    }
+
     // Session line.
     y += 2 * k;
     dl->AddLine(ImVec2(o.x, y), ImVec2(o.x + w, y), kInk, 2.0f);
@@ -1535,6 +1651,22 @@ void draw_mp_tag(const View& v) {
 
     if (g.panel_t > 0.001f) {
 
+        // THE PANEL FITS THE SCREEN (0.1.135; a tester's screen: three players and the voice row pushed the room buttons below the bottom edge). It hangs from the tag's
+        // top edge as before when there is room; when it would run past the bottom it moves up, and when even from the top of the screen it is too tall it is drawn
+        // smaller (its own scale pk, never under 55 %) -- the buttons at its foot always stay on the screen. The height is the one learned from the last frame.
+        float pk = k, ptop = ta.y - 8 * k;
+        {
+            const float top_min = v.org.y + 12 * k, bottom = v.org.y + v.h - 12 * k;
+            const float need = g.panel_h * k;
+            if (ptop + need > bottom) ptop = bottom - need;
+            if (ptop < top_min) {
+                ptop = top_min;
+                pk = need > 0 ? k * (bottom - top_min) / need : k;
+                if (pk < k * 0.55f) pk = k * 0.55f;
+            }
+        }
+        View pv = v; pv.k = pk;
+
         // The panel unfolds to the left of the tag, hanging from the same top edge,
         // and is exactly as tall as what it says.
         // Wider while somebody has cat cards up: four cards need about 440 stage units.
@@ -1544,41 +1676,41 @@ void draw_mp_tag(const View& v) {
             if (fabsf(want - g.panel_w) < 0.5f) g.panel_w = want;
         }
         const float PW = g.panel_w;
-        const float px1 = ta.x + 18 * k;   // tucked under the tag, which is drawn last
-        const float slide = (1.0f - e) * (PW * 0.35f) * k;
-        const ImVec2 pa(px1 - PW * k + slide, ta.y - 8 * k);
-        const ImVec2 pb(pa.x + PW * k, pa.y + g.panel_h * k);
+        const float px1 = ta.x + 18 * pk;   // tucked under the tag, which is drawn last
+        const float slide = (1.0f - e) * (PW * 0.35f) * pk;
+        const ImVec2 pa(px1 - PW * pk + slide, ptop);
+        const ImVec2 pb(pa.x + PW * pk, pa.y + g.panel_h * pk);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, e);
         if (overlay_window_begin("##mgmp_panel", pa, ImVec2(pb.x - pa.x, pb.y - pa.y), false)) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->ChannelsSplit(2);
             dl->ChannelsSetCurrent(1);
-            text_c(dl, (pa.x + pb.x) * 0.5f, pa.y + 34 * k, 42 * k, kInk, tr(Tx::MENU_MULTI));
+            text_c(dl, (pa.x + pb.x) * 0.5f, pa.y + 34 * pk, 42 * pk, kInk, tr(Tx::MENU_MULTI));
             float y = 0;
-            draw_room_info(dl, v, ImVec2(pa.x + 56 * k, pa.y + 104 * k), (PW - 112) * k, y, true);
+            draw_room_info(dl, pv, ImVec2(pa.x + 56 * pk, pa.y + 104 * pk), (PW - 112) * pk, y, true);
             const bool busy = signal_request_pending();
-            float by0 = y + 14 * k, by1 = by0 + 56 * k;
+            float by0 = y + 14 * pk, by1 = by0 + 56 * pk;
             if (room_is_host()) {
                 const bool locked = room_locked();
                 const bool can = locked ? room_can_unlock() : true;
-                if (paper_button("lock", ImVec2(pa.x + 56 * k, by0), ImVec2(pb.x - 56 * k, by1),
+                if (paper_button("lock", ImVec2(pa.x + 56 * pk, by0), ImVec2(pb.x - 56 * pk, by1),
                                  locked ? (can ? tr(Tx::UNLOCK) : tr(Tx::UNLOCK_WHEN)) : tr(Tx::LOCK),
-                                 26 * k, true, locked ? Tone::Normal : Tone::Good))
+                                 26 * pk, true, locked ? Tone::Normal : Tone::Good))
                     room_request_lock(!locked);
-                by0 = by1 + 12 * k; by1 = by0 + 56 * k;
+                by0 = by1 + 12 * pk; by1 = by0 + 56 * pk;
             }
-            if (paper_button("leave", ImVec2(pa.x + 56 * k, by0), ImVec2(pa.x + (PW / 2 - 8) * k, by1),
-                             tr(Tx::LEAVE_ROOM), 26 * k, !busy, Tone::Danger)) {
+            if (paper_button("leave", ImVec2(pa.x + 56 * pk, by0), ImVec2(pa.x + (PW / 2 - 8) * pk, by1),
+                             tr(Tx::LEAVE_ROOM), 26 * pk, !busy, Tone::Danger)) {
                 signal_request_leave();
                 g.panel_open = false;
             }
-            if (paper_button("fold", ImVec2(pa.x + (PW / 2 + 8) * k, by0), ImVec2(pb.x - 56 * k, by1),
-                             tr(Tx::FOLD), 26 * k))
+            if (paper_button("fold", ImVec2(pa.x + (PW / 2 + 8) * pk, by0), ImVec2(pb.x - 56 * pk, by1),
+                             tr(Tx::FOLD), 26 * pk))
                 g.panel_open = false;
-            const float h = (by1 - pa.y) / k + 46.0f;      // bottom margin for the torn edge
+            const float h = (by1 - pa.y) / pk + 46.0f;      // bottom margin for the torn edge
             g.panel_h = h;
             dl->ChannelsSetCurrent(0);
-            paper(dl, v, pa, ImVec2(pb.x, pa.y + h * k), e);
+            paper(dl, pv, pa, ImVec2(pb.x, pa.y + h * pk), e);
             dl->ChannelsMerge();
         }
         ImGui::End();
@@ -2779,9 +2911,36 @@ void poll_language() {
 // its own guards read, and the detour is the one place that has happened.
 char g_press[64];
 int  g_slot_req = -1;
+ImFont* menu_font() { return g.font; }
 void menu_request_press(const char* n) { strncpy_s(g_press, n ? n : "", _TRUNCATE); }
 void menu_request_slot(int s)          { g_slot_req = s; }
 int  menu_take_slot_request()          { const int s = g_slot_req; g_slot_req = -1; return s; }
+
+// THE FILE / SAVE PROBLEM POPUP (0.1.169): queued from any thread, drawn by draw_error_popup.
+struct ErrPop { char title[128]; char text[1024]; };
+SRWLOCK  g_err_lock = SRWLOCK_INIT;
+ErrPop   g_err_q[6];
+uint32_t g_err_n = 0;
+uint64_t g_err_seen[32];
+uint32_t g_err_seen_n = 0;
+
+void ui_error_popup(const char* title, const char* text) {
+    if (!title || !text || !text[0]) return;
+    uint64_t h = 14695981039346656037ull;
+    for (const char* s : { title, "\x1f", text }) for (; *s; ++s) h = (h ^ (uint8_t)*s) * 1099511628211ull;
+    AcquireSRWLockExclusive(&g_err_lock);
+    bool seen = false;
+    for (uint32_t i = 0; i < g_err_seen_n && !seen; ++i) seen = g_err_seen[i] == h;
+    const bool room = !seen && g_err_n < sizeof(g_err_q) / sizeof(g_err_q[0]);
+    if (!seen) g_err_seen[g_err_seen_n++ % (sizeof(g_err_seen) / sizeof(g_err_seen[0]))] = h;
+    if (room) {
+        strncpy_s(g_err_q[g_err_n].title, sizeof(g_err_q[0].title), title, _TRUNCATE);
+        strncpy_s(g_err_q[g_err_n].text, sizeof(g_err_q[0].text), text, _TRUNCATE);
+        ++g_err_n;
+    }
+    ReleaseSRWLockExclusive(&g_err_lock);
+    if (!seen) log_line_lvl(LogLevel::Warn, "MENU", "error popup %s: %s -- %s", room ? "shown to the player" : "NOT shown (six are already waiting)", title, text);
+}
 
 void menu_on_button(void* button) {
     if (!button) return;
@@ -2846,6 +3005,13 @@ void draw_save_sync(const View& v) {
     if (!in_room() || !checkpoint_sync_view(sv)) { was_up = false; return; }
     // The room panel would sit over the right of this one; fold it the moment this one appears (the
     // player can still open it again from its tag).
+    // THE CLICK THAT OPENED IT DOES NOT PRESS IT (0.1.169, room KD8E: every save pick was followed at once by "the round started over"). The panel comes up
+    // in the frame of the click on the save slot, and a button of it under the pointer took the same click. Its buttons answer once the panel (or its
+    // current page) has been up for a moment.
+    static int s_phase = -1;
+    static ULONGLONG s_since = 0;
+    if (!was_up || (int)sv.phase != s_phase) { s_phase = (int)sv.phase; s_since = GetTickCount64(); }
+    const bool ready = GetTickCount64() - s_since >= 600;
     if (!was_up) { was_up = true; g.panel_open = false; }
 
     const float k = v.k;
@@ -2888,8 +3054,10 @@ void draw_save_sync(const View& v) {
         }
         // A pick is not a promise: anybody may start the round over (everyone then picks again).
         if (paper_button("hs_repick", ImVec2(X(W / 2 - 150), Y(H - 96)), ImVec2(X(W / 2 + 150), Y(H - 40)),
-                         tr(Tx::REPICK), 26 * k))
+                         tr(Tx::REPICK), 26 * k, ready)) {
+            log_line("ROOM", "the player pressed 'pick again' on the save panel -- the round starts over for everybody");
             room_abort_selection();
+        }
     } else if (choosing) {
         text_c(dl, X(W / 2), Y(40), 44 * k, kInk, tr(Tx::CHOOSE_SYNC));
         text_c(dl, X(W / 2), Y(102), 22 * k, kInkSoft, tr(Tx::CHOOSE_SYNC_HINT));
@@ -2900,7 +3068,7 @@ void draw_save_sync(const View& v) {
         const float lx = ImGui::GetCursorScreenPos().x + 6 * k, lw = (W - 100 - 24) * k;
         auto row = [&](const char* id, const char* label, Tone tone, bool armed) {
             const ImVec2 rp = ImGui::GetCursorScreenPos();
-            const bool hit = paper_button(id, ImVec2(lx, rp.y + 2 * k), ImVec2(lx + lw, rp.y + 66 * k), label, 22 * k, true, tone, armed);
+            const bool hit = paper_button(id, ImVec2(lx, rp.y + 2 * k), ImVec2(lx + lw, rp.y + 66 * k), label, 22 * k, ready, tone, armed);
             ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + 76 * k));
             ImGui::Dummy(ImVec2(1, 0));
             return hit;
@@ -2919,8 +3087,10 @@ void draw_save_sync(const View& v) {
         }
         ImGui::EndChild();
         if (paper_button("hs_repick", ImVec2(X(W / 2 - 150), Y(H - 96)), ImVec2(X(W / 2 + 150), Y(H - 40)),
-                         tr(Tx::REPICK), 26 * k))
+                         tr(Tx::REPICK), 26 * k, ready)) {
+            log_line("ROOM", "the player pressed 'pick again' on the save panel -- the round starts over for everybody");
             room_abort_selection();
+        }
     } else {
         text_c(dl, X(W / 2), Y(50), 44 * k, kRed, tr(Tx::COMBO_INVALID));
         text_c(dl, X(W / 2), Y(122), 26 * k, kInk, tr(Tx::COMBO_INVALID_1));
@@ -2930,16 +3100,17 @@ void draw_save_sync(const View& v) {
             for (uint32_t i = 0; i < np; ++i)
                 if ((sv.selected >> (id_for_room_row(i) & 7)) & 1) {
                     const size_t at = strlen(who);
-                    _snprintf_s(who + at, sizeof(who) - at, _TRUNCATE, "%s%s", at ? ", " : "", peers[i].name);
+                    _snprintf_s(who + at, sizeof(who) - at, _TRUNCATE, "%s%s", at ? ((i18n_lang() == kLangZh || i18n_lang() == kLangJa) ? "、" : ", ") : "", peers[i].name);
                 }
             char line[480];
+            // both texts now open with "<names>的存档处于冒险途中" (0.1.143): those players' saves are mid-adventure, not in the warehouse.
             // bit 7: every one of them is on the map with no co-op record to recover it (kHoldersNoRecord) -- the way out is back to the warehouse, not "load the original save"
             _snprintf_s(line, sizeof(line), _TRUNCATE, tr((sv.selected & kHoldersNoRecord) ? Tx::COMBO_INVALID_4 : Tx::COMBO_INVALID_3), who[0] ? who : "?");
             wrap_text(dl, X(50), Y(204), (W - 100) * k, 22 * k, 28 * k, kInkSoft, line);
         }
         // OK starts the round over on EVERY peer: nobody is left holding a pick the host refused.
         if (paper_button("hs_ok", ImVec2(X(W / 2 - 150), Y(H - 90)), ImVec2(X(W / 2 + 150), Y(H - 34)),
-                         tr(Tx::OK_REPICK), 26 * k, true, Tone::Normal)) {
+                         tr(Tx::OK_REPICK), 26 * k, ready, Tone::Normal)) {
             checkpoint_sync_dismiss();
             room_abort_selection();
         }
@@ -3015,6 +3186,103 @@ void draw_abandon(const View& v) {
 }
 
 // The room's notices (a player dropped, the house boss is played alone): one at a time, with an OK.
+// ---- the file / save problem popup (0.1.169, see ui_error_popup; the queue is above it) ----
+void draw_error_popup(const View& v) {
+    ErrPop top{};
+    AcquireSRWLockShared(&g_err_lock);
+    const bool any = g_err_n > 0;
+    if (any) top = g_err_q[0];
+    ReleaseSRWLockShared(&g_err_lock);
+    if (!any) return;
+    const float k = v.k;
+    const float W = 940, H = 560;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_errpop")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kRed, top.title);
+    wrap_text(dl, X(60), Y(110), (W - 120) * k, 26 * k, 37 * k, kInk, top.text);
+    if (paper_button("ep_ok", ImVec2(X(W / 2 - 130), Y(H - 90)), ImVec2(X(W / 2 + 130), Y(H - 30)), tr(Tx::OK), 30 * k, true, Tone::Good)) {
+        AcquireSRWLockExclusive(&g_err_lock);
+        if (g_err_n > 0) { for (uint32_t i = 1; i < g_err_n; ++i) g_err_q[i - 1] = g_err_q[i]; --g_err_n; }
+        ReleaseSRWLockExclusive(&g_err_lock);
+        log_line("MENU", "error popup closed by the player: %s", top.title);
+    }
+    ImGui::End();
+}
+
+// THE URGENT FIX BANNER (0.1.186, mgmp_urgent): the server names a fix this mod does not have yet. As loud as the mod can be without stopping the game: a red
+// band across the top of the screen over every other window but the error popup, a gold frame that pulses, the fix's version and what it fixes, this mod's
+// version, and a button to put it away (a newer notice brings it back). The first frame it applies also writes a line into the room chat.
+void draw_urgent(const View& v) {
+    UrgentView u;
+    if (urgent_take_new(u)) {
+        char line[900];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::URGENT_BODY), u.version, u.text, u.mine);
+        char chat[960];
+        _snprintf_s(chat, sizeof(chat), _TRUNCATE, "%s %s", tr(Tx::URGENT_TITLE), line);
+        chat_local_note(chat);
+    }
+    if (!urgent_view(u)) return;
+    const float k = v.k;
+    if (k <= 0) return;
+    char body[900];
+    _snprintf_s(body, sizeof(body), _TRUNCATE, tr(Tx::URGENT_BODY), u.version, u.text, u.mine);
+    const float W = 1560;
+    const float text_h = wrap_text(nullptr, 0, 0, (W - 340) * k, 30 * k, 42 * k, IM_COL32(255, 255, 255, 255), body) / k;
+    const float H = (text_h + 110 > 190 ? text_h + 110 : 190);
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, 14);
+    const ImVec2 sz(W * k, H * k);
+    if (!overlay_window_begin("##mgmp_urgent", a, sz, false)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 b(a.x + sz.x, a.y + sz.y);
+    const float pulse = 0.5f + 0.5f * (float)sin(now() * 5.0);
+    dl->AddRectFilled(a, b, IM_COL32(128, 14, 14, 242), 14 * k);
+    dl->AddRect(a, b, IM_COL32(255, 205, 40, (int)(140 + 115 * pulse)), 14 * k, 0, (4 + 4 * pulse) * k);
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X((W - 260) / 2), Y(16), 44 * k, IM_COL32(255, 220, 60, 255), tr(Tx::URGENT_TITLE), true);
+    wrap_text(dl, X(40), Y(80), (W - 340) * k, 30 * k, 42 * k, IM_COL32(255, 255, 255, 255), body);
+    if (paper_button("urgent_ok", ImVec2(X(W - 270), Y(H / 2 - 34)), ImVec2(X(W - 40), Y(H / 2 + 34)), tr(Tx::URGENT_OK), 30 * k, true, Tone::Good)) urgent_dismiss();
+    ImGui::End();
+}
+
+// THE GAME UPDATE NOTICE (2026-11-05, mgmp_urgent.h): the same red banner as the urgent fix, below it when both are up.
+void draw_gamenotice(const View& v) {
+    GameNoticeView g;
+    if (!gamenotice_view(g)) return;
+    const float k = v.k;
+    if (k <= 0) return;
+    float top = 14;
+    UrgentView u;
+    if (urgent_view(u)) {
+        char body[900];
+        _snprintf_s(body, sizeof(body), _TRUNCATE, tr(Tx::URGENT_BODY), u.version, u.text, u.mine);
+        const float uh = wrap_text(nullptr, 0, 0, (1560 - 340) * k, 30 * k, 42 * k, IM_COL32(255, 255, 255, 255), body) / k;
+        top += (uh + 110 > 190 ? uh + 110 : 190) + 14;
+    }
+    const float W = 1560;
+    const float text_h = wrap_text(nullptr, 0, 0, (W - 340) * k, 30 * k, 42 * k, IM_COL32(255, 255, 255, 255), g.text) / k;
+    const float H = (text_h + 110 > 190 ? text_h + 110 : 190);
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, top);
+    const ImVec2 sz(W * k, H * k);
+    if (!overlay_window_begin("##mgmp_gamenotice", a, sz, false)) { ImGui::End(); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 b(a.x + sz.x, a.y + sz.y);
+    const float pulse = 0.5f + 0.5f * (float)sin(now() * 5.0);
+    dl->AddRectFilled(a, b, IM_COL32(128, 14, 14, 242), 14 * k);
+    dl->AddRect(a, b, IM_COL32(255, 205, 40, (int)(140 + 115 * pulse)), 14 * k, 0, (4 + 4 * pulse) * k);
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X((W - 260) / 2), Y(16), 44 * k, IM_COL32(255, 220, 60, 255), tr(Tx::GAMENOTICE_TITLE), true);
+    wrap_text(dl, X(40), Y(80), (W - 340) * k, 30 * k, 42 * k, IM_COL32(255, 255, 255, 255), g.text);
+    if (paper_button("gamenotice_ok", ImVec2(X(W - 270), Y(H / 2 - 34)), ImVec2(X(W - 40), Y(H / 2 + 34)), tr(Tx::URGENT_OK), 30 * k, true, Tone::Good)) gamenotice_dismiss();
+    ImGui::End();
+}
+
 void draw_room_notice(const View& v) {
     char text[1024];
     if (!room_notice(text, sizeof(text))) return;
@@ -3155,15 +3423,26 @@ void draw_settings_window(const View& v) {
     paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
     const float k = v.k;
     auto X = [&](float x) { return a.x + x * k; };
-    auto Y = [&](float y) { return a.y + y * k; };
-    auto stage_y = [&](float screen_y) { return k > 0 ? (screen_y - a.y) / k : 0.0f; };
-    text_c(dl, X(W / 2), Y(40), 48 * k, kInk, tr(Tx::MENU_SETTINGS));
+    // The list can be longer than the window (the experimental section grows with every feature): the mouse wheel scrolls what is between the title and the buttons below.
+    static float s_scroll = 0.0f, s_content = 0.0f;
+    const float view_top = 84.0f, view_bot = H - 116.0f;
+    {
+        const float max_scroll = s_content - view_bot + 12.0f > 0 ? s_content - view_bot + 12.0f : 0.0f;
+        if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) s_scroll -= ImGui::GetIO().MouseWheel * 70.0f;
+        if (s_scroll > max_scroll) s_scroll = max_scroll;
+        if (s_scroll < 0.0f) s_scroll = 0.0f;
+    }
+    auto Y = [&](float y) { return a.y + (y - s_scroll) * k; };           // the scrolling content
+    auto Yf = [&](float y) { return a.y + y * k; };                       // the parts that stay: title, the in-room note, the back button
+    auto stage_y = [&](float screen_y) { return k > 0 ? (screen_y - a.y) / k + s_scroll : 0.0f; };
+    text_c(dl, X(W / 2), Yf(40), 48 * k, kInk, tr(Tx::MENU_SETTINGS));
+    ImGui::PushClipRect(ImVec2(a.x, Yf(view_top)), ImVec2(a.x + sz.x, Yf(view_bot)), true);
 
     // Each setting: a box and its words, and a note under it. Not while a room is open -- the HOST's setting is the room's (its HELLO carries it).
     // An experimental one carries the warning in amber after its words (or on its own line when they do not fit together). Returns the y after it.
     const bool locked = in_room() || net_active();
     bool clicked = false;
-    auto box = [&](const char* id, float y, bool on, const char* lab, const char* note, uint32_t seed, bool experimental) -> float {
+    auto box = [&](const char* id, float y, bool on, const char* lab, const char* note, uint32_t seed, int warn_level) -> float {     // warn_level: 0 none, 1 amber (not fully tested), 2 red (not verified at all)
         const ImVec2 b0(X(70), Y(y)), b1(X(70 + 48), Y(y + 48));
         const float lw = text_size(30 * k, lab).x;
         ImGui::SetCursorScreenPos(b0);
@@ -3179,29 +3458,30 @@ void draw_settings_window(const View& v) {
         }
         text_at(dl, ImVec2(b1.x + 18 * k, b0.y + 8 * k), 30 * k, locked ? kGrey : kInk, lab);
         float note_y = y + 62;
-        if (experimental) {
-            const char* warn = tr(Tx::SET_EXP_WARN);
+        if (warn_level > 0) {
+            const char* warn = tr(warn_level >= 2 ? Tx::SET_EXP_UNTESTED : Tx::SET_EXP_WARN);
+            const ImU32 wc = warn_level >= 2 ? kRed : kAmber;
             const float wx = b1.x + 18 * k + lw + 20 * k;
-            if (wx + text_size(22 * k, warn).x <= X(W - 50)) text_at(dl, ImVec2(wx, b0.y + 14 * k), 22 * k, kAmber, warn);
-            else { text_at(dl, ImVec2(X(70), Y(y + 60)), 22 * k, kAmber, warn); note_y += 32; }
+            if (wx + text_size(22 * k, warn).x <= X(W - 50)) text_at(dl, ImVec2(wx, b0.y + 14 * k), 22 * k, wc, warn);
+            else { text_at(dl, ImVec2(X(70), Y(y + 60)), 22 * k, wc, warn); note_y += 32; }
         }
         return stage_y(wrap_text(dl, X(70), Y(note_y), (W - 140) * k, 22 * k, 29 * k, kInkSoft, note)) + 18;
     };
     float y = 96;
-    {   // THE ENEMY MULTIPLIER (2026-10-19): health and armor of every enemy in a room, x2 .. x8 in steps of 0.5 -- a slider; the file is written when it is let go
+    {   // THE ENEMY MULTIPLIER (2026-10-19): health and armor of every enemy in a room, x1 .. x8 in steps of 0.5 (x1 since 0.1.179; default x2) -- a slider; the file is written when it is let go
         static bool s_drag = false;
         const uint8_t cur = config().enemy_scale_half;
         char head[160];
         _snprintf_s(head, sizeof(head), _TRUNCATE, "%s:  x%g", tr(Tx::SET_ENEMY_SCALE), cur / 2.0);
         text_at(dl, ImVec2(X(70), Y(y + 4)), 30 * k, locked ? kGrey : kInk, head);
         const float tx0 = 100, tx1 = W - 100, ty = y + 70;          // the track
-        const int steps = 12;                                       // 4 .. 16 halves
+        const int steps = 14;                                       // 2 .. 16 halves
         dl->AddLine(ImVec2(X(tx0), Y(ty)), ImVec2(X(tx1), Y(ty)), locked ? kGrey : kInk, 3 * k);
         for (int i = 0; i <= steps; ++i) {
             const float x = tx0 + (tx1 - tx0) * i / steps;
             const bool whole = i % 2 == 0;
             dl->AddLine(ImVec2(X(x), Y(ty - (whole ? 10 : 6))), ImVec2(X(x), Y(ty + (whole ? 10 : 6))), locked ? kGrey : kInkSoft, 2 * k);
-            if (whole) { char t[8]; _snprintf_s(t, sizeof(t), _TRUNCATE, "%d", 2 + i / 2); text_c(dl, X(x), Y(ty + 28), 20 * k, kInkSoft, t); }
+            if (whole) { char t[8]; _snprintf_s(t, sizeof(t), _TRUNCATE, "%d", 1 + i / 2); text_c(dl, X(x), Y(ty + 28), 20 * k, kInkSoft, t); }
         }
         ImGui::SetCursorScreenPos(ImVec2(X(tx0 - 20), Y(ty - 24)));
         ImGui::InvisibleButton("##enemy_scale", ImVec2((tx1 - tx0 + 40) * k, 48 * k));
@@ -3210,7 +3490,7 @@ void draw_settings_window(const View& v) {
         if (ImGui::IsItemActive() && !locked && k > 0) {
             float f = (ImGui::GetIO().MousePos.x - X(tx0)) / ((tx1 - tx0) * k);
             f = f < 0 ? 0 : f > 1 ? 1 : f;
-            const uint8_t want = (uint8_t)(4 + (int)(f * steps + 0.5f));
+            const uint8_t want = (uint8_t)(2 + (int)(f * steps + 0.5f));
             if (want != config().enemy_scale_half) config_set_enemy_scale_half(want, false);
             s_drag = true;
         } else if (s_drag) {
@@ -3219,7 +3499,7 @@ void draw_settings_window(const View& v) {
             log_line("MENU", "ui.enemy_scale = %.1f (%s)", config().enemy_scale_half / 2.0, saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
         }
         const uint8_t now_half = config().enemy_scale_half;
-        const float kx = tx0 + (tx1 - tx0) * (now_half - 4) / (float)steps;
+        const float kx = tx0 + (tx1 - tx0) * ((int)now_half - 2) / (float)steps;
         rough_rect(dl, ImVec2(X(kx - 12), Y(ty - 18)), ImVec2(X(kx + 12), Y(ty + 18)), hov || s_drag ? kPaperHi : IM_COL32(255, 255, 250, locked ? 120 : 230),
                    locked ? kGrey : kInk, 2.4f, 359, 1.2f);
         y = stage_y(wrap_text(dl, X(70), Y(ty + 50), (W - 140) * k, 22 * k, 29 * k, kInkSoft, tr(Tx::SET_ENEMY_SCALE_NOTE))) + 18;
@@ -3228,7 +3508,7 @@ void draw_settings_window(const View& v) {
     // with no warning (and usually on by default); the experimental section holds only what is still being tried out. A feature that is verified later moves up.
     {   // the shared treasure chest (mgmp_treasure)
         const bool on = config().exp_treasure;
-        y = box("set_exp_treasure", y, on, tr(Tx::SET_EXP_TREASURE), tr(Tx::SET_EXP_TREASURE_NOTE), 347, false);
+        y = box("set_exp_treasure", y, on, tr(Tx::SET_EXP_TREASURE), tr(Tx::SET_EXP_TREASURE_NOTE), 347, 0);
         if (clicked) {
             const bool saved = config_set_exp_treasure(!on);
             log_line("MENU", "ui.exp_treasure = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
@@ -3236,7 +3516,7 @@ void draw_settings_window(const View& v) {
     }
     {   // each player's own random events (mgmp_indepevt)
         const bool on = config().exp_indep_events;
-        y = box("set_exp_indep_events", y, on, tr(Tx::SET_EXP_INDEP_EVENTS), tr(Tx::SET_EXP_INDEP_EVENTS_NOTE), 359, false);
+        y = box("set_exp_indep_events", y, on, tr(Tx::SET_EXP_INDEP_EVENTS), tr(Tx::SET_EXP_INDEP_EVENTS_NOTE), 359, 0);
         if (clicked) {
             const bool saved = config_set_exp_indep_events(!on);
             log_line("MENU", "ui.exp_indep_events = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
@@ -3249,17 +3529,36 @@ void draw_settings_window(const View& v) {
         text_at(dl, ImVec2(X(70), Y(y + 14)), 36 * k, kInk, tr(Tx::SET_EXP_SECTION));
         y = stage_y(wrap_text(dl, X(70), Y(y + 60), (W - 140) * k, 22 * k, 29 * k, kInkSoft, tr(Tx::SET_EXP_SECTION_NOTE))) + 16;
     }
-    {   // helping the one player whose house boss is today (mgmp_housecoop)
+    // Within the section: the amber warnings ("not fully tested") first, the red ones ("not verified at all") after them.
+    {   // voice chat (mgmp_voice): a microphone and a sound button on the room panel
+        const bool on = config().exp_voice;
+        y = box("set_exp_voice", y, on, tr(Tx::SET_EXP_VOICE), tr(Tx::SET_EXP_VOICE_NOTE), 365, 1);
+        if (clicked) {
+            const bool saved = config_set_exp_voice(!on);
+            log_line("MENU", "ui.exp_voice = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
+    }
+    {   // helping the one player whose house boss is today (mgmp_housecoop) -- never verified in a live game
         const bool on = config().exp_house_coop;
-        y = box("set_exp_house_coop", y, on, tr(Tx::SET_EXP_HOUSE_COOP), tr(Tx::SET_EXP_HOUSE_COOP_NOTE), 353, true);
+        y = box("set_exp_house_coop", y, on, tr(Tx::SET_EXP_HOUSE_COOP), tr(Tx::SET_EXP_HOUSE_COOP_NOTE), 353, 2);
         if (clicked) {
             const bool saved = config_set_exp_house_coop(!on);
             log_line("MENU", "ui.exp_house_coop = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
         }
     }
-    if (locked) text_at(dl, ImVec2(X(70), Y(H - 112)), 24 * k, kAmber, tr(Tx::SET_IN_ROOM));
+    s_content = y;
+    ImGui::PopClipRect();
+    if (s_content > view_bot) {      // a thin track and thumb at the right edge: there is more below / above
+        const float th0 = view_top + 8.0f, th1 = view_bot - 8.0f, span = th1 - th0, vis = view_bot - view_top;
+        const float thumb = span * vis / (s_content - view_top + 12.0f), max_scroll = s_content - view_bot + 12.0f;
+        const float t0 = th0 + (span - thumb) * (max_scroll > 0 ? s_scroll / max_scroll : 0.0f);
+        dl->AddLine(ImVec2(X(W - 26), Yf(th0)), ImVec2(X(W - 26), Yf(th1)), IM_COL32(30, 30, 30, 50), 3.0f * k);
+        dl->AddLine(ImVec2(X(W - 26), Yf(t0)), ImVec2(X(W - 26), Yf(t0 + thumb)), kInkSoft, 5.0f * k);
+    }
 
-    if (paper_button("set_back", ImVec2(X(W / 2 - 150), Y(H - 78)), ImVec2(X(W / 2 + 150), Y(H - 22)), tr(Tx::BACK), 32 * k))
+    if (locked) text_at(dl, ImVec2(X(70), Yf(H - 112)), 24 * k, kAmber, tr(Tx::SET_IN_ROOM));
+
+    if (paper_button("set_back", ImVec2(X(W / 2 - 150), Yf(H - 78)), ImVec2(X(W / 2 + 150), Yf(H - 22)), tr(Tx::BACK), 32 * k))
         g.win = Win::None;
     ImGui::End();
 }
@@ -3314,7 +3613,8 @@ void draw_mapvote(const View& v) {
     }
     if (counts) {
         char line[160];
-        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::MV_STATUS), have, total);
+        if (mapvote_held()) _snprintf_s(line, sizeof(line), _TRUNCATE, "%s", tr(Tx::MV_HELD));
+        else _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::MV_STATUS), have, total);
         text_c(dl, P(v, 960, 0).x, P(v, 0, 1000).y, 26 * k, kCreamHi, line, true);
     }
 }
@@ -3867,6 +4167,7 @@ void menu_draw() {
     poll_language();
     prevrun_tick();
     roomhist_tick();                // a room joined: remembered for a day (the list puts it first)
+    voice_tick();                   // 0.1.118: the microphone's frames go out from here; voice is switched off when the host's rule or the room is gone
     saveslots_auto_tick();          // back in the warehouse after a settled run: the auto save queue takes the current saves
     {   // a battle desync (debounced or halted): offer the log upload at once, the F2 window without the description
         char text[192] = {};
@@ -3987,6 +4288,10 @@ void menu_draw() {
     if (g.log_open) draw_log_window(v);
     room_toasts();
     draw_chat(v);
+    urgent_start();          // 0.1.186: the server's urgent fix notice (a thread asks once a minute; started once)
+    draw_urgent(v);
+    draw_gamenotice(v);
+    draw_error_popup(v);     // 0.1.169: a file / save problem, over everything else
 
     // A room just opened or closed: the connect window has done its job.
     static bool prev_room = false;

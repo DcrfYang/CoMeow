@@ -1,0 +1,206 @@
+// mgmp_urgent.cpp -- see mgmp_urgent.h.
+#include "mgmp_urgent.h"
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+#include "json.hpp"
+#include "mgmp_log.h"
+#include "mgmp_server_addr.h"
+
+#pragma comment(lib, "ws2_32.lib")
+
+namespace mgmp {
+namespace {
+
+using json = nlohmann::json;
+
+constexpr DWORD kFirstMs = 8000;      // the first ask, a few seconds after the menu is up
+constexpr DWORD kEveryMs = 60000;     // then about once a minute
+constexpr int   kTimeoutMs = 6000;
+
+SRWLOCK g_lock = SRWLOCK_INIT;
+bool g_have = false;                  // a notice that applies to this mod is current
+UrgentView g_cur;
+char g_dismissed[64] = {};
+char g_announced[64] = {};
+char g_logged[64] = {};
+volatile LONG g_started = 0;
+bool g_gn_have = false;               // the game update notice (see mgmp_urgent.h)
+GameNoticeView g_gn;
+char g_gn_dismissed[64] = {};
+char g_mine[24] = {};
+
+// This DLL's own version, from its VERSIONINFO resource (no version.lib: the fixed file info is found by its signature).
+void read_own_version() {
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&read_own_version, &self);
+    HRSRC r = self ? FindResourceW(self, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16)) : nullptr;   // VS_VERSION_INFO, RT_VERSION
+    HGLOBAL h = r ? LoadResource(self, r) : nullptr;
+    const uint8_t* p = h ? (const uint8_t*)LockResource(h) : nullptr;
+    const DWORD n = r ? SizeofResource(self, r) : 0;
+    for (DWORD i = 0; p && i + 52 <= n; i += 4) {
+        DWORD sig = 0; memcpy(&sig, p + i, 4);
+        if (sig != 0xFEEF04BDu) continue;
+        DWORD ms = 0, ls = 0; memcpy(&ms, p + i + 8, 4); memcpy(&ls, p + i + 12, 4);
+        _snprintf_s(g_mine, sizeof(g_mine), _TRUNCATE, "%u.%u.%u", (unsigned)HIWORD(ms), (unsigned)LOWORD(ms), (unsigned)HIWORD(ls));
+        return;
+    }
+    strcpy_s(g_mine, "0.0.0");
+}
+
+// GET http://<official address><path> -- the body, or empty (no notice, or no answer).
+std::string fetch(const char* path) {
+    std::string body;
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(kOfficialIp, "80", &hints, &res) != 0 || !res) return body;
+    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return body; }
+    DWORD to = kTimeoutMs;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+    const bool ok = connect(s, res->ai_addr, (int)res->ai_addrlen) == 0;
+    freeaddrinfo(res);
+    if (ok) {
+        char req[256];
+        const int n = _snprintf_s(req, sizeof(req), _TRUNCATE, "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: CoMeow/%s\r\nConnection: close\r\n\r\n", path, kOfficialIp, g_mine);
+        std::string all;
+        if (n > 0 && send(s, req, n, 0) == n) {
+            char buf[4096];
+            for (int got; (got = recv(s, buf, sizeof(buf), 0)) > 0 && all.size() < 65536; ) all.append(buf, (size_t)got);
+        }
+        const size_t sep = all.find("\r\n\r\n");
+        if (all.compare(0, 9, "HTTP/1.1 ") == 0 || all.compare(0, 9, "HTTP/1.0 ") == 0)
+            if (all.compare(9, 3, "200") == 0 && sep != std::string::npos) body = all.substr(sep + 4);
+    }
+    closesocket(s);
+    return body;
+}
+
+void apply(const std::string& body) {
+    UrgentView v;
+    bool applies = false;
+    const size_t a = body.find('{'), b = body.rfind('}');
+    if (a != std::string::npos && b != std::string::npos && b > a) {
+        const json j = json::parse(body.substr(a, b - a + 1), nullptr, false);
+        if (j.is_object() && j.contains("version") && j["version"].is_string() && j.contains("text") && j["text"].is_string()) {
+            strncpy_s(v.version, sizeof(v.version), j["version"].get<std::string>().c_str(), _TRUNCATE);
+            strncpy_s(v.text, sizeof(v.text), j["text"].get<std::string>().c_str(), _TRUNCATE);
+            if (j.contains("id") && j["id"].is_string()) strncpy_s(v.id, sizeof(v.id), j["id"].get<std::string>().c_str(), _TRUNCATE);
+            else strncpy_s(v.id, sizeof(v.id), v.version, _TRUNCATE);
+            strncpy_s(v.mine, sizeof(v.mine), g_mine, _TRUNCATE);
+            applies = urgent_version_cmp(g_mine, v.version) < 0;
+        }
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    const bool was = g_have;
+    g_have = applies;
+    if (applies) g_cur = v;
+    const bool log_it = applies && strcmp(g_logged, v.id) != 0;
+    if (log_it) strncpy_s(g_logged, sizeof(g_logged), v.id, _TRUNCATE);
+    ReleaseSRWLockExclusive(&g_lock);
+    if (log_it) log_line_lvl(LogLevel::Warn, "URGENT", "!! the server names an URGENT FIX %s (this mod is %s): %s -- the banner is shown", v.version, g_mine, v.text);
+    else if (was && !applies) log_line("URGENT", "the urgent fix notice is no longer up (expired, taken down, or this mod is not older)");
+}
+
+void apply_gamenotice(const std::string& body) {
+    GameNoticeView v;
+    bool have = false;
+    const size_t a = body.find('{'), b = body.rfind('}');
+    if (a != std::string::npos && b != std::string::npos && b > a) {
+        const json j = json::parse(body.substr(a, b - a + 1), nullptr, false);
+        if (j.is_object() && j.contains("id") && j["id"].is_string() && j.contains("text") && j["text"].is_string()) {
+            strncpy_s(v.id, sizeof(v.id), j["id"].get<std::string>().c_str(), _TRUNCATE);
+            strncpy_s(v.text, sizeof(v.text), j["text"].get<std::string>().c_str(), _TRUNCATE);
+            have = v.id[0] && v.text[0];
+        }
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    const bool fresh = have && (!g_gn_have || strcmp(g_gn.id, v.id) != 0);
+    const bool gone = !have && g_gn_have;
+    g_gn_have = have;
+    if (have) g_gn = v;
+    ReleaseSRWLockExclusive(&g_lock);
+    if (fresh) log_line_lvl(LogLevel::Warn, "URGENT", "!! the server posts a GAME UPDATE NOTICE (%s): %s -- the banner is shown", v.id, v.text);
+    else if (gone) log_line("URGENT", "the game update notice is no longer up");
+}
+
+DWORD WINAPI worker(void*) {
+    WSADATA wd{};
+    WSAStartup(MAKEWORD(2, 2), &wd);
+    Sleep(kFirstMs);
+    for (;;) {
+        apply(fetch("/update/urgent.txt"));
+        apply_gamenotice(fetch("/update/gamenotice.txt"));
+        Sleep(kEveryMs);
+    }
+}
+
+} // namespace
+
+int urgent_version_cmp(const char* a, const char* b) {
+    for (int part = 0; part < 4; ++part) {
+        char* ea = nullptr; char* eb = nullptr;
+        const long x = (a && *a) ? strtol(a, &ea, 10) : 0;
+        const long y = (b && *b) ? strtol(b, &eb, 10) : 0;
+        if (x != y) return x < y ? -1 : 1;
+        a = (ea && *ea == '.') ? ea + 1 : nullptr;
+        b = (eb && *eb == '.') ? eb + 1 : nullptr;
+        if (!a && !b) break;
+    }
+    return 0;
+}
+
+void urgent_start() {
+    if (InterlockedCompareExchange(&g_started, 1, 0) != 0) return;
+    read_own_version();
+    HANDLE t = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    log_line("URGENT", "the urgent fix notice is asked for every %u s (this mod %s)", (unsigned)(kEveryMs / 1000), g_mine);
+}
+
+bool urgent_view(UrgentView& out) {
+    AcquireSRWLockShared(&g_lock);
+    const bool show = g_have && strcmp(g_dismissed, g_cur.id) != 0;
+    if (show) out = g_cur;
+    ReleaseSRWLockShared(&g_lock);
+    return show;
+}
+
+bool urgent_take_new(UrgentView& out) {
+    AcquireSRWLockExclusive(&g_lock);
+    const bool fresh = g_have && strcmp(g_announced, g_cur.id) != 0;
+    if (fresh) { strncpy_s(g_announced, sizeof(g_announced), g_cur.id, _TRUNCATE); out = g_cur; }
+    ReleaseSRWLockExclusive(&g_lock);
+    return fresh;
+}
+
+bool gamenotice_view(GameNoticeView& out) {
+    AcquireSRWLockShared(&g_lock);
+    const bool show = g_gn_have && strcmp(g_gn_dismissed, g_gn.id) != 0;
+    if (show) out = g_gn;
+    ReleaseSRWLockShared(&g_lock);
+    return show;
+}
+
+void gamenotice_dismiss() {
+    AcquireSRWLockExclusive(&g_lock);
+    strncpy_s(g_gn_dismissed, sizeof(g_gn_dismissed), g_gn.id, _TRUNCATE);
+    ReleaseSRWLockExclusive(&g_lock);
+    log_line("URGENT", "the player put the game update notice away (%s)", g_gn.id);
+}
+
+void urgent_dismiss() {
+    AcquireSRWLockExclusive(&g_lock);
+    strncpy_s(g_dismissed, sizeof(g_dismissed), g_cur.id, _TRUNCATE);
+    ReleaseSRWLockExclusive(&g_lock);
+    log_line("URGENT", "the player put the urgent fix banner away (%s)", g_cur.id);
+}
+
+} // namespace mgmp

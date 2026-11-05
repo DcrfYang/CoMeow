@@ -71,5 +71,9 @@ struct MapVoteMark { uint8_t peer = 0; float cx = 0, cy = 0, half = 0, angle = 0
 int  mapvote_marks(MapVoteMark* out, int cap);
 // For the status line: how many of the room's players have picked, of how many; whether this player has; whether this one is the host's turn to be waited for.
 bool mapvote_counts(unsigned& have, unsigned& total, bool& i_picked);
+// The host's pick has been walked to and the node is still not entered after a few seconds: the game's entry is held (a checkpoint, a gear screen, the room's setup).
+bool mapvote_held();
+// A map node's position in the map's layer (the same geometry the vote's icons use); false when it does not read. (0.1.141: mgmp_follow's unstick)
+bool mapvote_node_world(void* node, float& x, float& y);
 
 } // namespace mgmp

@@ -1,5 +1,6 @@
 #include "mgmp_saveslots.h"
 #include "mgmp_i18n.h"
+#include "mgmp_menu.h"      // ui_error_popup: a file or save problem the player is shown (0.1.169)
 
 #include <windows.h>
 #include <algorithm>
@@ -14,6 +15,7 @@
 
 #include "mgmp_addresses.h"
 #include "mgmp_checkpoint.h"
+#include "mgmp_catsync.h"          // catsync_drop_swap_notes: a restored / loaded save replaces the one the notes were made in (0.1.170)
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_leave.h"
 #include "mgmp_log.h"
@@ -124,6 +126,13 @@ std::string utf8(const std::wstring& s) {
     std::string out(n, 0);
     WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n, nullptr, nullptr);
     return out;
+}
+
+// 0.1.169: a folder or file the backups need could not be made -- the player is shown it (the error code is taken before anything else runs)
+void dir_popup(const std::wstring& d, DWORD e) {
+    char text[1024];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_WRITE), utf8(d).c_str(), (unsigned long)e);
+    ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
 }
 
 std::wstring wide(const std::string& s) {
@@ -302,7 +311,7 @@ bool restore_handshake(const std::wstring& game, const HsList& files) {
             if (h == INVALID_HANDLE_VALUE) continue;
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                if (!DeleteFileW((d + L"\\" + fd.cFileName).c_str())) {
+                if (!checkpoint_archive_handshake_file(d + L"\\" + fd.cFileName)) {      // a handshake save is archived (the queue of 100), not deleted
                     FindClose(h); FindClose(hs); say(tr(Tx::SS_CLEAR_HS_FAIL), fd.cFileName); return false;
                 }
             } while (FindNextFileW(h, &fd));
@@ -332,6 +341,11 @@ bool capture_current(const std::wstring& game, Bytes out[kGameSlots], bool have[
         // bytes were taken as they were). The failure seen in the field was not a damaged save but one over the old 4 MiB bound -- YUEMO,
         // 2026-10-07: "the copy could not be read back" after a clean backup -- which kMaxLocalSaveBytes now covers.
         log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! %ls could not be copied cleanly (%s) -- validating the live file before accepting it", kGameFile[s], checkpoint_io::snapshot_why());
+        {   // 0.1.169: room KD8E -- the copy failed with error 5 beside the save; the player is shown it
+            char text[1024];
+            _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_BACKUP_COPY), utf8(kGameFile[s]).c_str(), checkpoint_io::snapshot_why());
+            ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+        }
         if (checkpoint_io::verified(f, out[s])) {
             have[s] = true;
             log_line_lvl(LogLevel::Warn, "SAVESLOTS", "the live %ls is a readable SQLite save; keeping it as the last-resort backup", kGameFile[s]);
@@ -370,11 +384,11 @@ bool capture_current(const std::wstring& game, Bytes out[kGameSlots], bool have[
 bool write_folder(const std::wstring& game, const std::wstring& final_dir, const Bytes bytes[kGameSlots],
                   const bool have[kGameSlots], SaveBackup& meta, const HsList* hs = nullptr) {
     const std::wstring root = root_of(game);
-    if (!ensure_dir(root)) { say(tr(Tx::SS_CREATE_FAIL), root.c_str()); return false; }
+    if (!ensure_dir(root)) { dir_popup(root, GetLastError()); say(tr(Tx::SS_CREATE_FAIL), root.c_str()); return false; }
 
     const std::wstring stage = root + L"\\_stage";
     wipe_dir(stage);
-    if (!ensure_dir(stage)) { say(tr(Tx::SS_TMP_FAIL)); return false; }
+    if (!ensure_dir(stage)) { dir_popup(stage, GetLastError()); say(tr(Tx::SS_TMP_FAIL)); return false; }
 
     for (int s = 0; s < kGameSlots; ++s) {
         meta.slot[s] = SaveSlotInfo{};
@@ -672,6 +686,7 @@ bool load_dir(const std::wstring& game, const std::wstring& dir, int index, bool
     if (autoq)                      say(tr(Tx::SS_AUTO_LOADED), index + 1, meta.name);
     else if (meta.handshake >= 0)   say(tr(Tx::SS_LOADED_HS), index + 1, meta.name, meta.handshake);
     else                            say(tr(Tx::SS_LOADED), index + 1, meta.name);
+    catsync_drop_swap_notes("a backup was loaded on the backup page");
     g.msg_load = true;
     return true;
 }
@@ -826,10 +841,10 @@ bool saveslots_import(int index, const wchar_t* path) {
 
     // Stage it, check it as a position would be checked, and only then put it in place.
     const std::wstring root = root_of(game);
-    if (!ensure_dir(root)) { say(tr(Tx::SS_CREATE_FAIL), root.c_str()); return false; }
+    if (!ensure_dir(root)) { dir_popup(root, GetLastError()); say(tr(Tx::SS_CREATE_FAIL), root.c_str()); return false; }
     const std::wstring stage = root + L"\\_import";
     wipe_dir(stage);
-    if (!ensure_dir(stage)) { say(tr(Tx::SS_TMP_FAIL)); return false; }
+    if (!ensure_dir(stage)) { dir_popup(stage, GetLastError()); say(tr(Tx::SS_TMP_FAIL)); return false; }
     for (const PackFile& f : files) {
         std::wstring rel = wide(f.path);
         for (wchar_t& c : rel) if (c == L'/') c = L'\\';
@@ -879,13 +894,13 @@ void saveslots_sync_refresh() {
     for (int s = 0; s < kGameSlots; ++s) { g.sync[s].clear(); g.syncref[s].clear(); }
     std::wstring game;
     if (!game_dir(game)) return;
-    const std::wstring root = hs_root(game);
-
     struct Found { int slot; SyncSave info; SyncRef ref; };
     std::vector<Found> all;
+    // the live queues, and the archive beside them (mgmp_handshake_old: what left a run's queue, see checkpoint_archive_handshake_file)
+    for (const std::wstring& root : { hs_root(game), hs_root(game) + L"_old" }) {
     WIN32_FIND_DATAW sub;
     HANDLE hs = FindFirstFileW((root + L"\\*").c_str(), &sub);
-    if (hs == INVALID_HANDLE_VALUE) return;
+    if (hs == INVALID_HANDLE_VALUE) continue;
     do {
         if (!(sub.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !plain_name(sub.cFileName) ||
             (sub.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
@@ -916,13 +931,14 @@ void saveslots_sync_refresh() {
         FindClose(h);
     } while (FindNextFileW(hs, &sub));
     FindClose(hs);
+    }
 
     std::sort(all.begin(), all.end(), [](const Found& a, const Found& b) {
         return a.ref.stamp != b.ref.stamp ? a.ref.stamp > b.ref.stamp : a.info.seq > b.info.seq; });   // newest first
     for (Found& f : all) {
         if ((int)g.sync[f.slot].size() >= kSyncMax) continue;
         HandshakeSaveInfo hi; Bytes db; SaveSlotInfo si;
-        if (checkpoint_peek_file(f.ref.path, f.ref.folder, hi, &db) && sync_probe(game, db, si)) { f.info.day = si.day; f.info.percent = si.percent; }
+        if (g.sync[f.slot].size() < 30 && checkpoint_peek_file(f.ref.path, f.ref.folder, hi, &db) && sync_probe(game, db, si)) { f.info.day = si.day; f.info.percent = si.percent; }   // the day / percent of the newest 30 only: each needs a database opened
         g.sync[f.slot].push_back(f.info);
         g.syncref[f.slot].push_back(std::move(f.ref));
     }
@@ -953,7 +969,7 @@ bool saveslots_sync_restore(int slot, int index) {
 
     // 2. It must be a database the game can be given (the same test a backup gets).
     {
-        if (!ensure_dir(root_of(game))) { say(tr(Tx::SS_CREATE_FAIL), root_of(game).c_str()); return false; }
+        if (!ensure_dir(root_of(game))) { dir_popup(root_of(game), GetLastError()); say(tr(Tx::SS_CREATE_FAIL), root_of(game).c_str()); return false; }
         const std::wstring probe = sync_probe_path(game);
         sync_probe_drop(probe);
         Bytes checked;
@@ -986,6 +1002,10 @@ bool saveslots_sync_restore(int slot, int index) {
     if (!checkpoint_io::atomic_write(target, db)) { say(tr(Tx::SS_WRITE_PARTIAL), kGameFile[slot]); return false; }
     log_line("SAVESLOTS", "slot %d restored from the handshake save of run %016llx node %llu (%s)", slot + 1,
              (unsigned long long)want.run, (unsigned long long)want.seq, utf8(ref.path).c_str());
+    // 0.1.170 (2026-11-03): what an in-room recovery does with the journal -- the run's owner and clone-origin notes -- so the run played on from here settles its clones
+    // back into their originals; and the swap notes of the save this one replaces are dropped (they would name the wrong cats in the House).
+    catsync_drop_swap_notes("a handshake save was restored on the backup page");
+    if (!checkpoint_import_notes_file(ref.path)) log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! the restored handshake save's owner / clone-origin notes could not be read");
     if (want.stage) say(tr(Tx::SS_SYNC_DONE_STAGE), slot + 1, tr(want.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
     else            say(tr(Tx::SS_SYNC_DONE), slot + 1, (unsigned)want.seq);
     g.msg_load = true;

@@ -16,6 +16,8 @@
 #include "mgmp_leave.h"
 #include "mgmp_menu.h"
 #include "mgmp_checkpoint.h"
+#include "mgmp_lockstep.h"   // unitprobe
+#include "mgmp_unitstate.h"  // usdev
 
 namespace mgmp {
 namespace {
@@ -213,6 +215,8 @@ void uitest_before_frame() {
         // The host's handshake choice without a click: -1 = the preparation stage, 0.. = that save.
         if (c.op == "hspick") { log_line("UITEST", "hspick %s -> %s", c.arg.c_str(), checkpoint_host_pick(atoi(c.arg.c_str())) ? "ok" : "refused"); g.wait = 2; break; }
         if (c.op == "hsdismiss") { checkpoint_sync_dismiss(); break; }
+        if (c.op == "usdev") { unitstate_dev(c.arg.c_str()); break; }
+        if (c.op == "unitprobe") { log_line("UITEST", "unitprobe -> %u unit(s)", lockstep_dev_unitprobe(c.arg == "deep")); break; }
         if (c.op == "pressbtn") { menu_request_press(c.arg.c_str()); g.wait = 2; break; }
         if (c.op == "waitscreen") {
             char nm[16] = {}; int budget = 60 * 240;

@@ -151,6 +151,8 @@ bool catsync_cat_exists(uint64_t id);
 // A cat an event brought into the run (gain_cat_familiar, after the game's own call): moved to the shared session_gained_id on every peer.
 // `counter_before` is catsync_id_counter() from just before the game's call. True when the cat was moved.
 bool catsync_on_gained_cat(uint64_t counter_before, const char* why);
+// A gained cat (any seat's) is in this run: that seat's next gained cat takes a later slot (0.1.146; a restore, or another player's cat arriving).
+void catsync_gained_seen(uint64_t id);
 uint64_t catsync_id_counter();
 
 // FNV-1a of a cat's serialized image -- the hash CATDATA carries; 0 when it cannot be serialized. For logs.
@@ -252,6 +254,22 @@ unsigned catsync_release_stuck_cats(const char* why);
 // setup message uses deterministic session IDs and the local party is changed
 // to those IDs before the message is sent.
 bool catsync_prepare_party_setup(SetupMsg& out, uint8_t owner_pos);
+// 0.1.131, THE CLASS COMPLETION CHECK (T_ClassCompletion): for the duration of the game's check the party list (and the departed list it reads for the monoclass /
+// solo-cat requirements) holds THIS player's own cats -- in a room a client's party is the shared layout then. begin returns whether it changed the lists; end puts
+// them back exactly. `why` is the event name, for the log (COMPLETION).
+bool catsync_completion_begin(const char* why);
+void catsync_completion_end();
+// 0.1.147: THE ROOM'S RULE for the solo-cat / same-class marks (mgmp_completion_rule.h): who brought what, by session cat id, is remembered when the shared roster is
+// installed and forgotten when the run is settled; the check above puts a departed list into the director that makes the game's own check come out as the rule.
+void catsync_note_departure(const uint64_t* ids, uint32_t n);
+void catsync_departure_clear();
+// 0.1.149: THE MARKS IN THE LOG (grep COMPLETION). marks_before / marks_after bracket the game's check (the progression's records are compared: what was given, whether it
+// is what the room's rule promised, kept in a ledger); marks_run_summary prints the ledger when the run is settled; announce_marks tells THIS player, at the chapter page when
+// every player is on it, whether the run can earn a special mark and which.
+void catsync_marks_before(const void* progression);
+void catsync_marks_after(const void* progression, const char* chapter, bool hard_path, bool swapped);
+void catsync_marks_run_summary(const char* how);
+void catsync_announce_marks();
 
 // Resolves and prologue-checks the game functions this module calls. Called
 // from hooks_verify_module alongside rng_set_base, because a bad address here
@@ -299,6 +317,10 @@ void catsync_dump_vectors(const char* why);
 // For a reconnecting peer -- see the comment on the definition. Both peers need it,
 // because after a reconnect the OTHER one has none of what this one already sent.
 void catsync_forget();
+// 0.1.170: the swap notes still waiting for a House save are dropped -- the save they were made in has been replaced (a handshake save restored, a backup loaded).
+void catsync_drop_swap_notes(const char* why);
+// The settlement is over: cats may be applied again (0.1.145; also when the run ended alone, where catsync_forget is not called).
+void catsync_settle_done(const char* why);
 
 // EITHER PEER: resolve m.id in this peer's run and deserialize over it.
 //
@@ -353,5 +375,9 @@ void* catsync_registry_cat(uint64_t id);
 // A NEW CatData read from a cat image the way setup builds a session cat (allocate + construct + read + post-load), its CatData+0xC48 set to
 // `save_id`. Not registered anywhere: the caller keeps it. nullptr when the image does not read.
 void* catsync_cat_from_image(const uint8_t* image, uint32_t len, uint64_t save_id);
+
+// 0.1.192: the party list (MewDirector+0x5C0 and its mirror) loses every id the save cannot load -- the inventory screen's cat selector reads CatData::by_id's answer with no
+// null check. Returns how many were taken out (their ids in `gone`, up to `cap`). Game thread.
+unsigned catsync_purge_missing_party(const char* why, uint64_t* gone, unsigned cap);
 
 } // namespace mgmp

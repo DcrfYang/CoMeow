@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
     F(CheckpointMsg, "checkpoint", dec_checkpoint);
     F(PageMsg, "page", dec_page);
     F(NodeVoteMsg, "nodevote", dec_nodevote);
+    F(VoiceMsg, "voice", dec_voice);
     F(CatsMsg, "cats", dec_cats);
     F(SaveWaitMsg, "savewait", dec_savewait);
     F(RollMsg, "roll", dec_roll);

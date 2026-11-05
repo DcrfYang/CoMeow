@@ -254,6 +254,24 @@ void leave_prune() {
     CHECK(roster_drop_positions(1u << 2, "position 2 left") == 2);
     CHECK(count(kDir_CatIdCount) == 2 && party[0] == 0x70000001 && count(kDir_CatFamiliars + 4) == 2 && familiars[0] == 0x71000001 && familiars[1] == 0x71000002);
     CHECK(roster_drop_positions(1u << 2, "again") == 0);
+    // 0.1.146: a cat position 2's own random event brought in (0x72000019) leaves with that position; position 1's (0x71000019) stays
+    initialize();
+    const uint64_t gained[4] = {0x71000001, 0x72000001, 0x72000019, 0x71000019};
+    std::memcpy(party, three, sizeof(party)); std::memcpy(mirror, three, sizeof(mirror)); std::memcpy(familiars, gained, sizeof(gained));
+    put(kDir_CatIdCount, uint32_t(2)); put(kDir_MirrorCount, uint32_t(2)); put(kDir_CatFamiliars + 4, uint32_t(4));
+    CHECK(roster_drop_positions(1u << 2, "position 2 left, with its gained cat") == 2);
+    CHECK(count(kDir_CatFamiliars + 4) == 2 && familiars[0] == 0x71000001 && familiars[1] == 0x71000019);
+    // 0.1.151: a resumed run keeps its gained cats after the clones IN ID ORDER, each noted with its seat -- whatever order this save's lists held them in
+    initialize(); peer = 0; grow_vectors = true;
+    const uint64_t hp[4] = {0x70000001, 0x70000002, 0, 0}, gmix[4] = {0x71000019, 0x70000019, 0x71000001, 0};
+    std::memcpy(party, hp, sizeof(party)); std::memcpy(mirror, hp, sizeof(mirror)); std::memcpy(familiars, gmix, sizeof(familiars));
+    put(kDir_CatIdCount, uint32_t(2)); put(kDir_MirrorCount, uint32_t(2)); put(kDir_CatFamiliars + 4, uint32_t(3));
+    { const uint64_t ids[3] = {0x70000001, 0x70000002, 0x71000001};
+      CHECK(roster_setup_install_shared(ids, 3, "resume with gained cats", true)); }
+    { uint32_t fn = 0; uint64_t* f = nullptr; std::memcpy(&fn, director + kDir_CatFamiliars + 4, 4); std::memcpy(&f, director + kDir_CatFamiliars + 8, 8);
+      CHECK(fn == 3 && f[0] == 0x71000001 && f[1] == 0x70000019 && f[2] == 0x71000019); }
+    CHECK(owner_notes[0x70000019] == 0 && owner_notes[0x71000019] == 1);
+    grow_vectors = false;
     // nothing of this peer's own in the lists: refused, the lists are untouched
     initialize();
     std::memcpy(party, hostparty, sizeof(party)); std::memcpy(mirror, hostparty, sizeof(mirror)); std::memcpy(familiars, clients, sizeof(familiars));
@@ -389,6 +407,8 @@ bool net_active() { return active; }
 NetRole net_role() { return peer ? NetRole::Client : NetRole::Host; }
 uint8_t net_peer_pos() { return peer; }
 uint8_t net_peer_count() { return peers; }
+uint8_t net_seat_span() { return peers; }
+bool net_seat_peer(uint8_t pos, uint8_t& id) { if (pos >= peers) return false; id = pos; return true; }
 bool net_send_party(const PartyMsg&) { return true; }
 bool lockstep_in_battle() { return in_battle; }
 bool lockstep_battle_list_gone() { return list_gone; }
@@ -400,6 +420,8 @@ bool lockstep_cat_is_mine(uint64_t id, bool& mine) {
 }
 bool catsync_cat_perished(uint64_t) { return false; }   // the roster asks whether a cat that left the lists is dead for good
 bool catsync_cat_exists(uint64_t) { return false; }     // ... and whether an unknown id in them is a real cat
+void catsync_gained_seen(uint64_t) {}
+void catsync_note_departure(const uint64_t*, uint32_t) {}   // 0.1.147: who brought what, for the class marks                    // a resumed run's gained cats advance their seat's next slot (0.1.146)
 bool lockstep_owner_pos(uint64_t id, uint8_t& owner) {
     auto found = owner_notes.find(id);
     if (found != owner_notes.end()) { owner = found->second; return true; }

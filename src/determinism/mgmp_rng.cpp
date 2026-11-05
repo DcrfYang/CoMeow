@@ -175,8 +175,8 @@ bool __fastcall h_rollchance(double p, double scale, uint64_t* state) {
             const uint32_t turn = lockstep_turn();
             if (battle) {
                 static uint64_t s_battle = 0;
-                static uint32_t s_turn = ~0u, s_n[sizeof(kIsolated) / sizeof(kIsolated[0])] = {};
-                if (battle != s_battle || turn != s_turn) { s_battle = battle; s_turn = turn; memset(s_n, 0, sizeof(s_n)); }
+                static uint32_t s_turn = ~0u, s_gen = ~0u, s_n[sizeof(kIsolated) / sizeof(kIsolated[0])] = {};
+                if (battle != s_battle || turn != s_turn || s_gen != lockstep_battle_gen()) { s_battle = battle; s_turn = turn; s_gen = lockstep_battle_gen(); memset(s_n, 0, sizeof(s_n)); }
                 const uint32_t n = ++s_n[iso - kIsolated];
                 uint64_t x = battle ^ ((uint64_t)iso->salt << 32) ^ ((uint64_t)turn * 0x100000001B3ull) ^ ((uint64_t)n * 0xD6E8FEB86659FD93ull);
                 uint64_t own[4];

@@ -28,6 +28,7 @@ uint32_t g_detail_sent[64] = {};                       // the flush whose detail
 struct RnglWant { uint32_t seq = 0; bool main = false, loose = false; };
 RnglWant g_want[kMaxPeers][64];                        // a difference with that peer's flush, waiting for its detail to name the sites
 uint64_t g_battle = 0;
+uint32_t g_gen = ~0u;
 uint32_t g_seq = 0, g_compared = 0, g_mismatched = 0, g_detailed = 0;
 uint32_t g_loose_mismatched = 0, g_loose_lines = 0;
 bool g_armed = false, g_shared = false, g_env_sent = false;
@@ -156,7 +157,7 @@ void rngl_flush(uint32_t turn, uint32_t action) {
     const bool on = lockstep_in_battle() && lockstep_fight_up() && !lockstep_enemies_all_down();
     if (!on) { if (g_armed) { rng_ledger_arm(false); g_armed = false; } return; }
     const uint64_t battle = lockstep_battle_id();
-    if (battle != g_battle) { rngl_reset(battle); g_armed = false; }
+    if (battle != g_battle || g_gen != lockstep_battle_gen()) { rngl_reset(battle); g_gen = lockstep_battle_gen(); g_armed = false; }
     if (!g_armed) {                                       // the first window of a battle is not a whole one: start counting here, say who this peer is, compare from the next flush on
         rng_ledger_arm(true); g_armed = true;
         if (!g_env_sent) {

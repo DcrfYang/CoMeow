@@ -66,6 +66,7 @@ struct State {
     bool     host_exp_treasure = false;     // ... and the host's ui.exp_treasure (HELLO rules bit 1, proto 90)
     bool     host_exp_house_coop = false;   // ... and the host's ui.exp_house_coop (HELLO rules bit 2, proto 94)
     bool     host_exp_indep_events = false; // ... and the host's ui.exp_indep_events (HELLO rules bit 3, proto 102)
+    bool     host_exp_voice = false;        // ... and the host's ui.exp_voice (HELLO rules bit 4, proto 107)
     uint8_t  host_enemy_scale_half = 4;     // ... and the host's ui.enemy_scale in halves (HELLO, proto 95)
     char     req_addr[192] = {};      // one address or a comma-separated list (see net_join)
     uint16_t req_port = 0;
@@ -73,6 +74,7 @@ struct State {
     // 0.1.57: the last "your versions differ" message, and when each peer was last told about (a refused client repeats its HELLO every 3 s)
     char      ver_text[1024] = {};
     ULONGLONG ver_at[kMaxPeers] = {};
+    ULONGLONG ver_refused_at[kMaxPeers] = {};      // the host refused this peer's HELLO (version / build / rules) at this time; 0 = not refused (or accepted since)
 };
 
 State g;
@@ -177,7 +179,7 @@ Hello our_hello() {
     h.proto      = kProtoVersion;
     h.gpak_hash  = g.gpak_hash;
     h.build_hash = g.build_hash;
-    h.rules      = (config().exp_treasure ? 2 : 0) | (config().exp_house_coop ? 4 : 0) | (config().exp_indep_events ? 8 : 0);    // meaningful from the host only (bit 0, ui.block_new_cats, is gone: 2026-10-21)
+    h.rules      = (config().exp_treasure ? 2 : 0) | (config().exp_house_coop ? 4 : 0) | (config().exp_indep_events ? 8 : 0) | (config().exp_voice ? 16 : 0);    // meaningful from the host only (bit 0, ui.block_new_cats, is gone: 2026-10-21)
     h.enemy_scale_half = config().enemy_scale_half;
     _snprintf_s(h.name, sizeof(h.name), _TRUNCATE, "%s",
                 net_role() == NetRole::Host ? "host" : "client");
@@ -238,6 +240,7 @@ bool parse_proto_reason(const char* why, uint32_t& first, uint32_t& second) {
 void announce_mismatch(uint8_t peer, const char* why, bool we_refused) {
     if (peer < kMaxPeers) {                                   // said once a minute per player: the refused client asks again every 3 seconds
         const ULONGLONG now = GetTickCount64();
+        if (we_refused) g.ver_refused_at[peer] = now;
         if (g.ver_at[peer] && now - g.ver_at[peer] < 60000) return;
         g.ver_at[peer] = now;
     }
@@ -257,6 +260,15 @@ void announce_mismatch(uint8_t peer, const char* why, bool we_refused) {
     }
     strncpy_s(g.ver_text, sizeof(g.ver_text), text, _TRUNCATE);
     room_push_notice(text);
+    // THE OTHER PLAYERS HAD NO WORD OF IT (0.1.114): a refused player stayed in the room list with "unknown" beside its name, and only the host (and the refused
+    // player) were told why. The host says it in the room's chat, to everybody.
+    if (we_refused && net_role() == NetRole::Host) {
+        char line[220];
+        uint32_t a2 = 0, b2 = 0;
+        if (parse_proto_reason(why, a2, b2)) _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::R_VER_ROOM_LINE), who, a2, b2);
+        else                                 _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::R_VER_ROOM_LINE_OTHER), who);
+        chat_system_line(line);
+    }
 }
 
 // Refuse one peer. On the host the session survives it -- the other players keep
@@ -326,6 +338,7 @@ void handle_hello(uint8_t from, const Hello& h) {
         refuse_peer(from, why);
         return;
     }
+    if (from < kMaxPeers) g.ver_refused_at[from] = 0;
     log_line("SESSION", "peer %u '%s' accepted (proto %u, build+rules+sim %016llx, gpak %016llx; this peer: %016llx / %016llx, sim revision %u)",
              (unsigned)from, h.name[0] ? h.name : "?", h.proto, (unsigned long long)h.build_hash, (unsigned long long)h.gpak_hash,
              (unsigned long long)g.build_hash, (unsigned long long)g.gpak_hash, (unsigned)tune::kSimRevision);
@@ -336,12 +349,14 @@ void handle_hello(uint8_t from, const Hello& h) {
         g.host_exp_treasure = (h.rules & 2) != 0;
         g.host_exp_house_coop = (h.rules & 4) != 0;
         g.host_exp_indep_events = (h.rules & 8) != 0;
-        g.host_enemy_scale_half = h.enemy_scale_half < 4 ? 4 : h.enemy_scale_half > 16 ? 16 : h.enemy_scale_half;
+        g.host_exp_voice = (h.rules & 16) != 0;
+        g.host_enemy_scale_half = h.enemy_scale_half < 2 ? 2 : h.enemy_scale_half > 16 ? 16 : h.enemy_scale_half;   // x1 .. x8 (0.1.179)
         log_line("SESSION", "the host's rule: enemy health and armor x%.1f", g.host_enemy_scale_half / 2.0);
         g.host_rules_known = true;
         log_line("SESSION", "the host's rule: \"a new cat joins\" effects are %s", g.host_block_new_cats ? "BLOCKED" : "left as they are");
         log_line("SESSION", "the host's experimental features: shared treasure chests %s, house boss co-op %s, independent random events %s",
                  g.host_exp_treasure ? "ON" : "off", g.host_exp_house_coop ? "ON" : "off", g.host_exp_indep_events ? "ON" : "off");
+        log_line("SESSION", "the host's voice chat: %s", g.host_exp_voice ? "ON" : "off");
     }
 
     if (net_role() != NetRole::Host) return;
@@ -531,6 +546,7 @@ bool begin(bool host, const char* addr, uint16_t port) {
     souljar_reset();
     g.ver_text[0] = 0;
     memset(g.ver_at, 0, sizeof(g.ver_at));
+    memset(g.ver_refused_at, 0, sizeof(g.ver_refused_at));
     if (host) set_status("hosting on port %u", (unsigned)port);
     else      set_status("joining %s:%u", addr, (unsigned)port);
     return true;
@@ -634,6 +650,11 @@ uint8_t session_enemy_scale_half() {
 bool session_exp_house_coop() {
     if (net_role() == NetRole::Client) return g.host_rules_known && g.host_exp_house_coop;
     return config().exp_house_coop;
+}
+
+bool session_exp_voice() {
+    if (net_role() == NetRole::Client) return g.host_rules_known && g.host_exp_voice;
+    return config().exp_voice;
 }
 
 bool session_exp_indep_events() {
@@ -933,6 +954,10 @@ void session_update() {
 
 bool        session_ready()  { return g.phase == Phase::Ready; }
 const char* session_status() { return g.status; }
+
+bool session_peer_refused(uint8_t peer) {
+    return peer < kMaxPeers && g.ver_refused_at[peer] && GetTickCount64() - g.ver_refused_at[peer] < 20000;      // the refused client asks again every 3 s
+}
 
 bool session_version_problem(char* out, size_t cap) {
     if (!out || !cap || g.phase == Phase::Ready || !g.ver_text[0]) return false;

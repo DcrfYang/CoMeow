@@ -37,6 +37,7 @@ constexpr uintptr_t kPassive_Owner = 0x38;    // Passive -> the Character that c
 constexpr uintptr_t kChar_Ident    = 0x958;   // the creation key: the same value on every peer for the same unit (mgmp_lockstep's roster uses it)
 
 uint64_t g_battle = 0;
+uint32_t g_gen = ~0u;
 uint32_t g_turn = ~0u;
 std::unordered_map<uint64_t, uint32_t> g_n;   // (unit key, handler) -> drawing calls this turn
 std::unordered_map<uint32_t, uint32_t> g_n_init;   // handler -> drawing calls this battle (kind 2)
@@ -85,7 +86,7 @@ void* fenced_call(int i, void* a, void* b, void* c, void* d, void* e, void* f, v
     if (!s) return g_orig[i](a, b, c, d, e, f, g, h);
     const uint64_t battle = lockstep_battle_id();
     const uint32_t turn = lockstep_turn();
-    if (battle != g_battle) { g_battle = battle; g_turn = ~0u; g_logged = 0; g_fenced = g_drew = 0; g_n_init.clear(); }
+    if (battle != g_battle || g_gen != lockstep_battle_gen()) { g_battle = battle; g_gen = lockstep_battle_gen(); g_turn = ~0u; g_logged = 0; g_fenced = g_drew = 0; g_n_init.clear(); }
     if (turn != g_turn) { g_turn = turn; g_n.clear(); }
     const FrameTarget& t = kFrameTargets[i];
     const bool init = t.kind == 2;
@@ -102,16 +103,17 @@ void* fenced_call(int i, void* a, void* b, void* c, void* d, void* e, void* f, v
     void* r = g_orig[i](a, b, c, d, e, f, g, h);
     rng_fence_leave();
     const bool drew = memcmp(s, seed, sizeof(seed)) != 0;
+    const uint64_t ended = s[0];                  // where its own stream stood when the call returned: two peers that drew the same number of times end on the same word
     memcpy(s, saved, sizeof(saved));
     ++g_fenced;
     if (drew) {
         ++g_drew;
         if (init) g_n_init[(uint32_t)i] = n + 1;
         else if (t.kind == 0) g_n[key] = n + 1;
-        if (g_logged < 40 || (g_drew % 500) == 0) {
+        if (g_logged < 40 || (init && g_logged < 120) || (g_drew % 500) == 0) {
             ++g_logged;
-            log_line("RNGFRAME", "%s (slot %u%s) of unit %08x drew from its own stream (turn %u, #%u, seed %016llx) -- the shared stream %016llx is put back [%llu fenced calls, %llu drew, this battle]",
-                     t.cls, (unsigned)t.slot, t.kind == 1 ? ", per frame" : (init ? ", at initialisation" : ""), unit, (unsigned)turn, n, (unsigned long long)seed[0], (unsigned long long)saved[0],
+            log_line("RNGFRAME", "%s (slot %u%s) of unit %08x drew from its own stream (turn %u, #%u, seed %016llx, ended on %016llx) -- the shared stream %016llx is put back [%llu fenced calls, %llu drew, this battle]",
+                     t.cls, (unsigned)t.slot, t.kind == 1 ? ", per frame" : (init ? ", at initialisation" : ""), unit, (unsigned)turn, n, (unsigned long long)seed[0], (unsigned long long)ended, (unsigned long long)saved[0],
                      (unsigned long long)g_fenced, (unsigned long long)g_drew);
         }
     }

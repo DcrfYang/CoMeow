@@ -57,7 +57,7 @@ int main() {
     static_assert(sizeof(kSigData) / sizeof(kSigData[0]) == (size_t)D_COUNT, "data sig count");
     const struct { int d; const char* name; } data_order[] = {
         { D_MewDirectorPtr, "MewDirectorPtr" }, { D_MouseCache, "MouseCache" }, { D_ApplicationBase, "ApplicationBase" },
-        { D_CatIdCounter, "CatIdCounter" }, { D_CatRegister, "CatRegister" }, { D_AbandonFunctionVtable, "AbandonFunctionVtable" },
+        { D_CatIdCounter, "CatIdCounter" }, { D_CatRegister, "CatRegister" }, { D_AbandonFunctionVtable, "AbandonFunctionVtable" }, { D_TextsObject, "TextsObject" },
     };
     CHECK(sizeof(data_order) / sizeof(data_order[0]) == (size_t)D_COUNT, "the data list here is out of date (%d enumerators)", (int)D_COUNT);
     for (const auto& e : data_order)

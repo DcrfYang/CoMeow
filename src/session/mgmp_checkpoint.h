@@ -47,6 +47,12 @@ bool checkpoint_stage_holding();
 // confirmation), which node (seq), how many players, and (database != null) the save itself. False for a file that is not a confirmed save of this player. `folder_id` is the id the folder is named after.
 struct HandshakeSaveInfo { uint8_t slot = 255, players = 0, stage = 0; bool after_boss = false; uint64_t run = 0, seq = 0, stamp = 0; };   // after_boss: confirmed right after the chapter boss; stage: kStagePrep / kStageReady, 0 = a node's save
 bool checkpoint_peek_file(const std::wstring& path, uint64_t folder_id, HandshakeSaveInfo& info, std::vector<uint8_t>* database);
+// 0.1.170: the owner and clone-origin notes of the handshake save at `path`, imported (the backup page's restore). False: the file could not be read.
+bool checkpoint_import_notes_file(const std::wstring& path);
+// THE QUEUE OF HANDSHAKE SAVES IS 100 LONG AND IS NOT CLEARED (2026-10-26): what leaves a run's live queue (<pairing>.N) -- the run's settlement, another run's commit, a restore, a backup load -- is moved to
+// <save dir>\mgmp_handshake_old\<id>\<pairing>-old.N (same file format, read by checkpoint_peek_file), and only the oldest beyond 100 per pairing are dropped.
+// This one is for a caller that is about to take a live file away (the backup load): a save is archived, anything else deleted. False: it could not be done.
+bool checkpoint_archive_handshake_file(const std::wstring& path);
 // The handshake saves of a run that went solo ("continue alone", or a settlement with no room) are kept -- the tombstone that vetoes a resume is written at once -- until the player is next in the warehouse.
 // _due: something is waiting; _deferred: do it now (called by the warehouse watch; does nothing while a room is up, and deletes only entries of that run).
 bool checkpoint_cleanup_due();

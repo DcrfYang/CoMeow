@@ -9,6 +9,7 @@
 #include <string>
 
 #include "mgmp_catview.h"
+#include "mgmp_chat.h"       // chat_local_note: the special-mark notice (0.1.149)
 #include "mgmp_checkpoint.h"
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_housecoop.h"
@@ -406,6 +407,7 @@ void tick_notices() {
 // either screen said why. Said every 30 s while the worst link of the room is 5 s or slower.
 constexpr uint32_t kSlowLinkMs = 5000;
 constexpr ULONGLONG kSlowLinkEveryMs = 30000;
+constexpr uint32_t kWaitingLinkMs = 15000;
 static void tick_slow_link() {
     static ULONGLONG said_at = 0;
     uint8_t who = kNoPeer;
@@ -418,7 +420,8 @@ static void tick_slow_link() {
     if (net_role() != NetRole::Host && who == kHostPeer) strncpy_s(name, sizeof(name), tr(Tx::R_THE_HOST), _TRUNCATE);
     else if (!room_peer_name(who, name, sizeof(name)) || !name[0]) _snprintf_s(name, sizeof(name), _TRUNCATE, "P%u", (unsigned)who + 1);
     char text[512];
-    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_SLOW_LINK), name, (ms + 500) / 1000);
+    // 0.1.184: past 15 s it is a wait, not a slow link -- said so, with the way out (nothing closes the link on its own any more)
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(ms >= kWaitingLinkMs ? Tx::R_LINK_WAITING : Tx::R_SLOW_LINK), name, (ms + 500) / 1000);
     toast(text);
     log_line("ROOM", "!! the link to peer %u ('%s') is slow: %u ms (the larger of its last round trip and its oldest unanswered ping) -- said to the player", (unsigned)who, name, ms);
 }
@@ -438,8 +441,61 @@ static void tick_direct_unreachable() {
              (unsigned)config().net_port, upnp_double_nat() ? " (the router sits behind another NAT)" : "");
 }
 
+// A GAME WHOSE CLOCKS RUN FAST OR SLOW (0.1.159, room WZJS 2026-11-01: the host's ran x12.75 -- a speed tool hooked into the game; "laggy, high latency, slow
+// animations"). mgmp_perf compares the game's clocks with the system's interrupt time every 10 s. This player's own: a notice once per episode, and a toast every
+// 60 s while it lasts. Another player's (its ping says so, proto 109): a notice once per episode, naming the player. Grep CLOCK.
+static void tick_clock() {
+    static bool self_said = false;
+    static ULONGLONG self_toast_at = 0;
+    static bool peer_said[kMaxPeers] = {};
+    if (!in_room()) { self_said = false; for (auto& s : peer_said) s = false; return; }
+    const ULONGLONG now = perf_ref_now_ms();          // not GetTickCount64: on the game whose clocks run fast it would repeat the toast every few seconds
+    if (perf_clock_abnormal()) {
+        char f[16];
+        _snprintf_s(f, sizeof(f), _TRUNCATE, "%.1f", perf_clock_x100() / 100.0);
+        char text[sizeof(g.notice[0])];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_CLOCK_SELF), f);
+        if (!self_said) {
+            self_said = true; self_toast_at = now;
+            push_notice(text);
+            log_line_lvl(LogLevel::Warn, "CLOCK", "!! this player is told that the game's clocks run x%s (a speed tool?)", f);
+        } else if (now - self_toast_at >= 60000 || now < self_toast_at) {
+            self_toast_at = now;
+            toast(text);
+        }
+    } else if (self_said) {
+        self_said = false;
+        log_line("CLOCK", "this game's clocks are right again -- the notice is not repeated");
+    }
+    uint8_t ids[kMaxPeers] = {};
+    if (!net_peer_ids(ids, kMaxPeers)) return;
+    const uint8_t n = net_peer_count() > kMaxPeers ? kMaxPeers : net_peer_count();
+    for (uint8_t i = 0; i < n; ++i) {
+        const uint8_t who = ids[i];
+        if (who >= kMaxPeers || who == net_self()) continue;
+        uint32_t x = 0;
+        const bool bad = perf_peer_clock(who, &x);
+        if (bad && !peer_said[who]) {
+            peer_said[who] = true;
+            char name[64] = {};
+            if (net_role() != NetRole::Host && who == kHostPeer) strncpy_s(name, sizeof(name), tr(Tx::R_THE_HOST), _TRUNCATE);
+            else if (!room_peer_name(who, name, sizeof(name)) || !name[0]) _snprintf_s(name, sizeof(name), _TRUNCATE, "P%u", (unsigned)who + 1);
+            char f[16];
+            _snprintf_s(f, sizeof(f), _TRUNCATE, "%.1f", x / 100.0);
+            char text[sizeof(g.notice[0])];
+            _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::R_CLOCK_PEER), name, f);
+            push_notice(text);
+            log_line_lvl(LogLevel::Warn, "CLOCK", "!! peer %u ('%s') says its game's clocks run x%s -- the players are told", (unsigned)who, name, f);
+        } else if (!bad && x && peer_said[who]) {
+            peer_said[who] = false;
+            log_line("CLOCK", "peer %u's clocks are right again (x%.2f)", (unsigned)who, x / 100.0);
+        }
+    }
+}
+
 void room_tick() {
     tick_slow_link();
+    tick_clock();
     tick_direct_unreachable();
     // Names: to everyone on a change of membership, else every few seconds.
     if (net_active() && net_peer_count() >= 2) {
@@ -483,6 +539,7 @@ void room_on_message(uint8_t from, const RoomCtlMsg& m) {
             log_line("ROOM", "peer %u is '%s' in the room", (unsigned)from, m.name);
         }
     } else if (m.kind == kRoomAbort) {
+        log_line("ROOM", "peer %u started the save selection over (its 'pick again', its main menu, or an OK after a refused pick)", (unsigned)from);   // 0.1.169: who did it
         if (checkpoint_abort_round()) {
             const int row = room_row_of_peer(from);
             char text[96];
@@ -506,6 +563,16 @@ bool room_on_slot_click(int slot, const wchar_t* path) {
     // In a room, a save is only ever picked together. A player whose session is not up would otherwise
     // load alone and walk the room's host out of hosting.
     if (!net_active()) { toast(tr(Tx::R_NOT_CONNECTED)); return true; }
+    // 0.1.158: alone in the room there is nobody to finish a handshake with, so the "wait for the handshake" below was the answer a host alone got
+    // (log 2026-10-31, room CCEH). The room's player count is the reason, and it is known before any handshake.
+    {
+        SignalPeer alone[kRows];
+        if (rows(alone) == 1) {      // 0 = the member list has not arrived yet (a client that just joined): the handshake answer below fits that
+            toast(tr(Tx::R_NEED_TWO));
+            log_line("ROOM", "save slot %d clicked with only this player in the room -- told that two players are needed", slot);
+            return true;
+        }
+    }
     if (!session_ready()) {
         // 0.1.57: "wait a few seconds" is only true when nothing is wrong. A player on another mod version is refused (and the host refuses it) and the
         // handshake never completes -- the click now says that, and which side has to update.
@@ -683,6 +750,7 @@ bool room_refuse_story_item(const char* item) {
 }
 
 void room_say_story_only_host() { toast(tr(Tx::R_STORY_ONLY_HOST)); }
+void room_say_gear_locked() { toast(tr(Tx::R_GEAR_LOCKED)); }
 void room_say_chapter_client() { toast(tr(Tx::R_CHAPTER_CLIENT)); }
 void room_say_chapter_wait() { toast(tr(Tx::R_CHAPTER_WAIT)); }
 void room_say_chapter_locked_2() { toast(tr(Tx::R_CHAPTER_LOCKED_2)); }
@@ -718,6 +786,11 @@ void room_say_cat_census(unsigned lost, const char* lost_names, unsigned duplica
 
 void room_push_notice(const char* text) { if (text && text[0]) push_notice(text); }
 void room_toast(const char* text) { if (text && text[0]) toast(text); }
+void room_say_marks(const char* text) {
+    if (!text || !text[0]) return;
+    toast(text);
+    chat_local_note(text);
+}
 
 bool room_peer_name(uint8_t id, char* out, size_t cap) {
     if (!out || !cap) return false;

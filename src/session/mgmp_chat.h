@@ -27,6 +27,10 @@ bool chat_available();
 void chat_on_message(uint8_t from, const ChatMsg& m);
 // This player's own line (the UI sends it with Enter): kept in the history and sent to the others. Empty after trimming = nothing happens. Returns whether a line was sent.
 bool chat_submit(const char* text);
+// A line from the mod itself (named "CoMeow"): kept here and sent to every other player. For things the whole room should read, e.g. a player refused for its version.
+void chat_system_line(const char* text);
+// A line from the mod itself that only THIS player reads (named "CoMeow", kept in the history, sent to nobody). For what every peer says in its own language (0.1.149).
+void chat_local_note(const char* text);
 // An emote from the picker (mgmp_emote: 0..kEmoteCount-1) as a line of its own; a die is rolled here.
 bool chat_submit_emote(int pick);
 

@@ -39,7 +39,7 @@ bool balance_is_enemy_faction(int32_t faction);
 // Scale a character the definition loader has just filled. `hp_before` is its current health from BEFORE the
 // loader ran: the loader only writes health for an initial_health definition, and a character that already
 // had its health (a reload in place) must not be doubled a second time. True when anything changed.
-// `scale_half` is the multiplier in halves (4 = x2 .. 16 = x8): the host's ui.enemy_scale (session_enemy_scale_half). Half values round to
+// `scale_half` is the multiplier in halves (2 = x1 .. 16 = x8; x1 leaves every number as the game has it): the host's ui.enemy_scale (session_enemy_scale_half). Half values round to
 // the nearest whole point, upward on a .5 -- the same integer arithmetic on every peer.
 bool balance_scale_enemy(void* chr, int32_t hp_before, uint32_t scale_half = 2 * kEnemyScale);
 

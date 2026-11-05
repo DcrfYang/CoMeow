@@ -29,5 +29,12 @@ uint32_t perf_link_slow_ms(uint8_t* who);
 // has no link of its own (pings are not relayed): its figure is this peer's round trip to the host plus the host's to it, from the list the host's ping carries
 // (proto 105), and `via_host` says so. False: no figure yet (still connecting), itself, or not in a room.
 bool perf_peer_latency_ms(uint8_t peer, uint32_t* ms, bool* via_host);
+// 0.1.159 (proto 109): this game's clocks (QueryPerformanceCounter / GetTickCount) against the system's interrupt time, which no hook inside the process can scale --
+// x100 of the last 10 s window (0 = not measured yet), and whether it is judged ABNORMAL (a speed tool). Measured every frame, in a room or not. Grep CLOCK.
+uint32_t perf_clock_x100();
+uint64_t perf_ref_now_ms();      // the reference clock itself (ms of the system's interrupt time): for intervals a speed tool must not shorten
+bool     perf_clock_abnormal();
+// Another player's clock as its last ping told (fresh in the last 30 s): true = that player's game judges its clocks abnormal; `x100` gets the rate (0 = unknown).
+bool     perf_peer_clock(uint8_t peer, uint32_t* x100);
 
 } // namespace mgmp

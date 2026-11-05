@@ -73,11 +73,8 @@ struct StreamFence {
     ~StreamFence() { if (on) mem_write(s, saved, sizeof(saved)); }
 };
 
-// The seat a cat id names: a session clone (0x70000000 + seat<<24 + slot), a cat an event brought into the run (the host's), else unknown.
-int seat_of(uint64_t id) {
-    if (session_is_gained(id)) return 0;
-    return session_cat_owner(id);
-}
+// The seat a cat id names: a session clone (0x70000000 + seat<<24 + slot), a cat an event brought into the run (its seat's: 0.1.146), else unknown.
+int seat_of(uint64_t id) { return session_cat_owner_any(id); }
 // Whose jar it is, in a room: the seat the cat's id names; a cat no seat names is the host's (the authority catsync gives such a cat).
 uint8_t owner_seat(uint64_t id) { const int s = seat_of(id); return s >= 0 ? (uint8_t)s : 0; }
 

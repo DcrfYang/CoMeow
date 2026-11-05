@@ -26,6 +26,8 @@
 #include "mgmp_choice.h"
 #include "mgmp_setup.h"
 #include "mgmp_room.h"
+#include "mgmp_i18n.h"     // tr: the notice for a save folder that takes no new file (0.1.168)
+#include "mgmp_menu.h"      // ui_error_popup: a file or save problem the player is shown (0.1.169)
 
 #include <windows.h>
 #include <shlobj.h>
@@ -528,6 +530,37 @@ constexpr uint32_t kDepartMaxPresses  = 5;
 
 State g;
 
+// THE PLAYER IS SHOWN A FILE OR SAVE PROBLEM (0.1.169): a file this module could not write, a save it could not copy for the room's sync save.
+void write_popup(const wchar_t* path, unsigned long err) {
+    char p8[MAX_PATH * 3] = {};
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, p8, sizeof(p8) - 1, nullptr, nullptr);
+    char text[1024];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_WRITE), p8, err);
+    ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+}
+void snapshot_popup() {
+    char text[1024];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_SNAPSHOT), g.name, checkpoint_io::snapshot_why()[0] ? checkpoint_io::snapshot_why() : "?");
+    ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+}
+
+// THE SAVE FOLDER MUST TAKE NEW FILES (0.1.168, room KD8E, 2026-11-02): on one of the two PCs every file created beside a save failed with error 5 (access denied) --
+// the room's sync saves could not be made, so every save pick ended in "recovery refused" and the round started over and over, and the game's own save at the end of
+// a run threw out of SQLite (an SQLite save needs its journal beside it) and crashed. A security program or a restore system was the likely cause; the player is told.
+void probe_dir_writable() {
+    wchar_t p[MAX_PATH];
+    _snwprintf_s(p, _TRUNCATE, L"%s\\mgmp-write-probe-%lu.tmp", g.dir, (unsigned long)GetCurrentProcessId());
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return; }
+    const DWORD e = GetLastError();
+    log_line_lvl(LogLevel::Error, "SAVEFILE", "!! no new file can be created in the save directory (error %lu%s) -- the game cannot write its saves there and the room's sync saves "
+                 "cannot be made (a security program or a restore system?); the player is told", (unsigned long)e, e == ERROR_ACCESS_DENIED ? ", access denied" : "");
+    char text[700];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::SF_DIR_UNWRITABLE), (unsigned long)e);
+    room_push_notice(text);
+    ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
+}
+
 void ensure_dir() {
     if (g.dir_tried) {
         // A guess made before Steam's id was known is looked at once more when it is.
@@ -546,7 +579,7 @@ void ensure_dir() {
     }
     g.dir_tried = true;                 // one attempt, one log line, whatever happens
     g.have_dir = resolve_save_dir(g.dir, MAX_PATH, &g.dir_unsure, &g.dir_how);
-    if (g.have_dir) log_line("SAVEFILE", "save directory: %ls", g.dir);
+    if (g.have_dir) { log_line("SAVEFILE", "save directory: %ls", g.dir); probe_dir_writable(); }
 }
 
 // Role and enablement come from the CONFIG, not from the session, and that is
@@ -839,7 +872,13 @@ bool savefile_choose_account(const wchar_t* name) {
     _snwprintf_s(cand, _TRUNCATE, L"%s\\%s\\saves", root, name);
     const DWORD attr = GetFileAttributesW(cand);
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) { log_line_lvl(LogLevel::Warn, "SAVEFILE", "!! no save folder %ls -- nothing switched", cand); return false; }
-    if (!write_chosen_account(name)) { log_line_lvl(LogLevel::Error, "SAVEFILE", "!! the choice of save folder could not be written to %ls -- nothing switched", kAccountFile); return false; }
+    if (!write_chosen_account(name)) {
+        const DWORD e = GetLastError();
+        log_line_lvl(LogLevel::Error, "SAVEFILE", "!! the choice of save folder could not be written to %ls -- nothing switched", kAccountFile);
+        wchar_t ap[MAX_PATH] = {};
+        write_popup(account_file_path(ap, MAX_PATH) ? ap : kAccountFile, e);
+        return false;
+    }
     const bool changed = !g.have_dir || _wcsicmp(cand, g.dir) != 0;
     log_line_lvl(LogLevel::Warn, "SAVEFILE", "the player chose the save folder %ls%s (was %ls, %s) -- remembered in %ls", cand, changed ? "" : " (the one in use)",
                  g.have_dir ? g.dir : L"none", g.dir_how && g.dir_how[0] ? g.dir_how : "?", kAccountFile);
@@ -873,7 +912,7 @@ bool savefile_read_checkpoint(uint8_t** data, uint32_t* size, uint64_t* hash) {
     _snwprintf_s(path, _TRUNCATE, L"%s\\%s", g.dir, wname);
     if (!flushed_lately) s_flushed_at = tick;
     checkpoint_io::Bytes snapshot;
-    if (!checkpoint_io::snapshot(path, snapshot)) { log_line("SAVEFILE", "!! checkpoint capture: the save '%s' could not be copied -- %s", g.name, checkpoint_io::snapshot_why()); return false; }
+    if (!checkpoint_io::snapshot(path, snapshot)) { log_line("SAVEFILE", "!! checkpoint capture: the save '%s' could not be copied -- %s", g.name, checkpoint_io::snapshot_why()); snapshot_popup(); return false; }
     if (checkpoint_io::snapshot_why()[0]) log_line("SAVEFILE", "checkpoint capture: %s", checkpoint_io::snapshot_why());
     *size = (uint32_t)snapshot.size();
     *data = (uint8_t*)malloc(*size);
@@ -896,7 +935,7 @@ bool savefile_read_stage(uint8_t** data, uint32_t* size, uint64_t* hash) {
     wchar_t path[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%s\\%s", g.dir, wname);
     checkpoint_io::Bytes snapshot;
-    if (!checkpoint_io::snapshot(path, snapshot)) { log_line("SAVEFILE", "!! stage capture: the save '%s' could not be copied -- %s", g.name, checkpoint_io::snapshot_why()); return false; }
+    if (!checkpoint_io::snapshot(path, snapshot)) { log_line("SAVEFILE", "!! stage capture: the save '%s' could not be copied -- %s", g.name, checkpoint_io::snapshot_why()); snapshot_popup(); return false; }
     if (checkpoint_io::snapshot_why()[0]) log_line("SAVEFILE", "stage capture: %s", checkpoint_io::snapshot_why());
     bool running = false;
     const bool known = checkpoint_io::in_run(path, running);
@@ -1234,6 +1273,7 @@ bool savefile_on_slot_click(void* ss, int slot) {
     // --- the client: local setup mode keeps its own save -----------------
     if (g.is_client && tune::kLocalSetup) {
         setup_reset_run();
+        catsync_settle_done("the client picked a save");   // 0.1.145: a slot pick starts a run; no settlement is in progress
         g.have_slot = true;
         g.slot = (uint32_t)slot;
         if (have_names && (uint32_t)slot < names.count) strncpy_s(g.name, names.v[slot], _TRUNCATE);
@@ -1518,6 +1558,7 @@ int savefile_autoselect(void* ss) {
                                  "client on this machine is already using it", path);
         else
             log_line("SAVEFILE", "!! could not write %ls (win32 %lu)", path, e);
+        write_popup(path, e);
         g.pending = false;
         return -1;
     }

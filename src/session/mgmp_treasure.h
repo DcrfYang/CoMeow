@@ -20,6 +20,10 @@
 
 namespace mgmp {
 
+// The registry's item pools built again from data/item_pools with the unlock answers in force now (sub_1407AB3D0, the shared stream put back).
+// mgmp_unlocks (0.1.154): at node entry, when a fight's reward begins and after the unlock window, as the ability/passive pool caches.
+bool treasure_rebuild_item_pools(const char* how);
+
 // THE ITEM'S DESCRIPTION AS PLAIN LINES (0.1.87, "show the item's effect under it when the mouse is on it"). In: the text the game's own builder
 // returns (UTF-8), with the markup its Flash text understands. Out: lines for the panel under the hovered item --
 //   - zero-width spaces (U+200B, the line-break hints of the Chinese and Japanese text) go; &nbsp; and U+00A0 become spaces;

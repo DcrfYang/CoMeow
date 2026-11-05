@@ -4,8 +4,12 @@
 #include "mgmp_uitest.h"      // the player-facing menus: drawn in this same frame
 #include "mgmp_leave.h"      // the co-op session decision -- see the panel section below
 #include "mgmp_chat.h"       // Enter: the room chat
+#include "mgmp_gameconsole.h" // ... which is the game's while its own debug console is open (0.1.150)
 
 #include <windows.h>
+#include <imm.h>          // the IME while a box of ours is typed in (0.1.172)
+#include "mgmp_imeui.h"   // ... and its candidates drawn inside the game (0.1.175, TSF UI-less mode)
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -779,9 +783,79 @@ void draw_session() {
 // This panel keeps the read-only lobby line in the session window and nothing that
 // dials a server.)
 
+// --- the IME while a box of ours is typed in ---------------------------------
+//
+// THE PLAYER'S IME MUST SHOW OVER THE GAME (0.1.172; a player, 2026-11-03: "typing Chinese in the game, the IME is not shown in front -- it used to be").
+// The game is SDL3, which gives its window NO input context unless the game itself asked for text input (ImmAssociateContext(hwnd, NULL) at window
+// creation and at every SDL_StopTextInput), may strip the show-UI bits of WM_IME_SETCONTEXT and keep the composition messages from DefWindowProc
+// (SDL_IME_IMPLEMENTED_UI), and keeps a focused fullscreen window topmost -- each of which hides the composition and the candidate window from a
+// player typing in the chat or a room name. So while an ImGui text box has the keyboard (io.WantTextInput, published by the frame): the window gets
+// the default input context if it had none, it is not topmost (the IME's candidate window can then always come above it), and the IME messages go
+// straight to DefWindowProc with every show-UI bit set; when the box lets go, both are put back as they were. Done on the WINDOW'S thread (the IMM
+// calls only work there), at the top of the window procedure; the frame posts a WM_NULL when the state flips, so it is not left for the next key.
+std::atomic<bool> g_ime_want{false};       // written by the frame (ui_on_swap)
+
+struct ImeState {
+    bool applied = false;                  // the state below was set up for a box that has the keyboard
+    bool gave_context = false;             // the window had no input context: the default one was associated, to be taken away again
+    bool dropped_topmost = false;          // the window was topmost: made not topmost, to be put back
+    int  logs = 0;
+};
+ImeState g_ime;                            // window thread only
+
+void ime_follow(HWND hwnd) {
+    const bool want = g_ime_want.load(std::memory_order_relaxed);
+    if (want == g_ime.applied) return;
+    g_ime.applied = want;
+    const bool say = g_ime.logs < 40;
+    imeui_set_active(want);                                               // 0.1.175: the candidate list drawn in the game while a box of ours is typed in
+    if (want) {
+        imeui_init(hwnd);
+        HIMC himc = ImmGetContext(hwnd);
+        const bool had = himc != nullptr;
+        if (himc) ImmReleaseContext(hwnd, himc);
+        g_ime.gave_context = !had && ImmAssociateContextEx(hwnd, nullptr, IACE_DEFAULT);
+        const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        g_ime.dropped_topmost = (ex & WS_EX_TOPMOST) &&
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        if (say) {
+            ++g_ime.logs;
+            const HKL kl = GetKeyboardLayout(0);
+            char file[MAX_PATH] = {};
+            ImmGetIMEFileNameA(kl, file, (UINT)sizeof(file));
+            HIMC now = ImmGetContext(hwnd);
+            const BOOL open = now ? ImmGetOpenStatus(now) : FALSE;
+            if (now) ImmReleaseContext(hwnd, now);
+            log_line("IME", "a text box of ours has the keyboard: input context %s%s, IME open %d, layout %p (%s), window %s%s, foreground %s",
+                     had ? "present" : "absent", had ? "" : (g_ime.gave_context ? " -> the default one associated" : " -> !! could not associate one"),
+                     (int)open, (void*)kl, file[0] ? file : "no IMM IME file", (ex & WS_EX_TOPMOST) ? "topmost" : "not topmost",
+                     g_ime.dropped_topmost ? " -> not topmost while typing" : ((ex & WS_EX_TOPMOST) ? " -> !! could not drop topmost" : ""),
+                     GetForegroundWindow() == hwnd ? "yes" : "no");
+        }
+    } else {
+        if (g_ime.gave_context) ImmAssociateContext(hwnd, nullptr);     // back to no context, as SDL had it
+        if (g_ime.dropped_topmost) SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        if (say && (g_ime.gave_context || g_ime.dropped_topmost)) {
+            ++g_ime.logs;
+            log_line("IME", "the text box let go: %s%s", g_ime.gave_context ? "input context taken away again " : "", g_ime.dropped_topmost ? "topmost put back" : "");
+        }
+        g_ime.gave_context = g_ime.dropped_topmost = false;
+    }
+}
+
+bool is_ime_message(UINT msg) {
+    switch (msg) {
+        case WM_IME_SETCONTEXT: case WM_IME_STARTCOMPOSITION: case WM_IME_COMPOSITION: case WM_IME_ENDCOMPOSITION:
+        case WM_IME_NOTIFY: case WM_IME_CHAR: return true;
+        default: return false;
+    }
+}
+
 // --- input ------------------------------------------------------------------
 
 LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g.ready) ime_follow(hwnd);
+
     // The toggle is read before ImGui sees anything, so the panel can always be
     // dismissed even if it has somehow captured the keyboard.
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == (WPARAM)g.toggle_vk) {
@@ -812,7 +886,11 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (chat_swallow_enter_remains(msg, (uintptr_t)wp)) return 0;
         if (msg == WM_KEYDOWN && wp == VK_RETURN) {
             if (chat_input_open()) { if (!(lp & 0x40000000)) chat_enter_key(false); return 0; }      // a held key's repeats do nothing
-            if (!(lp & 0x40000000) && chat_enter_key(ImGui::GetIO().WantTextInput)) return 0;
+            // 0.1.150: with the game's own debug console open Enter runs the command typed there -- it is the game's, not the chat's
+            if (!(lp & 0x40000000) && gameconsole_open()) {
+                static ULONGLONG said = 0; const ULONGLONG now = GetTickCount64();
+                if (!said || now - said > 30000) { said = now; log_line("CHAT", "Enter is left to the game: its debug console is open"); }
+            } else if (!(lp & 0x40000000) && chat_enter_key(ImGui::GetIO().WantTextInput)) return 0;
         }
     }
 
@@ -821,8 +899,24 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // ImGui only claims what is actually under its windows (WantCaptureMouse), so
     // an empty screen still belongs entirely to the game.
     if (g.ready) {
+        // 0.1.175: the composition string, for the candidate panel the game draws (before ImGui's handler, which ends a GCS_RESULTSTR composition itself)
+        if (g_ime.applied && msg == WM_IME_COMPOSITION) imeui_on_composition(hwnd, lp);
+        if (g_ime.applied && msg == WM_IME_ENDCOMPOSITION) imeui_end_composition();
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp))
             return 1;
+
+        // A box of ours is typed in (see ime_follow): the IME messages are the system's to show, not the game's. WM_IME_COMPOSITION already went
+        // through DefWindowProc in ImGui's handler above (which gives the result string to us as WM_IME_CHAR -> WM_CHAR).
+        if (g_ime.applied && is_ime_message(msg)) {
+            if (msg == WM_IME_COMPOSITION) return 0;
+            if (msg == WM_IME_SETCONTEXT && wp) {
+                if (g_ime.logs < 40 && (lp & ISC_SHOWUIALL) != ISC_SHOWUIALL) { ++g_ime.logs; log_line("IME", "WM_IME_SETCONTEXT came with show bits %08lX: all set", (unsigned long)(lp & ISC_SHOWUIALL)); }
+                lp |= ISC_SHOWUIALL;
+                if (imeui_takes_over()) lp &= ~(LPARAM)ISC_SHOWUICOMPOSITIONWINDOW;   // the game draws the composition with the candidates (0.1.175)
+            }
+            if (msg == WM_IME_STARTCOMPOSITION && imeui_takes_over()) return 0;     // ... so no system composition window either
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
 
         // Swallow what ImGui is using, so a click on a button does not also land
         // on the board behind it. Only when ImGui actually wants it: the game
@@ -1015,6 +1109,12 @@ void ui_on_swap(void* window) {
         draw_log();
     }
     menu_draw();
+    imeui_draw();             // 0.1.175: the IME's composition and candidates at the caret of a box of ours
+
+    {   // the IME follows whether a box of ours has the keyboard (ime_follow, on the window's thread)
+        const bool want = ImGui::GetIO().WantTextInput;
+        if (g_ime_want.exchange(want, std::memory_order_relaxed) != want && g.hwnd) PostMessageW(g.hwnd, WM_NULL, 0, 0);
+    }
 
     ImGui::Render();
     // RenderDrawData backs up and restores the GL state it touches, which is

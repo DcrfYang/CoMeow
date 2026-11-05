@@ -174,6 +174,9 @@ uint16_t    signal_host_port();
 const char* signal_last_event(); // last membership line, for the lobby's log
 
 // Snapshots. Both return how many were written.
+// The most rooms the list keeps: the lobby server's own cap (server/mgmp_server.cpp kMaxRooms). It was 32 here and in the menu -- rooms past the 32nd were
+// simply not shown (0.1.182). A list longer than this is logged.
+constexpr uint32_t kSignalMaxRooms = 64;
 uint32_t signal_rooms(SignalRoom* out, uint32_t cap);
 uint32_t signal_peers(SignalPeer* out, uint32_t cap);
 

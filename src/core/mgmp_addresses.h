@@ -104,7 +104,7 @@ enum Target : int {
     T_BuildTerrain,        // the build stage for the terrain (0x14035C070): in a room the shared stream is reset when it returns
     T_BuildProps,          // the build stage for props (0x14035E1F0): in a room the shared stream is reset when it returns
     T_BuildParty,          // the build stage for the player's party (0x14035C3E0): in a room the shared stream is reset when it returns
-    T_BuildAllies,         // the build stage for allies (0x14035DCC0): in a room the shared stream is reset when it returns
+    T_BuildAllies,         // the build stage 0x14035DCC0 -- read 2026-10-27: it is the SkillShare stage (see T_CatSpawn); in a room the shared stream is reset when it returns
     T_BuildExtra,          // the build stage for extra spawns (also called by a mid-battle spawner: only the build window is touched) (0x14035E5E0): in a room the shared stream is reset when it returns
     T_BuildEnemies,        // the build stage for the enemy list (0x14035D0B0): in a room the shared stream is reset when it returns
     T_RandomPool,          // WorldEvent `random_pool` handler (0x1409310B0): (event state, gon node) -- draws one weighted entry of an event outcome from the shared stream
@@ -189,6 +189,70 @@ enum Target : int {
     // 0x14022886A), after the "return home early" confirmation for a home node (type 4). The marker's own update then walks the party there and, on arrival, calls
     // EnterNode -- so holding this call holds the animation too. mgmp_mapvote swallows it and runs it later, for the host's pick, once every player has picked.
     T_NodeClick,
+    // THE AOE TILES THAT CHOOSE THEIR SAFE SQUARES AT RANDOM (0.1.125, room 2SYV: the Throbbing King's Roulette, "the safe tiles differ for every player"). Ability aoe_mode all_except_random /
+    // all_except_random_empty (6..10 safe squares) draws HOW MANY from the shared stream (TLS+0x178) but picks WHICH with TLS+0x198 -- the presentation stream, which is meant to differ between machines.
+    // The call (0x14002AA20: rcx Ability, dl, r8b) is fenced: that stream is set to a state both peers derive and put back afterwards.
+    T_AoeTiles,
+    // THE TERMINATOR HOUSE BOSS'S TWO MINIONS (0.1.128; effect T3HitlerTriggerInitialSpawns, 0x1407F5F20, rcx only): the level's 'HitlerMiniInitial' spots are SHUFFLED with the presentation stream
+    // (TLS+0x198, 0x1407F6005..0x1407F601A) and the first two get a minion -- in the co-op house fight each peer would put them elsewhere. Fenced like T_AoeTiles.
+    T_T3Spawns,
+    // THE CLASS COMPLETION MARKS (0.1.131; a tester: "the client beat the run with a class and got no mark for it"). GlobalProgressionData's
+    // complete_chapter_with_class / beat_chapter_boss check (0x1401C96B0: rcx progression, rdx std::string* event, r8b), called by finish_node (0x140392FC0) as a
+    // boss node ends, marks every class of the cats in the director's PARTY list (+0x5C0; alive, on adventure) in progression+0x768 (records of 0x58: class, chapter,
+    // difficulty, extra, monoclass, solocat). It runs in the return from the battle -- before the map's first update -- when a client's party list is still the room's
+    // SHARED layout (the host's cats; this player's own sit in the familiars until the map restores them). The client marked the host's classes, never its own.
+    T_ClassCompletion,
+    // SKILL SHARE IN A ROOM (0.1.136; a tester: "only the host's cats got the shared passive"). The battle build spawns the director's PARTY list (0x14035C3E0), each
+    // spawned cat going into the builder's vector at +0xD0 {Character*, ...}x16 bytes, then its familiar list (+0x648; spawned, NOT added to that vector), and right after
+    // that runs the SkillShare stage (0x14035DCC0, rcx builder -- hooked as T_BuildAllies, the name it had before it was read): a cat of the vector holding SkillShare (CatData+0x910/+0x938) or SkillShare_Disorder gives its other
+    // passive to every OTHER cat of the vector (0x140101C50). In a room the party list is the shared layout -- the host's cats; every other player's are familiars --
+    // so nothing was shared with them, and a SkillShare cat of theirs shared with nobody. Same on every peer: no desync, a missing rule.
+    T_CatSpawn,          // 0x140365D60: spawns one cat of the party or familiar list (rcx level, rdx, r8, r9 CatData*, [rsp+0x28]) -> Character*; recorded per build
+    // THE WHOLE TEAM WHERE THE GAME ASKS FOR "THE PARTY" (0.1.139, mgmp_teamlist). 0x1403B2F30 (rcx MewDirector, rdx out {u32 cap, u32 count, CatData**}) builds the party
+    // as CatData* from the party list (+0x5BC/+0x5C0) only -- in a room the host's cats. Its shared-event party effects, the battle start's ambush roll and the build's
+    // equipped global passives get every player's cats there; `level_up all` gets this player's own (room VTC9: Baphomet's party_damage hit the host's cats only).
+    T_PartyCats,
+    // THE GAME'S OWN DEBUG CONSOLE (0.1.150; settings.txt `enable_debugconsole true`, toggled by the backquote key): glaiel::DebugConsole's SDL event handler
+    // (0x140A139A0, rcx the console, rdx the SDL_Event; it does nothing unless +0x174 is 1, and while +0x198 is 1 an Enter runs the typed command). Hooked only to remember
+    // the object (mgmp_gameconsole.h): the room chat takes Enter in the window procedure, before the game, and must leave it to the game while the console is open.
+    T_ConsoleEvent,
+    // THE TILE OBJECTS UNDER A UNIT (0.1.161, sim 37; room EWDZ): sub_140117FC0(Character*) -> &Character+0xE90 (cap, count, data: the tile objects on its cells,
+    // whose element masks +0x130/+0x134 make the unit's standing-tile elements -- grass 0x10 from GrassTile, FlowerTile, TallGrass, TallFlower, TallBramble). CACHED:
+    // rebuilt only when the board's element version (*(Character+0x80)+0xA0, bumped by sub_1408AAE80 when an object with +0xA0 is placed, moved or removed)
+    // differs from the unit's key (+0xE58; -1 after the unit's own move or death), never while +0xEBC (its re-entry guard) is held. Who rebuilds first after a
+    // bump is whoever queries first -- the simulation, or recompute_stats called by the ability highlight (the aim preview, which the mod also draws for the
+    // other player): a history that differs per game. In a room the key is cleared before each unguarded call, so the list is always the board's of now.
+    T_TileList,
+    // THE DIFFICULTY (0.1.167, sim 41; room 86N5): sub_1403BBEE0(MewDirector*, bool with_items) -> the index into data/difficulties.gon (0..7 after the
+    // callers' clamp): the count of items tagged `increase_difficulty` (HardPill) in the party's gear AND THIS PLAYER'S BACKPACK (MewDirector+0x588,
+    // per player in a room), plus the house boss's difficulty when it is due. The battle build's parameters (sub_1403B94F0: champ/elite budget, champion
+    // chance, elite buffs, boss health multiplier) are read from that row -- the statics stage picks the champions (Level+0xB8 list) with them. The host
+    // had a higher index than its client: one TomTom became TomTom_Champion (60 hp) on the host only. In a room the battle parameters' call and a shared
+    // event's take the host's value (mgmp_unlocks: unlocks_difficulty); rewards, shops and the chapter marks keep this player's own.
+    T_Difficulty,
+    // THE TAG COUNT (0.1.170, sim 43; room DJVE, 2026-11-03): sub_1403B35C0(MewDirector*, std::string tag by value) -> how many items carrying the tag the party's
+    // gear AND THIS PLAYER'S BACKPACK hold. Two of its callers decide shared things: EnterNode's lambda_5 asks for `trigger_extra_event` (UltraVision3000 carries two:
+    // two more events after an event node's own), and the WorldEvent constructor asks for `increase_event_difficulty`. The host wore the item and drew its extra events
+    // alone; its clients drew none -- the next events differed and a client stood on the node with nothing to do. In a room both callers take the host's counts (UNLOCKS).
+    T_TagCount,
+    // THE STATUS AND PASSIVE FACTORIES AND THE REMOVAL (0.1.173, mgmp_unitstate; research RESEARCH-battle-sync-20261104.md). A unit's statuses and passives are components of
+    // its entity, made only by these two (by NAME, the class name: the console's `status NAME N` and `passive NAME N` call them) and taken away by Passive::Remove. Hooked to log
+    // every one given or taken in a room's battle (USTATUS), and their originals are what the unit-state repair creates and removes with.
+    T_ApplyStatus,       // 0x140483120: Passive*(std::string name BY VALUE, Character* target, int stacks, Character* source, p5, p6, bool, bool) -- 868 callers
+    T_AddPassive,        // 0x1404CCB20: Passive*(std::string name BY VALUE, Character* target, int stacks)
+    T_PassiveRemove,     // 0x140767FA0: void(Passive*) -- sets +0x75, marks the unit's passive cache dirty (+0xE50), destroys the component
+    // 0.1.185: the House scene's cat entity takes its cat -- void*(entity, u64 cat id (-1 = make a new cat), CatData* template); the House loader (0x1401E6D60) calls it
+    // for every cat the saved House names. A cat id CatData::by_id cannot load crashed in is_kitten (0x140942DC1) on the return home (11-04, two players, each twice).
+    T_HouseCatInit,
+    // 0.1.187: a cat's list read through its +0x9B0 field -- vec*(void* field, vec* out) (0x1400C8060); its caller 0x1403B3150 walks the party list as CatData* and
+    // passes cat+0x9B0 without a null check. KOALADZ (11-04, a 4-player room, three times): a null cat in that list crashed the map rebuild after a save load.
+    T_CatFieldList,
+    // 0.1.189: the spawn effect's cat-data builder (0x1407A2BA0, reads rcx only) -- `catdata fleshgolem / teamclone / souljar ...`: a golem's abilities are drawn from
+    // the ability pool of THIS save's unlocks, so on a client it is wrapped in the host's unlock lists (unlocks_force_host_lists).
+    T_SummonCatBuild,
+    // 0.1.192: the inventory screen's cat selector (0x1400DE040, rcx the selector, rdx an int64): it walks the party list (MewDirector+0x5C0) and reads CatData::by_id's answer
+    // with no null check (+0xC10) -- a party id the save does not hold crashed every load of that save (BF-202108081243, 11-05, three times). The list is cleared of such ids first.
+    T_CatSelectorInit,
     T_COUNT
 };
 
@@ -753,6 +817,22 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x00031CE0, "ABILITYPAY", "Ability: pay its cost and cast (a player cat's coins come from the local inventory)" },
     { 0x00166BC0, "ANTENNASCRAMBLE", "AlliesScrambleSpellAfterCast: an ally's cast spell replaced by a random one (the pick on a stream both peers derive)" },
     { 0x00228700, "NODECLICK", "MapNode click callback (the only writer of the marker's selected node)" },
+    { 0x0002AA20, "AOETILES", "Ability AOE tiles: the random-safe-square modes pick them with the presentation stream (fenced to a state both peers derive)" },
+    { 0x007F5F20, "T3SPAWNS", "effect T3HitlerTriggerInitialSpawns: shuffles the minion spots with the presentation stream (fenced to a state both peers derive)" },
+    { 0x001C96B0, "CLASSCOMPLETE", "GlobalProgressionData: complete_chapter_with_class / beat_chapter_boss -- marks the classes of the party's cats" },
+    { 0x00365D60, "CATSPAWN", "battle build: spawns one cat of the party or familiar list (recorded for the SkillShare stage)" },
+    { 0x003B2F30, "PARTYCATS", "MewDirector: the party list as CatData* -- the whole team (or this player's own cats) for some callers in a room" },
+    { 0x00A139A0, "CONSOLEEVENT", "glaiel::DebugConsole: SDL event handler (only remembers which object the console is, for the chat's Enter)" },
+    { 0x00117FC0, "TILELIST", "Character: the tile objects under the unit (cached; rebuilt at every query in a room)" },
+    { 0x003BBEE0, "DIFFICULTY", "MewDirector: the difficulty index (increase_difficulty items + house boss) -- the host's for the battle build and shared events in a room" },
+    { 0x003B35C0, "TAGCOUNT", "MewDirector: items carrying a tag (gear + backpack) -- the host's trigger_extra_event / increase_event_difficulty counts in a room" },
+    { 0x00483120, "APPLYSTATUS", "the status factory (by name) -- logged in a room's battle; the unit-state repair creates with it" },
+    { 0x004CCB20, "ADDPASSIVE", "the passive factory (by name) -- logged in a room's battle; the unit-state repair creates with it" },
+    { 0x00767FA0, "PASSIVEREMOVE", "Passive::Remove -- logged in a room's battle; the unit-state repair removes with it" },
+    { 0x001F8F60, "HOUSECAT", "House: a cat entity takes its cat by id -- a cat that cannot be loaded becomes the game's 'new cat' (-1) instead of a crash" },
+    { 0x000C8060, "CATFIELDLIST", "CatData: a list read through +0x9B0 -- a null cat (its field at 0x9B0) gives an empty list instead of a crash" },
+    { 0x007A2BA0, "SUMMONCAT", "spawn effect: a summon's cat data (FleshGolem, clones ...) -- a client answers its unlock checks with the host's lists" },
+    { 0x000DE040, "CATSELECT", "CatSelector::init: the party's ids the save does not hold are taken out of the list first (a null cat crashed it)" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -896,6 +976,27 @@ enum Call : int {
                              // cursor exists -- mgmp_menu checks the singleton exactly as the function does before calling it (0.1.91: the drawing board's tools)
     C_MapNodeBlocked,        // bool(MapMarker*, MapNode*) -- sub_1402223C0: TRUE = the party cannot walk there (no path, or an area that is not open); the marker's update clears a
                              // click's selection on it. mgmp_mapvote asks it before it takes a click as a vote, so a click the game would drop is not a pick (0.1.95)
+    C_TextsGet,              // std::wstring*(Texts*, std::wstring* out, const std::string* key, bool localize) -- sub_1409616D0: the game's text table lookup, in the language (and language pack) the
+                             // player has chosen: "CAT_CLASS_PSYCHIC_NAME" -> the name shown in the game. Reads [this+0x88] (the language mode). Called from Character's name setup at 0x11CBFD. (0.1.117)
+    C_WStrTidy,              // void(std::wstring*) -- sub_140052290: std::wstring::_Tidy_deallocate, frees what C_TextsGet allocated
+    C_PoolCachesClear,       // void(registry*) -- sub_1407AACD0: clears the registry's ability-pool cache (+0x1538), passive-pool cache (+0x1578) and item pools (+0x13D8). Only MewDirector::init
+                             // calls it. Not called by the mod: its first two calls (+0x10, +0x1C) are the map clear the mod runs on +0x1538/+0x1578 alone (0.1.154, mgmp_unlocks)
+    C_TagSpotAdd,            // bool(TileList*, const iVec2*) -- sub_14020BE10: appends a tile to a {u32 cap, u32 count, iVec2* data} list unless it is in it already (false = it was).
+                             // The level's tag_location build (0x14035FEFA) puts each tagged object's tile into level+0xF0[tag]+0x30 with it. mgmp_hooks: The Creator's 9 clone spots (0.1.165)
+    // --- the board's three repairs of 0.1.190 (mgmp_spawntest: a unit brought back to life, an ability made by name, a unit made from the host's cat data) ---
+    C_CharRevive,            // void(Character*, int hp) -- sub_140115B20: clears the death (+0x4C2), hp = max(hp, 1) or the given one (capped at max hp), plays "revive". The ReviveNextRound
+                             // status (0x1401474C0) and the debug revive-all (0x14015C700) call it with 0
+    C_CreateAbility,         // Ability*(SpawnDatabase*, Character* owner, const std::string& name, void* = null) -- sub_1407AC8A0. An unknown name ends in the game's error report: the
+                             // name is looked up in SpawnDatabase+0x198 first (C_GonGet), as the debug console's set-ability (0x14088A350) does; "RandomFrom..." draws from a pool (+0x3A8)
+    C_SpawnWithCatData,      // Character*(void* unused, std::string name BY VALUE, CatData*, World*) -- sub_1407ACFD0: SpawnAbility's `catdata ...` summon (0x1407A40AB); the cat data is COPIED
+    C_AbilityUiOf,           // Component*(Character*) -- sub_1400B4760: the unit's combat ability bar (component type 0x5D3), null when it has none
+    C_AbilityUiBuild,        // void(Component*, bool unused) -- sub_14077B350: builds the bar's buttons again (bMove, bAttack, bSpell ...), as the console's set-ability does after a change
+    C_GonGet,                // GonObject*(GonObject*, const std::string& key) -- sub_140942DA0: the child of that name, or the game's empty node (+0xA8 == 0); never fatal
+    C_AddTempAbility,        // Ability*(Character*, const std::string& name, bool) -- sub_140119480. Not called: its `mov rbx, [rip+X]` at +0x1C0 names the SpawnDatabase pointer (0x1413C79D0)
+    // --- 0.1.192: the deep repair of an item of another name (mgmp_lockstep: lockstep_swap_item_named) ---
+    C_EquipSwap,             // bool(CatData*, Item* new_item, int loc) -- sub_1400CA2E0: the gear page's swap: the new item goes into its slot (sub_1400C9EE0), the item of that id is taken out of the
+                             // backpack and the storage (Inventory+0x38 / +0x78, by id), the item the slot held goes into the inventory at `loc`. Its `mov rbx, [rip+X]` at +0x51 names the Inventory
+    C_InvRemove,             // void(container*, const Item*) -- sub_1402E24D0: an inventory container (an id -> Item map) loses the entry of that item's id (+0x00)
     C_COUNT
 };
 
@@ -1194,6 +1295,19 @@ static const CallDesc kCalls[C_COUNT] = {
     { 0x007AB3D0, "ItemRegistry: build the item pools (unlocked items only)" },
     { 0x009BE4E0, "glaiel::TempHideMouseCursor" },
     { 0x002223C0, "MapMarker: can the party NOT walk to this node" },
+    { 0x009616D0, "Texts::get(key): the game's localized text" },
+    { 0x00052290, "std::wstring::_Tidy_deallocate" },
+    { 0x007AACD0, "ItemRegistry: clear the ability/passive/item pool caches" },
+    { 0x0020BE10, "TileList: add a tile unless present" },
+    { 0x00115B20, "Character::revive(hp)" },
+    { 0x007AC8A0, "SpawnDatabase::CreateAbility" },
+    { 0x007ACFD0, "spawn a character from cat data" },
+    { 0x000B4760, "Character: its combat ability bar" },
+    { 0x0077B350, "combat ability bar: build the buttons" },
+    { 0x00942DA0, "GonObject::operator[](key)" },
+    { 0x00119480, "Character::AddTempAbility (names the SpawnDatabase)" },
+    { 0x000CA2E0, "CatData: equip an item, the old one to the inventory" },
+    { 0x002E24D0, "Inventory container: remove an item by id" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -1335,6 +1449,15 @@ constexpr uintptr_t kRet_EvPickCtor = 0x00913C14;
 // lambda_5 (0x14039D9B0, the event node's) draws the event itself -- `call sub_1403968E0` at 0x14039DA89, pool kind "normal" -- and hands the
 // NAME to the event scene (sub_1403B7300); the constructor then gets "OldCan", not "random", and draws nothing. T_EvPick acts on this return too.
 constexpr uintptr_t kRet_EvPickNode = 0x0039DA8E;
+// T_Difficulty's two shared callers (0.1.167): the battle build's parameters (sub_1403B94F0, `call` at 0x1403B951D) and the difficulty row of
+// sub_1403BA2E0 (`call` at 0x1403BA305) -- the WorldEvent constructor takes its event_difficulty from that row (0x140913B72), the combat rewards and
+// the house shop take other fields of it (per player: left alone, told apart by T_EvSetup being on the stack).
+constexpr uintptr_t kRet_DifficultyBattle = 0x003B9522;
+constexpr uintptr_t kRet_DifficultyRow    = 0x003BA30A;
+// T_TagCount's two shared callers (0.1.170): EnterNode's lambda_5 (`call` at 0x14039DA2F, trigger_extra_event) and the WorldEvent constructor (`call` at 0x140913B9E,
+// increase_event_difficulty). The difficulty index's own call (0x1403BBF56) is T_Difficulty's business.
+constexpr uintptr_t kRet_TagExtraEvent     = 0x0039DA34;
+constexpr uintptr_t kRet_TagEventDifficulty = 0x00913BA3;
 // THE BOUNTY HUNTER'S TARGET (weather BountyHunting -> EventBountyHunter, passive EventBounterHunterPassive). Its vtable slot +0x108 (sub_1407E99F0) walks the board's units, sorts them into two
 // lists -- faction 1 and every other faction -- and puts EventBounty 5 on one picked with T_PickRandom from the shared stream: the second list first (the call returns to kRet_BountyOthers), the
 // first if that one was empty (kRet_BountyFaction1). It runs while the hunter is being loaded at the battle's start, and that load draws a different number of times on each peer (2026-10-06:
