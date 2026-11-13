@@ -71,8 +71,20 @@ bool unit_die(void* chr);
 bool unit_set_ability(void* chr, uint8_t slot, const char* name, bool cat_too, const char*& why);
 // The spells past the first `keep` are destroyed (an item's ability ends the trim: false, `why`).
 bool unit_trim_spells(void* chr, uint32_t keep, const char*& why);
+// 0.1.217: the unit's cat data is a summon's own (FleshGolem's builder sets its save id to -1), not a cat of a save -- writing its spell names touches no player's cat.
+bool unit_catdata_is_summon(const void* chr);
 // As unit_spawn_at, but the unit is made from `cat` (a CatData, which the game copies) the way the game's `catdata` summon makes one (SpawnCharacterWithCatData 0x1407ACFD0).
 void* unit_spawn_catdata_at(void* tc, const void* like, const char* def, void* cat, int32_t x, int32_t y, const int32_t* keys, const char*& why);
+// 0.1.222: HOW THE GAME MADE EACH UNIT. The definition loader's hook (h_LoadChar) calls unit_note_load at its entry: `by_cat` when the load is called from the
+// cat-data wrapper (sub_1400FCB50: the `catdata` summon, the battle's own cats), else the unit is made by name (it may set cat data of its own: AtomicKitten,
+// ZombieCatFamiliar -- made by name natively, their brains' patterns name abilities a cat-data spawn does not give them). A unit loaded again (a transform: it has
+// a brain) keeps its note.
+void unit_note_load(void* chr, const char* def, bool by_cat);
+bool unit_made_from_catdata(const void* chr);
+// bit 0: this game made a unit of that definition from cat data, bit 1: by name. 0: never seen.
+uint32_t unit_def_load_kinds(const char* def);
+// The number of cat-data spawns that raised so far (each one leaves a half-made unit in the game's lists, marked started).
+uint32_t unit_catdata_spawn_raised();
 
 // h_NextTurn, before the original. Runs the pending request (if any) and reports on the units earlier requests touched.
 void spawntest_turn_boundary(void* turn_control);

@@ -75,6 +75,27 @@ int main() {
     { BoardSumMsg m; m.battle = 1; m.cats = kBoardMax; fits("boardsum", 16 + 4 + 4 + 32 + 4 * kBoardMax, m, enc_boardsum); }
     { TurnQueueMsg m; m.battle = 1; m.n = kTurnQueueMax; fits("turnqueue", 16 + 2 * kTurnQueueMax, m, enc_turnqueue); }
     { UstateReqMsg m; m.n = kUstateReqMax; fits("ustatereq", 32 + kUstateReqMax, m, enc_ustatereq); }
+    {   // 0.1.195: the fullest ground map -- every cell a tile with elements, every name at its longest
+        static TilesMsg m; m.battle = 1; m.w = 32; m.h = 32; m.nnames = kTileNamesMax;
+        for (uint32_t i = 0; i < kTileNamesMax; ++i) { memset(m.names[i], 'x', kTileNameLen - 1); m.names[i][kTileNameLen - 1] = 0; }
+        for (uint32_t c = 0; c < kTilesMaxCells; ++c) { m.cell[c] = (uint8_t)(c % kTileNamesMax); m.m0[c] = 0xFFFFFFFF; m.m1[c] = 1; }
+        fits("tiles", kSendTiles, m, enc_tiles);
+        static uint8_t buf[kSendTiles]; static TilesMsg back;
+        const uint32_t n = enc_tiles(buf, sizeof(buf), m);
+        const bool same = n && dec_tiles(buf, n, back) && back.w == 32 && back.nnames == kTileNamesMax && back.cell[1023] == m.cell[1023] && back.m0[5] == m.m0[5] && strcmp(back.names[3], m.names[3]) == 0;
+        printf("  %s  tiles round trip\n", same ? "ok  " : "FAIL"); if (!same) ++g_fail;
+    }
+    {   // 0.1.213: the fullest per-action check -- every row a living unit -- and its round trip
+        static ActCheckMsg m; m.battle = 1; m.turn = 7; m.action = (3u << 8) | 2; m.n = (uint8_t)kActCheckMax;
+        for (uint32_t i = 0; i < kActCheckMax; ++i) { m.row[i].flags = kActRowOk; m.row[i].hp = 100000 + (int32_t)i; m.row[i].shield = -1; m.row[i].tx = -5000; m.row[i].ty = (int16_t)i; }
+        m.row[5].flags = kActRowOk | kActRowDead;
+        fits("actcheck", kSendActCheck, m, enc_actcheck);
+        static uint8_t buf[kSendActCheck]; static ActCheckMsg back;
+        const uint32_t n = enc_actcheck(buf, sizeof(buf), m);
+        bool same = n && dec_actcheck(buf, n, back) && back.n == m.n && back.action == m.action;
+        for (uint32_t i = 0; same && i < kActCheckMax; ++i) same = act_rows_same(back.row[i], m.row[i]);
+        printf("  %s  actcheck round trip\n", same ? "ok  " : "FAIL"); if (!same) ++g_fail;
+    }
     { CatDigestMsg m; m.count = kCatDigestMax; for (uint32_t i = 0; i < kCatDigestMax; ++i) m.ids[i] = 1 + i; fits("catdigest", 2 + kCatDigestMax * 20, m, enc_catdigest); }
     { CheckpointMsg m; m.count = kMaxPeers; for (auto& c : m.candidates) c.run = 1;
       fits("checkpoint", 8192, m, [](uint8_t* p, uint32_t cap, const CheckpointMsg& x) { return enc_checkpoint(p, cap, x); }); }

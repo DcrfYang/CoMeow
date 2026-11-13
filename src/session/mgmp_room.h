@@ -32,6 +32,10 @@ namespace mgmp {
 struct RoomCtlMsg;
 
 void room_tick();                                       // from the frame hook
+// 0.1.203: the lobby closed the room (the host left) and the host has been silent for 30 s: the player is asked (the menu draws it); end = stop the
+// online game (a run goes on alone with this player's own cats), else wait (asked again 3 min later).
+bool room_host_gone_asking(uint32_t* silent_s);
+void room_host_gone_answer(bool end);
 void room_on_message(uint8_t from, const RoomCtlMsg& m);
 
 // --- the save screen ---------------------------------------------------------------------------------

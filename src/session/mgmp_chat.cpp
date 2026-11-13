@@ -49,7 +49,25 @@ void keep(const char* name, const char* text, bool self) {
 
 } // namespace
 
-bool chat_available() { return net_active() && net_peer_count() >= 2; }
+// CHAT WITHOUT THE GAME LINK (0.1.201): players whose versions differ are refused at the handshake, so no game link, and the chat -- which rode that
+// link only -- was gone too, though they sat in the same lobby room and could have told each other to update. With no game link, a line goes
+// through the lobby (signal_send_chat) to the room's other members, and theirs come back the same way (chat_take_lobby_lines).
+static bool game_link_up() { return net_active() && net_peer_count() >= 2; }
+bool chat_available() { return game_link_up() || signal_chat_possible(); }
+
+void chat_take_lobby_lines() {
+    char n[128], t[kChatTextMax * 2];
+    while (signal_take_chat(n, sizeof(n), t, sizeof(t))) {
+        char name[kChatNameMax], text[kChatTextMax];
+        clean(n, name, sizeof(name));
+        clean(t, text, sizeof(text));
+        if (!text[0]) continue;
+        if (!name[0]) strncpy_s(name, sizeof(name), "?", _TRUNCATE);
+        keep(name, text, false);
+        log_line("CHAT", "%s: %s", name, text);
+        log_line("CHAT", "  (that line came through the lobby: no game link to that player)");
+    }
+}
 
 void chat_on_message(uint8_t from, const ChatMsg& m) {
     char name[kChatNameMax], text[kChatTextMax];
@@ -71,7 +89,8 @@ bool chat_submit(const char* text) {
     strncpy_s(m.name, sizeof(m.name), name, _TRUNCATE);
     keep(m.name, m.text, true);
     log_line("CHAT", "%s (me): %s", m.name, m.text);
-    if (!net_send_chat(m)) log_line_lvl(LogLevel::Warn, "CHAT", "!! the line could not be sent");
+    if (game_link_up()) { if (!net_send_chat(m)) log_line_lvl(LogLevel::Warn, "CHAT", "!! the line could not be sent"); }
+    else if (!signal_send_chat(m.name, m.text)) log_line_lvl(LogLevel::Warn, "CHAT", "!! the line could not be sent (no game link, and the lobby cannot carry it)");
     return true;
 }
 

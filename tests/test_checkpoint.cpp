@@ -137,6 +137,7 @@ uint32_t catsync_origin_export(CloneOriginNote* out, uint32_t max) {
     out[0] = {0x70000001ull, 0x2daull}; out[1] = {0x71000001ull, 0x2fcull};
     return 2;
 }
+void catsync_restored_seat(uint8_t, uint64_t) {}
 void catsync_origin_import(const CloneOriginNote* in, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) if (in[i].clone && in[i].original) ++imported_origins;
 }
@@ -310,6 +311,28 @@ int main() {
     reset(L"frozen membership cannot shrink quorum",3); start(); boundary(6000);
     for(unsigned i=0;i<3;++i)at(i,[]{checkpoint_on_node(1,1);checkpoint_on_map(6001);});drain();
     live=2; at(0,[]{checkpoint_on_map(6001);CHECK(!checkpoint_can_enter());Entry e{};CHECK(read_entry(file(L".0"),e,true));CHECK(e.certificate.seq==1);});
+
+    // 0.1.206: a run of three resumed by two of them. The host is asked first; on "load" the third seat stays in the configuration as absent (kNoPeer), the
+    // journal and its certificates keep the run's three seats, and the run goes on certified by the two. On "no" the two-player round is refused as before.
+    for(int load=1;load>=0;--load) {
+        reset(load?L"a run of three resumed by two: the host loads it":L"a run of three resumed by two: the host declines",3); start(); boundary(8800); certified(1);
+        packets.clear(); map_packets.clear(); wait_packets.clear();
+        participants=2; live=2;
+        for(unsigned i=0;i<2;++i) { State old=states[i]; states[i]=State{}; states[i].on=true; states[i].host=i==0; states[i].identity=old.identity; states[i].root=old.root; states[i].path=old.path; }
+        selections();
+        at(0,[]{ char names[200]{}; CHECK(checkpoint_short_question(names,sizeof(names))); CHECK(strstr(names,"P3")!=nullptr); CHECK(!g.configured && !g.released && !g.failed); });
+        at(1,[]{ CHECK(!g.configured && !g.released); char n[8]; CHECK(!checkpoint_short_question(n,sizeof(n))); });   // only the host is asked
+        at(0,[&]{ checkpoint_short_answer(load!=0); }); drain();
+        if(!load) { at(0,[]{ CHECK(g.failed); }); continue; }
+        for(unsigned i=0;i<2;++i) at(i,[&]{
+            CHECK(!g.failed); CHECK(g.released); CHECK(g.seq==1); CHECK(g.config.count==3); CHECK(g.absent==4);
+            CHECK(seat_n[i]==3 && seats[i][0]==0 && seats[i][1]==1 && seats[i][2]==kNoPeer);
+        });
+        next(8801); certified(2);
+        for(unsigned i=0;i<2;++i) at(i,[]{ Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.certificate.count==3 && e.certificate.hashes[2]!=0 && e.certificate.seq==2); });
+        next(8802); certified(3);
+    }
+    participants=live=2;
 
     reset(L"a roster-only mismatch skips ONE node's checkpoint and never latches"); start(); boundary(7500); certified(1);
     // The client's NODEHASH reports before its checkpoint_on_node, the host's after it.
@@ -544,7 +567,7 @@ int main() {
     {
         auto session=[](const unsigned* who){
             packets.clear(); map_packets.clear(); live=participants;
-            State old[3]={states[0],states[1],states[2]}; State by_player[3];
+            static State old[3], by_player[3]; old[0]=states[0]; old[1]=states[1]; old[2]=states[2];   // static: a State is tens of KB
             for(unsigned i=0;i<3;++i) by_player[old[i].identity-100]=old[i];
             for(unsigned i=0;i<3;++i) {
                 const State& o=by_player[who[i]];

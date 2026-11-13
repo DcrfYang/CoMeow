@@ -195,15 +195,24 @@ bool setup_has_shared_roster(){refresh();return g.on&&(g.is_client?g.host_reply_
 bool setup_host_can_enter(){refresh();return !g.on||g.is_client||((g.chapter_seen||g.resume)&&all_ready());}
 bool setup_client_controls_locked(){refresh();return g.client_lock||(g.on&&(g.is_client||g.committed));}
 // 0: every player has chapter `act`; 2: somebody lacks chapter 2 (so chapters 2 and 3 are both closed); 3: everybody has chapter 2 but somebody lacks 3.
+// 0.1.216 (room VELM 11-09, three players: all three had just unlocked the lab, both clients reported it, and chapter 3 was refused at every try, under two hosts):
+// THE HOST'S OWN SAVE IS NOT ASKED. Its game only lets it pick an act that save has unlocked, by the game's own test; the mod's reading of the host's map flags is not
+// that test. The clients are judged by what they last reported (READY, or a later report of their flags), and a refusal names every player's flags.
 int chapter_locked_for(int act){
     if(act<2)return 0;
     bool lack2=false,lack3=false;
-    for(unsigned i=0;i<g.members;++i){
-        const uint32_t m=i==0?unlocks_mapflags():g.mapflags[i];
+    for(unsigned i=1;i<g.members;++i){
+        const uint32_t m=g.mapflags[i];
         if(!unlocks_allow(m,2))lack2=true;
         if(!unlocks_allow(m,3))lack3=true;}
     if(lack2)return 2;
     return act==3&&lack3?3:0;
+}
+void log_chapter_flags(int act){
+    char line[200]={};int w=_snprintf_s(line,sizeof(line),_TRUNCATE,"host %08x (not asked)",unlocks_mapflags());
+    for(unsigned i=1;i<g.members&&w>=0&&w<(int)sizeof(line)-40;++i)
+        w+=_snprintf_s(line+w,sizeof(line)-w,_TRUNCATE,", position %u %08x%s",i,g.mapflags[i],unlocks_allow(g.mapflags[i],act)?"":" (lacks it)");
+    log_line("SETUP","chapter %d: the players' map flags -- %s",act,line);
 }
 bool setup_on_select_act(int act){
     refresh();if(g.client_lock||(g.on&&g.is_client)){room_say_chapter_client();return false;}if(!g.on)return true;
@@ -220,7 +229,9 @@ bool setup_on_select_act(int act){
     // The host chooses for everybody: it may only choose a chapter every player has unlocked.
     if(const int why=chapter_locked_for(act)){
         if(why==2)room_say_chapter_locked_2();else room_say_chapter_locked_3();
-        log_line("SETUP","chapter %d refused: a player has not unlocked chapter %d",act,why);return false;}
+        log_line("SETUP","chapter %d refused: a player has not unlocked chapter %d",act,why);
+        {static int said_act=0;if(said_act!=act){said_act=act;log_chapter_flags(why);}}
+        return false;}
     ChapterSeedMsg seed{};seed.generation=g.round;
     auto* rng=rng_global_stream();if(!rng)return false;memcpy(seed.rng,rng,sizeof(seed.rng));
     if(!net_send_chapterseed(seed))return false; // seed must precede the command
@@ -309,10 +320,12 @@ void setup_on_chapter_control(void* screen,int act,int32_t* difficulty,void(*sel
 void setup_on_chapter_message(const ChapterMsg& m,uint8_t from){
     // proto 99: a client's own map flags, whenever they change -- for the area gate, outside any preparation round
     // 0.1.121: generation 2 is the HOST's live flags (a client's own report is generation 1)
-    if(m.kind==kChapterFlags){if(m.generation==2){if(from==kHostPeer)unlocks_on_host_flags(m.mapflags);return;}areagate_on_flags(from,m.mapflags,"its report");return;}
+    if(m.kind==kChapterFlags){if(m.generation==2){if(from==kHostPeer)unlocks_on_host_flags(m.mapflags);return;}areagate_on_flags(from,m.mapflags,"its report");
+        refresh();if(g.on&&!g.is_client){const int p=pos(from);if(p>0&&p<(int)kMaxPeers&&m.mapflags)g.mapflags[p]=m.mapflags;}return;}   // 0.1.216: the chapter check takes a client's latest flags
     // proto 102: a client is done with its own random event (mgmp_indepevt)
     if(m.kind==kChapterEventDone){indepevt_on_done(from,((uint64_t)m.mapflags<<32)|m.generation);return;}
     if(m.kind==kChapterEventName){indepevt_on_host_event(from,m.generation,m.mapflags);return;}
+    if(m.kind==kChapterListFix){if(net_role()==NetRole::Host)catsync_host_listfix(from,((uint64_t)m.mapflags<<32)|m.generation);return;}   // 0.1.213 (proto 117)
     if(m.kind==kChapterReady)areagate_on_flags(from,m.mapflags,"its READY");
     refresh();if(!g.on||!valid_chapter(m)||!freeze()||m.generation!=g.round)return;
     const int p=pos(from);

@@ -626,6 +626,10 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // publish is supposed to carry everything the client needs to build the same battle.
     // The post-battle promotion can have moved a client cat into the host party since the
     // last map tick; the publish below must carry the owner-split lists.
+    // 0.1.212: a client's cat the game took out of the familiar list in the last FIGHT goes back first (CHINAMI 11-08: ZaratanasCollar's familiar emptied it)
+    static uint32_t s_last_published_type = 0;
+    if (!g.is_client) catsync_host_keep_familiars("about to publish a node", s_last_published_type >= 5 && s_last_published_type <= 8);
+    if (!g.is_client) s_last_published_type = type;
     if (!g.is_client) roster_normalize_shared("about to publish a node");
     if (!g.is_client) catsync_dump_lists("about to publish a node");
 
@@ -1378,6 +1382,15 @@ void follow_mark_node_consumed(void* node) {
     }
     if (before) return;                     // already marked, by the game or by an earlier call
 
+    // NOT A SPECIAL EVENT'S NODE AT ITS ENTRY (0.1.204): of the 7 crashes at Mewgenics.exe+0x9BDA4B/0x9BDABF (a shader's program or uniform read after it was
+    // freed, in the frame's draw: GPC 11-07 00:21, DESKTOP-4NLA8EA 11-07 22:59, the 11-05 open one ...) 6 came within four lines of THIS write on a
+    // special_event node, as the client followed the host into it -- and none of ~10,000 writes on other node types. The node's look changes with the
+    // flag while the screen goes over to the event. Left to the map sync (the host's flag words are adopted on the map, between frames that draw it).
+    if (!strcmp(node_type_name(node_type(node)), "special_event")) {
+        log_line("FOLLOW", "the followed special_event node %p is NOT marked consumed at its entry (the write crashed the draw of its look, 0x9BDA) -- the map sync takes the host's flag later", node);
+        return;
+    }
+
     const uint8_t after = 1;
     if (!mem_write((uint8_t*)node + kNode_Consumed, &after, sizeof(after))) {
         log_line_lvl(LogLevel::Error, "FOLLOW",
@@ -1396,6 +1409,50 @@ void follow_mark_node_consumed(void* node) {
              node, node_type_name(node_type(node)), (unsigned)kNode_Consumed, check,
              check == 1 ? "read back agrees" : "READ-BACK DISAGREES");
     if (check == 1) cascade_consume_empty_neighbours(node, 0);
+}
+
+// THE PARTY STANDS ON THE NODE BEFORE IT IS ENTERED (0.1.218). Crash Mewgenics.exe+0x9BDA4B/0x9BDABF -- the frame's draw binds a shader program that was freed
+// (0x1409BDA20 via the batch flush 0x140A485A0) -- kept coming after 0.1.204 had stopped marking special_event nodes done at their entry: yuge 11-08 23:08
+// (special_event), yuge 11-10 20:54 (a BATTLE node, marked done), DESKTOP-9CMVOS6 11-10 22:01 (special_event right after the Core boss, room D6UL). What all three had in
+// common, as the last mod line before the crash, was follow_move_marker_to: the marker's SELECTION written right AFTER the client's EnterNode, so the map set off a walk
+// in the very frame the screen went over to the event or the battle. The game never does that: its click selects, the walk runs on a live map, and the node is entered
+// when the marker has ARRIVED (standing on it, no walk, no selection). That arrival state is what is written now, before the entry; after it nothing is written.
+void follow_place_marker_on(void* node) {
+    if (!g.on || !g.is_client || !g.map || !node) return;
+    void* marker = nullptr;
+    if (!mem_read((const uint8_t*)g.map + kMap_Marker, &marker, sizeof(marker)) || !marker) {
+        log_line("FOLLOW", "marker: MapScreen+0x%X did not read as the marker object -- the party icon stays where it was", (unsigned)kMap_Marker);
+        return;
+    }
+    uint32_t idx = 0;
+    if (!index_of_node(g.map, node, idx)) {
+        log_line_lvl(LogLevel::Warn, "FOLLOW", "marker: the followed node %p is not in this peer's node vector -- the marker is left alone", node);
+        return;
+    }
+    void *at = nullptr, *moving = nullptr, *sel = nullptr;
+    mem_read((const uint8_t*)marker + kMarker_AtNode, &at, sizeof(at));
+    mem_read((const uint8_t*)marker + kMarker_MovingTo, &moving, sizeof(moving));
+    mem_read((const uint8_t*)marker + kMarker_Selected, &sel, sizeof(sel));
+    if (at == node && !moving && !sel) return;                     // already standing there: the instant nodes' walk (0.1.120) arrived on its own
+    void* const none = nullptr;
+    bool ok = mem_write((uint8_t*)marker + kMarker_MovingTo, &none, sizeof(none)) && mem_write((uint8_t*)marker + kMarker_Selected, &none, sizeof(none)) &&
+              mem_write((uint8_t*)marker + kMarker_AtNode, &node, sizeof(node));
+    // ...and WHERE IT IS DRAWN (0.1.219; Dcrf 11-10 23:20, room E7BN: "我的猫在地图上不移动，但可以正常进入节点" -- +0x50 is only the node the party stands on, the icon
+    // stayed where the last walk had left it). The game's own arrival (0x1402222BD) writes the same: the marker's transform (+0x48) at +0x80/+0x88 = the node's
+    // look position (node+0x160 -> +0x70/+0x74, floats) as doubles, +0x90 = 0, and the walk's progress +0x68 back to 0.
+    {
+        const uint8_t* look = nullptr; uint8_t* xform = nullptr; float pos[2] = {};
+        if (mem_read((const uint8_t*)node + 0x160, &look, sizeof(look)) && look && mem_read(look + 0x70, pos, sizeof(pos)) &&
+            mem_read((const uint8_t*)marker + 0x48, &xform, sizeof(xform)) && xform) {
+            const double at[3] = { (double)pos[0], (double)pos[1], 0.0 };
+            const double zero = 0.0;
+            ok = mem_write(xform + 0x80, at, sizeof(at)) && mem_write((uint8_t*)marker + 0x68, &zero, sizeof(zero)) && ok;
+        } else ok = false;
+    }
+    uint32_t at_idx = 0;
+    const bool at_known = at && index_of_node(g.map, at, at_idx);
+    log_line("FOLLOW", "marker: the party is put ON node %u before this peer enters it (it stood on node %d%s%s) -- the state the game's own walk leaves on arrival; nothing of the map is written after the entry (crash 0x9BDA)%s",
+             idx, at_known ? (int)at_idx : -1, moving ? ", walking" : "", sel ? ", a node selected" : "", ok ? "" : " -- A WRITE FAILED");
 }
 
 void follow_move_marker_to(void* node) {
@@ -1683,6 +1740,38 @@ bool send_map(void* map, uint32_t count, uint8_t kind, uint32_t epoch, const uin
     return true;
 }
 
+// THE MAP'S NODE STATES AFTER THE MAP SYNC (0.1.215, room 38C9 11-09 and 16 more uploads of 11-08/09). A node's button can be clicked only when the node is
+// open to the party: its reachable byte (+0x16C) and its look's state, which the game works out from the done flags in C_MapNodeRefresh -- over every node
+// when the party arrives at one, and when the map's looks are made. A done flag the map sync writes afterwards is not seen: since 0.1.204 a special_event node
+// is not marked done as the client follows into it (crash 0x9BDA), the client's map came back from the event with that node open, and its done flag came
+// with the host's map a moment later -- the next node stayed closed (every click on it reached no button) until the save was loaded again. After any flag
+// the map sync writes, the game's own refresh runs over every node, as its arrival does.
+constexpr uintptr_t kNode_Reachable = 0x16C;
+using fn_node_refresh = bool (__fastcall*)(void* node);
+static bool call_node_refresh(fn_node_refresh fn, void* node) {
+    __try { fn(node); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void refresh_node_states(void* map, uint32_t count, const char* why) {
+    const fn_node_refresh fn = (fn_node_refresh)addr_of_call(C_MapNodeRefresh);
+    if (!fn) { log_line_lvl(LogLevel::Warn, "FOLLOW", "!! node states not refreshed after %s: the game's node refresh was not found -- a node may stay closed until the map is made again", why); return; }
+    uint32_t refreshed = 0, opened = 0, closed = 0, faults = 0;
+    char list[160] = {}; int w = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        void* node = node_at(map, i);
+        if (!node) continue;
+        uint8_t before = 0, after = 0;
+        mem_read((const uint8_t*)node + kNode_Reachable, &before, 1);
+        if (!call_node_refresh(fn, node)) { ++faults; continue; }
+        ++refreshed;
+        mem_read((const uint8_t*)node + kNode_Reachable, &after, 1);
+        if (before == after) continue;
+        if (after) ++opened; else ++closed;
+        if (w >= 0 && (size_t)w < sizeof(list) - 16) w += _snprintf_s(list + w, sizeof(list) - w, _TRUNCATE, " %u:%u>%u", i, (unsigned)before, (unsigned)after);
+    }
+    log_line_lvl(faults ? LogLevel::Warn : LogLevel::Info, "FOLLOW", "%snode states refreshed after %s: %u node(s), %u now reachable, %u no longer%s%s%s", faults ? "!! " : "", why, refreshed, opened, closed,
+             w > 0 ? " --" : "", list, faults ? " (the refresh FAULTED on some nodes)" : "");
+}
+
 // THE CLIENT'S PARTY MARKER STANDS WHERE THE HOST'S DOES (0.1.139, room F499). A client enters a node the host entered at once (follow) and only
 // SELECTS it on its marker; the icon walks there when the map runs again. A save taken in between -- the checkpoint is staged the moment the map is
 // back, right after a node -- keeps the party on the node BEFORE. Restored, the client's game had the party one node behind: the boss node, reachable
@@ -1774,6 +1863,7 @@ bool map_seed_sync(void* map) {
         log_line_lvl(LogLevel::Warn, "FOLLOW", "ADOPTED the host's map: %u of %u node seed(s) and %u node flag word(s) were overwritten "
                                               "(same node count and types) -- the maps now agree", seeds_changed, count, flags_changed);
         align_party_marker(map, ss.party_at);
+        if (flags_changed) refresh_node_states(map, count, "the host's node flags were taken");
         return true;
     }
     // The host's seeds have not (all) arrived: wait for them, a few seconds at most.

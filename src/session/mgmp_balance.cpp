@@ -1,5 +1,6 @@
 // mgmp_balance.cpp -- see mgmp_balance.h.
 #include "mgmp_balance.h"
+#include <cstring>
 #include "mgmp_config.h"
 #include "mgmp_addresses.h"
 #include "mgmp_log.h"
@@ -23,6 +24,11 @@ uint64_t balance_ruleset_id() {
 
 bool balance_is_enemy_faction(int32_t f) {
     return f == 2 || (f >= 8 && f <= 12);
+}
+
+bool balance_exempt_definition(const char* name) {
+    static const char kCreatorClone[] = "PlayerCat_FinalBossClone";
+    return name && !strncmp(name, kCreatorClone, sizeof(kCreatorClone) - 1);
 }
 
 bool balance_scale_enemy(void* chr, int32_t hp_before, uint32_t scale_half) {

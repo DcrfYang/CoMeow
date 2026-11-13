@@ -90,6 +90,7 @@ add_library(mgmp SHARED
     src/session/mgmp_teamlist.cpp
     src/session/mgmp_mapvote.cpp
     src/determinism/mgmp_dmgfence.cpp
+    src/determinism/mgmp_shufflefence.cpp
     src/session/mgmp_chat.cpp
     src/session/mgmp_urgent.cpp
     src/session/mgmp_emote.cpp
@@ -98,6 +99,7 @@ add_library(mgmp SHARED
     src/session/mgmp_spawntest.cpp
     src/session/mgmp_unitprobe.cpp
     src/session/mgmp_unitstate.cpp
+    src/session/mgmp_tilesync.cpp
     src/ui/mgmp_imeui.cpp
     src/session/mgmp_catsync.cpp
     src/session/mgmp_invsync.cpp

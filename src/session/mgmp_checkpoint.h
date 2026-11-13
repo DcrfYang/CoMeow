@@ -107,6 +107,10 @@ bool checkpoint_sync_view(SaveSyncView& out);
 bool checkpoint_host_pick(int index);
 // Put the "invalid" panel away; the next slot click starts a fresh round.
 void checkpoint_sync_dismiss();
+// 0.1.206: the host's save is on the map and its records hold this run with more players than are in the room. True while the host is asked (the names of the
+// missing ones in `names`); the answer resumes the run without them (load) -- their cats leave the run and they cannot come back into it before it ends -- or not.
+bool checkpoint_short_question(char* names, size_t cap);
+void checkpoint_short_answer(bool load);
 // START THE SAVE-SELECTION ROUND OVER (2026-09-30): this peer forgets its own pick and, on the host,
 // every pick it was holding -- including the ones queued for "the next handshake". Refused (false) once
 // the host has chosen, because from there the saves are being restored and loaded. Used by the room

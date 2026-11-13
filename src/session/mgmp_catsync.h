@@ -128,6 +128,11 @@ struct SetupMsg;
 // (See the two notes above for what they are for and why the declarations live here rather than
 // at global scope.)
 uint32_t serialize_cat(void* cat, uint8_t** out);
+// 0.1.219, the STRAYS log (see T_StrayGen). The list of the cats whose same-sex pairing gave no kitten (GlobalProgressionData+0x780: the next day's
+// "GayStrayChance" is its length), its length, its entries from `from` on with each cat's name / gender / sexuality; and a stray just generated.
+uint32_t catsync_gay_list_count();
+void     catsync_log_gay_list(const char* when, uint32_t from);
+void     catsync_log_stray_made(void* cat, const void* stats);
 bool     catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len);
 // The cats THIS player brings, as room-panel briefs (mgmp_catbrief.h): every cat of the run
 // (party AND familiars -- the mod swaps and replaces those lists, so which list a cat sits in says
@@ -304,6 +309,14 @@ bool catsync_apply_snapshot(const CatDataMsg& m, const char* why, bool allow_cre
 struct EnterNodeMsg;
 bool catsync_read_familiars(EnterNodeMsg& node);
 bool catsync_apply_familiars(const EnterNodeMsg& node);
+// 0.1.212: host, before a node is published -- a client's living cat that left the familiar list during the last battle (after_battle) is put back; returns how many.
+unsigned catsync_host_keep_familiars(const char* why, bool after_battle);
+// 0.1.213 (proto 117), HOST: a client's report that the node snapshot lost its living cat `id` -- put back into the familiar list when the seat is the sender's.
+void catsync_host_listfix(uint8_t from, uint64_t id);
+// 0.1.213 (usdev famdrop ID): this game's familiar list loses that cat (the test of the list repair)
+bool catsync_dev_familiar_drop(uint64_t id);
+// 0.1.212: this player's cats in the run's party + familiar lists now (1 when unreadable).
+unsigned catsync_own_cats_listed();
 
 // Diagnose side: print the run's party list and the familiar list BY ID, at the moment the host
 // is about to publish a node. Written 2026-09-23 because the client kept receiving four cats
@@ -319,6 +332,10 @@ void catsync_dump_vectors(const char* why);
 void catsync_forget();
 // 0.1.170: the swap notes still waiting for a House save are dropped -- the save they were made in has been replaced (a handshake save restored, a backup loaded).
 void catsync_drop_swap_notes(const char* why);
+// 0.1.226: the seat this player had in the run of a handshake save restored from the backup page (its certificate names every seat's identity) -- alone, the run's
+// cats of that seat are this player's (alone_check, the settlement), whatever the cats' originals say.
+void catsync_restored_seat(uint8_t seat, uint64_t run);
+void catsync_add_swap_note(uint64_t clone, uint64_t original, bool due);     // tests: a rename note as a merge leaves it
 // The settlement is over: cats may be applied again (0.1.145; also when the run ended alone, where catsync_forget is not called).
 void catsync_settle_done(const char* why);
 

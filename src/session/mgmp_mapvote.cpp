@@ -62,6 +62,8 @@ struct State {
     float     cam_logged_x = 1e9f, cam_logged_y = 1e9f;
     ULONGLONG cam_logged_at = 0;
     int       cam_lines = 0, cal_lines = 0;
+    ULONGLONG waiting_since = 0;      // 0.1.197: every other player has picked and this one has not, since
+    uint32_t  waiting_said = ~0u;
 } g;
 
 bool engaged() { return follow_active() && net_peer_count() >= 2 && net_self() != kNoPeer; }
@@ -91,6 +93,7 @@ void reset_locked(const char* why) {
     if (g.book.any() || g.exec) log_line("MAPVOTE", "the picks are forgotten (%s)", why);
     g.book.clear();
     g.exec = false; g.force = false; g.said_blocked = ~0u; g.arrived_at = 0;
+    g.waiting_since = 0; g.waiting_said = ~0u;
     for (uint32_t& x : g.geo_logged) x = 0;
 }
 
@@ -184,7 +187,14 @@ bool mapvote_node_world(void* node, float& x, float& y) { return node_world(node
 
 bool mapvote_on_click(void* node) {
     Lock lock;
-    if (!node || !engaged()) return false;
+    if (!node) return false;
+    // 0.1.197: said, not silent (room KD8E 11-06 21:25, three players: the third player's clicks on the map after the chapter boss left no line at all -- "点不了",
+    // the room waited on its pick and broke up; which gate turned them away could not be read)
+    if (!engaged()) {
+        said_pass(!follow_active() ? "the vote is off: this peer does not follow the room's map" : net_peer_count() < 2 ? "the vote is off: no other player is connected"
+                                                                                                                 : "the vote is off: this peer has no seat yet", ~0u, false);
+        return false;
+    }
     void* map = g.map ? g.map : follow_map_screen();
     uint32_t idx = 0;
     if (!map) { said_pass("no map screen seen yet", ~0u, false); return false; }
@@ -306,6 +316,27 @@ void mapvote_tick(void* map, MapVoteClickFn click) {
         send_vote(g.book.v[self].seed0, g.book.v[self].index, true);
         g.resend_at = now + kResendMs;
     }
+    // 0.1.197 DIAGNOSTICS (room KD8E 11-06 21:25, three players: after the chapter boss the third player's clicks on the two nodes the others had picked reached no
+    // node button at all -- no MAPVOTE, no FOLLOW line -- "点不了", and the room broke up). Every other player has picked a node for 15 s and this one has not: what
+    // this game thinks of that node (where its party marker stands, whether the game's walk check lets the party there).
+    if (!g.book.has(self)) {
+        uint32_t others = 0, want = ~0u;
+        for (uint8_t p = 0; p < kMaxPeers; ++p) if (p != self && g.book.has(p)) { ++others; want = g.book.v[p].index; }
+        if (others && others + 1 >= n) {
+            if (!g.waiting_since) g.waiting_since = now;
+            else if (now - g.waiting_since > 15000 && g.waiting_said != want) {
+                g.waiting_said = want;
+                void* node = follow_node_by_index(map, want);
+                uint32_t ai = ~0u, mi = ~0u;
+                if (at) follow_index_of(map, at, ai);
+                if (moving) follow_index_of(map, moving, mi);
+                log_line_lvl(LogLevel::Warn, "MAPVOTE", "!! every other player has picked node %u for 15 s and this player has not: the party marker stands at node %d (walking to %d), "
+                             "node %u is %s by the game's walk check, consumed %d, type %u (no 'click on node' line since: a click never reached the node's button)",
+                             want, (int)ai, (int)mi, want, node ? (marker && marker_blocks(marker, node) ? "BLOCKED" : "open") : "not found", node ? (int)follow_node_consumed(node) : -1,
+                             node ? (unsigned)follow_node_type(node) : 0u);
+            }
+        } else g.waiting_since = 0;
+    } else g.waiting_since = 0;
     if (net_role() != NetRole::Host || !click) return;
 
     // THE HOST: every player has picked (or it holds Ctrl) -- its own pick is entered

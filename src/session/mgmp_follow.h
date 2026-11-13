@@ -88,6 +88,9 @@ void follow_mark_node_consumed(void* node);
 // the player had clicked. Visual only: the functional half ("this node is done") is
 // follow_mark_node_consumed, and play already works without it.
 void follow_move_marker_to(void* node);
+// 0.1.218: the party marker put ON the followed node -- standing there (+0x50), not walking (+0x58), nothing selected (+0x60): the state the game's own walk leaves when
+// it arrives and enters the node. Called BEFORE the client's entry; nothing of the map is written after it (see the definition: crash 0x9BDA).
+void follow_place_marker_on(void* node);
 
 // The chapter map's node seeds. The host sends its own (once per map); a client with the same node count and types writes them over its own
 // before its map is reported to the checkpoint, which otherwise refuses two maps whose seeds differ. Stored on arrival, applied in follow_map_update.

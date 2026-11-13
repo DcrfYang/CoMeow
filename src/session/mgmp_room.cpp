@@ -493,7 +493,91 @@ static void tick_clock() {
     }
 }
 
+// THE CHAT HINT (0.1.198): once the room is locked and the players' saves are loaded into the House -- a new run starts from there (a sync save resumed on the map
+// never shows the House first) -- each player is told in its own chat that it plays online now and Enter opens the chat. Once per locked room: the House after
+// the run's settlement does not say it again; a room unlocked and locked again does.
+void tick_chat_hint() {
+    static bool said = false;
+    if (!in_room() || !room_locked()) { said = false; return; }
+    if (said || page_self() != PageState::House || !chat_available()) return;
+    said = true;
+    chat_local_note(tr(Tx::CHAT_HINT_ONLINE));
+    log_line("ROOM", "the chat hint is shown (the room is locked and this player's save is in the House)");
+}
+
+// THE SERVER'S SYSTEM MESSAGES (0.1.201): the admin page sends a line to a room through the lobby (MSG "sysmsg", queued by the signal thread); each
+// member shows it in its chat as a system line -- a room of one too (the chat history shows in any lobby room, see draw_chat).
+void tick_sysmsg() {
+    char text[1600];
+    while (signal_take_sysmsg(text, sizeof(text))) {
+        char line[1700];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::SYSMSG_FROM_SERVER), text);
+        chat_local_note(line);
+    }
+}
+
+// THE HOST LEFT AND IS SILENT (0.1.203; this PC 11-07 22:3x: after a settled run the lobby said "the host left the room", the game link -- Steam, its
+// timeout 24 h since 0.1.184 -- never closed, the player saw "the link to the host is slow" every 30 s for minutes and could not start a game alone).
+// Nothing is closed on its own (the user's rule: wait, never disconnect by itself): when the lobby has closed the room AND the host has not answered for
+// kHostGoneAskMs, the player is ASKED -- end the online game (a run goes on with this player's own cats: the leave module's "continue alone") or keep
+// waiting (asked again kHostGoneAgainMs later). The host answering again puts the question away.
+namespace {
+constexpr uint32_t  kHostGoneAskMs   = 30000;
+constexpr ULONGLONG kHostGoneAgainMs = 180000;
+bool      g_hg_asking = false;
+uint32_t  g_hg_ms = 0;
+ULONGLONG g_hg_next = 0;
+}
+
+static void tick_host_gone() {
+    const ULONGLONG closed = signal_room_closed_at();
+    if (!closed || !net_active() || net_peer_count() < 2 || net_role() != NetRole::Client) {
+        if (g_hg_asking) log_line("ROOM", "the host-gone question is put away (the session %s)", closed ? "ended" : "has a room again");
+        g_hg_asking = false; g_hg_next = 0;
+        if (closed && !net_active()) signal_room_closed_clear();
+        return;
+    }
+    uint8_t who = kNoPeer;
+    const uint32_t ms = perf_link_slow_ms(&who);
+    if (who != kHostPeer || ms < kHostGoneAskMs) {
+        if (g_hg_asking && (who != kHostPeer || ms < 5000)) { g_hg_asking = false; log_line("ROOM", "the host answers again -- the host-gone question is put away"); }
+        return;
+    }
+    g_hg_ms = ms;
+    if (!g_hg_asking && GetTickCount64() >= g_hg_next) {
+        g_hg_asking = true;
+        log_line_lvl(LogLevel::Warn, "ROOM", "!! the lobby closed the room (the host left it) and the host has not answered for %u s -- the player is asked: end the online game, or wait", ms / 1000);
+    }
+}
+
+bool room_host_gone_asking(uint32_t* silent_s) {
+    if (silent_s) *silent_s = (g_hg_ms + 500) / 1000;
+    return g_hg_asking;
+}
+
+void room_host_gone_answer(bool end) {
+    if (!g_hg_asking) return;
+    g_hg_asking = false;
+    if (!end) {
+        g_hg_next = GetTickCount64() + kHostGoneAgainMs;
+        log_line("ROOM", "the player keeps waiting for the host (asked again in %llu s if it is still silent)", (unsigned long long)(kHostGoneAgainMs / 1000));
+        return;
+    }
+    signal_room_closed_clear();
+    if (leave_in_run()) {
+        log_line_lvl(LogLevel::Warn, "ROOM", "the player ends the online game (the host left and is silent) -- in a run: it goes on alone with this player's own cats");
+        leave_decide_continue_alone();
+    } else {
+        log_line_lvl(LogLevel::Warn, "ROOM", "the player ends the online game (the host left and is silent) -- not in a run: the session is closed");
+        session_request_disconnect();
+    }
+}
+
 void room_tick() {
+    tick_host_gone();
+    tick_sysmsg();
+    chat_take_lobby_lines();
+    tick_chat_hint();
     tick_slow_link();
     tick_clock();
     tick_direct_unreachable();

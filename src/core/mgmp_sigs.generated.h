@@ -283,6 +283,10 @@ static const SigTargetDesc kTargetSigs[] = {
       "48 8B C4 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 F8 F8 FF FF 48 81 EC C8 07 00 00 0F 29 70 A8 0F 29 78 98 44 0F 29 40 88 44 0F 29 88 78 FF FF FF" },
     { 0x000DE040, "CATSELECT",
       "48 8B C4 48 89 50 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 98 FE FF FF 48 81 EC 28 02 00 00 0F 29 70 A8 0F 29 78 98" },
+    { 0x000689E0, "DIFFSET",
+      "89 54 24 10 4C 8B DC 55 56 57 41 54 41 56 41 57 49 8D 6B A1 48 81 EC B8 00 00 00 48 8B 05 ? ? ? ? 4C 8D 79 10" },
+    { 0x000AA1E0, "STRAYGEN",
+      "48 85 D2 0F 84 ? ? ? ? 48 8B C4 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 28 FF FF FF" },
 };
 
 // INDEXED BY enum Call -- order is load-bearing.
@@ -447,6 +451,12 @@ static const SigTargetDesc kCallSigs[] = {
       "48 89 5C 24 08 48 89 6C 24 18 56 57 41 56 48 81 EC 80 00 00 00 45 8B F0 48 8B F2 48 8B E9 4C 8B C2" },
     { 0x002E24D0, "Inventory container: remove an item by id",
       "40 53 48 83 EC 20 44 0F B6 02 4C 8B D1 48 B9 B3 01 00 00 00 01 00 00 48 B8 25 23 22 84 E4 9C F2 CB" },
+    { 0x0010A4C0, "Character: break a gear item",
+      "48 89 5C 24 08 48 89 74 24 18 55 57 41 56 48 8D AC 24 40 FF FF FF 48 81 EC C0 01 00 00 41 0F B6 D8" },
+    { 0x0089A700, "Tile: replace with a tile of a class (by name)",
+      "48 8B C4 48 89 58 08 48 89 50 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 68 88 48 81 EC 40 01 00 00" },
+    { 0x002262A0, "MapNode: refresh its reachable byte and look from the done flags",
+      "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 41 56 41 57 48 8B EC 48 83 EC 40 48 8B 81 60 01 00 00 33 F6 48 8B F9 80 48 08 20 40 38 B1 69 01 00 00" },
 };
 
 // Globals, recovered from a referencing instruction's own

@@ -129,6 +129,11 @@ bool savefile_adventure_is_loaded();
 // False if it cannot be resolved; the reason is logged by the resolver.
 bool savefile_save_dir(wchar_t* out, size_t out_len);
 
+// 0.1.197: the free space of the disk that holds the saves. The check runs from the menu's frame (it looks every 30 s itself): logged, and the player warned before a
+// save write fails for want of space. The text form ("C:", "312 MB") is for the crash box of a "database or disk is full".
+void savefile_disk_check();
+bool savefile_disk_free_text(char* drive, size_t drive_cap, char* amount, size_t amount_cap);
+
 // WHICH ACCOUNT'S SAVES (2026-10-15). With several account folders under <appdata>\Glaiel Games\Mewgenics and no Steam id to match one, the
 // folder was a guess (the newest save file). Now the player is asked (the title screen's question) and the answer is remembered in
 // <the DLL's folder>\save_account.txt; the backup page can switch it too. A remembered choice wins over the Steam id.

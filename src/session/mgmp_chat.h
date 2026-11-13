@@ -22,6 +22,7 @@ struct ChatLine {
 
 // A session with at least one other player: there is somebody to talk to.
 bool chat_available();
+void chat_take_lobby_lines();                // 0.1.201: the lines other players sent through the lobby (no game link to them) -- game thread, every frame
 
 // A line arrived from another player.
 void chat_on_message(uint8_t from, const ChatMsg& m);

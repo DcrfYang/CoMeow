@@ -9,6 +9,7 @@
 #include "mgmp_lockstep.h"
 #include "mgmp_catsync.h"
 #include "mgmp_i18n.h"       // tr: the popup for a save the game could not read or write (0.1.170)
+#include "mgmp_savefile.h"   // savefile_disk_free_text: the free space named in the box of a full disk (0.1.197)
 
 #include <windows.h>
 
@@ -414,6 +415,13 @@ void tell_save_error() {
     if (!io) return;
     char text[1200];
     _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_CRASH_SAVE), w, tr(full ? Tx::ERR_HINT_DISKFULL : Tx::ERR_HINT_SAVEIO));
+    char drive[16] = {}, amount[32] = {};
+    if (full && savefile_disk_free_text(drive, sizeof(drive), amount, sizeof(amount))) {      // 0.1.197: how much is free, said in the box
+        const size_t used = strlen(text);
+        char line[256];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, tr(Tx::ERR_DISK_FREE_NOW), drive, amount);
+        _snprintf_s(text + used, sizeof(text) - used, _TRUNCATE, "\n\n%s", line);
+    }
     wchar_t wt[1200] = {}, wh[200] = {};
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wt, 1199);
     MultiByteToWideChar(CP_UTF8, 0, tr(Tx::ERR_CRASH_SAVE_TITLE), -1, wh, 199);

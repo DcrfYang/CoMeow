@@ -1516,8 +1516,26 @@ void draw_room_info(ImDrawList* dl, const View& v, ImVec2 o, float w, float& y_o
                 const uint8_t pid = peer_for_row(i);
                 const bool no_link = pid == 0xFF;
                 if (i < 8) { if (!no_link) s_nolink_since[i] = 0; else if (!s_nolink_since[i]) s_nolink_since[i] = GetTickCount64(); }
+                // 0.1.219: a missing link says WHY, where this game knows it -- a version is only known to differ once the host has refused it (the red line above),
+                // so "maybe another version" is not said for a link that never came up: on a client the host's row tells the Steam relay's failures / the call-back,
+                // on the host a player's row tells that this player's Steam connection failed here (room 68NZ, WR7M: "一直连不上" read as a version problem)
+                static uint32_t s_host_fail_at[8] = {};
+                static bool s_host_fail_base[8] = {};
+                if (i < 8 && (!no_link || !s_host_fail_base[i])) { s_host_fail_at[i] = steam_bridge_host_failures(); s_host_fail_base[i] = true; }   // the count when the row was last linked (or first drawn)
+                uint32_t steam_fails = 0; bool calling_back = false;
+                const bool host_row = !room_is_host() && p.role[0] == 'h';
+                if (host_row) net_dial_steam_status(&steam_fails, &calling_back);
+                const bool peer_steam_failed = room_is_host() && i < 8 && steam_bridge_host_failures() > s_host_fail_at[i];
                 if (!no_link && session_peer_refused(pid))
                     text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kRed, tr(Tx::ROW_VER_REFUSED));
+                else if (no_link && host_row && calling_back)
+                    text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kAmber, tr(Tx::ROW_STEAM_CALLBACK));
+                else if (no_link && host_row && steam_fails) {
+                    char row[256];
+                    _snprintf_s(row, sizeof(row), _TRUNCATE, tr(Tx::ROW_STEAM_FAIL_HOST), (unsigned)steam_fails);
+                    text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kRed, row);
+                } else if (no_link && peer_steam_failed)
+                    text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kRed, tr(Tx::ROW_STEAM_FAIL_PEER));
                 else if (no_link && i < 8 && s_nolink_since[i] && GetTickCount64() - s_nolink_since[i] > 8000)
                     text_at(dl, ImVec2(name_x, y + 42 * k), 22 * k, kAmber, tr(Tx::ROW_NO_LINK));
                 else
@@ -2768,7 +2786,7 @@ void draw_chat(const View& v) {
     // Not typing: the history for five seconds after the last line, then a fade. NO BACKGROUND (2026-10-06): the lines stand on the game itself; a soft light halo behind each letter keeps them
     // readable on a dark scene.
     const uint64_t until = chat_show_until();
-    if (!until || !chat_available()) return;
+    if (!until || (!chat_available() && !signal_room()[0])) return;      // 0.1.201: in a lobby room even alone -- the server's system messages reach a room of one
     const uint64_t t = GetTickCount64();
     if (t >= until + kChatFadeMs) return;
     const float a = t <= until ? 1.0f : 1.0f - (float)(t - until) / (float)kChatFadeMs;
@@ -3210,6 +3228,63 @@ void draw_error_popup(const View& v) {
         if (g_err_n > 0) { for (uint32_t i = 1; i < g_err_n; ++i) g_err_q[i - 1] = g_err_q[i]; --g_err_n; }
         ReleaseSRWLockExclusive(&g_err_lock);
         log_line("MENU", "error popup closed by the player: %s", top.title);
+    }
+    ImGui::End();
+}
+
+// THE HOST LEFT AND IS SILENT (0.1.203, mgmp_room tick_host_gone): the player decides -- end the online game or keep waiting. Nothing closes on its own.
+void draw_host_gone(const View& v) {
+    uint32_t silent = 0;
+    if (!room_host_gone_asking(&silent)) return;
+    const float k = v.k;
+    const float W = 980, H = 560;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_hostgone")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kRed, tr(Tx::HG_TITLE));
+    char text[900];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::HG_TEXT), (unsigned)silent);
+    wrap_text(dl, X(60), Y(110), (W - 120) * k, 26 * k, 37 * k, kInk, text);
+    if (paper_button("hg_end", ImVec2(X(W / 2 - 300), Y(H - 90)), ImVec2(X(W / 2 - 20), Y(H - 30)), tr(Tx::HG_END), 30 * k, true, Tone::Good)) {
+        log_line("MENU", "host gone: the player chose to end the online game");
+        room_host_gone_answer(true);
+    }
+    if (paper_button("hg_wait", ImVec2(X(W / 2 + 20), Y(H - 90)), ImVec2(X(W / 2 + 300), Y(H - 30)), tr(Tx::HG_WAIT), 30 * k, true, Tone::Normal)) {
+        log_line("MENU", "host gone: the player chose to keep waiting");
+        room_host_gone_answer(false);
+    }
+    ImGui::End();
+}
+
+// A RUN RESUMED WITHOUT A PLAYER (0.1.206, mgmp_checkpoint find_short_run): the host's save is on the map and its run had more players than are in the room. The host
+// decides: load it without them (they cannot come back into this adventure before it ends), or not.
+void draw_short_question(const View& v) {
+    char names[200] = {};
+    if (!checkpoint_short_question(names, sizeof(names))) return;
+    const float k = v.k;
+    const float W = 1000, H = 520;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_shortrun")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(36), 40 * k, kRed, tr(Tx::SHORT_TITLE));
+    char text[900];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::SHORT_TEXT), names);
+    wrap_text(dl, X(60), Y(110), (W - 120) * k, 26 * k, 37 * k, kInk, text);
+    if (paper_button("sr_load", ImVec2(X(W / 2 - 300), Y(H - 90)), ImVec2(X(W / 2 - 20), Y(H - 30)), tr(Tx::SHORT_LOAD), 30 * k, true, Tone::Good)) {
+        log_line("MENU", "short run: the host loads the save without %s", names);
+        checkpoint_short_answer(true);
+    }
+    if (paper_button("sr_cancel", ImVec2(X(W / 2 + 20), Y(H - 90)), ImVec2(X(W / 2 + 300), Y(H - 30)), tr(Tx::SHORT_CANCEL), 30 * k, true, Tone::Normal)) {
+        log_line("MENU", "short run: the host does not load it");
+        checkpoint_short_answer(false);
     }
     ImGui::End();
 }
@@ -4169,6 +4244,7 @@ void menu_draw() {
     roomhist_tick();                // a room joined: remembered for a day (the list puts it first)
     voice_tick();                   // 0.1.118: the microphone's frames go out from here; voice is switched off when the host's rule or the room is gone
     saveslots_auto_tick();          // back in the warehouse after a settled run: the auto save queue takes the current saves
+    savefile_disk_check();          // 0.1.197: the save disk's free space (every 30 s): logged, and the player warned before a save write fails for want of it
     {   // a battle desync (debounced or halted): offer the log upload at once, the F2 window without the description
         char text[192] = {};
         if (lockstep_take_desync_notice(text, sizeof(text)) && logupload_status().state != LogUploadState::Working) {
@@ -4291,6 +4367,8 @@ void menu_draw() {
     urgent_start();          // 0.1.186: the server's urgent fix notice (a thread asks once a minute; started once)
     draw_urgent(v);
     draw_gamenotice(v);
+    draw_host_gone(v);       // 0.1.203: the host left the room and is silent -- end the online game, or wait
+    draw_short_question(v);  // 0.1.206: the host's run had more players than are here -- load it without them, or not
     draw_error_popup(v);     // 0.1.169: a file / save problem, over everything else
 
     // A room just opened or closed: the connect window has done its job.
@@ -4319,9 +4397,27 @@ void menu_draw() {
         if (sq != dial_seen) {
             dial_seen = sq;
             if (in_room() && !room_is_host() && !g.room_connected) {
-                say(tr(Tx::DIAL_FAILED), (unsigned)config().net_port);
+                // 0.1.193: over Steam relay, both directions tried and failed -- the advice is server relay, not port forwarding (room 68NZ, 11-05)
+                if (net_dial_steam_failed()) say(tr(Tx::DIAL_FAILED_STEAM));
+                else say(tr(Tx::DIAL_FAILED), (unsigned)config().net_port);
                 signal_request_leave();
             }
+        }
+    }
+    {   // 0.1.219: a joiner is told EARLY that Steam relay is not getting through (two failed calls) -- before, the advice came only after the call-back too had
+        // timed out, minutes later; meanwhile the row said "maybe another version" (room WR7M, 11-10)
+        static bool s_said = false;
+        uint32_t fails = 0; bool back = false;
+        net_dial_steam_status(&fails, &back);
+        if (!in_room() || room_is_host() || g.room_connected) s_said = false;
+        else if (!s_said && fails >= 2) { s_said = true; say(tr(Tx::R_STEAM_RETRYING), (unsigned)fails); }
+    }
+    {   // 0.1.193: the HOST is told when a joiner's Steam connection failed on its side (otherwise it only saw a player come and go)
+        static uint32_t steam_fail_seen = steam_bridge_host_failures();
+        const uint32_t f = steam_bridge_host_failures();
+        if (f != steam_fail_seen) {
+            steam_fail_seen = f;
+            if (in_room() && room_is_host()) say(tr(Tx::R_STEAM_PEER_FAILED));
         }
     }
 

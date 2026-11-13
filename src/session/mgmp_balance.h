@@ -43,6 +43,10 @@ bool balance_is_enemy_faction(int32_t faction);
 // the nearest whole point, upward on a .5 -- the same integer arithmetic on every peer.
 bool balance_scale_enemy(void* chr, int32_t hp_before, uint32_t scale_half = 2 * kEnemyScale);
 
+// 0.1.207 (the user's rule): definitions the multiplier never touches, by name. The Creator's phase-1 clones of the players' cats (TheCreator_SpawnCloneTeam ->
+// PlayerCat_FinalBossClone, PlayerCat_FinalBossClone_Elite ...) are enemy-faction copies of the team; they keep the game's own health and armor.
+bool balance_exempt_definition(const char* name);
+
 // THE RULESET both peers must share (2026-10-01): everything that changes what a battle computes but is not in the
 // game's data -- the enemy multiplier and the test aid. Folded into the handshake identity, so two builds (or two
 // configs) with different rules refuse each other at the door instead of halting at turn 0.

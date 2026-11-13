@@ -501,6 +501,8 @@ bool unit_board_size(const void* chr, int32_t& w, int32_t& h) {
     return chr && board_size(const_cast<void*>(chr), w, h);
 }
 
+static bool g_mod_spawning = false;     // 0.1.222: the mod's own spawns -- their loads say nothing about how the GAME makes that kind (unit_note_load)
+
 void* unit_spawn_at(void* tc, const void* like, const char* def, int32_t x, int32_t y, const int32_t* keys, const char*& why) {
     why = nullptr;
     if (!tc || !like || !def || !usable_def(def)) { why = "no usable definition name or no unit to borrow the world from"; return nullptr; }
@@ -511,7 +513,10 @@ void* unit_spawn_at(void* tc, const void* like, const char* def, int32_t x, int3
     GameStr s;
     if (!world || !make_str(s, def)) { why = "no world, or the name could not be built"; return nullptr; }
     void* made = nullptr;
-    if (!call_spawn(&s, world, made)) { why = "the spawn raised an exception"; return nullptr; }
+    g_mod_spawning = true;
+    const bool spawned = call_spawn(&s, world, made);
+    g_mod_spawning = false;
+    if (!spawned) { why = "the spawn raised an exception"; return nullptr; }
     if (!made) { why = "the game returned no unit"; return nullptr; }
     const int rc = call_place(made, tc, x, y, f[0], f[1], keys);
     if (rc) { why = "placing the new unit failed"; log_line_lvl(LogLevel::Error, "SPAWNTEST", "unit_spawn_at: placing '%s' %p at (%d,%d) failed (rc %d)", def, made, x, y, rc); return nullptr; }
@@ -640,6 +645,11 @@ bool unit_set_ability(void* chr, uint8_t slot, const char* name, bool cat_too, c
     return true;
 }
 
+bool unit_catdata_is_summon(const void* chr) {
+    const uint8_t* cat = nullptr; uint64_t id = 0;
+    return chr && mem_read((const uint8_t*)chr + kChar_CatData, &cat, 8) && cat && mem_read(cat + kCatData_SaveId, &id, 8) && id == ~0ull;
+}
+
 bool unit_trim_spells(void* chr, uint32_t keep, const char*& why) {
     why = nullptr;
     uint8_t* c = (uint8_t*)chr;
@@ -659,6 +669,56 @@ bool unit_trim_spells(void* chr, uint32_t keep, const char*& why) {
     return true;
 }
 
+namespace {
+constexpr uintptr_t kWorld_EntCount = 0xDC, kWorld_EntData = 0xE0;     // the world's entity vector (cap +0xD8), appended by the spawn at 0x1407C26FC
+constexpr uintptr_t kEnt_Started = 0x11;                               // set once the start queue has run the entity's vfunc +0x30 (0x14096AC27)
+const void* g_catload_chr[512] = {};          // units the game made from cat data it was handed (unit_note_load)
+uint32_t    g_catload_n = 0;
+struct DefKinds { char name[48]; uint32_t kinds; };
+DefKinds    g_def_kinds[256] = {};
+uint32_t    g_def_kinds_n = 0;
+volatile LONG g_catspawn_raised = 0;
+}
+
+void unit_note_load(void* chr, const char* def, bool by_cat) {
+    const uint8_t* c = (const uint8_t*)chr;
+    void* brain = nullptr;
+    if (!c || !mem_read(c + kChar_Brain, &brain, 8) || brain) return;          // a transform (the unit has its brain): its note stands
+    uint32_t at = g_catload_n;
+    for (uint32_t i = 0; i < g_catload_n; ++i) if (g_catload_chr[i] == chr) { at = i; break; }
+    if (by_cat) {
+        if (at == g_catload_n) {
+            if (g_catload_n < 512) at = g_catload_n++;
+            else { memmove(g_catload_chr, g_catload_chr + 1, sizeof(g_catload_chr) - sizeof(g_catload_chr[0])); at = 511; }
+        }
+        g_catload_chr[at] = chr;
+    } else if (at < g_catload_n) {                                              // the memory of a unit made from cat data, now another unit made by name
+        g_catload_chr[at] = g_catload_chr[--g_catload_n];
+    }
+    if (!def || !def[0] || g_mod_spawning) return;
+    for (uint32_t i = 0; i < g_def_kinds_n; ++i)
+        if (strcmp(g_def_kinds[i].name, def) == 0) { g_def_kinds[i].kinds |= by_cat ? 1u : 2u; return; }
+    if (g_def_kinds_n < 256) {
+        DefKinds& k = g_def_kinds[g_def_kinds_n++];
+        strncpy_s(k.name, sizeof(k.name), def, _TRUNCATE);
+        k.kinds = by_cat ? 1u : 2u;
+    }
+}
+
+bool unit_made_from_catdata(const void* chr) {
+    if (!chr) return false;
+    for (uint32_t i = 0; i < g_catload_n; ++i) if (g_catload_chr[i] == chr) return true;
+    return false;
+}
+
+uint32_t unit_def_load_kinds(const char* def) {
+    if (!def) return 0;
+    for (uint32_t i = 0; i < g_def_kinds_n; ++i) if (strcmp(g_def_kinds[i].name, def) == 0) return g_def_kinds[i].kinds;
+    return 0;
+}
+
+uint32_t unit_catdata_spawn_raised() { return (uint32_t)g_catspawn_raised; }
+
 void* unit_spawn_catdata_at(void* tc, const void* like, const char* def, void* cat, int32_t x, int32_t y, const int32_t* keys, const char*& why) {
     why = nullptr;
     auto spawn = (fn_spawncat)addr_of_call(C_SpawnWithCatData);
@@ -671,7 +731,27 @@ void* unit_spawn_catdata_at(void* tc, const void* like, const char* def, void* c
     GameStr s;
     if (!world || !make_str(s, def)) { why = "no world, or the name could not be built"; return nullptr; }
     void* made = nullptr;
-    __try { made = spawn(nullptr, &s, cat, world); } __except (EXCEPTION_EXECUTE_HANDLER) { why = "the spawn raised an exception"; return nullptr; }
+    uint32_t listed0 = 0;
+    mem_read((const uint8_t*)world + kWorld_EntCount, &listed0, 4);
+    g_mod_spawning = true;
+    __try { made = spawn(nullptr, &s, cat, world); } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_mod_spawning = false;
+        // 0.1.222: the spawn puts the new Character into the world's lists BEFORE its definition is loaded (0x1407C25F0 -> 0x1400FCB50): a load that throws leaves it there
+        // half-made, with no brain, and the world's start queue (0x14096AB90: vfunc +0x30 once, unless +0x0F or +0x11 is set) reads that brain at the next update (link 11-10,
+        // 0x105845). The new entries of the world's entity vector are marked started (+0x11), so the start is never run on them.
+        InterlockedIncrement(&g_catspawn_raised);
+        why = "the game's cat-data spawn raised an exception";
+        uint32_t listed = 0; const uint8_t* ents = nullptr; unsigned marked = 0;
+        if (mem_read((const uint8_t*)world + kWorld_EntCount, &listed, 4) && mem_read((const uint8_t*)world + kWorld_EntData, &ents, 8) && ents && listed > listed0 && listed - listed0 <= 4)
+            for (uint32_t k = listed0; k < listed; ++k) {
+                uint8_t* e = nullptr; const uint8_t one = 1;
+                if (mem_read(ents + k * 8, &e, 8) && e && mem_write(e + kEnt_Started, &one, 1)) ++marked;
+            }
+        log_line_lvl(LogLevel::Error, "SPAWNTEST", "!! the cat-data spawn of '%s' raised an exception -- the game had already listed the new unit (%u new entit(ies), %u marked started so their start never runs)",
+                     def, listed > listed0 ? listed - listed0 : 0, marked);
+        return nullptr;
+    }
+    g_mod_spawning = false;
     if (!made) { why = "the game returned no unit"; return nullptr; }
     const int rc = call_place(made, tc, x, y, f[0], f[1], keys);
     if (rc) { why = "placing the new unit failed"; log_line_lvl(LogLevel::Error, "SPAWNTEST", "unit_spawn_catdata_at: placing '%s' %p at (%d,%d) failed (rc %d)", def, made, x, y, rc); return nullptr; }

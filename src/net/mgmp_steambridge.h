@@ -43,6 +43,8 @@ bool steam_bridge_dead();                                // Steam networking is 
 void steam_bridge_status_text(char* out, unsigned cap);  // "authentication: ready, relay network: ready, ..." (best effort, may be stale by a second)
 // Why the last Steam connection ended: Steam's end reason (5001 = an internal error on the accepting side) and its debug text.
 void steam_bridge_last_failure(int* reason, char* dbg, unsigned cap);
+// 0.1.193: on the host, how many Steam connections of joiners failed (a call refused for its certificate, a call-back that timed out) -- the menu tells the host.
+uint32_t steam_bridge_host_failures();
 
 // --- reverse dialling ---------------------------------------------------------------------------------------------------------
 // Steam's certificate check is asymmetric: the side whose Steam client holds an OLDER network configuration cannot accept a connection whose

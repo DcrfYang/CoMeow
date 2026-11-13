@@ -130,6 +130,9 @@ bool net_relay_serve(const char* host_token, uint32_t id, uint16_t game_port);
 void net_relay_stop();
 // A joiner dials the relay with the candidate "relay:<its token>" in the address list given to net_join.
 uint32_t net_dial_seq();              // goes up by one each time a dial gives up on every address
+bool net_dial_steam_failed();         // 0.1.193: the last failed dial tried the host over Steam (and the call-back) and that failed
+// 0.1.219: the dial in progress (or the last one): how many of its Steam calls to the host failed, and whether it now waits for the host to call back
+void net_dial_steam_status(uint32_t* failures, bool* calling_back);
 int      net_dial_error();            // the last WSA error of that failure (10060 timed out, 10061 refused, 10051/10065 no route)
 void net_shutdown();
 
@@ -281,7 +284,18 @@ bool net_send_ustatereq(const UstateReqMsg& m);
 bool net_ucat_keep(uint64_t battle, uint8_t index, int32_t key, uint64_t save_id, const uint8_t* image, uint32_t size, uint64_t hash);
 bool net_send_ucatreq(const UcatReqMsg& m);
 uint32_t net_host_ucat(uint64_t battle, uint8_t index, int32_t key, uint8_t* out, uint32_t cap);
+// proto 116 (mgmp_tilesync). HOST: this boundary's ground map to every client. CLIENT: the host's raw MSG_TILES payload of that boundary (its length, 0 when not here).
+bool net_send_tiles(const TilesMsg& m);
+uint32_t net_host_tiles(uint64_t battle, uint32_t turn, uint8_t* out, uint32_t cap);
 uint32_t net_host_ustate(uint64_t battle, uint32_t turn, uint8_t index, uint8_t* out, uint32_t cap);
+// proto 117 (0.1.213). HOST: one action's unit rows to every client. CLIENT: the host's check of that action, when it is here.
+bool net_send_actcheck(const ActCheckMsg& m);
+bool net_host_actcheck(uint64_t battle, uint32_t turn, uint32_t action, ActCheckMsg& out);
+// 0.1.213, CLIENT: the host's hash of that turn of that battle, when it has arrived (kept beside the queue).
+bool net_host_hash(uint64_t battle, uint32_t turn, HashMsg& out);
+// 0.1.213, HOST: a client whose link is slow is streamed every boundary's full board and pushed the unit records that changed (see net_ustate_publish).
+void net_set_slow_peer(uint8_t peer, bool slow);
+bool net_slow_peer(uint8_t peer);
 // proto 111: the host's turn queue of one boundary -- HOST: to every client (before that boundary's board); CLIENT: the one the receive thread kept (the last many are).
 bool net_send_turnqueue(const TurnQueueMsg& m);
 bool net_host_turnqueue(uint64_t battle, uint32_t turn, TurnQueueMsg& out);

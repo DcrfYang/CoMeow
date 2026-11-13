@@ -89,6 +89,7 @@
 #include "mgmp_gains.h"        // 0.1.83: a cat's battle gains go to its owner
 #include "mgmp_teamlist.h"     // 0.1.139: the whole team where the game reads "the party"
 #include "mgmp_dmgfence.h"     // 0.1.83: R001, every damage instance on a stream of its own
+#include "mgmp_shufflefence.h"  // 0.1.217: a shuffle of battle units starts from roster order (FleshGolem)
 #include "mgmp_unitstate.h"    // 0.1.173: the status/passive factories logged, and called by the unit-state repair
 
 #include <cstdio>
@@ -792,6 +793,21 @@ bool __fastcall h_IsKitten(void* cat) {
 // definition built through the same factory, so this one place covers them all. Every peer runs it with the same
 // inputs, so the lockstep state stays identical. Alone, the shipped game is untouched.
 void* __fastcall h_LoadChar(void* chr, void* name, uint8_t a, uint8_t b) {
+    if (chr) {      // 0.1.222: how the game makes this unit (from cat data it was handed, or by name) -- noted alone too, a room's battle may follow
+        // The cat-data wrapper sub_1400FCB50 calls the loader as `xor r9d,r9d; mov r8b,1; mov rdx,rax; mov rcx,r14; call` (0x1400FCBDE); no other caller has those
+        // bytes. Checked at the return address, with the call's target, so another game build that moved it answers "by name".
+        static const uint8_t kWrapCall[13] = { 0x45, 0x33, 0xC9, 0x41, 0xB0, 0x01, 0x48, 0x8B, 0xD0, 0x49, 0x8B, 0xCE, 0xE8 };
+        const uint8_t* ret = (const uint8_t*)_ReturnAddress();
+        uint8_t code[17] = {};
+        bool by_cat = false;
+        if (mem_read(ret - 17, code, sizeof(code)) && memcmp(code, kWrapCall, sizeof(kWrapCall)) == 0) {
+            int32_t rel = 0; memcpy(&rel, code + 13, 4);
+            by_cat = (uintptr_t)(ret + rel) == addr_of(T_LoadChar);
+        }
+        char def[48] = "";
+        mem_read_std_string(name, def, sizeof(def));
+        unit_note_load(chr, def, by_cat);
+    }
     if (!multiplayer_live() || !chr) return o_LoadChar(chr, name, a, b);
     // The shared stream before every definition a battle loads: the two peers' lists show the first load after which they drew differently.
     if (const uint64_t* s = rng_global_stream()) {
@@ -802,11 +818,14 @@ void* __fastcall h_LoadChar(void* chr, void* name, uint8_t a, uint8_t b) {
         log_line("RNGTRACE", "stream %016llx before loading '%s'", (unsigned long long)s0, what);
     }
     unlocks_build_load();   // inside the battle build: this load starts from a stream every peer shares
-    {   char nm[48] = "?"; mem_read_std_string(name, nm, sizeof(nm)); unlocks_midbattle_load(nm); }   // in a fight: the same fence for a summon or a pickup (what it draws stays inside it)
+    char nm[64] = "?";
+    mem_read_std_string(name, nm, sizeof(nm));
+    unlocks_midbattle_load(nm);   // in a fight: the same fence for a summon or a pickup (what it draws stays inside it)
     int32_t hp_before = 0;
     mem_read((const uint8_t*)chr + kChr_Hp, &hp_before, sizeof(hp_before));
     void* r = o_LoadChar(chr, name, a, b);
-    balance_scale_enemy(chr, hp_before, session_enemy_scale_half());
+    if (!balance_exempt_definition(nm)) balance_scale_enemy(chr, hp_before, session_enemy_scale_half());
+    else log_line("BALANCE", "'%s' keeps the game's own health and armor (The Creator's clone of a player's cat: no enemy multiplier)", nm);
     unlocks_build_load_done();   // ...and again when it is over: what the definition drew (a random cat's name) must not reach the next roll
     unlocks_midbattle_load_done();
     return r;
@@ -922,6 +941,9 @@ void __fastcall h_MapUpdate(void* self) {
     if (void* confirmed = areagate_take_confirmed_node(self)) { h_EnterNode(self, confirmed); return; }
     if (void* node = follow_map_update(self)) {
         storage_diag_items("before a node is entered (following the host)", false);
+        // 0.1.218: the party is put ON the node first -- the arrival the game's own walk ends in (its marker promotes +0x58 to +0x50, then the node is entered:
+        // 0x14039B180, which enters only a node whose done byte is still 0) -- instead of a selection written after the entry (crash 0x9BDA)
+        follow_place_marker_on(node);
         o_EnterNode(self, node);
         follow_after_enter_node();
         // READ-ONLY, and off by default: the window dump that finds the field marking "this
@@ -930,11 +952,10 @@ void __fastcall h_MapUpdate(void* self) {
         follow_probe_node(node);
         // And the fix that measurement bought: the client's own copy of the map is told the
         // node is done, with the same single-byte write the host's game makes. Client-only
-        // and idempotent -- see follow_mark_node_consumed.
+        // and idempotent -- see follow_mark_node_consumed. (After the entry, as in the game: its arrival enters only a node not yet done.)
         follow_mark_node_consumed(node);
-        // And the visual half: the party ICON, by writing the same selection slot the
-        // game's own node click writes. See follow_move_marker_to.
-        follow_move_marker_to(node);
+        // The visual half (the party ICON) is follow_place_marker_on above, BEFORE the entry. Until 0.1.218 the selection was written here, after it:
+        // the map set off a walk in the frame the screen went over to the node (crash 0x9BDA4B/0x9BDABF, three times on 11-08..11-10).
         // AFTER the original, so EnterNode has already copied this node's seed into
         // the stream -- the perturbation has to land on the state the node will
         // actually draw from, not on the one it is about to replace. No-op on the
@@ -1845,9 +1866,27 @@ void __fastcall h_HouseCountdown(void* gpd) {
 }
 typedef void* (__fastcall* fn_overnight)(void* house, void* out_vec);
 fn_overnight o_HouseOvernight = nullptr;
-void* __fastcall h_HouseOvernight(void* house, void* out_vec) { if (housecoop_overnight(out_vec)) return out_vec; return o_HouseOvernight(house, out_vec); }
+void* __fastcall h_HouseOvernight(void* house, void* out_vec) {
+    if (housecoop_overnight(out_vec)) return out_vec;
+    const uint32_t before = catsync_gay_list_count();       // 0.1.219 (STRAYS): the night's same-sex pairings add both cats to this list
+    void* r = o_HouseOvernight(house, out_vec);
+    catsync_log_gay_list("after the night", before);
+    return r;
+}
 fn_one_ptr o_HouseStrays = nullptr;
-void __fastcall h_HouseStrays(void* house) { if (housecoop_skip_strays()) return; o_HouseStrays(house); }
+void __fastcall h_HouseStrays(void* house) {
+    if (housecoop_skip_strays()) { catsync_log_gay_list("the day's strays are SKIPPED (the co-op's inserted day) -- the list is not cleared", 0); return; }
+    catsync_log_gay_list("the day's strays begin", 0);
+    o_HouseStrays(house);
+    log_line("STRAYS", "the day's strays are done: %u cat(s) left in the same-sex pairing list", catsync_gay_list_count());
+}
+// 0.1.219: every stray the generator makes (see T_StrayGen) -- it reads rcx and rdx only; the other two registers are passed through
+typedef void (__fastcall* fn_straygen)(void* cat, void* stats, void* c, void* d);
+fn_straygen o_StrayGen = nullptr;
+void __fastcall h_StrayGen(void* cat, void* stats, void* c, void* d) {
+    o_StrayGen(cat, stats, c, d);
+    catsync_log_stray_made(cat, stats);
+}
 fn_one_ptr o_HouseFight = nullptr;
 static void house_fight_original(void* data) { o_HouseFight(data); }
 void __fastcall h_HouseFight(void* data) {
@@ -1861,8 +1900,27 @@ void __fastcall h_HouseFight(void* data) {
     o_HouseFight(data);
 }
 fn_one_ptr o_BeatHouseBoss = nullptr;
+// THE KAIJU FIGHT WITH NO WINNER (0.1.197; LAPTOP-KM5VGMBP 11-06 20:54, 20:55, 21:00, solo): GlobalProgressionData::BeatHouseBoss opens with "the next house boss is
+// 'pyrophina_vs_zaratana' (+0x458) and no winning kaiju is reported (+0x4B8, its length at +0x4C8)" -> throw "no winning kaiju reported", before it changes anything.
+// Both kaiju had gone down together on turn 1 (the game's debug console open, a command at each load), the fight was won, and the throw ended the process -- at every
+// start, since the save resumes in that fight. With no winner the call would only throw: it is not made, the player is told, the house boss stays to be fought again.
+static bool kaiju_without_winner(void* gpd, char* boss, size_t cap) {
+    boss[0] = 0;
+    uint64_t winner_len = 1;
+    if (!gpd || !mem_read_std_string((const uint8_t*)gpd + 0x458, boss, cap) || !mem_read((const uint8_t*)gpd + 0x4C8, &winner_len, sizeof(winner_len))) return false;
+    return strcmp(boss, "pyrophina_vs_zaratana") == 0 && winner_len == 0;
+}
 void __fastcall h_BeatHouseBoss(void* gpd) {
     housecoop_log_boss("BeatHouseBoss (a house boss won): before");          // 0.1.92 diagnostics (HOUSEBOSS)
+    char boss[64];
+    if (kaiju_without_winner(gpd, boss, sizeof(boss))) {
+        log_line_lvl(LogLevel::Error, "HOUSEBOSS", "!! the house boss '%s' was won with no winning kaiju reported (both went down together) -- the game would throw "
+                     "\"no winning kaiju reported\" and end the process: BeatHouseBoss is NOT called, the boss stays scheduled; the player is told", boss);
+        char text[1200];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::HB_NOWINNER), boss);
+        ui_error_popup(tr(Tx::HB_NOWINNER_TITLE), text);
+        return;
+    }
     if (housecoop_skip_beat_boss()) return;
     o_BeatHouseBoss(gpd);
     housecoop_log_boss("BeatHouseBoss: after (the next house boss is scheduled here)");
@@ -2172,6 +2230,43 @@ void* __fastcall h_CatSelectorInit(void* self, int64_t arg) {
         ui_error_popup(tr(Tx::ERR_FILE_TITLE), text);
     }
     return o_CatSelectorInit(self, arg);
+}
+
+// EVERY DIFFICULTY IN A ROOM (0.1.210, the user's rule; see T_ChapterDiffSet): the chapter page's setter caps the chosen difficulty at the act's unlocked one. In a room the
+// cap is the highest the game unlocks (kChapterMaxDifficulty) and the arrows are shown, for the length of this one call -- the save's own values are put back right after,
+// so nothing of the unlock is written (only the chosen difficulty, as the game always does; a battle reads that one, no cap). Alone the game is untouched.
+using fn_diffset_t = void (__fastcall*)(void*, int32_t);
+fn_diffset_t o_ChapterDiffSet = nullptr;
+void __fastcall h_ChapterDiffSet(void* self, int32_t difficulty) {
+    if (!multiplayer_live() || !self) { o_ChapterDiffSet(self, difficulty); return; }
+    uint8_t *dir = nullptr, *prog = nullptr, *table = nullptr, *rec = nullptr;
+    int32_t act = -1, cap = 0;
+    uint8_t on = 0;
+    const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+    // self: +8 the act records' table, +0x10 the act index (read off the setter's own prologue); the table's entries are the director's records
+    const bool ok = at && mem_read((const void*)at, &dir, sizeof(dir)) && dir && mem_read(dir + kDir_Progress, &prog, sizeof(prog)) && prog &&
+                    mem_read((uint8_t*)self + 8, &table, sizeof(table)) && table && mem_read((uint8_t*)self + 0x10, &act, sizeof(act)) && act >= 0 && act < 3 &&
+                    mem_read(table + act * 8, &rec, sizeof(rec)) && rec == prog + kProg_ActRecords + kProg_ActRecordSize * act &&
+                    mem_read(rec, &cap, sizeof(cap)) && mem_read(prog + kProg_DifficultyOn, &on, sizeof(on));
+    if (!ok) {
+        static bool said = false;
+        if (!said) { said = true; log_line_lvl(LogLevel::Warn, "DIFFCAP", "the chapter page's difficulty record is not where it was found (act %d) -- the game's own cap stays", (int)act); }
+        o_ChapterDiffSet(self, difficulty);
+        return;
+    }
+    if (on && cap >= kChapterMaxDifficulty) { o_ChapterDiffSet(self, difficulty); return; }
+    const int32_t open = kChapterMaxDifficulty;
+    const uint8_t yes = 1;
+    const bool raised = mem_write(rec, &open, sizeof(open)) && (on || mem_write(prog + kProg_DifficultyOn, &yes, sizeof(yes)));
+    static ULONGLONG said_at = 0;
+    if (GetTickCount64() - said_at > 5000) {
+        said_at = GetTickCount64();
+        log_line("DIFFCAP", "act %d in a room: unlocked %d%s -- every difficulty 0..%d is offered (asked for %d)%s", act + 1, (int)cap, on ? "" : " (difficulty not in this save yet)",
+                 (int)kChapterMaxDifficulty, (int)difficulty, raised ? "" : "  (WRITE FAILED: the game's cap stays)");
+    }
+    o_ChapterDiffSet(self, difficulty);
+    mem_write(rec, &cap, sizeof(cap));                                            // the save's own unlock, as it was
+    if (!on) mem_write(prog + kProg_DifficultyOn, &on, sizeof(on));
 }
 
 void* __fastcall h_HouseCatInit(void* ent, int64_t id, void* tmpl) {
@@ -2634,6 +2729,8 @@ const Binding kBindings[] = {
     { T_CatFieldList,    (void*)&h_CatFieldList,    (void**)&o_CatFieldList },
     { T_SummonCatBuild,  (void*)&h_SummonCatBuild,  (void**)&o_SummonCatBuild },
     { T_CatSelectorInit, (void*)&h_CatSelectorInit, (void**)&o_CatSelectorInit },
+    { T_ChapterDiffSet, (void*)&h_ChapterDiffSet, (void**)&o_ChapterDiffSet },
+    { T_StrayGen,       (void*)&h_StrayGen,       (void**)&o_StrayGen },
     { T_ResDejaVu, (void*)&h_ResDejaVu, (void**)&o_ResDejaVu },
     { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
     { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },
@@ -2810,6 +2907,7 @@ int hooks_install() {
     installed += rngframe_install(g_base);
     installed += gains_install(g_base);
     installed += dmgfence_install(g_base);
+    installed += shufflefence_install(g_base);
     // The random picks from the AnyUnlocked ability pool and its kin (mgmp_poolfence, 0.1.75): the same kind of list, one derived stream per pick.
     installed += poolfence_install(g_base);
 

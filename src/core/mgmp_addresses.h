@@ -253,6 +253,14 @@ enum Target : int {
     // 0.1.192: the inventory screen's cat selector (0x1400DE040, rcx the selector, rdx an int64): it walks the party list (MewDirector+0x5C0) and reads CatData::by_id's answer
     // with no null check (+0xC10) -- a party id the save does not hold crashed every load of that save (BF-202108081243, 11-05, three times). The list is cleared of such ids first.
     T_CatSelectorInit,
+    // 0.1.210: the chapter page's difficulty setter -- void(closure* self, int difficulty) (0x1400689E0; the raise / lower callbacks and the page's build call it). It caps
+    // the difficulty at the act's unlocked one (MewDirector+0x5A8 -> +0x408 + 0x18*act, the int at +0; 0 when the byte at +0x3E0 says difficulty is not in the game yet),
+    // stores it at that record's +8 and shows the arrows. In a room every difficulty (0..kChapterMaxDifficulty) is offered: the cap is raised for the length of the call.
+    T_ChapterDiffSet,
+    // 0.1.219: the stray generator -- void(CatData* new cat, vector<{std::string name, double value}>* the day's house stats) (0x1400AA1E0, reads rcx/rdx only; its one
+    // caller is the House cat entity for an id of -1, 0x1401F9482). With the stat "GayStrayChance" (= the length of GlobalProgressionData+0x780, the cats of the
+    // night's same-sex pairings) the stray takes a listed cat's gender and a sexuality in [0.9, 1) -- the STRAYS log names each one (a player saw only gay toms)
+    T_StrayGen,
     T_COUNT
 };
 
@@ -833,6 +841,8 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x000C8060, "CATFIELDLIST", "CatData: a list read through +0x9B0 -- a null cat (its field at 0x9B0) gives an empty list instead of a crash" },
     { 0x007A2BA0, "SUMMONCAT", "spawn effect: a summon's cat data (FleshGolem, clones ...) -- a client answers its unlock checks with the host's lists" },
     { 0x000DE040, "CATSELECT", "CatSelector::init: the party's ids the save does not hold are taken out of the list first (a null cat crashed it)" },
+    { 0x000689E0, "DIFFSET", "chapter page: the difficulty setter -- in a room every difficulty can be chosen, unlocked or not" },
+    { 0x000AA1E0, "STRAYGEN", "House: a stray cat generated (logged: its gender, sexuality and the day's stray stats)" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -997,6 +1007,18 @@ enum Call : int {
     C_EquipSwap,             // bool(CatData*, Item* new_item, int loc) -- sub_1400CA2E0: the gear page's swap: the new item goes into its slot (sub_1400C9EE0), the item of that id is taken out of the
                              // backpack and the storage (Inventory+0x38 / +0x78, by id), the item the slot held goes into the inventory at `loc`. Its `mov rbx, [rip+X]` at +0x51 names the Inventory
     C_InvRemove,             // void(container*, const Item*) -- sub_1402E24D0: an inventory container (an id -> Item map) loses the entry of that item's id (+0x00)
+    // --- 0.1.194: an item the host's game broke, broken here the same way (mgmp_lockstep: lockstep_break_item) ---
+    C_ItemBreak,             // bool(Character*, Item* in its cat data's slot, bool force) -- sub_14010A4C0: the gear's break: its on-break event (StatusOnBreak ...) runs, then the item leaves
+                             // the slot (sub_1400CA510(cat data, item, 4, true)). An 'indestructible' item without `force` only gets durability -1 and false. The game's own caller is
+                             // the per-action check 0x140109B9E (force 0) for every slot item 0x1402DE650 says is used up
+    // --- 0.1.195: the board's ground tiles (mgmp_tilesync) ---
+    C_TileReplace,           // Tile*(Tile* old, std::string name BY VALUE, bool checked) -- sub_14089A700: the tile of that class (BlankTile, WaterTile, ... 'RandomDifferentTile') made on
+                             // the old tile's cell, the old one retired (each class's ReplaceWith<T>, e.g. 0x1402E7CE0: refused by the old tile's vtable+0x170 for some classes).
+                             // TileTrail's own call 0x1407D3B64 passes checked = 1
+    // --- 0.1.215: the map's node states after the map sync (mgmp_follow) ---
+    C_MapNodeRefresh,        // bool(MapNode*) -- sub_1402262A0: the node's reachable byte (+0x16C: done, or a node leading to it done), its look's state (+0x178 -> +0x2F0: 4 done,
+                             // 5 open to the party) and its clip names, from the done flags (+0x168) as they are now. The game runs it over every node when the party arrives at one
+                             // (0x140393360, after the arrival's own done write) and when the map's looks are made (0x14021D82A); a done flag written after that is not seen until then
     C_COUNT
 };
 
@@ -1308,6 +1330,9 @@ static const CallDesc kCalls[C_COUNT] = {
     { 0x00119480, "Character::AddTempAbility (names the SpawnDatabase)" },
     { 0x000CA2E0, "CatData: equip an item, the old one to the inventory" },
     { 0x002E24D0, "Inventory container: remove an item by id" },
+    { 0x0010A4C0, "Character: break a gear item" },
+    { 0x0089A700, "Tile: replace with a tile of a class (by name)" },
+    { 0x002262A0, "MapNode: refresh its reachable byte and look from the done flags" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -1705,6 +1730,15 @@ constexpr uintptr_t kDir_DebugUnlock = 0x78D;
 
 constexpr const char kBtnName_ChapterLower[] = "Button_LowerDifficulty";
 constexpr const char kBtnName_ChapterRaise[] = "Button_RaiseDifficulty";
+// 0.1.210, THE ACTS' DIFFICULTY (T_ChapterDiffSet): MewDirector+0x5A8 is the progress object. Its byte +0x3E0 = difficulty choice is in the game (0: the page hides
+// the arrows); +0x408 + 0x18*act are the three acts' records {int unlocked @+0, int chosen @+8} -- saved with the game (0x1401D4682), raised by the quest command
+// unlock_act_difficulty (0x1401CE2D2), and the chosen one is what a battle's difficulty index starts from (sub_1403BBEE0: +0x410 / +0x428 / +0x440 + HardPills).
+// data/adventure_progression_unlocks.gon unlocks 1..3 per act (hard, crazy, impossible); 4..7 exist only through increase_difficulty items.
+constexpr uintptr_t kDir_Progress        = 0x5A8;
+constexpr uintptr_t kProg_DifficultyOn   = 0x3E0;
+constexpr uintptr_t kProg_ActRecords     = 0x408;
+constexpr uintptr_t kProg_ActRecordSize  = 0x18;
+constexpr int32_t   kChapterMaxDifficulty = 3;
 
 // --- the loaded-scene list ---------------------------------------------------
 //

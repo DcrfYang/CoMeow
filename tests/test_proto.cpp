@@ -503,7 +503,7 @@ int main() {
             check(enc_chapter(fb, sizeof(fb), f) == 15, "a map flag report encodes");
             f.act = 2; check(!enc_chapter(fb, sizeof(fb), f), "a map flag report with an act is refused");
             f.act = 0; f.difficulty = 3; check(!enc_chapter(fb, sizeof(fb), f), "a map flag report with a difficulty is refused");
-            f.difficulty = 0; f.kind = 5; check(!enc_chapter(fb, sizeof(fb), f), "an unknown chapter kind is refused");
+            f.difficulty = 0; f.kind = 6; check(!enc_chapter(fb, sizeof(fb), f), "an unknown chapter kind is refused");
         }
         {   // proto 102: a client is done with its own random event -- the node seed in generation (low) and mapflags (high)
             ChapterMsg d{}; d.kind = kChapterEventDone; d.generation = 0x89ABCDEFu; d.mapflags = 0x01234567u; uint8_t db[15]{};

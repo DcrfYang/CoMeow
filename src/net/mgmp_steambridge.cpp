@@ -152,6 +152,7 @@ uint32_t g_listen2_h = 0;
 volatile LONG g_auth_avail = 0, g_relay_avail = 0, g_cfg_avail = 0;
 char g_status_line[260] = "not polled yet";
 volatile LONG g_last_reason = 0;
+volatile LONG g_host_failures = 0;   // 0.1.193: joiners' Steam connections that failed on the host (see steam_bridge_host_failures)
 char g_last_dbg[132] = {};
 
 volatile LONG g_started = 0;
@@ -255,6 +256,9 @@ void log_end_reason(const void* cb, uint32_t h, int st) {
         log_line("STEAMNET", "connection %u ended: state %d, end reason %d '%s'", h, st, reason, dbg);
         InterlockedExchange(&g_last_reason, reason);
         memcpy(g_last_dbg, dbg, sizeof(g_last_dbg) - 1);
+        // 0.1.193: a joiner's connection that failed on the HOST (room 68NZ's host, 11-05: 'Bad cert: CA key ... is not known to us', then the call-back timed out) --
+        // a certificate the two Steam clients do not share (4xxx) or a call that never connected (5003)
+        if (g_listen_h && (reason == 5003 || (reason >= 4000 && reason < 5000))) InterlockedIncrement(&g_host_failures);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -607,6 +611,8 @@ void steam_bridge_status_text(char* out, unsigned cap) {
     if (!steam_bridge_ready()) { _snprintf_s(out, cap, _TRUNCATE, "Steam networking is starting"); return; }
     _snprintf_s(out, cap, _TRUNCATE, "%s", g_status_line);
 }
+
+uint32_t steam_bridge_host_failures() { return (uint32_t)InterlockedCompareExchange(&g_host_failures, 0, 0); }
 
 void steam_bridge_last_failure(int* reason, char* dbg, unsigned cap) {
     if (reason) *reason = (int)InterlockedCompareExchange(&g_last_reason, 0, 0);

@@ -11,6 +11,7 @@
 //   mgmp_loader.exe                       -- game path from mgmp.json
 //   mgmp_loader.exe <path\to\Mewgenics.exe> [args...]
 //   mgmp_loader.exe --attach <pid>        -- inject into an already-running process
+//   mgmp_loader.exe --attach-early <pid>  -- the same, parked on its next frame first (the launcher's auto-inject, 0.1.200)
 //   mgmp_loader.exe [--debug|--no-debug]  -- DEBUG MODE for this run only
 //
 // --debug / --no-debug are the mod's first real launch parameter. They are
@@ -49,8 +50,13 @@
 
 namespace {
 
+// --attach-early: the game's frame thread this loader holds suspended, if any. A failure that ends the loader (die) lets it go first -- a loader that
+// exits with the thread suspended leaves the player's game frozen for good, and that game is one this loader did not start.
+HANDLE g_resume_on_die = nullptr;
+
 void die(const wchar_t* what) {
     DWORD e = GetLastError();
+    if (g_resume_on_die) { ResumeThread(g_resume_on_die); g_resume_on_die = nullptr; }
     fflush(stdout);   // ExitProcess does not flush the CRT, and losing the
                       // preceding progress lines makes the error unreadable
     wchar_t msg[512] = {};
@@ -508,6 +514,117 @@ void apply_debug_marker(const wchar_t* dir, int flag) {
                                             L"slot_from on exit)" : L"OFF");
 }
 
+// ONE INJECTOR PER GAME PROCESS (0.1.200): the launcher's auto-inject watcher and an ordinary launch (or its Steam re-launch follow) can see the same
+// process; whoever creates this name first injects, the other leaves it alone. The handle is kept for the loader's lifetime (the name lives while it is open).
+bool claim_process(DWORD pid) {
+    wchar_t name[64];
+    swprintf_s(name, L"Local\\mgmp_attach_%lu", pid);
+    HANDLE m = CreateMutexW(nullptr, FALSE, name);
+    if (!m) return true;                               // cannot tell: go on (a second LoadLibraryW of the same path only adds a reference)
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(m); return false; }
+    return true;                                       // deliberately not closed
+}
+
+// --- AUTO-INJECT (0.1.200): a game some other program started ------------------------------------------------------------------------------
+//
+// Players who start the game from another mod manager could not have both: that manager's launch, or ours. The launcher's "自动注入" watches for
+// Mewgenics.exe and hands each new process to this mode. It does what the ordinary launch does at its stage 2 -- park the frame loop on FrameBegin
+// with `jmp $`, inject while a thread sits there, restore the bytes and let the frame run -- so the DLL is in before the next frame starts, whether
+// the process is still starting up (the usual case: the watcher sees it within ~100 ms) or already on the main menu. FrameBegin runs every frame,
+// so there is always a next one to park on.
+//
+// Exit codes: 0 injected, 5 it already had the DLL, 2 not the pinned build (refused, nothing written), 3 another injector has this process,
+// 4 the process went away (a Steam re-launch: its replacement is a new process the watcher sees), 1 any other failure.
+int attach_early(DWORD pid, const wchar_t* dll) {
+    if (!claim_process(pid)) { wprintf(L"[*] pid %lu is being injected by another loader -- left alone\n", pid); return 3; }
+    HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE,
+                              FALSE, pid);
+    if (!proc) {
+        const DWORD e = GetLastError();
+        fwprintf(stderr, L"[!] could not open pid %lu (error %lu)%s\n", pid, e,
+                 e == ERROR_ACCESS_DENIED ? L" -- the game runs with more rights than this loader (start CoMeow as administrator)" : L"");
+        return 1;
+    }
+    if (module_loaded(pid, dll)) { wprintf(L"[*] pid %lu already has %s\n", pid, dll); CloseHandle(proc); return 5; }
+
+    // The image base comes from the PEB, which a process seen in its first milliseconds may not have filled in yet.
+    uintptr_t image_base = 0;
+    for (int i = 0; i < 200 && !remote_image_base(proc, &image_base); ++i) {
+        if (WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) { CloseHandle(proc); return 4; }
+        Sleep(25);
+    }
+    if (!image_base) { fwprintf(stderr, L"[!] could not read pid %lu's image base\n", pid); CloseHandle(proc); return 1; }
+
+    const uintptr_t park_at = image_base + mgmp::kParkRva;
+    {   // an exe too small to hold the park point is another program by the same name, or another build: not ours (and nothing to wait for)
+        IMAGE_DOS_HEADER dos = {};
+        IMAGE_NT_HEADERS64 nt = {};
+        for (int i = 0; i < 200; ++i) {
+            if (ReadProcessMemory(proc, (void*)image_base, &dos, sizeof(dos), nullptr) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+                ReadProcessMemory(proc, (BYTE*)image_base + dos.e_lfanew, &nt, sizeof(nt), nullptr) && nt.Signature == IMAGE_NT_SIGNATURE) break;
+            nt.Signature = 0;
+            if (WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) { CloseHandle(proc); return 4; }
+            Sleep(25);
+        }
+        if (nt.Signature != IMAGE_NT_SIGNATURE) { fwprintf(stderr, L"[!] could not read pid %lu's PE headers\n", pid); CloseHandle(proc); return 1; }
+        if ((uint64_t)mgmp::kParkRva + 16 > nt.OptionalHeader.SizeOfImage) {
+            fwprintf(stderr, L"[!] pid %lu's image (0x%lX bytes) cannot hold the park point -- not the game build this mod is made for, not injected\n",
+                     pid, nt.OptionalHeader.SizeOfImage);
+            CloseHandle(proc);
+            return 2;
+        }
+    }
+    unsigned char sig[16] = {};
+    bool read_ok = false;
+    for (int i = 0; i < 200; ++i) {                                         // the image's pages are there from the start; a moment's retry costs nothing
+        if (ReadProcessMemory(proc, (void*)park_at, sig, sizeof(sig), nullptr)) { read_ok = true; break; }
+        if (WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) { CloseHandle(proc); return 4; }
+        Sleep(25);
+    }
+    if (!read_ok) { fwprintf(stderr, L"[!] could not read pid %lu's park point\n", pid); CloseHandle(proc); return 1; }
+    if (memcmp(sig, mgmp::kParkSig, sizeof(sig)) != 0) {
+        fwprintf(stderr, L"[!] pid %lu is not the game build this mod is made for (the park point differs) -- not injected\n", pid);
+        CloseHandle(proc);
+        return 2;
+    }
+
+    const unsigned char park_insn[2] = { 0xEB, 0xFE };   // jmp $
+    const unsigned char saved_park[2] = { sig[0], sig[1] };
+    if (!write_code(proc, park_at, park_insn, sizeof(park_insn))) { fwprintf(stderr, L"[!] could not patch pid %lu's park point\n", pid); CloseHandle(proc); return 1; }
+    wprintf(L"[*] pid %lu: image base %p, waiting for its next frame at %p\n", pid, (void*)image_base, (void*)park_at);
+
+    DWORD parked_tid = 0;
+    bool exited = false;
+    HANDLE parked = wait_until_parked_any(proc, pid, 0, park_at, 120000, &parked_tid, &exited);
+    if (!parked) {
+        if (!exited) write_code(proc, park_at, saved_park, sizeof(saved_park));
+        if (exited) wprintf(L"[*] pid %lu exited before its next frame (a Steam re-launch hands the game to a new process)\n", pid);
+        else fwprintf(stderr, L"[!] pid %lu did not reach its next frame within 120 s -- park removed, not injected\n", pid);
+        CloseHandle(proc);
+        return exited ? 4 : 1;
+    }
+    g_resume_on_die = parked;
+    write_code(proc, park_at, saved_park, sizeof(saved_park));      // a pristine prologue for MinHook (see stage 3 of the launch)
+
+    wchar_t ev_name[64];
+    swprintf_s(ev_name, L"Local\\mgmp_hooks_ready_%lu", pid);
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, ev_name);
+    wprintf(L"[*] pid %lu parked on thread %lu; injecting %s\n", pid, parked_tid, dll);
+    const bool ok = inject(proc, dll);
+    if (ok && ready && WaitForSingleObject(ready, 30000) != WAIT_OBJECT_0) wprintf(L"[!] timed out waiting for hooks-ready; unparking anyway\n");
+    if (ready) CloseHandle(ready);
+
+    alignas(16) CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    if (GetThreadContext(parked, &ctx)) { ctx.Rip = park_at; SetThreadContext(parked, &ctx); }
+    g_resume_on_die = nullptr;
+    ResumeThread(parked);
+    CloseHandle(parked);
+    CloseHandle(proc);
+    wprintf(ok ? L"[+] pid %lu injected (auto-inject)\n" : L"[!] pid %lu: injection failed\n", pid);
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -556,6 +673,10 @@ int wmain(int argc, wchar_t** argv) {
         return ok ? 0 : 1;
     }
 
+    // --- auto-inject mode (0.1.200): a game another program started ---
+    if (argc >= 3 && _wcsicmp(argv[1], L"--attach-early") == 0)
+        return attach_early((DWORD)wcstoul(argv[2], nullptr, 10), dll);
+
     // --- launch mode ---
     wchar_t game[MAX_PATH] = {};
     int     first_game_arg = 2;
@@ -595,6 +716,7 @@ int wmain(int argc, wchar_t** argv) {
         die(L"CreateProcessW");
 
     wprintf(L"[*] launched suspended: pid %lu\n", pi.dwProcessId);
+    claim_process(pi.dwProcessId);      // 0.1.200: the auto-inject watcher leaves this one to us
 
     wchar_t flag[8];
     bool no_inject = GetEnvironmentVariableW(L"MGMP_NOINJECT", flag, 8) > 0 && flag[0] == L'1';
@@ -722,6 +844,10 @@ int wmain(int argc, wchar_t** argv) {
             }
 
             wprintf(L"[*] following the re-launch into pid %lu\n", new_pid);
+            if (!claim_process(new_pid)) {      // 0.1.200: the launcher's auto-inject watcher got there first and injects it
+                wprintf(L"[+] the re-launched game (pid %lu) is being injected by the auto-inject watcher\n", new_pid);
+                return 0;
+            }
             if (!wait_modules_ready(new_pid, 30000))
                 fwprintf(stderr, L"[!] kernel32 never showed up in pid %lu's module list; "
                                  L"injecting anyway\n", new_pid);

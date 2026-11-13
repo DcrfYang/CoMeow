@@ -156,7 +156,8 @@ void indepevt_ctor_begin(void* world_event, const void* name_string) {
         return;
     }
     bool swapped = true;
-    if (net_role() == NetRole::Client) swapped = roster_party_swap_for_own_event();
+    if (net_role() == NetRole::Client && !catsync_own_cats_listed()) swapped = false;          // 0.1.212: no cat of this player listed -- the shared party (see indepevt_after_pick)
+    else if (net_role() == NetRole::Client) swapped = roster_party_swap_for_own_event();
     g.own_node = follow_here_seed();
     g.own_we = world_event;
     g.own_seed = follow_here_seed();
@@ -282,7 +283,12 @@ void indepevt_after_pick(void* out_name, bool in_ctor) {
     // A CLIENT'S OWN CATS, from here on: the draw above was made with the shared party (the same event as the host's), the subject the
     // constructor picks next must be one of this player's cats.
     bool swapped = true;
-    if (net_role() == NetRole::Client) swapped = roster_party_swap_for_own_event();
+    // 0.1.212: NO CAT OF THIS PLAYER IN THE RUN'S LISTS (CHINAMI 11-08: the host's familiar list had lost them) -- a swap to "this player's cats" leaves the
+    // constructor nothing to draw the event's subject from, and it dereferenced that empty pick (crash at 0x14013E264). The shared party stays instead.
+    if (net_role() == NetRole::Client && !catsync_own_cats_listed()) {
+        log_line_lvl(LogLevel::Warn, "INDEPEVT", "!! event '%s': no cat of this player is in the run's lists -- the shared party keeps it (an empty subject list would crash the event)", name);
+        swapped = false;
+    } else if (net_role() == NetRole::Client) swapped = roster_party_swap_for_own_event();
     g.own_node = follow_here_seed();
     if (in_ctor) {
         g.own_we = g.ctor_we;

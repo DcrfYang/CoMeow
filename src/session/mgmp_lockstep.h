@@ -205,7 +205,11 @@ void lockstep_dev_arm_stat_repair();
 // when there is nothing to halt (no battle snapshotted in a session, or already halted).
 bool lockstep_dev_force_halt();
 const void* lockstep_dev_player_cat();
-const void* lockstep_dev_unit(uint32_t index);   // 0.1.190 DEV: roster entry `index` (null when out of range or gone)
+const void* lockstep_dev_unit(uint32_t index);
+// 0.1.213 (usdev boardskip N): this client ignores the host's next N boards -- the boundary then differs and only the resync can put it right
+void lockstep_dev_board_skip(uint32_t n);
+// 0.1.195: the battle's board (a live unit's Character+0x80), null outside a battle or when no live unit is readable. Game thread.
+const void* lockstep_board();   // 0.1.190 DEV: roster entry `index` (null when out of range or gone)
 // DEV (mgmp_unitprobe): logs every unit of the live battle list (works in single player too); `deep` adds the raw field dumps. Returns the units logged.
 uint32_t lockstep_dev_unitprobe(bool deep);
 // The roster index of a unit of the current battle, -1 when it is none (mgmp_unitstate's log).
@@ -217,6 +221,12 @@ int lockstep_equip_named(void* chr, const char* name, int32_t durability, int32_
 // player's -- the item of that name in this player's backpack is the one taken (no duplicate), the old one goes into the backpack; not own (another player's cat, an enemy):
 // the old item is taken out of this player's backpack again (it is not this player's). 1 = done, 0 = the slot does not hold the name afterwards, < 0 = not available / faulted.
 int lockstep_swap_item_named(void* chr, uint32_t slot, const char* name, int32_t durability, int32_t aux, bool own);
+// 0.1.194: whether this battle's pre-battle audit AGREED on the cat of `chr` (its save id) and both sides then had `item` in gear slot `slot` -- the one case in which an item
+// the host's slot no longer holds left it during the fight (it broke there), and not a gear change one side never saw.
+bool lockstep_gear_agreed_at_start(const void* chr, uint32_t slot, const char* item);
+// 0.1.194: the item in gear slot `slot` of `chr` broken the game's way (C_ItemBreak: its on-break effects run, then it leaves the slot). 1 = the slot is empty afterwards,
+// 0 = the game refused (an indestructible item), < 0 = not available / faulted.
+int lockstep_break_item(void* chr, uint32_t slot);
 // DEV (0.1.174, harness usdev): on THIS game only -- rotate three non-player roster entries (a -> b -> c -> a: the numbering the board must put back), or move unit u's entry
 // to the end of this round's turn queue (the order the queue sync must put back). False when refused.
 bool lockstep_dev_roster_rotate(uint32_t a, uint32_t b, uint32_t c);

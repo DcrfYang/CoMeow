@@ -116,6 +116,14 @@ int main() {
     CHECK(!balance_scale_enemy(chr, 0));
     CHECK(!balance_scale_enemy(nullptr, 0));
 
+    printf("-- The Creator's clones of the players' cats are not scaled (0.1.207) --\n");
+    CHECK(balance_exempt_definition("PlayerCat_FinalBossClone"));
+    CHECK(balance_exempt_definition("PlayerCat_FinalBossClone_Elite"));
+    CHECK(!balance_exempt_definition("TheCreator"));
+    CHECK(!balance_exempt_definition("PlayerCat_FinalBoss"));
+    CHECK(!balance_exempt_definition(""));
+    CHECK(!balance_exempt_definition(nullptr));
+
     printf("-- the ruleset id the handshake compares --\n");
     CHECK(balance_ruleset_id() == balance_ruleset_id() && balance_ruleset_id() != 0);
 

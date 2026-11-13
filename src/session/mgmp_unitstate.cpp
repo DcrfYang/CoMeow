@@ -11,6 +11,8 @@
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
 #include "mgmp_spawntest.h"      // 0.1.190: unit_set_ability / unit_trim_spells
+#include "mgmp_tilesync.h"       // 0.1.195: usdev tile / tiledump
+#include "mgmp_catsync.h"        // 0.1.213: usdev famdrop
 
 #include <windows.h>
 #include <cstdio>
@@ -154,6 +156,14 @@ bool set_passive_data(const void* chr, uint8_t* pas, const char* value) {
 }
 
 // --- reading ---------------------------------------------------------------------------------------------------------------------------
+// AN ELITE'S LOOK IS NOT STATE (0.1.197; room 9UJT/7C6X 11-06 17:06 and 17:32, battles a41bf86f and 0b59c417): the host's unit of an index was an elite and this
+// peer's a plain one; the repair added the elite's passives by name, EliteParticle "the factory made nothing" -- never the same, the next boundary halted -- and twice
+// the game crashed in the next frame's update of its visual objects (Mewgenics.exe+0x94EAA6, NULL+0x10, no mgmp frame), right after EliteTint / EliteFlatTint were
+// made on a unit the elite build never touched. These three only draw the elite (a tint, a flat tint, a particle): out of the record, the digest and the repair.
+bool cosmetic_passive(const char* name) {
+    return !strcmp(name, "EliteTint") || !strcmp(name, "EliteFlatTint") || !strcmp(name, "EliteParticle");
+}
+
 void read_passives(const void* chr, UnitDeep& d) {
     const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
     if (!mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return;
@@ -167,6 +177,7 @@ void read_passives(const void* chr, UnitDeep& d) {
         const VtInfo* v = class_of(c);
         if (!v || v->kind < 1) continue;
         if (mem_read(c + kPas_Removed, &removed, 1) && removed) continue;
+        if (cosmetic_passive(v->name)) continue;
         UsPassive& p = d.p[d.np++];
         p.type = (uint16_t)v->type; p.status = v->kind == 2 ? 1 : 0;
         mem_read(c + kPas_Stacks, &p.stacks, 4);
@@ -293,7 +304,20 @@ uint32_t unitstate_digest(const UnitDeep& d) {
     // record and the diff names them.
     // A passive's DATA is not hashed either (0.1.190): a status or passive the repair makes by name has no data node, the host's one made by an ability has one ('Burn 1')
     // -- hashed, that pair could never be settled (KD8E test, turn 18). The data is compared and put right whenever BOTH sides have one and the unit is repaired at all.
-    for (uint32_t i = 0; i < d.np; ++i) { const UsPassive& p = d.p[i]; h = fnv(h, &p.type, 2); h = fnv(h, &p.status, 1); h = fnv(h, &p.stacks, 4); }
+    // THE PASSIVES' ORDER IS NOT HASHED (0.1.216, sim 57; room KD8E 11-09 22:25, battle cdddc23b: an item the host's game broke during a hit was broken here by the repair,
+    // the game's way -- the same passives came out in another order, "the digests differ, no field does", two resyncs failed and the battle halted). The diff and the
+    // repair match passives by type; the digest now does too: each passive is hashed alone and the set is summed (and xor'ed), so two lists that hold the same passives
+    // agree whatever their order.
+    {
+        uint32_t sum = 0, x = 0;
+        for (uint32_t i = 0; i < d.np; ++i) {
+            const UsPassive& p = d.p[i];
+            uint32_t e = 2166136261u;
+            e = fnv(e, &p.type, 2); e = fnv(e, &p.status, 1); e = fnv(e, &p.stacks, 4);
+            sum += e; x ^= e * 0x9E3779B1u;
+        }
+        h = fnv(h, &sum, 4); h = fnv(h, &x, 4);
+    }
     h = fnv(h, &d.na, 1);
     for (uint32_t i = 0; i < d.na; ++i) { const UsAbility& a = d.a[i]; h = fnv(h, &a.slot, 1); h = fnv_s(h, a.name); h = fnv(h, a.f, sizeof(a.f)); }
     h = fnv(h, &d.items, 1);
@@ -345,6 +369,7 @@ void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& min
                 used_m[j] = found = true;
                 const UsPassive& a = host.p[i]; const UsPassive& b = mine.p[j];
                 if (!data_alike(a, b)) put(" %s data '%s'|'%s'", a.name, a.data, b.data);
+                if (a.status != b.status) put(" %s status bit %u|%u", a.name, (unsigned)a.status, (unsigned)b.status);   // 0.1.216: hashed, and was never shown
                 if (a.f70 != b.f70 || a.f74 != b.f74 || a.f78 != b.f78) put(" %s flags %X/%X/%X|%X/%X/%X (not hashed)", a.name, a.f70, a.f74, a.f78, b.f70, b.f74, b.f78);
             }
         if (!found) {
@@ -358,6 +383,7 @@ void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& min
         const UsAbility* a = i < host.na ? &host.a[i] : nullptr; const UsAbility* b = i < mine.na ? &mine.a[i] : nullptr;
         if (!a || !b) { put(" ability %u '%s'|'%s'", i, a ? a->name : "-", b ? b->name : "-"); continue; }
         if (strcmp(a->name, b->name) != 0) { put(" ability slot %u '%s'|'%s'", (unsigned)a->slot, a->name, b->name); continue; }
+        if (a->slot != b->slot) { put(" %s in slot %u|%u", a->name, (unsigned)a->slot, (unsigned)b->slot); continue; }    // 0.1.216: hashed, and was never shown
         for (uint32_t k = 0; k < kUsAbilInts; ++k) if (a->f[k] != b->f[k]) put(" %s+%X %d|%d", a->name, k < 14 ? 0x34 + k * 4 : 0xC8 + (k - 14) * 4, a->f[k], b->f[k]);
     }
     if (host.items != mine.items) put(" item slots %u|%u", host.items, mine.items);
@@ -390,14 +416,56 @@ uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const 
     // another save, a CustomEnemyCat the board had to make by name, a clone -- gets the host's, made by the game's own ability factory in the host's slots (the sequence of
     // the game's debug console's set-ability: the old ability is destroyed with whatever it gave). A missing item is equipped before, since an item's ability comes with its
     // item; an item's ability is never made by name. Everything below then compares against the bar as it is now.
+    // A PLAYER'S CAT IS NEVER TURNED INTO ANOTHER CAT (0.1.204; room 7UTR 11-07 15:18: the two games had other data for all 8 player cats -- the pre-battle audit
+    // said "0 agree, 8 DIFFER", the roster had 24 units on one side and 25 on the other -- and this repair "put right" every cat at an index into the host's
+    // cat at that index: other items equipped, the class's basic attack replaced, 27 changes on one cat; the game crashed on its next start). A player's cat
+    // whose basic attack (slot 1: the class's) differs from the host's is ANOTHER cat, not this cat in another state: nothing of it is changed, it is said.
+    // 0.1.222 (NIRVANA KD8E 11-10, battle a147b88f): a class's basic attack is named Basic*. The host's Tank was Webbed, and Webbed puts 'BreakWeb' in slot 1 -- that is the
+    // cat in another STATE, not another cat: it is repaired, and slot 1 is left to the status repair (the game's own Webbed swaps the attack and keeps the class's to restore).
+    bool slot1_by_state = false;
+    if (player_cat) {
+        const char* ha = nullptr; const char* ma = nullptr;
+        for (uint32_t i = 0; i < host.na; ++i) if (host.a[i].slot == 1) ha = host.a[i].name;
+        for (uint32_t i = 0; i < mine_in.na; ++i) if (mine_in.a[i].slot == 1) ma = mine_in.a[i].name;
+        if (ha && ma && ha[0] && ma[0] && strcmp(ha, ma) != 0) {
+            if (_strnicmp(ha, "Basic", 5) == 0 && _strnicmp(ma, "Basic", 5) == 0) {
+                log_line_lvl(LogLevel::Error, "USYNC", "!! unit %u is a player's cat whose basic attack is '%s' here and '%s' on the host -- another cat (the two games hold other cat data, "
+                             "or another roster order): NOT repaired, nothing of the cat is changed", (unsigned)index, ma, ha);
+                return 0;
+            }
+            slot1_by_state = true;
+            log_line_lvl(LogLevel::Warn, "USYNC", "unit %u: slot 1 is '%s' here and '%s' on the host -- a status's stand-in attack (not a class's Basic*): the cat is repaired, slot 1 is left to its statuses",
+                         (unsigned)index, ma, ha);
+        }
+    }
     static UnitDeep cur;           // this game's record, read again after the bar changed (game thread only)
     cur = mine_in;
     const UnitDeep& mine = cur;
     auto kit_of = [&]() {
         bool d = host.na != cur.na;
-        for (uint32_t i = 0; i < host.na && i < cur.na && !d; ++i) d = host.a[i].slot != cur.a[i].slot || strcmp(host.a[i].name, cur.a[i].name) != 0;
+        for (uint32_t i = 0; i < host.na && i < cur.na && !d; ++i) d = host.a[i].slot != cur.a[i].slot || (strcmp(host.a[i].name, cur.a[i].name) != 0 && !(slot1_by_state && host.a[i].slot == 1));
         return d;
     };
+    // 0'. ANOTHER ITEM IN A SLOT IS SWAPPED FOR THE HOST'S FIRST (0.1.216; room KD8E 11-09 17:26, battle 5b36a4e6: the host's cat wore LilBattery, this game's copy
+    // Antidote -- step 0 made the trinket's ability 'tk_LilBattery' by name, step 3 then swapped the item, which brought its own: two of it, the spell trim took the
+    // wrong one, two resyncs failed and the battle halted). An item's abilities come with the item; with the host's item in place the bar is compared after.
+    if (host.items && cur.items) {
+        bool swapped = false;
+        for (uint32_t k = 0; k < kUsItems; ++k) {
+            const UsItem& a = host.it[k]; const UsItem& b = cur.it[k];
+            if (!a.name[0] || !b.name[0] || strcmp(a.name, b.name) == 0) continue;
+            char was[kUsNameLen] = {};
+            strncpy_s(was, b.name, _TRUNCATE);
+            const int r = lockstep_swap_item_named(chr, k, a.name, a.dur, a.aux, own_cat);
+            if (r == 1) { ++changed; swapped = true; put(" item %u '%s'->'%s' first (swapped; its abilities come with it)", k, was, a.name); }
+        }
+        if (swapped) {
+            const uint8_t one = 1;
+            mem_write((uint8_t*)chr + kChar_PassiveDirty, &one, 1);
+            call_recompute(chr);
+            unitstate_read(chr, cur);
+        }
+    }
     if (kit_of()) {
         bool bar_changed = false;
         if (host.items && cur.items)
@@ -413,8 +481,11 @@ uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const 
             const UsAbility* b = nullptr;
             for (uint32_t j = 0; j < cur.na && !b; ++j) if (cur.a[j].slot == a.slot) b = &cur.a[j];
             if (b && strcmp(a.name, b->name) == 0) continue;
+            if (slot1_by_state && a.slot == 1) continue;      // 0.1.222: the status repair below brings it (or takes it away)
             const char* why = nullptr;
-            if (unit_set_ability(chr, a.slot, a.name, !player_cat, why)) { ++changed; bar_changed = true; put(" ability slot %u '%s'->'%s'", (unsigned)a.slot, b ? b->name : "-", a.name); }
+            // 0.1.217: a summon's cat data is its own (FleshGolem: save id -1) -- its spell names take the host's too, or the unit's turn rebuilt the old spells from them
+            // (room H22P 11-09: the owner's golem was put right at the boundary and still cast its own 'Marked' a turn later; the host halted)
+            if (unit_set_ability(chr, a.slot, a.name, !player_cat || unit_catdata_is_summon(chr), why)) { ++changed; bar_changed = true; put(" ability slot %u '%s'->'%s'", (unsigned)a.slot, b ? b->name : "-", a.name); }
             else { ++failed; put(" !ability slot %u '%s' not made (%s)", (unsigned)a.slot, a.name, why ? why : "?"); }
             if (bar_changed) unitstate_read(chr, cur);
         }
@@ -428,6 +499,45 @@ uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const 
             else { ++failed; put(" !spells past the host's %u not destroyed (%s)", host_spells, why ? why : "?"); }
         }
         if (bar_changed) {
+            const uint8_t one = 1;
+            mem_write((uint8_t*)chr + kChar_PassiveDirty, &one, 1);
+            call_recompute(chr);
+            unitstate_read(chr, cur);
+        }
+    }
+    // 0b. AN ITEM THE HOST'S GAME BROKE (0.1.194; room BNYQ 11-05 20:51, battle 275b4a3e, turn 15): a hit broke a player cat's BonesHat on the host and not here, and the item
+    // could not be taken -- "!item 0 is 'BonesHat' here, '' on the host", a halt at the next boundary. When this battle's pre-battle audit agreed on the cat and had this item in
+    // this slot on both sides, the host's empty slot means it left during the fight: it is broken here the game's way, its on-break effects (StatusOnBreak ...) run as they ran
+    // on the host. Done before the passives are compared, so what the break gave is not made a second time below. Any other empty slot on the host stays a reported difference.
+    if (host.items && cur.items) {
+        bool broke = false;
+        for (uint32_t k = 0; k < kUsItems; ++k) {
+            if (host.it[k].name[0] || !cur.it[k].name[0] || !lockstep_gear_agreed_at_start(chr, k, cur.it[k].name)) continue;
+            char was[kUsNameLen] = {};
+            strncpy_s(was, cur.it[k].name, _TRUNCATE);
+            if (lockstep_break_item(chr, k) == 1) { ++changed; broke = true; put(" item %u '%s' broken (as on the host)", k, was); }
+        }
+        if (broke) {
+            const uint8_t one = 1;
+            mem_write((uint8_t*)chr + kChar_PassiveDirty, &one, 1);
+            call_recompute(chr);
+            unitstate_read(chr, cur);
+        }
+    }
+    // 0c. AN ITEM THE HOST'S SLOT HOLDS AND THIS ONE LACKS IS EQUIPPED BEFORE THE PASSIVES ARE COMPARED (0.1.212; room 8F23 11-08, battle a9e5412e, turn 9): a cat's
+    // OakHelmet burned away on one peer only, the repair added its Flammable passive by name AND equipped the helmet (step 3), which brought a second Flammable --
+    // "STILL DIFFERS", the next boundary halted. Equipped first, what the item gives is in place when the passives are compared, and nothing is made twice.
+    if (host.items && cur.items) {
+        bool equipped = false;
+        for (uint32_t k = 0; k < kUsItems; ++k) {
+            if (!host.it[k].name[0] || cur.it[k].name[0]) continue;
+            bool elsewhere = false;                                    // the same item in another slot here is step 3's business (it reports the slot)
+            for (uint32_t j = 0; j < kUsItems && !elsewhere; ++j) elsewhere = strcmp(cur.it[j].name, host.it[k].name) == 0;
+            if (elsewhere) continue;
+            const int slot = lockstep_equip_named(chr, host.it[k].name, host.it[k].dur, host.it[k].aux);
+            if (slot >= 0) { ++changed; equipped = true; put(" +item '%s' before the passives (what it gives comes with it)", host.it[k].name); }
+        }
+        if (equipped) {
             const uint8_t one = 1;
             mem_write((uint8_t*)chr + kChar_PassiveDirty, &one, 1);
             call_recompute(chr);
@@ -591,6 +701,27 @@ void unitstate_note_remove(const void* passive, uint32_t ra) {
 //   status NAME N | passive NAME N | remove NAME | stacks NAME N | field 0xOFF VALUE | durability SLOT VALUE
 //   0.1.190: ability SLOT NAME (this cat's slot made anew) | trim N (its spells past N destroyed) | unitkill U (unit U's hp and shields 0) | unitoff U (unit U off the board, silently)
 bool unitstate_dev(const char* cmd) {
+    if (cmd && !strncmp(cmd, "tiledump", 8)) { tilesync_dev_dump(lockstep_board()); return true; }
+    if (cmd && !strncmp(cmd, "tile ", 5)) {        // 0.1.195: tile X Y NAME -- one cell of THIS game's ground changed
+        unsigned x = 0, y = 0; char name[64] = {};
+        const bool ok = sscanf_s(cmd + 5, "%u %u %63s", &x, &y, name, (unsigned)sizeof(name)) == 3 && tilesync_dev_set(lockstep_board(), x, y, name);
+        log_line_lvl(LogLevel::Warn, "TILESYNC", "dev: %s -> %s", cmd, ok ? "done" : "FAILED");
+        return ok;
+    }
+    // 0.1.213: the resync, the slow link and the list repair, on THIS game only
+    if (cmd && !strncmp(cmd, "boardskip ", 10)) { lockstep_dev_board_skip((uint32_t)atoi(cmd + 10)); log_line_lvl(LogLevel::Warn, "USYNC", "dev: %s -> the next board(s) of the host are ignored here", cmd); return true; }
+    if (cmd && !strncmp(cmd, "slowpeer ", 9)) {
+        unsigned p = 0, on = 1;
+        const bool ok = sscanf_s(cmd + 9, "%u %u", &p, &on) >= 1 && p < kMaxPeers;
+        if (ok) net_set_slow_peer((uint8_t)p, on != 0);
+        log_line_lvl(LogLevel::Warn, "USYNC", "dev: %s -> %s", cmd, ok ? "done" : "FAILED");
+        return ok;
+    }
+    if (cmd && !strncmp(cmd, "famdrop ", 8)) {
+        const bool ok = catsync_dev_familiar_drop(strtoull(cmd + 8, nullptr, 0));
+        log_line_lvl(LogLevel::Warn, "USYNC", "dev: %s -> %s", cmd, ok ? "done" : "FAILED");
+        return ok;
+    }
     void* chr = (void*)lockstep_dev_player_cat();
     if (!chr || !cmd) { log_line("USYNC", "dev: no player cat"); return false; }
     char op[32] = {}, a1[64] = {}; long long v = 0;

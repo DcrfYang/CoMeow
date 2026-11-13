@@ -166,6 +166,15 @@ const char* signal_status();     // one line: what the lobby shows at the top
 const char* signal_server();     // "addr:port" we are connected to, "" if not
 const char* signal_name();       // this player's lobby name
 const char* signal_room();       // room id, "" when not in one
+bool signal_take_sysmsg(char* out, size_t cap);   // 0.1.201: the next system message the server's admin page sent to this room (game thread)
+// 0.1.201: chat through the lobby, for when the game link is not up (versions differ, the handshake refused): possible while connected and in a
+// room of two or more; a line out is sent on the next signal_update; a line in is taken by the game thread.
+bool signal_chat_possible();
+// 0.1.203: GetTickCount64 of the lobby closing this peer's room while its game link was still up (the host left the lobby); 0 = not so.
+uint64_t signal_room_closed_at();
+void signal_room_closed_clear();
+bool signal_send_chat(const char* name, const char* text);
+bool signal_take_chat(char* name, size_t name_cap, char* text, size_t text_cap);
 const char* signal_role();       // "host" | "client" | ""
 // where the host is; "" until a room is joined. May be a comma-separated list (the address, then fallbacks): pass it
 // to session_request_join as it is.

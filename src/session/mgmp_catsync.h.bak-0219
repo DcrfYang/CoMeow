@@ -1,0 +1,391 @@
+#pragma once
+// mgmp_catsync -- the host's cats are pushed to the client, as bytes the GAME
+// produced, through the game's own serializer.
+//
+// THE BUG THIS CLOSES, measured 2026-08-24. Both peers loaded byte-identical
+// saves (hash 78887bfc13cd5b04 on both). The host then equipped a trinket during
+// the adventure. Four turns into the next battle:
+//
+//   !! HALT at turn 4: cat 19 slot 4:4 (gon 'tk_GlowingCoin') is empty on this peer
+//
+// A save file syncs the run at the moment it is written and nothing after it, so
+// every meta-layer change since then is invisible. Worse, it is invisible to the
+// detector too: `state_hash` covers HP, shield, max HP, tile, facing and dead --
+// not abilities and not equipment -- so the peers agreed on every hash right up
+// to the halt. What caught it was the ability cross-check (resolve by slot,
+// validate by GON name), which is the one thing in the battle layer that looks
+// at what a cat can DO rather than at what has happened to it.
+//
+// WHY BYTES AND NOT A REPLAYED ACTION. Replicating the click was the obvious
+// plan, and the map layer's success makes it look easy. It is a dead end:
+//
+//   - glaiel::InventoryItemBox::click() @ 0x14034DF60 IS a clean boundary by the
+//     usual test -- exactly one code caller, only data xref is .pdata, so not
+//     virtual. But it is `void click(void)`: everything about what was clicked
+//     lives in `this`, a UI box that exists only while the inventory screen is
+//     open, and the client is not in that screen.
+//   - it only STARTS a flow. Confirmation popup, then an AbilityChooser -- a
+//     second decision point -- then lambdas whose actual mutation fans out over
+//     ~8 CatData helpers. The bottom of that stack, sub_1400B3920, has 40 call
+//     sites: a shared container primitive, the same trap as
+//     CustomVector<T*>::push_back.
+//
+// So replaying means driving a UI flow on a peer that is not in it, and
+// reimplementing means reproducing eight mutations exactly, where a single miss
+// diverges SILENTLY. Both are worse than the halt they would replace.
+//
+// WHAT MAKES THE THIRD OPTION WORK:
+//
+//   void glaiel::SerializeCatData(CatData&, ByteStream&, bool)  @ 0x14022E9A0
+//
+// is BIDIRECTIONAL. Every field branches on the stream mode at ByteStream+0x00
+// (0 = read, 1 = write), so the same function that saves a cat on the host loads
+// one on the client. We reimplement nothing; we move bytes the game wrote into
+// the game's own reader. The format even carries its own version tag (19) as its
+// first field, and both peers run the same pinned build.
+//
+// Identity is free here, unlike everywhere else in this project. CatData+0x00 is
+// a u64 id, serialized right after that version tag, and the run holds a
+// registry that maps it to a CatData*. No index scheme, no name cross-check, no
+// pointer that dies between runs.
+//
+// This is RUNSTATE from the design notes' protocol table, arriving early and scoped to
+// cats.
+//
+// WHAT IT DOES NOT COVER, stated plainly: equipping MOVES an item from the run
+// inventory onto the cat. Syncing CatData alone leaves the client with the item
+// on the cat AND still in its inventory -- a duplicate. The run inventory is
+// separate state and needs the same treatment; nothing here or in `state_hash`
+// will notice. See "the inventory half" in the .cpp.
+//
+// --- WHAT CHANGED ON 2026-09-22: IT RUNS BOTH WAYS --------------------------
+//
+// Until now the host was the only writer: it published at its node entry and the
+// client applied. The design asks for more -- each player may change what its OWN
+// cats carry during a run -- and under the one-way rule the client's change was
+// simply overwritten by the host's next push, which is a bug a player sees: the
+// trinket goes back in the bag.
+//
+// Both peers now publish and both apply, and what keeps that from being two writers
+// fighting over one cat is mgmp_split's rule one layer up: a cat has ONE editor, the
+// peer whose input drives it. It is not enforced by a lookup here -- the split is
+// over battle roster SLOTS, and this module works in cat IDs -- but by the BASELINE
+// the two peers keep per cat (see the State comment in the .cpp): a peer publishes a
+// cat only when its bytes differ from the value the two last agreed on, and agreeing
+// is both "I sent this" and "I applied this". A client with no baseline for a cat --
+// one the host has never sent it -- stays silent, and that is what stops a client's
+// copy of a run it does not own from reverting the host's edits.
+//
+// WHAT IS STILL ONE-WAY, and the honest consequence: the INVENTORY (mgmp_invsync).
+// Equipping moves an item out of the shared bag and onto the cat, and only the cat
+// half travels back, so after a client equips, the item is on the cat on both peers
+// AND still in the bag on both. That is a duplicate rather than a divergence, which
+// is the saving grace: the two peers hold the SAME bag, so no hash disagrees, the
+// node hash stays quiet, and no battle halts -- but the run has a spare copy of the
+// item. The set is right; the cost is the spare. Closing it means mgmp_invsync going
+// both ways under a merge rule, and an item's only portable identity is its GON name
+// plus its stat fields -- see the reasoning in mgmp_invsync.h.
+
+#include <cstdint>
+
+// THE PER-CAT SERIALIZER, IN ONE CALL (2026-09-23). Defined in mgmp_catsync.cpp at GLOBAL
+// scope -- the linker names it ?serialize_cat@@YAIPEAXPEAPEAE@Z, with no namespace prefix
+// -- so the declaration belongs HERE, outside `namespace mgmp`. A declaration written
+// inside that namespace binds to mgmp::serialize_cat and never resolves, which is exactly
+// how the first attempt at using it from mgmp_choice.cpp failed to link.
+//
+// Why anyone else wants it: this is the bytes SerializeCatData produces for one cat, i.e.
+// the very image mgmp_catsync compares between the peers. It is the only way to see a
+// change that lives BEHIND A POINTER (a replaced passive ability, for one) -- hashing the
+// CatData object's own bytes cannot see those, measured 2026-09-23.
+// (Declarations moved INSIDE namespace mgmp on 2026-09-23 -- see below. A declaration at global
+//  scope mangles differently from a definition at mgmp scope, which is the LNK2019 that had been
+//  sitting unexplored in this file's history.)
+
+// WRITE A CAT IMAGE OVER AN ARBITRARY CatData (2026-09-23).
+//
+// The same bidirectional serializer, in read mode, against whatever address is handed in --
+// which is not always a cat of the run. It exists for the level-up path: the game's pending
+// level-up carries a CatData COPY (the id at CatData+0xC48 was found inside the object the
+// opener is passed -- see the OPENER scan in mgmp_choice), and the panel, the stat numbers and
+// the four options are all built from that copy. Writing THIS peer's cat into the copy, before
+// the screen is built, is what makes the three of them the game's own work around this peer's
+// cat instead of the shared draw's.
+//
+// `len` is bounds-checked against kMaxCatBytes and the read position must land exactly on it,
+// because a short read would leave the destination half-overwritten: the same two checks the
+// cat-sync apply path makes, for the same reason.
+bool catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len);
+
+namespace mgmp {
+
+struct CatDataMsg;
+struct CatDigestMsg;
+struct CatBrief;
+struct SetupMsg;
+
+// Take this cat's image into a caller-owned buffer / lay an image over an arbitrary CatData.
+// (See the two notes above for what they are for and why the declarations live here rather than
+// at global scope.)
+uint32_t serialize_cat(void* cat, uint8_t** out);
+bool     catsync_deserialize_into(void* cat, const uint8_t* image, uint32_t len);
+// The cats THIS player brings, as room-panel briefs (mgmp_catbrief.h): every cat of the run
+// (party AND familiars -- the mod swaps and replaces those lists, so which list a cat sits in says
+// nothing about whose it is), each serialized by the game, read by mgmp_catblob.h, its maximum health
+// asked of the game itself (CatData::max_health), then kept only when it is this peer's by IDENTITY:
+//   - a session id (0x70000000 + owner<<24 + n) names its owner;
+//   - otherwise the ownership notes lockstep holds;
+//   - otherwise, once the run is a shared one (it holds session ids), the cat is the HOST's -- the
+//     authority for a cat nobody claimed, e.g. one an event just added;
+//   - before there is any shared run, the cat is simply this player's own pick.
+// Returns false when the run's cats cannot be read right now (the caller keeps what it had);
+// otherwise true with `n` filled, at most `max`, in a stable order. Read-only, needs no session.
+bool catsync_local_briefs(CatBrief* out, uint32_t max, uint32_t& n);
+
+// Has the game marked this cat dead for good (corpse destroyed, or the `kill` event)? Read off its CatData; false when it cannot be
+// looked up. See kCatData_Killed in mgmp_addresses.h.
+bool catsync_cat_perished(uint64_t id);
+
+// Is there a cat with this id in the game's registry? (A cat gained during the run -- the gain_cat_familiar event -- is one.)
+bool catsync_cat_exists(uint64_t id);
+// A cat an event brought into the run (gain_cat_familiar, after the game's own call): moved to the shared session_gained_id on every peer.
+// `counter_before` is catsync_id_counter() from just before the game's call. True when the cat was moved.
+bool catsync_on_gained_cat(uint64_t counter_before, const char* why);
+// A gained cat (any seat's) is in this run: that seat's next gained cat takes a later slot (0.1.146; a restore, or another player's cat arriving).
+void catsync_gained_seen(uint64_t id);
+uint64_t catsync_id_counter();
+
+// FNV-1a of a cat's serialized image -- the hash CATDATA carries; 0 when it cannot be serialized. For logs.
+uint64_t catsync_image_hash(void* cat);
+// Capture the four cats currently selected in this peer's local setup. The
+// returned images are owned by the caller and must be freed with free().
+bool catsync_export_party_setup(SetupMsg& out);
+// Read existing session IDs from BOTH saved lists; never clone or renumber on resume.
+bool catsync_export_resume(SetupMsg& out, uint8_t owner);
+void catsync_setup_sent(const SetupMsg& snapshot);
+// Transactionally isolate owned cats immediately before native home settlement.
+bool catsync_prepare_settlement(void* director);
+// THE LAST LINE BEFORE AN UNFILTERED SETTLEMENT (0.1.79): when catsync_prepare_settlement refuses, this only takes the OTHER players' session cats out of the
+// run's three lists (party, mirror, familiars) -- by their owner note, or by their id when there is none (a clone slot 1..4 or a gained-cat slot of another
+// position) -- and leaves everything else as it is. The native settlement then cannot make another player's cat a cat of this House. False when this peer's
+// position is not known or a list cannot be read; nothing is written then.
+bool catsync_strip_peer_copies_for_settlement(void* director);
+// RETURN A RUN'S CLONES TO THE CATS THEY WERE MADE FROM (2026-10-01, review finding F1).
+// A player's selected cats are cloned into session cats for the run (0x70000000 + owner<<24 + n); the game flags
+// the ORIGINALS "on adventure" at departure and settles only the clones. This finds this peer's SETTLED clones
+// (flags non-zero, not on adventure), pairs each with the one ordinary cat that has the same seed (the original --
+// the clone is a byte copy), writes the clone's image over it (id kept; flags, level, equipment, injuries as the
+// run left them) and retires the clone (flags 0, the state every leftover clone is already in). An original that is
+// not on adventure, a seed that is not unique, or a write that fails leaves everything as it was. Called right
+// after the native settlement and, as a safety net for saves the old behaviour left behind, before a new run's
+// clones are made. Returns how many clones were merged.
+// `after_native_settlement`: the run has just been settled by the game (run_settled). Only then is a clone of this run that is STILL out on adventure -- the settlement walks the party
+// and clears the mark on every cat in it -- a cat that was not in the party at the end: it left during the run (leave_party_temporarily, came back as an enemy, ...). Its original
+// then comes home as LEFT (0x10) -- or dead (0x20) when the clone died -- exactly as the game marks a cat that is not in the party. Never before a setup: a crashed run's clones
+// are still out on adventure there too.
+unsigned catsync_merge_session_cats(const char* why, bool after_native_settlement = false);
+
+// A cat's BODY PARTS AND MUTATIONS, as one log line (PARTS): the game's own mutation lister (0x1400CB690, the one the cat card uses) walks 14 slots of 0x54 bytes in the cat data, each with a part
+// id at +0x8C, a mutation value at +0x90 and a "has a mutation" byte at +0xA4 (slot k: add 0x54*k). Written as `id` or `id*mutation`, with the count in front and a hash of the whole table behind it.
+// Logged where a cat is copied (clone, setup apply, merge-back) so that "this end's cats all have the same mutations" can be traced to the step that did it.
+void catsync_log_cat_parts(const void* cat, const char* what);
+// Real cats whose ids fall among the ids reserved for clones (older builds left such cats in saves) are moved to ordinary ids, and the run's party list is re-pointed. Returns how many were moved.
+// Cheap when there is nothing to do; called from the collar/gear pages and before the party exchange.
+unsigned catsync_relocate_squatters(const char* why);
+// WHETHER THIS ID IS A SESSION CLONE'S (2026-10-05): the ids reserved for clones are 0x70000000 + (the player's position << 24) + a slot 1..4. A cat the GAME made while its id counter sat inside that range
+// (the counter follows the highest id in the save, and a save that held a retired clone started it there) has an id in the range too -- a newborn kitten got 0x71000013 -- but it is no clone: the slot is
+// above 4. The kitten rule answered "never a kitten" for everything in the range, so a newborn in the warehouse was an adult until the room was left.
+inline bool catsync_is_clone_id(uint64_t id) {
+    if (id < 0x70000000ull || id >= 0x80000000ull) return false;
+    const uint64_t slot = id & 0xFFFFFFull;
+    return slot >= 1 && slot <= 4;
+}
+// Whether this cat id is in the run's party list (the cats chosen at the House's departure box). False when the list cannot be read.
+bool catsync_in_run_party(uint64_t id);
+// Whether the run's lists hold clones this peer knows (an owner or origin note names them): the run is a shared one, whatever the network says.
+bool catsync_run_is_shared();
+// The log's picture of the session's cat bookkeeping (lists, day, counter, every clone slot of every player). Reading only.
+void catsync_log_snapshot(const char* stage);
+
+// WHOSE CATS THE RUN HOLDS, in the log (AUDIT), at the moments a player can end up with someone else's: when a session ends, when a save is loaded, at a departure and after a settlement. One line for the
+// situation (in a room or alone, this peer's position), one per cat of the run's party and familiar lists (its id and which player's session range that is, flags, seed, birth day, owner note, recorded origin),
+// one per clone slot of OTHER players that is still alive and not out on adventure -- the ones the House would show or an adventure box could pick -- and a "!!" line for every cat that is another player's
+// while this peer is not in a room. Reading only; every read is guarded.
+void catsync_log_audit(const char* stage);
+
+// LEAVING A ROOM (2026-10-05): once a session that held other players' cats ends, the run keeps only this peer's own. catsync_shutdown arms it; the tick runs from MapScreen::update (so on the map, between
+// nodes: at once when the player is on the map, and not until they are back on it when they were in a battle), takes the other players' session cats out of the run's lists, retires their copies in the
+// registry and logs what it did. A new session cancels it. No "play alone" click is involved.
+void catsync_leave_tick();
+// After a settlement: the other players' leftover copies (flagged out on adventure, not in the run's lists) are retired so the save does not keep them. Returns how many.
+unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions = 0xFFFFFFFFu);   // only_positions: bit p = position p (a player that dropped out)
+
+// The House is about to write its state (T_HouseSave; `house` = the writer's first argument). Every House cat entity whose id is a clone's that the merge swapped into its original
+// gets the ORIGINAL's id, so `house_state` names the cats that came home -- see swap_identity.
+void catsync_house_save(void* house);
+// The cat census (see mgmp_catsync.cpp): taken when the House's box sets off (`box` = the ids in it), checked after a shared run is settled.
+void catsync_census_take(const uint64_t* box, uint32_t nbox);
+void catsync_census_check(const char* stage);
+// A save was loaded: an earlier census is dropped; a save already on an adventure is counted again as loaded (0.1.51).
+void catsync_census_on_save_loaded();
+
+// THE SAVE THE NATIVE SETTLEMENT WRITES IS NOT THE ONE THAT COUNTS (2026-10-03). MewDirector::SaveGame is the settlement's own last step, and it runs BEFORE the clone merge: the file on disk then
+// holds the settled CLONES under their session ids, the originals still "on adventure", and a house_state naming the clones. A player who reloads before anything saves again got the
+// un-retired originals back. After a merge that changed anything, the game's own SaveGame is called once more (the House state writer hook puts the House's ids right inside it).
+bool catsync_save_game(const char* why);
+
+// WHICH ORIGINAL A CLONE CAME FROM, REMEMBERED (2026-10-02). The merge used to find an original by its seed among cats flagged "out on
+// adventure" -- fine from the warehouse, but a run resumed from a handshake save may no longer offer that evidence. The setup now
+// records clone -> original, the journal keeps the record (disk version 3), a restore reads it back, and the merge trusts it first
+// (after checking the seed still matches); the seed search stays as the fallback.
+struct CloneOriginNote { uint64_t clone = 0; uint64_t original = 0; };
+void     catsync_note_origin(uint64_t clone, uint64_t original);
+uint64_t catsync_origin_of(uint64_t clone);                    // 0 when not recorded
+uint32_t catsync_origin_export(CloneOriginNote* out, uint32_t max);
+void     catsync_origin_import(const CloneOriginNote* in, uint32_t count);
+void     catsync_origin_clear();                                   // tests: the table as it is on a fresh process
+// ORIGINALS THE OLD BEHAVIOUR LEFT "ON ADVENTURE" (2026-10-01). Before the merge existed, a joint run's originals kept
+// the on-adventure bit for good and their progress went to clones that were later overwritten -- the user's saves hold
+// seven or eight such cats, invisible in the House. When no run of this player is in progress (the chapter page of a
+// fresh setup, and right after a run ended) every ordinary cat still flagged on adventure that is not in the run's own
+// party is such a leftover: the bit is cleared and the cat is home again. Returns how many.
+unsigned catsync_release_stuck_cats(const char* why);
+// Make the selected four cats independent of the other save.  The returned
+// setup message uses deterministic session IDs and the local party is changed
+// to those IDs before the message is sent.
+bool catsync_prepare_party_setup(SetupMsg& out, uint8_t owner_pos);
+// 0.1.131, THE CLASS COMPLETION CHECK (T_ClassCompletion): for the duration of the game's check the party list (and the departed list it reads for the monoclass /
+// solo-cat requirements) holds THIS player's own cats -- in a room a client's party is the shared layout then. begin returns whether it changed the lists; end puts
+// them back exactly. `why` is the event name, for the log (COMPLETION).
+bool catsync_completion_begin(const char* why);
+void catsync_completion_end();
+// 0.1.147: THE ROOM'S RULE for the solo-cat / same-class marks (mgmp_completion_rule.h): who brought what, by session cat id, is remembered when the shared roster is
+// installed and forgotten when the run is settled; the check above puts a departed list into the director that makes the game's own check come out as the rule.
+void catsync_note_departure(const uint64_t* ids, uint32_t n);
+void catsync_departure_clear();
+// 0.1.149: THE MARKS IN THE LOG (grep COMPLETION). marks_before / marks_after bracket the game's check (the progression's records are compared: what was given, whether it
+// is what the room's rule promised, kept in a ledger); marks_run_summary prints the ledger when the run is settled; announce_marks tells THIS player, at the chapter page when
+// every player is on it, whether the run can earn a special mark and which.
+void catsync_marks_before(const void* progression);
+void catsync_marks_after(const void* progression, const char* chapter, bool hard_path, bool swapped);
+void catsync_marks_run_summary(const char* how);
+void catsync_announce_marks();
+
+// Resolves and prologue-checks the game functions this module calls. Called
+// from hooks_verify_module alongside rng_set_base, because a bad address here
+// is a refusal at startup rather than a crash three screens later.
+void catsync_set_base(uintptr_t base);
+
+void catsync_init();
+void catsync_shutdown();
+
+// EITHER PEER: serialize every cat in the run and send the ones whose bytes differ
+// from the value the two peers last agreed on. The host calls it where it enters a
+// map node -- the point both peers already synchronize on, and the last moment
+// before a battle can be built out of a stale cat. The client calls it from the map
+// tick (see catsync_map_tick), which is what lets an equip made on this peer's own
+// cat reach the host in time to be in the next battle. Cheap and idempotent:
+// unchanged cats cost a serialize and a hash compare, and send nothing.
+//
+// `quiet_if_nothing` is for the caller that runs often: the map tick would otherwise
+// repeat "0 sent, 0 unchanged" once a second forever. A node entry passes false, and
+// that matters more than it looks -- "the publish ran and had NOTHING to send" is the
+// evidence that a cat this peer applied earlier was not sent back, which is the whole
+// of the no-revert property. Suppressing it made that proof unobservable.
+bool catsync_publish(const char* why, bool quiet_if_nothing = false, bool force = false);
+
+// HOST: the same push, to ONE peer -- the join catch-up, and nothing else. The
+// rest of the session expects a broadcast. A refusal (cats held, no run, a cat
+// that would not serialize) is reported to the caller rather than only logged,
+// because the catch-up makes the node message that follows it conditional on
+// this having arrived.
+bool catsync_publish_to(uint8_t peer, const char* why, bool force = false);
+bool catsync_apply_snapshot(const CatDataMsg& m, const char* why, bool allow_create = false);
+struct EnterNodeMsg;
+bool catsync_read_familiars(EnterNodeMsg& node);
+bool catsync_apply_familiars(const EnterNodeMsg& node);
+// 0.1.212: host, before a node is published -- a client's living cat that left the familiar list during the last battle (after_battle) is put back; returns how many.
+unsigned catsync_host_keep_familiars(const char* why, bool after_battle);
+// 0.1.213 (proto 117), HOST: a client's report that the node snapshot lost its living cat `id` -- put back into the familiar list when the seat is the sender's.
+void catsync_host_listfix(uint8_t from, uint64_t id);
+// 0.1.213 (usdev famdrop ID): this game's familiar list loses that cat (the test of the list repair)
+bool catsync_dev_familiar_drop(uint64_t id);
+// 0.1.212: this player's cats in the run's party + familiar lists now (1 when unreadable).
+unsigned catsync_own_cats_listed();
+
+// Diagnose side: print the run's party list and the familiar list BY ID, at the moment the host
+// is about to publish a node. Written 2026-09-23 because the client kept receiving four cats
+// that were all its own -- which means the host's publish has nothing else to carry, and the
+// only way to say which list holds whose cats on a live run is to look. Log only.
+void catsync_dump_lists(const char* why);
+// The party, mirror and familiar vectors as raw {cap, count, pointer, ids}. Log only.
+void catsync_dump_vectors(const char* why);
+
+// EITHER PEER: forget the baseline, so the next catsync_publish is a FULL push.
+// For a reconnecting peer -- see the comment on the definition. Both peers need it,
+// because after a reconnect the OTHER one has none of what this one already sent.
+void catsync_forget();
+// 0.1.170: the swap notes still waiting for a House save are dropped -- the save they were made in has been replaced (a handshake save restored, a backup loaded).
+void catsync_drop_swap_notes(const char* why);
+// The settlement is over: cats may be applied again (0.1.145; also when the run ended alone, where catsync_forget is not called).
+void catsync_settle_done(const char* why);
+
+// EITHER PEER: resolve m.id in this peer's run and deserialize over it.
+//
+// A cat that arrives while this peer is in a battle is HELD, not applied and
+// not dropped -- writing it would edit state the fight derives from outside the
+// hashed stream, and dropping it loses it for good, because the sender dedupes
+// against the last hash it sent. Both peers hold now; the drains are the client's
+// map-follow tick and the host's node entry.
+void catsync_on_message(const CatDataMsg& m);
+
+// EITHER PEER: apply every held cat, if any. The client calls it from the
+// map-follow tick, immediately before this peer enters the node the host entered --
+// the same point invsync_apply_pending uses, and for the same two reasons: it is off
+// the battle screen, and it is still in time for whatever the node opens. The HOST
+// calls it at its own node entry, immediately before the publish below it, which is
+// the same two properties from the other side: no battle has been built yet, and
+// what it just applied is in the state that follows.
+void catsync_apply_pending(const char* why);
+
+// CLIENT: the throttled publish on the map tick. The host's edits reach this peer at
+// the node boundary; this peer's own edits have to travel the other way, and waiting
+// for the next node the host enters is too late for THAT node's battle -- so it
+// publishes while the map is up. No-op on the host, whose node-entry publish already
+// covers the same ground.
+void catsync_map_tick();
+
+// --- the per-cat digest and owner-authoritative healing (2026-09-29, proto 43) ---
+//
+// Every peer's map tick broadcasts CATDIGEST: (id, hash, size) for every cat in its
+// run, about once a second and immediately when a hash changes. The host relays it,
+// so every peer sees every other peer's digest.
+//
+// Stored here, COMPARED on this peer's own map tick (never inside a battle). For a
+// cat whose bytes differ, the cat's OWNER is the authority -- lockstep_owner_pos,
+// else the control split, else the host. The authority re-sends its copy (to that
+// peer when it has a direct link, which the host does; broadcast otherwise, which
+// the host relays). A difference has to be seen in two consecutive digests with the
+// same pair of hashes first, so a push that is merely in flight is not answered.
+// Four quick attempts, then one every ~16 digests with an Error line: a copy that
+// will not converge is reported and retried, never a stopped run. A peer that is not
+// the authority only logs the difference; the first time a cat differs, each peer
+// writes its own copy's bytes next to the log (mgmp_catdump_*.bin) for diffing.
+void catsync_on_digest(uint8_t from, const CatDigestMsg& m);
+
+// --- for mgmp_souljar (2026-10-22) ---
+// This peer's seat (the position a session cat id names), the one catsync itself uses.
+uint8_t catsync_my_seat();
+// The run's cat ids, party then familiars; 0 when the lists cannot be read.
+uint32_t catsync_run_cat_list(uint64_t* out, uint32_t cap);
+// The CatData the registry holds for `id` (the game's own lookup, guarded); nullptr when there is none or nothing could be read.
+void* catsync_registry_cat(uint64_t id);
+// A NEW CatData read from a cat image the way setup builds a session cat (allocate + construct + read + post-load), its CatData+0xC48 set to
+// `save_id`. Not registered anywhere: the caller keeps it. nullptr when the image does not read.
+void* catsync_cat_from_image(const uint8_t* image, uint32_t len, uint64_t save_id);
+
+// 0.1.192: the party list (MewDirector+0x5C0 and its mirror) loses every id the save cannot load -- the inventory screen's cat selector reads CatData::by_id's answer with no
+// null check. Returns how many were taken out (their ids in `gone`, up to `cap`). Game thread.
+unsigned catsync_purge_missing_party(const char* why, uint64_t* gone, unsigned cap);
+
+} // namespace mgmp

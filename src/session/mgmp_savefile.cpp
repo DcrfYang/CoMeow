@@ -823,6 +823,64 @@ bool savefile_save_dir(wchar_t* out, size_t out_len) {
     return true;
 }
 
+// --- THE SAVE DISK'S FREE SPACE (0.1.197) ---
+// DESKTOP-S066ATC 11-06 20:48 and 21:10: "database or disk is full" twice -- the game's save write threw out of SQLite as the gear page opened and the process went
+// down. The box after the crash (0.1.170) named it, but only once the run was lost, and the same player crashed again twenty minutes later. The free space of the
+// disk that holds the saves is looked at from the menu's frame every kDiskCheckMs: logged at the first look and whenever it crosses a step, and below kDiskLowBytes
+// the player is told BEFORE a save fails (once a session; once more below kDiskCriticalBytes).
+namespace {
+constexpr ULONGLONG kDiskCheckMs = 30000;
+constexpr ULONGLONG kDiskLowBytes = 512ull << 20, kDiskCriticalBytes = 128ull << 20;
+bool save_disk_free(wchar_t* drive, size_t drive_len, ULONGLONG& free_bytes) {
+    wchar_t root[MAX_PATH];
+    if (!save_root(root, MAX_PATH)) return false;
+    ULARGE_INTEGER avail{}, total{}, tfree{};
+    if (!GetDiskFreeSpaceExW(root, &avail, &total, &tfree)) return false;
+    free_bytes = avail.QuadPart;
+    _snwprintf_s(drive, drive_len, _TRUNCATE, L"%.2s", root);
+    return true;
+}
+void bytes_text(ULONGLONG b, char* out, size_t cap) {
+    if (b >= (1ull << 30)) _snprintf_s(out, cap, _TRUNCATE, "%.1f GB", (double)b / (double)(1ull << 30));
+    else _snprintf_s(out, cap, _TRUNCATE, "%llu MB", (unsigned long long)(b >> 20));
+}
+} // namespace
+
+bool savefile_disk_free_text(char* drive, size_t drive_cap, char* amount, size_t amount_cap) {
+    wchar_t d[8] = {}; ULONGLONG f = 0;
+    if (!save_disk_free(d, 8, f)) return false;
+    WideCharToMultiByte(CP_UTF8, 0, d, -1, drive, (int)drive_cap, nullptr, nullptr);
+    bytes_text(f, amount, amount_cap);
+    return true;
+}
+
+void savefile_disk_check() {
+    static ULONGLONG next_at = 0;
+    static int logged_step = -1, warned = 0;          // warned: 0 none, 1 low, 2 critical
+    const ULONGLONG now = GetTickCount64();
+    if (now < next_at) return;
+    next_at = now + kDiskCheckMs;
+    wchar_t d[8] = {}; ULONGLONG f = 0;
+    if (!save_disk_free(d, 8, f)) return;
+    const int step = f < kDiskCriticalBytes ? 0 : f < kDiskLowBytes ? 1 : f < (2ull << 30) ? 2 : 3;
+    char drive[16] = {}, amount[32] = {};
+    WideCharToMultiByte(CP_UTF8, 0, d, -1, drive, sizeof(drive), nullptr, nullptr);
+    bytes_text(f, amount, sizeof(amount));
+    if (step != logged_step) {
+        logged_step = step;
+        log_line_lvl(step <= 1 ? LogLevel::Error : LogLevel::Info, "SAVEFILE", "%sthe disk of the saves (%s) has %s free%s", step <= 1 ? "!! " : "", drive, amount,
+                     step == 0 ? " -- the game's next save write can fail (SQLite: \"database or disk is full\") and crash" : step == 1 ? " -- low" : "");
+    }
+    const int want = step == 0 ? 2 : step == 1 ? 1 : 0;
+    if (want > warned) {
+        warned = want;
+        char text[1200];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, tr(Tx::ERR_DISK_LOW), drive, amount);
+        ui_error_popup(tr(Tx::ERR_DISK_LOW_TITLE), text);
+        log_line_lvl(LogLevel::Error, "SAVEFILE", "!! the player is told the save disk is low (%s free)", amount);
+    }
+}
+
 // --- WHICH ACCOUNT'S SAVES (2026-10-15): the question and the switch, see the header ---
 int savefile_accounts(SaveAccount* out, int cap) {
     ensure_dir();

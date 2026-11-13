@@ -539,6 +539,7 @@ bool invsync_publish(const char*, bool) { return send_ok; }
 bool runhist_publish(const char*, bool) { return send_ok; }
 bool catsync_read_familiars(EnterNodeMsg&) { return true; }
 bool catsync_apply_familiars(const EnterNodeMsg& m) { return apply_ok && m.familiar_count == 0; }
+unsigned catsync_host_keep_familiars(const char*, bool) { return 0; }
 bool catsync_apply_snapshot(const CatDataMsg& m, const char*, bool) { cat_values.push_back(m.data[0]); return apply_ok; }
 bool invsync_apply_snapshot(const InventoryMsg& m, const char*) { coins.push_back(m.coins); return apply_ok; }
 bool runhist_apply_snapshot(const RunHistMsg& m, const char*) { histories.push_back(m.size); return apply_ok; }

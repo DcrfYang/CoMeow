@@ -62,6 +62,13 @@ struct State {
     // that came before this peer began it (the host keeps them, a client is not asked until all have arrived).
     uint8_t stage=0; ULONGLONG stageAt=0; bool stageDone[3]{}; CheckpointMsg selTx{};
     CheckpointMsg early[3][kMaxPeers]{}; bool haveEarly[3][kMaxPeers]{};
+    // A RUN RESUMED WITHOUT ONE OF ITS PLAYERS (0.1.206). bit i: the configuration's position i is a seat of the run whose player is not in the room (its peer is kNoPeer):
+    // nothing is waited for from it, its id and slot stay in the configuration (the journal's name and certificates, the session cats' seats), and the absent seat's cats
+    // leave the run like any seat that drops out (catsync drop_absent_seats). The host is asked first (shortAsk); shortCfg is the configuration it would send.
+    uint8_t absent=0;
+    bool shortAsk=false, shortDecided=false, shortLoad=false;
+    CheckpointMsg shortCfg{};
+    char shortNames[200]{};
 };
 State g;
 bool g_manual=false;
@@ -107,20 +114,25 @@ uint64_t now() {
     FILETIME ft{}; GetSystemTimeAsFileTime(&ft);
     return (uint64_t(ft.dwHighDateTime)<<32)|ft.dwLowDateTime;
 }
+bool absent_at(unsigned i) { return i<8 && ((g.absent>>i)&1)!=0; }
+unsigned present_count() { unsigned n=0; for(unsigned i=0;i<g.config.count;++i) if(!absent_at(i)) ++n; return n; }
 bool all(const bool* flags) {
-    if(g.config.count<2) return false;
-    for(unsigned i=0;i<g.config.count;++i) if(!flags[i]) return false;
+    if(g.config.count<2 || present_count()<2) return false;
+    for(unsigned i=0;i<g.config.count;++i) if(!absent_at(i) && !flags[i]) return false;
     return true;
 }
+// The stand-in for an absent seat's database hash in a certificate: never 0 (a 0 hash refuses the certificate), never a real save's.
+uint64_t absent_hash(unsigned i) { return 0xA85E47A85E47ull ^ (g.config.identities[i]<<1) ^ 1; }
 int position(uint8_t peer) {
     for(unsigned i=0;i<g.config.count;++i) if(g.config.peers[i]==peer) return int(i);
     return -1;
 }
 bool membership() {   // the same members as the configuration, in any order (the order is the configuration's: net_set_seat_order)
     uint8_t ids[kMaxPeers]{};
-    if(!net_active() || net_peer_count()!=g.config.count || !net_peer_ids(ids,kMaxPeers)) return false;
+    if(!net_active() || net_peer_count()!=present_count() || !net_peer_ids(ids,kMaxPeers)) return false;
     for(unsigned i=0;i<g.config.count;++i) {
-        bool here=false; for(unsigned j=0;j<g.config.count;++j) if(ids[j]==g.config.peers[i]) here=true;
+        if(absent_at(i)) continue;                              // 0.1.206: a seat whose player is not in the room
+        bool here=false; for(unsigned j=0;j<present_count();++j) if(ids[j]==g.config.peers[i]) here=true;
         if(!here) return false;
     }
     return true;
@@ -598,19 +610,83 @@ bool configure(const CheckpointMsg& m) {
     if(g.configured) return same_config(m) && m.identity==g.config.identity;
     if(!g.selected || m.count<2 || m.count>kMaxPeers || m.peers[0]!=kHostPeer) return false;
     g.pos=255;
+    uint8_t absent=0; unsigned present=0;
     for(unsigned i=0;i<m.count;++i) {
         if(!m.identities[i] || m.slots[i]>31) return false;
-        for(unsigned j=0;j<i;++j) if(m.identities[i]==m.identities[j] || m.peers[i]==m.peers[j]) return false;   // seat order, not ascending ids (proto 86)
+        for(unsigned j=0;j<i;++j)
+            if(m.identities[i]==m.identities[j] || (m.peers[i]!=kNoPeer && m.peers[i]==m.peers[j])) return false;   // seat order, not ascending ids (proto 86)
+        if(m.peers[i]==kNoPeer) { absent|=(uint8_t)(1u<<i); continue; }   // 0.1.206: a seat of the run whose player is not in the room
+        ++present;
         if(m.peers[i]==net_self()) g.pos=(uint8_t)i;
     }
+    if(present<2) return false;
     if(g.pos>=m.count || (m.identities[g.pos]!=g.identity && !(g.identity2 && m.identities[g.pos]==g.identity2)) || m.slots[g.pos]!=g.slot ||
        !m.identity || m.hashes[g.pos]!=g.selectionNonce || m.mode!=(g.inSession?1:0)) return false;
+    g.absent=absent;
+    if(absent) log_line_lvl(LogLevel::Warn,"CHECKPOINT","the run is resumed WITHOUT the player(s) of seat mask %#x: nothing is waited for from them, their cats leave the run",(unsigned)absent);
     g.config=m; g.configured=true;
     net_set_seat_order(m.peers,m.count);   // every position from here on is this order's (session cat ids, owner notes, this journal)
     resolve_paths();
     if(!membership()) return false;
     name_other_order();
     send_offer(); return !g.failed;
+}
+// A RUN OF MORE PLAYERS THAN ARE HERE (0.1.206, the user's rule: the host may resume it without the missing one(s), after being told). The host's own records of
+// an UNFINISHED run (its .state marker says mode 1, a confirmed save sits beside it) whose seat 0 is this host on this slot and which holds every player now in
+// the room on the slot each of them picked -- with one or more seats beyond them. `full` is the configuration that resumes it: the run's own seats, ids and slots
+// (so every player finds the same journal, certificates and session cat seats), the players here on their seats, the others kNoPeer.
+bool header_current(const Bytes& bytes) {
+    if(bytes.size()<44) return false;
+    Reader r(bytes.data(),(uint32_t)bytes.size()-8);
+    const uint32_t magic=r.u32v(); r.u32v(); const uint32_t compat=r.u32v(); const uint64_t build=r.u64v(); const uint64_t gpak=r.u64v();
+    return r.ok && magic==kDiskMagic && compat==kCheckpointCompatibility && build==compatibility_build && gpak==compatibility_gpak;
+}
+bool find_short_run(const CheckpointMsg& here,CheckpointMsg& full,char* names,size_t cap) {
+    const uint64_t mine[2]={ g.identity, g.identity2 };
+    for(int rr=0;rr<2;++rr) {
+        if(!mine[rr] || (rr==1 && mine[1]==mine[0])) continue;
+        if(g.hroot.empty() && (rr || g.root.empty())) continue;
+        const std::wstring dir=g.hroot.empty() ? g.root : g.hroot+L"\\"+std::to_wstring(mine[rr]);   // no handshake folder (the tests): the records' own folder
+        WIN32_FIND_DATAW fd{};
+        HANDLE h=FindFirstFileW((dir+L"\\*.state").c_str(),&fd);
+        if(h==INVALID_HANDLE_VALUE) continue;
+        bool found=false;
+        do {
+            const std::wstring name=fd.cFileName;
+            const std::wstring key=name.substr(0,name.size()-6);
+            Bytes bytes; Entry e{};
+            if(!checkpoint_io::read(dir+L"\\"+name,bytes) || !header_current(bytes) || !parse_entry(bytes,e,false,true)) continue;
+            const CheckpointMsg& c=e.certificate;
+            if(c.mode!=1 || !c.run || c.count<=here.count || c.count>kMaxPeers) continue;
+            if(GetFileAttributesW((dir+L"\\"+key+L".0").c_str())==INVALID_FILE_ATTRIBUTES) continue;   // no confirmed save to resume
+            auto same=[](uint64_t a,uint64_t a2,uint64_t b,uint64_t b2){ return (a && (a==b || a==b2)) || (a2 && (a2==b || a2==b2)); };
+            if(!same(c.identities[0],c.identities2[0],here.identities[0],here.identities2[0]) || c.slots[0]!=here.slots[0]) continue;
+            CheckpointMsg m=c; m.kind=kCheckpointConfig; m.identity=here.identity; m.mode=here.mode;
+            for(auto& x:m.candidates) x={};
+            m.run=0; m.seq=0; m.stamp=0; m.map=0; m.token=0;
+            bool used[kMaxPeers]{}; bool ok=true;
+            for(unsigned i=0;i<c.count;++i) { m.peers[i]=kNoPeer; m.hashes[i]=0; }
+            for(unsigned j=0;j<here.count && ok;++j) {
+                int at=-1;
+                for(unsigned i=0;i<c.count;++i)
+                    if(!used[i] && same(c.identities[i],c.identities2[i],here.identities[j],here.identities2[j]) && c.slots[i]==here.slots[j]) { at=(int)i; break; }
+                if(at<0 || (j==0)!=(at==0)) { ok=false; break; }
+                used[at]=true; m.peers[at]=here.peers[j]; m.hashes[at]=here.hashes[j];
+                if(!m.identities2[at]) m.identities2[at]=here.identities2[j];
+            }
+            if(!ok) continue;
+            int w=0; names[0]=0;
+            for(unsigned i=0;i<c.count;++i)
+                if(!used[i] && w>=0 && (size_t)w<cap-48) w+=_snprintf_s(names+w,cap-w,_TRUNCATE,"%sP%u (ID %llu)",w?"、":"",i+1,(unsigned long long)c.identities[i]);
+            full=m;
+            log_line_lvl(LogLevel::Warn,"CHECKPOINT","an unfinished run of %u player(s) (run %016llx, %ls) holds every player here -- %s not here; the host is asked whether to resume it without them",
+                         (unsigned)c.count,(unsigned long long)c.run,key.c_str(),names);
+            found=true;
+        } while(!found && FindNextFileW(h,&fd));
+        FindClose(h);
+        if(found) return true;
+    }
+    return false;
 }
 void configure_host() {
     if(!g.host || !g.selected || g.configured || g.failed) return;
@@ -659,6 +735,16 @@ void configure_host() {
         std::swap(m.peers[i],m.peers[j]); std::swap(m.slots[i],m.slots[j]);
         std::swap(m.identities[i],m.identities[j]); std::swap(m.identities2[i],m.identities2[j]); std::swap(m.hashes[i],m.hashes[j]);
     }
+    // 0.1.206: the host's save is on the map and its records hold this run with more players than are here -- asked first (checkpoint_short_question).
+    if(!g.inSession && g.mode==1 && !g.shortDecided) {
+        CheckpointMsg full{};
+        if(find_short_run(m,full,g.shortNames,sizeof(g.shortNames))) { g.shortCfg=full; g.shortAsk=true; status("the host is asked whether to resume the run without the missing player(s)"); return; }
+    }
+    if(g.shortDecided && g.shortLoad) {
+        CheckpointMsg full{};
+        if(!find_short_run(m,full,g.shortNames,sizeof(g.shortNames))) { fail("recovery refused: the run with the missing player(s) is no longer found"); return; }
+        m=full;
+    }
     if(!net_send_checkpoint(m) || !configure(m)) fail("recovery refused: invalid participants or slot configuration");
 }
 // Every confirmed save that ALL participants hold, newest first: by creation time, then by number (after a restore two saves of a run can share a number).
@@ -670,6 +756,7 @@ unsigned common_saves(CheckpointRef* out) {
         if(dup) continue;
         bool common=true;
         for(unsigned i=0;i<g.config.count;++i) {
+            if(absent_at(i)) continue;               // 0.1.206: an absent seat offers nothing and is not asked
             auto& o=g.offers[i];
             if(o.mode==3 || o.mode==4 || (o.run && o.run!=candidate.run) || !has_ref(o,candidate)) common=false;
         }
@@ -689,6 +776,7 @@ unsigned common_saves(CheckpointRef* out) {
 void note_refusal() {
     uint8_t holders=0; bool noRecord=false, withRecord=false;
     for(unsigned i=0;i<g.config.count;++i) {
+        if(absent_at(i)) continue;
         const auto& m=g.offers[i];
         unsigned snaps=0; for(const auto& c:m.candidates) if(c.run) ++snaps;
         log_line("CHECKPOINT","offer of player %u (peer %u): mode %u, run %016llx, %u snapshot(s)%s",i+1,(unsigned)g.config.peers[i],(unsigned)m.mode,
@@ -705,6 +793,7 @@ void choose() {
     if(!g.host || !all(g.haveOffer) || g.failed || g.tx.kind==kCheckpointSelect) return;
     bool fresh=true;
     for(unsigned i=0;i<g.config.count;++i) {
+        if(absent_at(i)) continue;
         const auto& m=g.offers[i];
         if(m.mode==2) { fail("recovery refused: a participant chose play alone"); return; }
         if(m.mode==1 || m.mode==4 || has_candidate(m)) fresh=false;
@@ -716,7 +805,7 @@ void choose() {
         // never silently walk away from.
         if(g.choosing || g.invalid) return;
         bool running=false;
-        for(unsigned i=0;i<g.config.count;++i) if(g.offers[i].mode==1 || g.offers[i].mode==4) running=true;
+        for(unsigned i=0;i<g.config.count;++i) if(!absent_at(i) && (g.offers[i].mode==1 || g.offers[i].mode==4)) running=true;
         g.listN=nc; for(unsigned i=0;i<nc;++i) g.list[i]=common[i];
         g.listPrep=!running;
         if(!nc && !g.listPrep) {
@@ -862,7 +951,7 @@ void prepare() {
     // ITS map did not change between its arrival and its capture (checkpoint_on_map).
     uint64_t map=g.arrivals[0].map;
     if(!map) { fail("checkpoint refused: the host's map is unreadable"); return; }
-    for(unsigned i=1;i<g.config.count;++i) if(g.arrivals[i].map!=map) {
+    for(unsigned i=1;i<g.config.count;++i) if(!absent_at(i) && g.arrivals[i].map!=map) {
         log_line("CHECKPOINT","map %016llx on peer slot %u differs from the host's %016llx -- continuing",
                      (unsigned long long)g.arrivals[i].map,i,(unsigned long long)map);
     }
@@ -875,7 +964,9 @@ void prepare() {
 }
 void commit_if_ready() {
     if(!g.host || !all(g.ack) || g.committed || g.failed) return;
-    CheckpointMsg m=g.tx; m.kind=kCheckpointCommit; m.token=certificate_hash(m);
+    CheckpointMsg m=g.tx; m.kind=kCheckpointCommit;
+    for(unsigned i=0;i<m.count;++i) if(absent_at(i)) m.hashes[i]=absent_hash(i);   // 0.1.206: an absent seat stages nothing; its stand-in keeps the certificate whole
+    m.token=certificate_hash(m);
     // The certificate proves every frozen participant durably staged its OWN
     // database at this boundary. Never reduce this set when a link disappears.
     if(!membership()) { fail("checkpoint held: session membership changed"); return; }
@@ -1306,6 +1397,22 @@ bool checkpoint_import_notes_file(const std::wstring& path) {
     if(e.owner_count) lockstep_owner_note_import(e.owners,e.owner_count);
     if(e.origin_count) catsync_origin_import(e.origins,e.origin_count);
     log_line("CHECKPOINT","backup page restore: %u owner note(s) and %u clone-origin note(s) taken from the handshake save",e.owner_count,e.origin_count);
+    {   // 0.1.226: THIS PLAYER'S SEAT in that run -- the certificate's identities are in seat order (proto 86); this machine is its Steam id or its install fingerprint
+        wchar_t dir[MAX_PATH]{}; uint64_t fp=0, steam=0;
+        if(savefile_save_dir(dir,MAX_PATH)) {
+            const std::wstring root=std::wstring(dir)+L"\\mgmp_handshake";
+            checkpoint_io::identity(fp,root.c_str(),nullptr);
+            steam=checkpoint_io::steam_id_from_dir(dir);
+        }
+        const CheckpointMsg& c=e.certificate;
+        int seat=-1, hits=0;
+        for(unsigned i=0;i<c.count && i<kMaxPeers;++i) {
+            const uint64_t a=c.identities[i], b=c.identities2[i];
+            if((a && (a==fp || a==steam)) || (b && (b==fp || b==steam))) { seat=(int)i; ++hits; }
+        }
+        if(hits==1) catsync_restored_seat((uint8_t)seat,c.run);
+        else log_line_lvl(LogLevel::Warn,"CHECKPOINT","backup page restore: this player's seat in the run is not read off the certificate (%d seat(s) carry this machine's ids, %u seat(s) in it)",hits,(unsigned)c.count);
+    }
     return true;
 }
 // One file of the live handshake folder that is about to be removed by someone else (a backup load puts its own queue in its place): a save goes to the archive, anything else is deleted.
@@ -1454,6 +1561,19 @@ bool checkpoint_host_pick(int index) {
 }
 
 void checkpoint_sync_dismiss() { g.dismissed=true; }
+
+bool checkpoint_short_question(char* names,size_t cap) {
+    if(!g.on || !g.host || !g.shortAsk || g.shortDecided || g.failed || g.configured) return false;
+    if(names && cap) strncpy_s(names,cap,g.shortNames,_TRUNCATE);
+    return true;
+}
+
+void checkpoint_short_answer(bool load) {
+    if(!g.shortAsk || g.shortDecided) return;
+    g.shortAsk=false; g.shortDecided=true; g.shortLoad=load;
+    log_line_lvl(LogLevel::Warn,"CHECKPOINT","the host %s the run without %s",load?"RESUMES":"does NOT resume",g.shortNames);
+    configure_host();
+}
 
 void checkpoint_tick() {
     if(!g.on || !g.host || !g_manual || g.inSession) return;

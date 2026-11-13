@@ -156,10 +156,27 @@ UcatFrame g_ucat_kept[kUcatKeep];
 uint32_t g_ucat_kept_next = 0;
 UcatFrame g_ucat_box[kUcatBox];
 uint32_t g_ucat_box_next = 0;
+// CLIENT: the host's ground maps (proto 116, mgmp_tilesync), raw payloads, one per boundary
+constexpr uint32_t kTilesBox = 8;
+struct TilesBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+TilesBox g_tiles_box[kTilesBox];
+uint32_t g_tiles_box_next = 0;
 constexpr uint32_t kUsBox = 128;
 struct UstateBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t index = 0; uint8_t* data = nullptr; uint32_t len = 0; };
 UstateBox g_us_box[kUsBox];
 uint32_t g_us_box_next = 0;
+// CLIENT: the host's per-action checks (proto 117, MSG_ACTCHECK), raw payloads by battle/turn/action
+constexpr uint32_t kActBox = 48;
+struct ActBox { uint64_t battle = 0; uint32_t turn = 0, action = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+ActBox g_act_box[kActBox];
+uint32_t g_act_box_next = 0;
+// CLIENT (0.1.213): the host's last turn hashes (net_host_hash), guarded by g.cs
+constexpr uint32_t kHashRing = 16;
+HashMsg g_hash_ring[kHashRing];
+uint32_t g_hash_next = 0;
+// HOST (0.1.213): the clients whose link is slow (net_set_slow_peer, from the round trips mgmp_perf measures). Each boundary's full board is streamed to them and the
+// records of the units that changed since the last boundary are pushed -- what they would otherwise ask for and wait a round trip or two to get. Guarded by g.cs.
+bool g_slow_peer[kMaxPeers] = {};
 uint32_t g_roll_next = 0;
 
 // A FULL QUEUE (0.1.182). The game thread drains it once a frame; while it is stalled (a save load, a scene change: seconds) a voice frame comes ~24 times a second
@@ -209,6 +226,8 @@ void queue_push(const NetMsg& m) {
     if (m.type == MSG_UNLOCKS && m.unlocks.extra_events >= 0) g_level_box.extra_events = m.unlocks.extra_events;           // proto 112
     if (m.type == MSG_UNLOCKS && m.unlocks.event_difficulty >= 0) g_level_box.event_difficulty = m.unlocks.event_difficulty;
     if (m.type == MSG_ROLL) g_roll_ring[g_roll_next++ % kRollRing] = m.roll;
+    // 0.1.213: the host's turn hashes, kept beside the queue -- a client's resync at a boundary waits for the host's hash of that turn without pumping the queue
+    if (m.type == MSG_HASH && g.role == NetRole::Client && m.from == kHostPeer) g_hash_ring[g_hash_next++ % kHashRing] = m.hash;
     if (m.type == MSG_BOARD) {
         const BoardMsg& b = m.board;
         BoardAssembled* box = nullptr;
@@ -547,6 +566,36 @@ void client_store_ucat(const uint8_t* payload, uint32_t plen) {
     slot = f;
     LeaveCriticalSection(&g.cs);
 }
+void client_store_tiles(const uint8_t* payload, uint32_t plen) {
+    if (!g.cs_ready || plen < 1 + 8 + 4 || plen > kSendTiles) return;
+    TilesBox b{};
+    memcpy(&b.battle, payload + 1, 8); memcpy(&b.turn, payload + 9, 4);
+    b.data = (uint8_t*)malloc(plen);
+    if (!b.data) return;
+    memcpy(b.data, payload, plen); b.len = plen;
+    EnterCriticalSection(&g.cs);
+    TilesBox* slot = nullptr;
+    for (uint32_t k = 0; k < kTilesBox && !slot; ++k) if (g_tiles_box[k].battle == b.battle && g_tiles_box[k].turn == b.turn) slot = &g_tiles_box[k];
+    if (!slot) slot = &g_tiles_box[g_tiles_box_next++ % kTilesBox];
+    free(slot->data);
+    *slot = b;
+    LeaveCriticalSection(&g.cs);
+}
+void client_store_actcheck(const uint8_t* payload, uint32_t plen) {
+    if (!g.cs_ready || plen < 1 + 8 + 4 + 4 + 1 || plen > kSendActCheck) return;
+    ActBox b{};
+    memcpy(&b.battle, payload + 1, 8); memcpy(&b.turn, payload + 9, 4); memcpy(&b.action, payload + 13, 4);
+    b.data = (uint8_t*)malloc(plen);
+    if (!b.data) return;
+    memcpy(b.data, payload, plen); b.len = plen;
+    EnterCriticalSection(&g.cs);
+    ActBox* slot = nullptr;
+    for (uint32_t k = 0; k < kActBox && !slot; ++k) if (g_act_box[k].data && g_act_box[k].battle == b.battle && g_act_box[k].turn == b.turn && g_act_box[k].action == b.action) slot = &g_act_box[k];
+    if (!slot) slot = &g_act_box[g_act_box_next++ % kActBox];
+    free(slot->data);
+    *slot = b;
+    LeaveCriticalSection(&g.cs);
+}
 void client_store_ustate(const uint8_t* payload, uint32_t plen) {
     if (!g.cs_ready || plen < 1 + 8 + 4 + 1) return;
     UstateBox b{};
@@ -756,6 +805,10 @@ void recv_loop(Link& link) {
         // proto 115: a unit's cat data, asked for and answered the same way
         if (payload[0] == MSG_UCATREQ)   { if (g.role == NetRole::Host) host_answer_ucatreq(link, payload, plen); continue; }
         if (payload[0] == MSG_UCAT)      { if (g.role != NetRole::Host) client_store_ucat(payload, plen); continue; }
+        // proto 116: the host's ground map of a boundary, a mailbox like the unit records
+        if (payload[0] == MSG_TILES)     { if (g.role != NetRole::Host) client_store_tiles(payload, plen); continue; }
+        // proto 117: the host's per-action check, a mailbox too
+        if (payload[0] == MSG_ACTCHECK)  { if (g.role != NetRole::Host) client_store_actcheck(payload, plen); continue; }
 
         NetMsg m{};
         if (!decode_into(payload, plen, m)) {
@@ -1133,6 +1186,9 @@ void net_relay_stop() { InterlockedIncrement(&g_rl_gen); }
 HANDLE  g_dial_thread = nullptr;
 volatile LONG g_dial_seq = 0;
 volatile LONG g_dial_err = 0;
+volatile LONG g_dial_steam_failed = 0;   // 0.1.193: see net_dial_steam_failed
+volatile LONG g_dial_steam_tries = 0;    // 0.1.219: Steam calls of this dial that failed (net_dial_steam_status)
+volatile LONG g_dial_steam_back  = 0;    // 0.1.219: the dial waits for the host's call-back
 
 // One address: a non-blocking connect that is waited for in 100 ms slices (so a shutdown is noticed). 0 = connected, else a WSA error.
 int dial_one(const char* addr, uint16_t port, SOCKET& out) {
@@ -1174,6 +1230,9 @@ int dial_one(const char* addr, uint16_t port, SOCKET& out) {
 
 DWORD WINAPI dial_thread(LPVOID) {
     int last = WSAETIMEDOUT;
+    InterlockedExchange(&g_dial_steam_failed, 0);
+    InterlockedExchange(&g_dial_steam_tries, 0);
+    InterlockedExchange(&g_dial_steam_back, 0);
     for (int i = 0; i < g_dial.n && !InterlockedCompareExchange(&g.stop, 0, 0); ++i) {
         log_line("NET", "connecting to %s:%u (%d of %d)", g_dial.cands[i], (unsigned)g_dial.port, i + 1, g_dial.n);
         SOCKET s = INVALID_SOCKET;
@@ -1190,6 +1249,7 @@ DWORD WINAPI dial_thread(LPVOID) {
                     for (int w = 0; w < 30 && !InterlockedCompareExchange(&g.stop, 0, 0); ++w) Sleep(50);
                 }
                 s = steam_bridge_dial(strtoull(g_dial.cands[i] + 6, nullptr, 10), kSteamDialMs, &g.stop, &why);
+                if (s == INVALID_SOCKET) InterlockedIncrement(&g_dial_steam_tries);
                 if (s != INVALID_SOCKET || why == 1 || why == 2 || InterlockedCompareExchange(&g.stop, 0, 0)) break;
             }
             if (s == INVALID_SOCKET && why == 3 && g_steam_reverse && !InterlockedCompareExchange(&g.stop, 0, 0)) {
@@ -1202,7 +1262,10 @@ DWORD WINAPI dial_thread(LPVOID) {
                 if (steam_bridge_rev_arm()) {
                     if (g_steam_reverse(host_id)) {
                         int rw = 0;
+                        InterlockedExchange(&g_dial_steam_back, 1);
                         s = steam_bridge_rev_wait(kSteamRevMs, &g.stop, &rw);
+                        InterlockedExchange(&g_dial_steam_back, 0);
+                        if (s == INVALID_SOCKET) InterlockedIncrement(&g_dial_steam_tries);
                         log_line("NET", s != INVALID_SOCKET ? "the host's call came through" : "!! the host did not call back in time (%d)", rw);
                         if (s == INVALID_SOCKET) why = rw == 2 ? 2 : 3;
                     } else {
@@ -1212,6 +1275,7 @@ DWORD WINAPI dial_thread(LPVOID) {
                 }
             }
             e = s != INVALID_SOCKET ? 0 : (why == 2 ? WSAETIMEDOUT : WSAECONNREFUSED);
+            if (s == INVALID_SOCKET) InterlockedExchange(&g_dial_steam_failed, 1);
         } else if (!strncmp(g_dial.cands[i], "relay:", 6)) {
             // The same TCP link, carried by the lobby server (the host chose "server relay"): the socket the server hands over IS the game socket.
             int why = 0;
@@ -1288,6 +1352,11 @@ bool net_join(const char* addr, uint16_t port) {
 }
 
 uint32_t net_dial_seq() { return (uint32_t)InterlockedCompareExchange(&g_dial_seq, 0, 0); }
+bool net_dial_steam_failed() { return InterlockedCompareExchange(&g_dial_steam_failed, 0, 0) != 0; }
+void net_dial_steam_status(uint32_t* failures, bool* calling_back) {
+    if (failures) *failures = (uint32_t)InterlockedCompareExchange(&g_dial_steam_tries, 0, 0);
+    if (calling_back) *calling_back = InterlockedCompareExchange(&g_dial_steam_back, 0, 0) != 0;
+}
 int      net_dial_error() { return (int)InterlockedCompareExchange(&g_dial_err, 0, 0); }
 
 // The transport learns our own id from the same PEERS message the session layer
@@ -1459,6 +1528,7 @@ void net_shutdown() {
     g.self = kNoPeer;
     g.roster_valid = false;
     g.seat_count = 0;
+    for (uint32_t p = 0; p < kMaxPeers; ++p) g_slow_peer[p] = false;      // 0.1.213: the next room's peer with this id is measured afresh
     set_state(NetState::Idle);
 }
 
@@ -1620,10 +1690,16 @@ void net_clear_battle_caches() {
     g_sum_next = 0;
     for (uint32_t k = 0; k < kTqRing; ++k) g_tq_ring[k] = TurnQueueMsg{};
     g_tq_next = 0;
+    for (uint32_t k = 0; k < kTilesBox; ++k) { free(g_tiles_box[k].data); g_tiles_box[k] = TilesBox{}; }
+    g_tiles_box_next = 0;
     g_board_latest_battle = 0; g_board_latest_turn = 0;
     for (uint32_t k = 0; k < kBoardKeep; ++k) { free(g_kept[k].data); g_kept[k] = KeptBoard{}; }
     g_kept_next = 0;
     for (uint32_t p = 0; p < kMaxPeers; ++p) g_board_stream[p] = 0;
+    for (uint32_t k = 0; k < kActBox; ++k) { free(g_act_box[k].data); g_act_box[k] = ActBox{}; }      // 0.1.213
+    g_act_box_next = 0;
+    for (uint32_t k = 0; k < kHashRing; ++k) g_hash_ring[k] = HashMsg{};      // a battle entered again keeps its id: the last entry's turn hashes must not answer a resync
+    g_hash_next = 0;
     for (uint32_t k = 0; k < kUcatBox; ++k) { free(g_ucat_box[k].data); g_ucat_box[k] = UcatFrame{}; }      // a battle entered again keeps its id: an old fight's cat must not be taken
     g_ucat_box_next = 0;
     for (uint32_t k = 0; k < kUcatKeep; ++k) { free(g_ucat_kept[k].data); g_ucat_kept[k] = UcatFrame{}; }
@@ -1661,7 +1737,7 @@ uint32_t net_board_publish(const BoardMsg* chunks, uint32_t n, const BoardSumMsg
     if (!slot) slot = &g_kept[g_kept_next++ % kBoardKeep];
     free(slot->data);
     slot->battle = battle; slot->turn = turn; slot->data = data; slot->len = len;
-    for (uint32_t p = 0; p < kMaxPeers; ++p) stream[p] = g_board_stream[p] == battle;
+    for (uint32_t p = 0; p < kMaxPeers; ++p) stream[p] = g_board_stream[p] == battle || g_slow_peer[p];     // 0.1.213: a slow link gets every board whole, unasked
     // the copy sent below is taken under the lock: a request answered on a receive thread may replace the slot meanwhile
     uint8_t* mine = (uint8_t*)malloc(len ? len : 1);
     if (mine) memcpy(mine, data, len);
@@ -1716,8 +1792,83 @@ void net_ustate_publish(uint64_t battle, uint32_t turn, uint8_t* const* blobs, c
     for (uint32_t i = 0; i < kBoardMax; ++i) { free(s->blob[i]); s->blob[i] = nullptr; s->len[i] = 0; }
     s->battle = battle; s->turn = turn;
     for (uint32_t i = 0; i < n && i < kBoardMax; ++i) { s->blob[i] = blobs[i]; s->len[i] = lens[i]; }
+    // 0.1.213: A SLOW LINK IS SENT WHAT CHANGED, UNASKED. The records of the previous boundary are kept beside these; a unit whose record differs from it (past the
+    // 14-byte header: type, battle, turn, index) went through something this turn, and a client whose link is slow gets it now -- its repair finds it in its mailbox
+    // instead of asking and waiting (room DBJ3, 11-08: the records came after 3 s and were too late). Copies taken under the lock, sent after it.
+    bool any_slow = false;
+    for (uint32_t p = 0; p < kMaxPeers; ++p) any_slow = any_slow || g_slow_peer[p];
+    const KeptUstate* prev = nullptr;
+    if (any_slow && turn > 0)
+        for (uint32_t k = 0; k < kUsKeep && !prev; ++k) if (&g_us_kept[k] != s && g_us_kept[k].battle == battle && g_us_kept[k].turn + 1 == turn) prev = &g_us_kept[k];
+    uint8_t* push[kBoardMax] = {}; uint32_t push_len[kBoardMax] = {}; uint32_t npush = 0;
+    if (any_slow)
+        for (uint32_t i = 0; i < n && i < kBoardMax; ++i) {
+            if (!s->blob[i] || s->len[i] <= 14) continue;
+            const bool same = prev && prev->blob[i] && prev->len[i] == s->len[i] && memcmp(prev->blob[i] + 14, s->blob[i] + 14, s->len[i] - 14) == 0;
+            if (same) continue;
+            push[npush] = (uint8_t*)malloc(s->len[i]);
+            if (push[npush]) { memcpy(push[npush], s->blob[i], s->len[i]); push_len[npush] = s->len[i]; ++npush; }
+        }
+    bool slow[kMaxPeers] = {};
+    for (uint32_t p = 0; p < kMaxPeers; ++p) slow[p] = g_slow_peer[p];
     LeaveCriticalSection(&g.cs);
     for (uint32_t i = kBoardMax; i < n; ++i) free(blobs[i]);
+    if (npush) {
+        uint32_t reached = 0;
+        for (int li = 0; li < kMaxPeers; ++li) {
+            Link& l = g.links[li];
+            if (!InterlockedCompareExchange(&l.live, 0, 0) || l.id >= kMaxPeers || !slow[l.id]) continue;
+            for (uint32_t k = 0; k < npush; ++k) link_send(l, kHostPeer, push[k], push_len[k]);
+            ++reached;
+        }
+        static uint32_t said = 0;
+        if (reached && said < 40) { ++said; log_line("USYNC", "-> turn %u: %u unit record(s) that changed this turn pushed to %u slow client(s), unasked", (unsigned)turn, npush, reached); }
+        for (uint32_t k = 0; k < npush; ++k) free(push[k]);
+    }
+}
+void net_set_slow_peer(uint8_t peer, bool slow) {
+    if (!g.cs_ready || peer >= kMaxPeers) return;
+    EnterCriticalSection(&g.cs);
+    const bool was = g_slow_peer[peer];
+    g_slow_peer[peer] = slow;
+    LeaveCriticalSection(&g.cs);
+    if (was != slow) log_line("BOARD", "%s peer %u: %s", slow ? "!!" : "", (unsigned)peer,
+                              slow ? "its link is slow -- every boundary's full board and the changed unit records go to it unasked" : "its link is quick again -- boards and records go to it when it asks");
+}
+bool net_slow_peer(uint8_t peer) {
+    if (!g.cs_ready || peer >= kMaxPeers) return false;
+    EnterCriticalSection(&g.cs);
+    const bool s = g_slow_peer[peer];
+    LeaveCriticalSection(&g.cs);
+    return s;
+}
+bool net_send_actcheck(const ActCheckMsg& m) {
+    if (g.role != NetRole::Host) return false;
+    uint8_t p[kSendActCheck];
+    const uint32_t n = enc_actcheck(p, sizeof(p), m);
+    return n && net_send(p, n);
+}
+bool net_host_hash(uint64_t battle, uint32_t turn, HashMsg& out) {
+    if (!g.cs_ready || !battle) return false;
+    bool ok = false;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kHashRing; ++k) {                      // oldest to newest: the newest of a turn wins (a resynced client may be sent a second one)
+        const HashMsg& h = g_hash_ring[(g_hash_next + k) % kHashRing];
+        if (h.battle_id == battle && h.turn == turn) { out = h; ok = true; }
+    }
+    LeaveCriticalSection(&g.cs);
+    return ok;
+}
+bool net_host_actcheck(uint64_t battle, uint32_t turn, uint32_t action, ActCheckMsg& out) {
+    if (!g.cs_ready || !battle) return false;
+    uint8_t buf[kSendActCheck]; uint32_t len = 0;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kActBox && !len; ++k) {
+        const ActBox& b = g_act_box[k];
+        if (b.data && b.battle == battle && b.turn == turn && b.action == action && b.len <= sizeof(buf)) { memcpy(buf, b.data, b.len); len = b.len; }
+    }
+    LeaveCriticalSection(&g.cs);
+    return len && dec_actcheck(buf, len, out);
 }
 bool net_ucat_keep(uint64_t battle, uint8_t index, int32_t key, uint64_t save_id, const uint8_t* image, uint32_t size, uint64_t hash) {
     if (!g.cs_ready || g.role != NetRole::Host || !image || !size) return false;
@@ -1736,6 +1887,23 @@ bool net_ucat_keep(uint64_t battle, uint8_t index, int32_t key, uint64_t save_id
     f->battle = battle; f->index = index; f->key = key; f->data = p; f->len = n;
     LeaveCriticalSection(&g.cs);
     return true;
+}
+bool net_send_tiles(const TilesMsg& m) {
+    if (g.role != NetRole::Host) return false;
+    static uint8_t p[kSendTiles];
+    const uint32_t n = enc_tiles(p, sizeof(p), m);
+    return n && net_send(p, n);
+}
+uint32_t net_host_tiles(uint64_t battle, uint32_t turn, uint8_t* out, uint32_t cap) {
+    if (!g.cs_ready || !battle || !out) return 0;
+    uint32_t got = 0;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kTilesBox && !got; ++k) {
+        const TilesBox& b = g_tiles_box[k];
+        if (b.data && b.battle == battle && b.turn == turn && b.len <= cap) { memcpy(out, b.data, b.len); got = b.len; }
+    }
+    LeaveCriticalSection(&g.cs);
+    return got;
 }
 bool net_send_ucatreq(const UcatReqMsg& m) { uint8_t p[32]; const uint32_t n = enc_ucatreq(p, sizeof(p), m); return n && net_send(p, n); }
 uint32_t net_host_ucat(uint64_t battle, uint8_t index, int32_t key, uint8_t* out, uint32_t cap) {

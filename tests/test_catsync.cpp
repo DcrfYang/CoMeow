@@ -706,6 +706,18 @@ void clones_without_an_original_and_the_id_counter() {
     // a leftover of an older build that is itself settled and has no original is simply the cat it is
     { void* lone = allocate(0xC58); put(lone, kCatData_SaveId, uint64_t(0x71000009ull)); put(lone, 0, uint64_t(31337)); put(lone, kCatData_Flags, uint64_t(kHome)); entries[0x71000009ull].cat = lone; }
     CHECK(catsync_merge_session_cats("t") == 0 && flags_of(0x71000009ull) == kHome);
+
+    // 0.1.209 (ll's 八云紫): a leftover of an older build still out on adventure whose ordinary original is AT HOME is a stale copy -- retired at the settlement, never
+    // before it (a merge outside the settlement leaves it), and never when the ordinary original is away or missing (then it may be the cat's only carrier).
+    { void* home = allocate(0xC58); put(home, kCatData_SaveId, uint64_t(0x3d)); put(home, 0, uint64_t(0xae3b22b6)); put(home, kCatData_Flags, uint64_t(kHome)); entries[0x3d].cat = home;
+      void* stale = allocate(0xC58); put(stale, kCatData_SaveId, uint64_t(0x71000011ull)); put(stale, 0, uint64_t(0xae3b22b6)); put(stale, kCatData_Flags, uint64_t(kHome | 0x80000)); entries[0x71000011ull].cat = stale;
+      void* sole = allocate(0xC58); put(sole, kCatData_SaveId, uint64_t(0x71000012ull)); put(sole, 0, uint64_t(0x5eed)); put(sole, kCatData_Flags, uint64_t(kHome | 0x80000)); entries[0x71000012ull].cat = sole; }
+    sync_list();
+    catsync_merge_session_cats("not the settlement");
+    CHECK(flags_of(0x71000011ull) == (kHome | 0x80000));                // outside the settlement: untouched
+    catsync_merge_session_cats("settlement", true);
+    CHECK(flags_of(0x71000011ull) == 0 && flags_of(0x3d) == kHome);   // the stale copy is retired, the cat at home stays as it is
+    CHECK(flags_of(0x71000012ull) == (kHome | 0x80000));                // no ordinary cat with its seed: kept
     entries.clear(); peer_position = 0; catsync_forget();
 }
 
@@ -750,6 +762,70 @@ void the_fallback_filter_takes_out_only_other_players_cats() {
     put(director, kDir_MirrorData, (const uint64_t*)party); put(director, kDir_MirrorCount, uint32_t(0));
     put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
     peer_count = 2;
+}
+
+// 0.1.212 (CHINAMI 11-08): the game emptied the host's familiar list at the end of a fight (an item-linked familiar's collar came off) and the clients' cats were in
+// no list any more. At the next publish after a fight the living ones go back; a dead one, one of a player who left, or a loss after an event node stays out.
+void the_host_puts_lost_client_cats_back_after_a_fight() {
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : {0x71000001ull, 0x71000002ull, 0x72000001ull}) {
+        void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, 0, id * 7); put(c, kCatData_Flags, uint64_t(kHome)); entries[id].cat = c;
+    }
+    sync_list();
+    static uint64_t lst[1] = {0x70000001ull}, fam[8] = {0x71000001ull, 0x71000002ull, 0x72000001ull};
+    { void* h = allocate(0xC58); put(h, kCatData_SaveId, uint64_t(0x70000001ull)); put(h, kCatData_Flags, uint64_t(kHome)); entries[0x70000001ull].cat = h; sync_list(); }
+    put(director, kDir_CatIdCount, uint32_t(1)); put(director, kDir_CatIdCap, uint32_t(1)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_CatFamiliars, uint32_t(8)); put(director, kDir_CatFamiliars + 4, uint32_t(3)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    CHECK(catsync_host_keep_familiars("t", false) == 0);                                  // the reference: three client cats
+    put(director, kDir_CatFamiliars + 4, uint32_t(0));                                    // the fight emptied the list
+    CHECK(catsync_host_keep_familiars("after an event", false) == 0);                     // not after a fight: left as it is
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);
+    put(director, kDir_CatFamiliars + 4, uint32_t(3));
+    CHECK(catsync_host_keep_familiars("t", false) == 0);                                  // the reference again
+    put(director, kDir_CatFamiliars + 4, uint32_t(0));
+    put(entries[0x71000002ull].cat, kCatData_Flags, uint64_t(0x13));                       // this one died in the fight
+    absent_seats = 1u << 2;                                                               // and seat 2's player left
+    CHECK(catsync_host_keep_familiars("after a fight", true) == 1);
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 1 && fam[0] == 0x71000001ull);
+    absent_seats = 0;
+    catsync_forget();
+    put(director, kDir_CatIdData, (const uint64_t*)party); put(director, kDir_CatIdCount, uint32_t(4));
+    put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
+    entries.clear();
+}
+
+// 0.1.213 (proto 117): a client's report that the host's lists lost one of its living cats -- taken back only for the sender's own seat, a registered living cat,
+// and not twice.
+void the_host_takes_back_a_cat_its_owner_reports() {
+    entries.clear(); peer_position = 0; peer_count = 3; initialize();
+    std::strcpy(cfg.net_role, "host"); catsync_init();
+    for (uint64_t id : {0x71000001ull, 0x71000002ull, 0x72000001ull}) {
+        void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, 0, id * 3); put(c, kCatData_Flags, uint64_t(kHome)); entries[id].cat = c;
+    }
+    put(entries[0x71000002ull].cat, kCatData_Flags, uint64_t(0x13));                       // dead
+    { void* h = allocate(0xC58); put(h, kCatData_SaveId, uint64_t(0x70000001ull)); put(h, kCatData_Flags, uint64_t(kHome)); entries[0x70000001ull].cat = h; }
+    sync_list();
+    static uint64_t lst[1] = {0x70000001ull}, fam[8] = {};
+    put(director, kDir_CatIdCount, uint32_t(1)); put(director, kDir_CatIdCap, uint32_t(1)); put(director, kDir_CatIdData, (const uint64_t*)lst);
+    put(director, kDir_CatFamiliars, uint32_t(8)); put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)fam);
+    catsync_host_listfix(2, 0x71000001ull);                                               // seat 1 is peer 1, not peer 2: refused
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);
+    catsync_host_listfix(1, 0x71000002ull);                                               // dead: refused
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);
+    catsync_host_listfix(1, 0x71000001ull);                                               // its owner, alive: queued, not written under an open map
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 0);
+    catsync_host_listfix(1, 0x71000001ull);                                               // reported twice: queued once
+    catsync_host_keep_familiars("entering a node", false);                                // the next publish takes it back (after an event too)
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 1 && fam[0] == 0x71000001ull);
+    catsync_host_listfix(1, 0x71000001ull);                                               // listed already: nothing queued
+    catsync_host_listfix(2, 0x72000001ull);                                               // seat 2 is peer 2
+    catsync_host_keep_familiars("entering a node", false);
+    CHECK(get<uint32_t>(director, kDir_CatFamiliars + 4) == 2 && fam[1] == 0x72000001ull);
+    catsync_forget();
+    put(director, kDir_CatIdData, (const uint64_t*)party); put(director, kDir_CatIdCount, uint32_t(4));
+    put(director, kDir_CatFamiliars + 4, uint32_t(0)); put(director, kDir_CatFamiliars + 8, (const uint64_t*)nullptr);
+    peer_count = 2; entries.clear();
 }
 
 // 0.1.131, THE CLASS COMPLETION CHECK: a client's party list is the room's shared layout (the host's cats) when the game checks the classes of a beaten boss; for the
@@ -1292,6 +1368,30 @@ void a_dead_squatter_does_not_take_a_new_cats_house_entity() {
 
 // NOT EVERY LIVING CAT HAS A HOUSE ENTITY (0.1.86, DESKTOP-RNOL7FR 2026-10-24: two cats, flags 1003, sat on 70000001/2 with no entity; moved, they were
 // reported as two lost cats). A squatter the House names is renamed in it; one the House does not name is not expected there -- no notice.
+// Dcrf 48PG 11-11 (0.1.223): a "before setup" note 71000003 -> 446 (no House up) and this run's settlement note 71000003 -> 720002a6; the House holds ONE entity
+// 71000003 and the Warrior 446 its own. The stale note must not win: 446 stays once, the Druid gets the entity.
+void a_stale_note_does_not_take_a_new_runs_entity() {
+    entries.clear(); peer_position = 0; peer_count = 2; initialize();
+    std::strcpy(cfg.net_role, "client"); catsync_init();
+    catsync_drop_swap_notes("t");
+    auto make = [](uint64_t id, uint64_t seed, uint64_t flags) {
+        void* c = allocate(0xC58); put(c, kCatData_SaveId, id); put(c, 0, seed); put(c, kCatData_Flags, flags); entries[id].cat = c; return c;
+    };
+    make(0x446ull, 0x4460, kHome); make(0x720002a6ull, 0x2a60, kHome); sync_list();
+    catsync_add_swap_note(0x71000003ull, 0x446ull, false);           // the stale one, from the "before setup" merge
+    catsync_add_swap_note(0x71000003ull, 0x720002a6ull, true);       // this run's
+    FakeHouse h({0x446ull, 0x71000003ull});
+    catsync_house_save(h.house);
+    CHECK(h.id(0) == 0x446ull && h.id(1) == 0x720002a6ull);
+    // the repair of a House already written that way: 446 twice, 720002a6 due and named by none
+    catsync_drop_swap_notes("t");
+    catsync_add_swap_note(0x71000009ull, 0x720002a6ull, true);       // makes 720002a6 due; no entity carries 71000009
+    FakeHouse twice({0x446ull, 0x446ull});
+    catsync_house_save(twice.house);
+    CHECK((twice.id(0) == 0x446ull && twice.id(1) == 0x720002a6ull) || (twice.id(1) == 0x446ull && twice.id(0) == 0x720002a6ull));
+    catsync_drop_swap_notes("t");
+}
+
 void a_squatter_without_a_house_entity_is_not_lost() {
     entries.clear(); peer_position = 0; peer_count = 2; initialize();
     std::strcpy(cfg.net_role, "host"); catsync_init();
@@ -1746,6 +1846,7 @@ bool net_send_catdata_to(uint8_t peer, const CatDataMsg& m) {
     return true;
 }
 bool net_send_catdigest(const CatDigestMsg& m) { digests.push_back(m); return true; }
+bool net_send_chapter(const ChapterMsg&) { return true; }   // 0.1.213: the list-fix report (catsync_apply_familiars)
 uintptr_t addr_of_call(Call c) {
     switch (c) {
     case C_SerializeCatData: return (uintptr_t)&serialize;
@@ -1776,7 +1877,7 @@ int main() {
     local_upgrade_after_peer_push(); optional_item_replacement(); resume_owned_snapshots(); settlement_owner_filter();
     settlement_without_battle_split();
     in_session_next_run_replaces_stale_session_cats(); replace_party_for_real = true; clones_return_to_their_originals(); alone_check_finds_this_players_position(); a_player_who_drops_out_loses_their_cats_for_everyone_else();
-    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_dead_squatter_does_not_take_a_new_cats_house_entity(); a_squatter_without_a_house_entity_is_not_lost(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); the_fallback_filter_takes_out_only_other_players_cats(); the_class_completion_check_counts_own_cats(); the_game_console_state_is_read_from_the_object(); the_class_marks_follow_the_rooms_rule(); the_marks_are_logged_and_compared(); gained_cats_in_the_class_check_and_the_settlement(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
+    legacy_clones_are_merged_before_they_are_overwritten(); merge_refusals_and_rollback(); clones_without_an_original_and_the_id_counter(); copies_at_home_do_not_make_the_original_ambiguous(); recorded_origin_beats_the_seed_search(); real_cats_on_reserved_ids_are_moved(); host_save_with_squatters_and_a_session_range_counter(); a_dead_squatter_does_not_take_a_new_cats_house_entity(); a_squatter_without_a_house_entity_is_not_lost(); a_stale_note_does_not_take_a_new_runs_entity(); a_real_cat_that_cannot_move_is_not_overwritten(); identical_session_cats_are_rebuilt_at_setup(); settlement_survives_the_other_player_leaving(); the_fallback_filter_takes_out_only_other_players_cats(); the_host_puts_lost_client_cats_back_after_a_fight(); the_host_takes_back_a_cat_its_owner_reports(); the_class_completion_check_counts_own_cats(); the_game_console_state_is_read_from_the_object(); the_class_marks_follow_the_rooms_rule(); the_marks_are_logged_and_compared(); gained_cats_in_the_class_check_and_the_settlement(); a_settlement_retires_the_other_players_copies(); stuck_originals_are_released(); replace_party_for_real = false; variable_exports_and_settlement();
     digest_heals_from_owner(); catsync_shutdown();
     auto* ids = (IdVector*)(director + kDir_CatFamiliars);
     std::free(ids->data);

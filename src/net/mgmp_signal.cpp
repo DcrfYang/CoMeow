@@ -35,6 +35,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <string>
 
 #include <bcrypt.h>
@@ -46,6 +47,15 @@ namespace mgmp {
 namespace {
 
 using nlohmann::json;
+
+// 0.1.201: the admin page's system messages, from the signal thread to the game thread (signal_take_sysmsg)
+SRWLOCK g_sysmsg_lock = SRWLOCK_INIT;
+std::deque<std::string> g_sysmsg;
+// 0.1.201: CHAT THROUGH THE LOBBY when the game link is not up (the players' versions differ, the handshake refused, the link is still being made):
+// lines out (name, text) wait for signal_update; lines in wait for the game thread (signal_take_chat). Both under g_sysmsg_lock.
+std::deque<std::pair<std::string, std::string>> g_chat_out, g_chat_in;
+// 0.1.203: when the lobby closed this peer's room while the game link was still up (the host left the lobby); 0 = not so. A new room clears it.
+volatile ULONGLONG g_room_closed_at = 0;
 
 // Lines the worker may run ahead of the game thread before it starts dropping.
 // The lobby is a handful of messages a second, so overflow means the game
@@ -131,6 +141,7 @@ struct State {
     UpnpState upnp_prev = UpnpState::Idle;
     char     event[160] = {};
     bool     server_pw = false;        // the server's welcome said it knows room passwords
+    bool     server_chat = false;      // 0.1.201: ...and that it relays chat lines between room members (an older lobby refuses "chat" as unknown)
     bool     room_pw   = false;        // the room we are in has one
     char     error_code[24] = {};      // see signal_error_code
     uint32_t error_seq = 0;
@@ -503,7 +514,9 @@ std::string candidate_list() {
     const bool steam_ok = config().net_steam && g.host_steam[0] && steam_bridge_id() && !is_private_host(g.host_addr);
     const std::string st = std::string("steam:") + g.host_steam;
     if (tr_is("relay")) return g.ptok[0] ? std::string("relay:") + g.ptok : tcp;
-    if (tr_is("direct")) return tcp;
+    // 0.1.202: "direct" with a port the server could NOT reach (room 2G85 11-07 21:08: three dials into a closed port, a timeout each, while the host's
+    // Steam id was known) -- the host opens Steam as well then (see "reach"), so Steam is tried first and the address after it
+    if (tr_is("direct")) return (g.host_reach == 2 && steam_ok) ? st + "," + tcp : tcp;
     if (tr_is("steam")) return steam_ok ? st : tcp;
     if (!steam_ok) return tcp;
     return (g.host_reach == 2) ? st + "," + tcp : tcp + "," + st;
@@ -670,6 +683,10 @@ void adopt_room(const char* role) {
             if (tr_is("relay")) net_relay_set_server(g.addr, g.port);      // the server carries the bytes: no port, no Steam
             if (want_direct) upnp_start(config().net_port);
             if (want_steam && config().net_steam) steam_bridge_host_start(config().net_port);   // Steam peers reach the same game port, bridged
+            if (!want_steam && tr_is("direct") && g.dcheck == DirectCheck::Closed && config().net_steam) {      // 0.1.202: see "reach"
+                steam_bridge_host_start(config().net_port);
+                log_line_lvl(LogLevel::Warn, "SIGNAL", "!! this room's carrier is direct, but the pre-check found our game port closed -- Steam is opened as well, so players can still join");
+            }
         }
         set_status("room %s -- you are the HOST (listening on port %u%s)",
                    g.room, (unsigned)config().net_port, tr_is("relay") ? ", via the server" : tr_is("steam") ? ", Steam relay" : tr_is("direct") ? ", direct" : "");
@@ -717,6 +734,7 @@ void handle_line(const char* line) {
 
     if (t == "welcome") {
         { auto pw = j.find("pw"); g.server_pw = pw != j.end() && pw->is_boolean() && pw->get<bool>(); }
+        { auto ch = j.find("chat"); g.server_chat = ch != j.end() && ch->is_boolean() && ch->get<bool>(); }
         auto it = j.find("rooms");
         if (it != j.end()) store_rooms(*it);
         store_relay_info(j);
@@ -733,6 +751,7 @@ void handle_line(const char* line) {
     }
 
     if (t == "joined") {
+        g_room_closed_at = 0;
         const std::string role = jstr(j, "role");
         strncpy_s(g.room, sizeof(g.room), jstr(j, "id").c_str(), _TRUNCATE);
         strncpy_s(g.host_addr, sizeof(g.host_addr), jstr(j, "addr").c_str(), _TRUNCATE);
@@ -810,6 +829,7 @@ void handle_line(const char* line) {
         // ends when the game link itself closes, or by hand.
         if (net_active() && net_peer_count() >= 2) {
             log_line_lvl(LogLevel::Warn, "SIGNAL", "the lobby room is gone but the game link is up -- the game goes on (it ends when the link closes, or by hand)");
+            g_room_closed_at = GetTickCount64();      // 0.1.203: if the host stays silent as well, the player is asked (room_tick: tick_host_gone)
             return;
         }
         session_request_disconnect();
@@ -827,6 +847,27 @@ void handle_line(const char* line) {
     }
 
     if (t == "pong") return;
+
+    if (t == "chat") {          // 0.1.201: another member's chat line, relayed by the lobby (its game link to us is not up)
+        const std::string name = jstr(j, "name"), text = jstr(j, "text");
+        if (!text.empty()) {
+            AcquireSRWLockExclusive(&g_sysmsg_lock);
+            if (g_chat_in.size() < 32) g_chat_in.emplace_back(name, text);
+            ReleaseSRWLockExclusive(&g_sysmsg_lock);
+        }
+        return;
+    }
+
+    if (t == "sysmsg") {        // 0.1.201: a system message the server's admin page sent to this room; shown in the chat by the game thread (signal_take_sysmsg)
+        const std::string text = jstr(j, "text");
+        if (!text.empty()) {
+            AcquireSRWLockExclusive(&g_sysmsg_lock);
+            if (g_sysmsg.size() < 16) g_sysmsg.push_back(text);
+            ReleaseSRWLockExclusive(&g_sysmsg_lock);
+            log_line("SIGNAL", "a system message from the server for room %s: %.300s", g.room, text.c_str());
+        }
+        return;
+    }
 
     if (t == "pipe") {
         // A joiner wants a pipe through the server: open ours and bridge it to the game's own port.
@@ -865,6 +906,13 @@ void handle_line(const char* line) {
             if (!g.room[0]) return;
         }
         g.reach = open ? 1 : 2;
+        // 0.1.202: A "direct" room whose port the server cannot reach can take nobody (room 2G85 11-07 21:08: a joiner dialled the closed port three times,
+        // timing out each time, until the host remade the room with Steam). The host opens Steam as well; a joiner that hears the port is closed tries
+        // Steam first (candidate_list).
+        if (!open && g.room[0] && !_stricmp(g.role, "host") && tr_is("direct") && config().net_steam && !is_private_host(g.addr)) {
+            steam_bridge_host_start(config().net_port);
+            log_line_lvl(LogLevel::Warn, "SIGNAL", "!! this room's carrier is direct, but the server cannot reach our game port -- Steam is opened as well, so players can still join");
+        }
         log_line_lvl(open ? LogLevel::Info : LogLevel::Warn, "SIGNAL", "%sthe server %s our game port %s:%d from outside",
                      open ? "" : "!! ", open ? "reached" : "could NOT reach", jstr(j, "addr").c_str(), jint(j, "port", 0));
         return;
@@ -1018,6 +1066,41 @@ void apply_request() {
 
 } // namespace
 
+uint64_t signal_room_closed_at() { return g_room_closed_at; }
+void signal_room_closed_clear() { g_room_closed_at = 0; }
+
+bool signal_chat_possible() { return g.server_chat && state() == SignalState::Connected && g.room[0] && g.peer_count >= 2; }
+
+bool signal_send_chat(const char* name, const char* text) {
+    if (!text || !text[0] || !signal_chat_possible()) return false;
+    AcquireSRWLockExclusive(&g_sysmsg_lock);
+    const bool ok = g_chat_out.size() < 16;
+    if (ok) g_chat_out.emplace_back(name ? name : "", text);
+    ReleaseSRWLockExclusive(&g_sysmsg_lock);
+    return ok;
+}
+
+bool signal_take_chat(char* name, size_t name_cap, char* text, size_t text_cap) {
+    AcquireSRWLockExclusive(&g_sysmsg_lock);
+    const bool any = !g_chat_in.empty();
+    if (any) {
+        strncpy_s(name, name_cap, g_chat_in.front().first.c_str(), _TRUNCATE);
+        strncpy_s(text, text_cap, g_chat_in.front().second.c_str(), _TRUNCATE);
+        g_chat_in.pop_front();
+    }
+    ReleaseSRWLockExclusive(&g_sysmsg_lock);
+    return any;
+}
+
+bool signal_take_sysmsg(char* out, size_t cap) {
+    if (!out || !cap) return false;
+    AcquireSRWLockExclusive(&g_sysmsg_lock);
+    const bool any = !g_sysmsg.empty();
+    if (any) { strncpy_s(out, cap, g_sysmsg.front().c_str(), _TRUNCATE); g_sysmsg.pop_front(); }
+    ReleaseSRWLockExclusive(&g_sysmsg_lock);
+    return any;
+}
+
 // ---------------------------------------------------------------------------
 
 // The net layer's dial thread calls this when Steam refused our call: ask the host (through the lobby server) to call us instead.
@@ -1091,6 +1174,18 @@ void signal_update() {
     direct_check_step();
 
     if (state() == SignalState::Connected) {
+        for (;;) {      // 0.1.201: chat lines through the lobby
+            std::pair<std::string, std::string> line;
+            AcquireSRWLockExclusive(&g_sysmsg_lock);
+            const bool any = !g_chat_out.empty();
+            if (any) { line = g_chat_out.front(); g_chat_out.pop_front(); }
+            ReleaseSRWLockExclusive(&g_sysmsg_lock);
+            if (!any) break;
+            if (!g.room[0]) continue;
+            json o = json::object();
+            o["t"] = "chat"; o["name"] = line.first; o["text"] = line.second;
+            if (!send_obj(o)) log_line_lvl(LogLevel::Warn, "SIGNAL", "!! a chat line could not be sent through the server");
+        }
         if (g.want_lock >= 0 && g.room[0]) {
             json o = json::object();
             o["t"] = "lock"; o["on"] = g.want_lock == 1;

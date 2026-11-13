@@ -85,7 +85,9 @@ void fill_server(LogUploadRequest& req) {
     strncpy_s(req.addr, sizeof(req.addr), c.signal_addr, _TRUNCATE);
     if (char* colon = strchr(req.addr, ':')) *colon = 0;      // "host:port" in the address field: the port field is the one used
     req.port = c.signal_port;
-    if (c.signal_name[0]) strncpy_s(req.player, sizeof(req.player), c.signal_name, _TRUNCATE);
+    // 0.1.208: the name the player typed in the multiplayer window (ui.player_name, the lobby's name too) before the config's, then the computer's -- the admin list showed computer names
+    if (c.ui_player_name[0]) strncpy_s(req.player, sizeof(req.player), c.ui_player_name, _TRUNCATE);
+    else if (c.signal_name[0]) strncpy_s(req.player, sizeof(req.player), c.signal_name, _TRUNCATE);
     else { DWORD n = sizeof(req.player); if (!GetComputerNameA(req.player, &n)) strcpy_s(req.player, "player"); }
 }
 

@@ -516,6 +516,8 @@ struct Client {
     bool     beats      = false;    // it has sent {"t":"ping"}: a mod that heartbeats, so silence for kHeartbeatLostMs means it is gone
     int      probes_made = 0;       // reachability probes started for this connection
     int      relays_made = 0;       // "relay" requests forwarded for this connection (capped)
+    uint64_t chat_window = 0;       // 0.1.201: the start of this connection's current chat window, and the lines relayed in it (flood guard)
+    int      chat_lines  = 0;
     char     steam[24]   = {};      // the peer's SteamID64 (digits), when it said so
     int      reach       = 0;       // the probe's verdict on this peer's game port: 0 unknown, 1 open, 2 not reachable
     uint64_t last_probe  = 0;
@@ -1131,6 +1133,7 @@ void handle_line(int slot, const std::string& line) {
         o["proto"] = 1;
         o["pw"]    = true;          // this server understands room passwords
         o["logs"]  = !g_logdir.empty();   // ...and collects game logs
+        o["chat"]  = true;          // ...and relays chat lines between room members (0.1.201, "chat")
         o["rooms"] = rooms_array();
         put_relay_info(o);
         send_json(c.sock, o);
@@ -1153,6 +1156,50 @@ void handle_line(int slot, const std::string& line) {
     }
 
     if (t == "list") { send_rooms(c.sock); return; }
+
+    // CHAT THROUGH THE LOBBY (0.1.201): {"t":"chat","name":"..","text":".."} from a room member -> the same to the room's OTHER members. The mod uses it
+    // when its game link is not up -- players whose versions differ are refused at the handshake and could not even tell each other so. At most 8
+    // lines per 5 s per connection; a line of at most 600 bytes.
+    if (t == "chat") {
+        if (c.room < 0) return;
+        const std::string text = json_str(j, "text");
+        if (text.empty() || text.size() > 600) return;
+        const uint64_t now = tick_ms();
+        if (now - c.chat_window > 5000) { c.chat_window = now; c.chat_lines = 0; }
+        if (++c.chat_lines > 8) return;
+        std::string name = json_str(j, "name");
+        if (name.empty() || name.size() > 64) name = c.name;
+        Room& r = g_rooms[c.room];
+        json m = json::object();
+        m["t"] = "chat"; m["name"] = name; m["text"] = text;
+        for (int i = 0; i < r.count; ++i) if (r.members[i] != slot) send_json(g_clients[r.members[i]].sock, m);
+        return;
+    }
+
+    // A SYSTEM MESSAGE TO ONE ROOM (0.1.201, the admin page's "发送系统消息"): {"t":"admin_say","room":"KD8E","text":"..."} -> {"t":"sysmsg","text":"..."} to
+    // every member, a room of one included; the asker gets {"t":"admin_said","ok":..,"sent":n,"msg":..}. Only from this machine (127.0.0.1 / ::1): the admin
+    // page runs beside the lobby and is behind its own login; no player connection comes from loopback.
+    if (t == "admin_say") {
+        const bool local = !strcmp(c.ip, "127.0.0.1") || !strcmp(c.ip, "::1") || !strcmp(c.ip, "::ffff:127.0.0.1");
+        json o = json::object();
+        o["t"] = "admin_said";
+        if (!local) { o["ok"] = false; o["msg"] = "not allowed from this address"; send_json(c.sock, o); return; }
+        const std::string id = json_str(j, "room"), text = json_str(j, "text");
+        o["room"] = id;
+        const int ri = id.empty() ? -1 : find_room_by_id(id.c_str());
+        if (ri < 0 || !g_rooms[ri].count) { o["ok"] = false; o["msg"] = "no such room"; send_json(c.sock, o); return; }
+        if (text.empty() || text.size() > 1500) { o["ok"] = false; o["msg"] = "the text is empty or longer than 1500 bytes"; send_json(c.sock, o); return; }
+        Room& r = g_rooms[ri];
+        json m = json::object();
+        m["t"] = "sysmsg";
+        m["text"] = text;
+        int sent = 0;
+        for (int i = 0; i < r.count; ++i) { send_json(g_clients[r.members[i]].sock, m); ++sent; }
+        logf("room %s: a system message from the admin page to %d member(s): %.200s", r.id, sent, text.c_str());
+        o["ok"] = true; o["sent"] = sent;
+        send_json(c.sock, o);
+        return;
+    }
 
     if (t == "logbegin") { handle_logbegin(c, j); return; }
     if (t == "logchunk") { handle_logchunk(c, j); return; }
