@@ -320,7 +320,7 @@ bool archive_path(const std::wstring& root,const std::wstring& key,const std::ws
     const std::vector<unsigned> nums=numbered_files(dir,key+L"-old.");
     const unsigned n=nums.empty() ? 1u : (nums.back()>=999999u ? 1u : nums.back()+1u);
     const std::wstring to=dir+L"\\"+key+L"-old."+std::to_wstring(n);
-    if(!MoveFileExW(from.c_str(),to.c_str(),MOVEFILE_WRITE_THROUGH)) return false;
+    if(!MoveFileExW(from.c_str(),to.c_str(),checkpoint_io::move_flags(0))) return false;
     return true;
 }
 bool archive_index(unsigned k) { return archive_path(g.root,g.key,qfile(k)); }
@@ -377,7 +377,7 @@ bool promote(const CheckpointMsg& c) {
     // keep[r] goes to r+1. The ones that move UP (keep[r]==r) are a prefix: move them newest-last (descending); the ones that move DOWN
     // (keep[r]>r+1) move ascending. Either way the target is free when it is used.
     auto mv=[&](unsigned from,unsigned to) {
-        return from==to || MoveFileExW(qfile(from).c_str(),qfile(to).c_str(),MOVEFILE_WRITE_THROUGH)!=0;
+        return from==to || MoveFileExW(qfile(from).c_str(),qfile(to).c_str(),checkpoint_io::move_flags(0))!=0;
     };
     for(size_t r=keep.size();r-->0;) if(keep[r]==r && !mv(keep[r],(unsigned)r+1)) return false;
     for(size_t r=0;r<keep.size();++r) if(keep[r]>r+1 && !mv(keep[r],(unsigned)r+1)) return false;
@@ -442,6 +442,13 @@ void send_offer() {
         if(!read_entry(file(L".state"),state,false)) { fail("recovery refused: corrupt pairing state"); return; }
         offer.run=state.certificate.run;
         offer.mode=state.certificate.mode;
+        // NO PLAY-ALONE MARK ANY MORE (0.1.232, the user's rule): a player who went on alone after the room broke up resumes with the others from the run's last handshake
+        // save next time -- what was played alone is dropped, as with any restore. A mode-2 mark an older build wrote (0.1.230: rooms 95LJ -> 7J9P, it refused every round)
+        // is read as what it is, an unfinished run: the rules below then resume it from a save on the map, or retire it from a warehouse save.
+        if(offer.mode==2) {
+            log_line("CHECKPOINT","this journal holds an older build's play-alone mark for run %016llx -- read as an unfinished run (a resume goes back to its handshake save)",(unsigned long long)offer.run);
+            offer.mode=1;
+        }
         // Warehouse status alone must never silently release an unfinished journal.
         if(offer.mode==0) offer.mode=1;
         state_marker=true;
@@ -781,8 +788,8 @@ void note_refusal() {
         unsigned snaps=0; for(const auto& c:m.candidates) if(c.run) ++snaps;
         log_line("CHECKPOINT","offer of player %u (peer %u): mode %u, run %016llx, %u snapshot(s)%s",i+1,(unsigned)g.config.peers[i],(unsigned)m.mode,
                  (unsigned long long)m.run,snaps,m.mode==4?" -- its save is on the map and there is no co-op record to recover it with":(m.mode==1||snaps)?" -- holds an unfinished co-op record":"");
-        if((m.mode==1||m.mode==4||snaps) && g.config.peers[i]<kMaxPeers) holders|=(uint8_t)(1u<<g.config.peers[i]);
-        if(m.mode==4) noRecord=true; else if(m.mode==1||snaps) withRecord=true;
+        if((m.mode==1||m.mode==2||m.mode==4||snaps) && g.config.peers[i]<kMaxPeers) holders|=(uint8_t)(1u<<g.config.peers[i]);
+        if(m.mode==4) noRecord=true; else if(m.mode==1||m.mode==2||snaps) withRecord=true;
     }
     // bit 7 of the mask the panel gets: EVERY holder's save is on the map with no record (kHoldersNoRecord) -- a different instruction from "load the original save"
     if(noRecord && !withRecord) holders|=kHoldersNoRecord;
@@ -795,8 +802,8 @@ void choose() {
     for(unsigned i=0;i<g.config.count;++i) {
         if(absent_at(i)) continue;
         const auto& m=g.offers[i];
-        if(m.mode==2) { fail("recovery refused: a participant chose play alone"); return; }
-        if(m.mode==1 || m.mode==4 || has_candidate(m)) fresh=false;
+        // 0.1.232: an older client still offers mode 2 for a run it went on alone with -- an unfinished run, resumed from the common handshake save
+        if(m.mode==1 || m.mode==2 || m.mode==4 || has_candidate(m)) fresh=false;
     }
     CheckpointRef common[kCheckpointCandidates]{}; const unsigned nc=common_saves(common);
     if(g_manual && !g.inSession) {
@@ -1430,10 +1437,11 @@ bool checkpoint_archive_handshake_file(const std::wstring& path) {
 }
 bool checkpoint_on_alone() {
     if(!g.configured || !g.run) return true;
-    // Tombstone FIRST. A crash between this write and the later cleanup still vetoes resume.
-    if(!marker(2)) { fail("play alone held: cannot persist recovery invalidation"); return false; }
+    // 0.1.232 (the user's rule): NO TOMBSTONE. Going on alone does not end the run for the room -- the next room resumes it from the run's last handshake save and what was
+    // played alone is dropped. The journal keeps its unfinished state; the saves are archived only once this player is back in the warehouse with no room (the run is
+    // over for it then), and stay restorable from the backup page.
     defer_cleanup("play alone");
-    g.failed=true; status("play alone: this recovery run is permanently invalid; its saves are kept until the warehouse"); return true;
+    g.failed=true; status("play alone: this session's recovery stops here; the run can be resumed with the others from its last handshake save"); return true;
 }
 void checkpoint_clear(bool broadcast) {
     if(!g.configured || !g.run || g.finished) return;

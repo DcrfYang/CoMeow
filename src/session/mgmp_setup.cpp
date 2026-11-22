@@ -79,7 +79,11 @@ bool valid(const SetupMsg& m,int owner=-1){
     if(owner<0)for(unsigned i=0;i<g.members;++i)if(!counts[i])return false;
     return true;
 }
+// 2026-11-16: the last shared roster installed, kept for a house boss co-op -- its gear screen's departure writes this player's own selection into the party lists
+// AFTER the barrier installed them (the lock is held until every player is ready), so the fight's start installs them again (setup_reinstall_shared).
+uint64_t g_last_ids[kSetupMaxCats]{};uint32_t g_last_n=0;
 bool install(const SetupMsg& m){uint64_t ids[kSetupMaxCats]{};for(unsigned i=0;i<m.count;++i)ids[i]=m.cats[i].id;
+    g_last_n=m.count<=kSetupMaxCats?m.count:0;for(unsigned i=0;i<g_last_n;++i)g_last_ids[i]=ids[i];
     return roster_setup_install_shared(ids,m.count,"all-player setup barrier",g.resume);}
 bool apply(const SetupMsg& m,bool skip_own){
     for(unsigned i=0;i<m.count;++i){const auto& c=m.cats[i];if(skip_own&&session_cat_owner(c.id)==net_peer_pos())continue;
@@ -268,8 +272,17 @@ bool setup_on_house_gear_done(void* director,void(*go)(void*)){
     return true;
 }
 bool setup_house_pending(){return g.hold.on&&g.hold.house;}
+bool setup_reinstall_shared(const char* why){
+    if(!g_last_n){log_line_lvl(LogLevel::Warn,"SETUP","!! no shared roster was installed this round -- the party lists are left as they are (%s)",why);return false;}
+    return roster_setup_install_shared(g_last_ids,g_last_n,why,false);}
 // After a house fight's `go`: what a chapter commit leaves for the map that is never generated.
 static void house_go_done(){unlocks_override_clear();map_seed_armed=false;}
+// 0.1.236 (review H4): a house boss co-op cancelled while this player's lock is held: no fight starts, and the barrier starts over (its READYs belonged to the co-op)
+void setup_drop_house_hold(const char* why){
+    if(!(g.hold.on&&g.hold.house))return;
+    log_line("SETUP","house boss co-op: the held gear screen lock is DROPPED (%s) -- no fight starts; the barrier starts over",why?why:"?");
+    g.hold=Hold{};house_go_done();setup_reset_run();
+}
 void setup_tick(){
     if(!g.hold.on)return;
     refresh();

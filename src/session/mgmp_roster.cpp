@@ -1388,7 +1388,15 @@ static bool swap_capture() {
         if(owner==0){if(spn>=4)return false;shared_party[spn++]=all[i];}else shared_fam[sfn++]=all[i];
         if(owner==net_peer_pos())local[ln++]=all[i];else other[on++]=all[i];
     }
-    if(!ln||ln>4||!spn)return false;
+    // 0.1.247 (room KD8E 11-21): ONE SIDE WITH NO CAT LEFT IS STILL A LAYOUT. A host whose cats all died has the others' cats in its party (the game's
+    // own promotion) -- the shared party is then the first four of them, as the host's game holds it; a player whose cats all died keeps no local view.
+    if(ln>4||(!spn&&!sfn))return false;
+    if(!spn){
+        const uint32_t k=sfn<4?sfn:4;
+        memcpy(shared_party,shared_fam,k*4);spn=k;
+        memmove(shared_fam,shared_fam+k,(sfn-k)*4);sfn-=k;
+        for(uint32_t i=sfn;i<16;++i)shared_fam[i]=0;
+    }
     if(spn!=pn || !same_list(shared_party,spn,party,pn))
         log_line("ROSTER","shared roster captured with cats on the wrong side (party %u, familiars %u) -- "
                  "restoring by ownership: %u host cat(s) + %u other(s)",pn,fn,spn,sfn);
@@ -1507,7 +1515,10 @@ static void swap_forget_gone() {
     if (!ng || ng >= g_swap.pn + g_swap.fn) return;                      // nothing gone, or "everything" = not a verdict
     uint32_t local_left = g_swap.ln;
     for (uint32_t i = 0; i < ng; ++i) if (has_id(g_swap.local, g_swap.ln, gone[i])) --local_left;
-    if (local_left == 0) return;                                          // never leave this peer with no cat of its own
+    // 0.1.247 (room KD8E 11-21): a side whose last cat died is dropped too -- the game took the cat out on every peer. A player left with no cat of
+    // its own watches; the run goes on while any player has a cat.
+    if (local_left == 0)
+        log_line_lvl(LogLevel::Warn, "ROSTER", "!! every cat of this player is gone from the run -- it keeps no local view and watches while the others play on");
 
     char text[128] = {};
     int off = 0;
@@ -1519,6 +1530,16 @@ static void swap_forget_gone() {
         erase_id(g_swap.fam_before, g_swap.fn, gone[i]);
         erase_id(g_swap.local, g_swap.ln, gone[i]);
         erase_id(g_swap.others, g_swap.on, gone[i]);
+    }
+    // 0.1.247: no host cat left -- the game puts the others' cats in the party (the host's lists after the battle: party [71000001], familiars []).
+    // The frozen layout does the same, or the next node's restore had no party to write ("roster write failed -- node 1 NOT entered").
+    if (g_swap.pn == 0 && g_swap.fn > 0) {
+        const uint32_t k = g_swap.fn < 4 ? g_swap.fn : 4;
+        memcpy(g_swap.party_before, g_swap.fam_before, k * 4);
+        memmove(g_swap.fam_before, g_swap.fam_before + k, (g_swap.fn - k) * 4);
+        for (uint32_t i = g_swap.fn - k; i < g_swap.fn; ++i) g_swap.fam_before[i] = 0;
+        g_swap.pn = k; g_swap.fn -= k;
+        log_line_lvl(LogLevel::Warn, "ROSTER", "!! no host cat is left in the run: the other players' first %u cat(s) make the shared party, as the host's game has them", k);
     }
     memcpy(g_swap.mirror_before, g_swap.party_before, sizeof(g_swap.mirror_before));
     log_line_lvl(LogLevel::Warn, "ROSTER",
@@ -1541,6 +1562,7 @@ static void swap_apply_now() {
         return;
     }
     g_swap.waiting_reported = false;
+    if (!g_swap.ln) return;                 // 0.1.247: this player has no cat left -- the shared lists stay up, there is nothing of its own to show
     // Keep the per-run identities; an event's temporary list is not a new team selection.
     g_swap.active = true;
     g_swap_holds = true;
@@ -1562,6 +1584,10 @@ bool roster_party_swap_for_own_event() {
     if (!g_setup_ready || !tune::kPartySwapWhileEditing || !net_active() || net_peer_pos() == 0) return false;
     if (!swap_capture()) {
         log_line_lvl(LogLevel::Warn, "ROSTER", "!! own random event: the local roster could not be captured -- the event keeps the shared party");
+        return false;
+    }
+    if (!g_swap.ln) {
+        log_line_lvl(LogLevel::Warn, "ROSTER", "!! own random event: this player has no cat left -- the event keeps the shared party");
         return false;
     }
     g_swap.active = true;
@@ -1750,15 +1776,37 @@ bool roster_adopt_host_shared(const uint64_t* cats, uint32_t cn, const uint64_t*
         if (owner >= net_seat_span() || (owner == 0 && fam[i] >= 0x70000000ull && !session_is_gained(fam[i]))) refuse = "a familiar not owned by a client";
         else fams[nfn++] = (uint32_t)fam[i];
     }
+    // A HOST WITH NO CAT OF ITS OWN LEFT (0.1.229, room WEEH 11-15): both of its cats died in a battle the others won, and the game filled its party
+    // with the other players' cats. Every party cat then belongs to a client: that party is taken as the host has it (the next battle spawns it on
+    // the host). A party that mixes host and client cats is still refused -- the host's own normalisation puts that one back before it publishes.
+    uint32_t foreign = 0;
     for (uint32_t i = 0; i < cn && !refuse; ++i) {
         bool familiar = false;
         for (uint32_t j = 0; j < fn; ++j) familiar = familiar || fam[j] == cats[i];
         if (familiar) continue;
         if (!cats[i] || cats[i] >= UINT32_MAX) refuse = "a bad cat id";
-        else if (shared_owner((uint32_t)cats[i]) != 0) refuse = "a party cat not owned by the host";
-        else if (npn >= 4) refuse = "more than four host cats";
-        else party[npn++] = (uint32_t)cats[i];
+        else if (npn >= 4) refuse = "more than four party cats";
+        else {
+            const uint8_t owner = shared_owner((uint32_t)cats[i]);
+            if (owner >= net_seat_span()) refuse = "a party cat of no seat";
+            else { if (owner != 0) ++foreign; party[npn++] = (uint32_t)cats[i]; }
+        }
     }
+    if (!refuse && foreign && foreign != npn) refuse = "a party cat not owned by the host";
+    if (!refuse && foreign) {
+        // ...and only when this peer has seen the host's cats die: every host cat of the last layout it took has perished here as well.
+        uint32_t host_known = 0, host_dead = 0;
+        for (uint32_t i = 0; i < g_swap.pn && i < 4; ++i) {
+            const uint32_t id = g_swap.party_before[i];
+            if (!id || shared_owner(id) != 0) continue;
+            ++host_known;
+            if (catsync_cat_perished(id)) ++host_dead;
+        }
+        // 0.1.247: or the layout already lost them (the corpse drop took every host cat out and put the others' cats in the party)
+        if (host_known ? host_dead != host_known : !g_swap.captured) refuse = "a party cat not owned by the host";
+    }
+    if (!refuse && foreign)
+        log_line_lvl(LogLevel::Warn, "ROSTER", "%s: the host's party is %u cat(s) of the other players -- the host has none of its own left; taken as it is", why, npn);
     if (!refuse && !npn) refuse = "no host cat";
     if (!refuse && npn + nfn > kSwapIds) refuse = "too many cats";
     if (!refuse) {
@@ -1770,7 +1818,8 @@ bool roster_adopt_host_shared(const uint64_t* cats, uint32_t cn, const uint64_t*
     for (uint32_t i = 0; i < npn + nfn && !refuse; ++i) {
         if (shared_owner(all[i]) == net_peer_pos()) local[ln++] = all[i]; else other[on++] = all[i];
     }
-    if (!refuse && (!ln || ln > 4)) refuse = "this peer would keep no cat of its own";
+    // 0.1.247: no cat of its own is fine once this player's last cat died (the layout has none left): it watches while the others play on
+    if (!refuse && (ln > 4 || (!ln && !(g_swap.captured && g_swap.ln == 0)))) refuse = "this peer would keep no cat of its own";
     if (refuse) {
         log_line_lvl(LogLevel::Warn, "ROSTER", "!! %s: host roster NOT adopted -- %s (%u cat(s), %u familiar(s))",
                      why, refuse, cn, fn);

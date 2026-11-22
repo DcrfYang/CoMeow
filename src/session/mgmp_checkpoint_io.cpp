@@ -26,17 +26,18 @@ uint64_t nonce() {
     if(BCryptGenRandom(nullptr,(PUCHAR)&v,sizeof(v),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0) return 0;
     return v;
 }
+bool g_test_skip_flush=false;
 bool atomic_write(const std::wstring& path, const Bytes& bytes) {
     if(bytes.empty()) return false;
     auto tmp=path+L".tmp-"+std::to_wstring(GetCurrentProcessId());
     HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(h==INVALID_HANDLE_VALUE) return false;
     DWORD n=0;
-    bool ok=WriteFile(h,bytes.data(),(DWORD)bytes.size(),&n,nullptr) && n==bytes.size() && FlushFileBuffers(h);
+    bool ok=WriteFile(h,bytes.data(),(DWORD)bytes.size(),&n,nullptr) && n==bytes.size() && (g_test_skip_flush || FlushFileBuffers(h));
     CloseHandle(h);
     // Verify disk contents before the one atomic rename makes them visible.
     Bytes check; ok=ok && read(tmp,check,(uint32_t)bytes.size()) && check==bytes;
-    if(ok) ok=MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+    if(ok) ok=MoveFileExW(tmp.c_str(),path.c_str(),move_flags(MOVEFILE_REPLACE_EXISTING))!=0;
     if(!ok) DeleteFileW(tmp.c_str()); return ok;
 }
 // The only identity folder (a decimal number) under `root`, or 0 when there are none or several.
@@ -104,7 +105,7 @@ bool identity(uint64_t& id, const wchar_t* adopt_root, bool* adopted) {
     uint64_t hash=savefile_hash(bytes.data(),8); memcpy(bytes.data()+8,&hash,8);
     HANDLE h=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(h==INVALID_HANDLE_VALUE) return false;
-    DWORD n=0; bool ok=WriteFile(h,bytes.data(),16,&n,nullptr) && n==16 && FlushFileBuffers(h);
+    DWORD n=0; bool ok=WriteFile(h,bytes.data(),16,&n,nullptr) && n==16 && (g_test_skip_flush || FlushFileBuffers(h));
     CloseHandle(h); return ok;
 }
 
@@ -491,7 +492,7 @@ bool restore(const std::wstring& target,const Bytes& bytes,bool require_run) {
     }
     if(!ok) DeleteFileW(staged.c_str());
     CloseHandle(lease); // Windows replacement itself needs to open the destination.
-    if(ok) ok=MoveFileExW(staged.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+    if(ok) ok=MoveFileExW(staged.c_str(),target.c_str(),move_flags(MOVEFILE_REPLACE_EXISTING))!=0;
     return ok;
 }
 } }

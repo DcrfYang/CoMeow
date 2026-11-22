@@ -60,6 +60,8 @@ void note(const char* kind, const char* name, const SigResolution& r) {
         log_raw("  [!] %s %-34s UNRESOLVED: %s", kind, name, r.why);
         return;
     }
+    if (r.foreign)
+        log_raw("  [~] %s %-34s another mod loader's hook is on its first bytes (e.g. Mewjector) -- ours is chained on top of it", kind, name);
     if (r.drift != 0)
         log_raw("  [~] %s %-34s %s", kind, name, r.why);
 }

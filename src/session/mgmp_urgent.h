@@ -36,6 +36,9 @@ struct GameNoticeView {
 bool gamenotice_view(GameNoticeView& out);
 void gamenotice_dismiss();
 
+// This mod's own version ("0.1.234"), from the DLL's VERSIONINFO; "0.0.0" when it cannot be read (0.1.234: the important update notice).
+const char* urgent_own_version();
+
 // "a.b.c(.d)" compared numerically: <0, 0, >0. Exposed for the tests.
 int urgent_version_cmp(const char* a, const char* b);
 

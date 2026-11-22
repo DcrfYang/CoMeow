@@ -146,8 +146,15 @@ int main() {
         n = enc_hello(buf, sizeof(buf), h);
         Reader r2(buf, n); r2.u8v(); Hello o2{};
         check(dec_hello(r2, o2) && o2.enemy_scale_half == 11, "the host's enemy multiplier (x5.5) rides in the HELLO (proto 95)");
-        Reader r3(buf, n - 1); r3.u8v(); Hello o3{};
-        check(dec_hello(r3, o3) && o3.enemy_scale_half == 4, "an older HELLO without it still decodes (x2)");
+        Reader r3(buf, n - 2); r3.u8v(); Hello o3{};       // 0.1.243: the house boss multiplier comes after it
+        check(dec_hello(r3, o3) && o3.enemy_scale_half == 4 && o3.house_scale_half == 2, "an older HELLO without it still decodes (x2)");
+        // 0.1.243: the host's house boss co-op multiplier rides after the enemy one; a HELLO without it (0.1.242) reads x1
+        h.house_scale_half = 7;
+        n = enc_hello(buf, sizeof(buf), h);
+        Reader r4(buf, n); r4.u8v(); Hello o4{};
+        check(dec_hello(r4, o4) && o4.enemy_scale_half == 11 && o4.house_scale_half == 7, "the host's house boss multiplier (x3.5) rides in the HELLO (0.1.243)");
+        Reader r5(buf, n - 1); r5.u8v(); Hello o5{};
+        check(dec_hello(r5, o5) && o5.enemy_scale_half == 11 && o5.house_scale_half == 2, "a HELLO without the house boss multiplier reads x1");
     }
 
     printf("\n-- Welcome carries all four xoshiro words --\n");

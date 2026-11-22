@@ -52,7 +52,10 @@ void sql_exec(const std::wstring& file,const char* command) {
 void reset(const wchar_t* name,unsigned count=2) {
     participants=live=count; packets.clear(); map_packets.clear(); capture_ok=true; connected=true; stage_capture_ok=true;
     wchar_t cwd[MAX_PATH]{}; GetCurrentDirectoryW(MAX_PATH,cwd);
-    testroot=std::wstring(cwd)+L"\\_buildcheck\\checkpoint-tests-"+std::to_wstring(checkpoint_io::nonce());
+    // 2026-11-15: every run's folders go under _buildcheck\tmp-tests (the script empties it first) -- they used to pile up beside the scripts (14,529 of them)
+    const std::wstring tmp=std::wstring(cwd)+L"\\_buildcheck\\tmp-tests";
+    CreateDirectoryW(tmp.c_str(),nullptr);
+    testroot=tmp+L"\\checkpoint-tests-"+std::to_wstring(checkpoint_io::nonce());
     CHECK(CreateDirectoryW(testroot.c_str(),nullptr));
     for(unsigned i=0;i<count;++i) {
         states[i]=State{}; auto& s=states[i]; s.on=true; s.host=i==0; s.identity=100+i;
@@ -210,6 +213,7 @@ static void test_identity_adoption() {
 }
 
 int main() {
+    checkpoint_io::g_test_skip_flush=true;   // the writes are checked by reading them back; flushing each one to the disk only made the run slow
     checkpoint_set_capture_patience(0);   // a failing capture latches at once in the tests below; the retry has its own test
     test_identity_adoption();
     reset(L"four participants / independent DBs / latest common restore",4); start(); boundary(1000); certified(1);
@@ -279,6 +283,13 @@ int main() {
 
     reset(L"play alone invalidation survives process restart"); start(); boundary(4000);
     at(1,[]{CHECK(checkpoint_on_alone());}); restart(); CHECK(states[0].failed && states[1].failed);
+
+    // 0.1.230 (rooms 95LJ -> 7J9P): a run left to play alone that never settled -- the player's save is in the warehouse again. The same players pair
+    // again: its play-alone mark retires that run and a fresh start is offered, instead of "recovery refused: a participant chose play alone" at every round.
+    reset(L"a play-alone mark does not refuse a later run from the warehouse"); start(); boundary(4100);
+    at(1,[]{CHECK(checkpoint_on_alone());});
+    for(unsigned i=0;i<2;++i)at(i,[]{sql_exec(g.path,"UPDATE properties SET data=0 WHERE key='on_adventure'");});
+    restart(); CHECK(states[0].released && states[1].released && !states[0].failed && !states[1].failed); CHECK(states[0].seq==0);
 
     // 2026-10-05: "continue alone" and a solo settlement keep the run's handshake saves until the warehouse; the tombstone is written at once
     reset(L"play alone keeps the handshake saves until the warehouse"); start(); boundary(4500);

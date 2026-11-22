@@ -288,6 +288,7 @@ uint32_t net_host_ucat(uint64_t battle, uint8_t index, int32_t key, uint8_t* out
 bool net_send_tiles(const TilesMsg& m);
 uint32_t net_host_tiles(uint64_t battle, uint32_t turn, uint8_t* out, uint32_t cap);
 uint32_t net_host_ustate(uint64_t battle, uint32_t turn, uint8_t index, uint8_t* out, uint32_t cap);
+void net_drop_ustate(uint64_t battle, uint32_t turn, uint8_t index);   // 0.1.239: a record that is not the board row's reading is let go
 // proto 117 (0.1.213). HOST: one action's unit rows to every client. CLIENT: the host's check of that action, when it is here.
 bool net_send_actcheck(const ActCheckMsg& m);
 bool net_host_actcheck(uint64_t battle, uint32_t turn, uint32_t action, ActCheckMsg& out);
@@ -302,6 +303,8 @@ bool net_host_turnqueue(uint64_t battle, uint32_t turn, TurnQueueMsg& out);
 // Forgets what the host sent for battles that are over -- the boards, the rolls and the level box. Called when a save is loaded: a node entered again keeps its battle id, and a stale board of turn 0 would
 // otherwise be applied before the host's new one arrives.
 void net_clear_battle_caches();
+// 0.1.246: a mid-battle re-snapshot -- the battle's stores that arrived before `before` (GetTickCount64) are let go (the turn numbering restarts).
+void net_forget_battle_before(uint64_t battle, unsigned long long before);
 // The host's weather names that came with that level (same mailbox): true when the level message for `node_id` has arrived.
 bool net_host_weather(uint64_t node_id, char (*names)[kWeatherLen], uint8_t& n);
 // proto 110: the host's difficulty index -- with `node_id`, the one sent with that battle's build information (-1 until it came); with 0, the latest

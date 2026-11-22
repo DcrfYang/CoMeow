@@ -119,14 +119,17 @@ struct LevelBox { uint64_t node = 0; char name[64] = {}; uint64_t bnode = 0; uin
 // boundary, until the host stopped for a player (2026-10-20: nine boundaries in a row).
 constexpr uint32_t kBoardRing = 8;
 BoardAssembled g_board_ring[kBoardRing];
+ULONGLONG      g_board_at[kBoardRing] = {};
 uint32_t g_board_next = 0;
 // CLIENT: the host's board digests (proto 98), small enough to keep a long run of them; and the latest boundary anything of the board came for (net_board_seen_past).
 constexpr uint32_t kSumRing = 128;
 BoardSumMsg g_sum_ring[kSumRing];
+ULONGLONG   g_sum_at[kSumRing] = {};          // 0.1.246: when each arrived (net_forget_battle_before)
 uint32_t g_sum_next = 0;
 // CLIENT: the host's turn queues (proto 111), one per boundary, the same mailbox shape.
 constexpr uint32_t kTqRing = 16;
 TurnQueueMsg g_tq_ring[kTqRing];
+ULONGLONG    g_tq_at[kTqRing] = {};
 uint32_t g_tq_next = 0;
 uint64_t g_board_latest_battle = 0;
 uint32_t g_board_latest_turn = 0;
@@ -137,16 +140,17 @@ void board_note_latest(uint64_t battle, uint32_t turn) {
 // HOST: the encoded chunks of the last kBoardKeep boundaries (each a run of [u32 length][payload]), for a client that asks (MSG_BOARDREQ, answered on its receive thread);
 // and which clients asked to be sent every boundary's chunks for the rest of a battle (kBoardReqStream). Guarded by g.cs.
 constexpr uint32_t kBoardKeep = 64;
-struct KeptBoard { uint64_t battle = 0; uint32_t turn = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+struct KeptBoard { uint64_t battle = 0; uint32_t turn = 0; uint8_t* data = nullptr; uint32_t len = 0; ULONGLONG at = 0; };
 KeptBoard g_kept[kBoardKeep];
 uint32_t g_kept_next = 0;
 uint64_t g_board_stream[kMaxPeers] = {};
 constexpr uint32_t kRollRing = 64;
-RollMsg g_roll_ring[kRollRing];            // the host's last rolls, guarded by g.cs
+RollMsg g_roll_ring[kRollRing];
+ULONGLONG g_roll_at[kRollRing] = {};            // the host's last rolls, guarded by g.cs
 // PROTO 113, mgmp_unitstate. HOST: every unit's deep-state record of the last kUsKeep boundaries (encoded MSG_USTATE payloads), answered on a client's request from its
 // receive thread. CLIENT: the records the host sent, by battle/turn/index. Both guarded by g.cs.
 constexpr uint32_t kUsKeep = 6;
-struct KeptUstate { uint64_t battle = 0; uint32_t turn = 0; uint8_t* blob[kBoardMax] = {}; uint32_t len[kBoardMax] = {}; };
+struct KeptUstate { uint64_t battle = 0; uint32_t turn = 0; uint8_t* blob[kBoardMax] = {}; uint32_t len[kBoardMax] = {}; ULONGLONG at = 0; };
 KeptUstate g_us_kept[kUsKeep];
 uint32_t g_us_kept_next = 0;
 // PROTO 115 (0.1.190): units made from cat data. HOST: the battle's cat images (encoded MSG_UCAT frames), by battle/index/key; CLIENT: the frames the host sent. Both under g.cs.
@@ -158,21 +162,22 @@ UcatFrame g_ucat_box[kUcatBox];
 uint32_t g_ucat_box_next = 0;
 // CLIENT: the host's ground maps (proto 116, mgmp_tilesync), raw payloads, one per boundary
 constexpr uint32_t kTilesBox = 8;
-struct TilesBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+struct TilesBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t* data = nullptr; uint32_t len = 0; ULONGLONG at = 0; };
 TilesBox g_tiles_box[kTilesBox];
 uint32_t g_tiles_box_next = 0;
 constexpr uint32_t kUsBox = 128;
-struct UstateBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t index = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+struct UstateBox { uint64_t battle = 0; uint32_t turn = 0; uint8_t index = 0; uint8_t* data = nullptr; uint32_t len = 0; uint32_t seq = 0; ULONGLONG at = 0; };
 UstateBox g_us_box[kUsBox];
 uint32_t g_us_box_next = 0;
 // CLIENT: the host's per-action checks (proto 117, MSG_ACTCHECK), raw payloads by battle/turn/action
 constexpr uint32_t kActBox = 48;
-struct ActBox { uint64_t battle = 0; uint32_t turn = 0, action = 0; uint8_t* data = nullptr; uint32_t len = 0; };
+struct ActBox { uint64_t battle = 0; uint32_t turn = 0, action = 0; uint8_t* data = nullptr; uint32_t len = 0; ULONGLONG at = 0; };
 ActBox g_act_box[kActBox];
 uint32_t g_act_box_next = 0;
 // CLIENT (0.1.213): the host's last turn hashes (net_host_hash), guarded by g.cs
 constexpr uint32_t kHashRing = 16;
 HashMsg g_hash_ring[kHashRing];
+ULONGLONG g_hash_at[kHashRing] = {};
 uint32_t g_hash_next = 0;
 // HOST (0.1.213): the clients whose link is slow (net_set_slow_peer, from the round trips mgmp_perf measures). Each boundary's full board is streamed to them and the
 // records of the units that changed since the last boundary are pushed -- what they would otherwise ask for and wait a round trip or two to get. Guarded by g.cs.
@@ -225,15 +230,19 @@ void queue_push(const NetMsg& m) {
     if (m.type == MSG_UNLOCKS && m.unlocks.difficulty >= 0) g_level_box.difficulty = m.unlocks.difficulty;
     if (m.type == MSG_UNLOCKS && m.unlocks.extra_events >= 0) g_level_box.extra_events = m.unlocks.extra_events;           // proto 112
     if (m.type == MSG_UNLOCKS && m.unlocks.event_difficulty >= 0) g_level_box.event_difficulty = m.unlocks.event_difficulty;
-    if (m.type == MSG_ROLL) g_roll_ring[g_roll_next++ % kRollRing] = m.roll;
+    if (m.type == MSG_ROLL) { g_roll_at[g_roll_next % kRollRing] = GetTickCount64(); g_roll_ring[g_roll_next++ % kRollRing] = m.roll; }
     // 0.1.213: the host's turn hashes, kept beside the queue -- a client's resync at a boundary waits for the host's hash of that turn without pumping the queue
-    if (m.type == MSG_HASH && g.role == NetRole::Client && m.from == kHostPeer) g_hash_ring[g_hash_next++ % kHashRing] = m.hash;
+    if (m.type == MSG_HASH && g.role == NetRole::Client && m.from == kHostPeer) { g_hash_at[g_hash_next % kHashRing] = GetTickCount64(); g_hash_ring[g_hash_next++ % kHashRing] = m.hash; }
     if (m.type == MSG_BOARD) {
         const BoardMsg& b = m.board;
         BoardAssembled* box = nullptr;
         for (uint32_t k = 0; k < kBoardRing && !box; ++k)
             if (g_board_ring[k].battle == b.battle && g_board_ring[k].turn == b.turn) box = &g_board_ring[k];
         if (!box) { box = &g_board_ring[g_board_next++ % kBoardRing]; *box = BoardAssembled{}; box->battle = b.battle; box->turn = b.turn; }
+        // 0.1.246: a new publication of this battle and turn starts at its first chunk -- it is not merged into the last one (a mid-battle re-snapshot restarts
+        // the turns under the same battle id: the new turn 0's chunks went into the battle's first turn-0 board, which already read as complete)
+        if (b.first == 0 && box->got) { const uint64_t bb = box->battle; const uint32_t bt = box->turn; *box = BoardAssembled{}; box->battle = bb; box->turn = bt; }
+        g_board_at[box - g_board_ring] = GetTickCount64();
         if (box->cats != b.cats || box->total != b.total) {
             *box = BoardAssembled{};   // a republication of that turn with another shape: start over
             box->battle = b.battle; box->turn = b.turn; box->cats = b.cats; box->total = b.total;
@@ -254,6 +263,7 @@ void queue_push(const NetMsg& m) {
         for (uint32_t k = 0; k < kSumRing && !slot; ++k) if (g_sum_ring[k].battle == s.battle && g_sum_ring[k].turn == s.turn) slot = &g_sum_ring[k];
         if (!slot) slot = &g_sum_ring[g_sum_next++ % kSumRing];
         *slot = s;
+        g_sum_at[slot - g_sum_ring] = GetTickCount64();
         board_note_latest(s.battle, s.turn);
     }
     if (m.type == MSG_TURNQUEUE) {
@@ -262,6 +272,7 @@ void queue_push(const NetMsg& m) {
         for (uint32_t k = 0; k < kTqRing && !slot; ++k) if (g_tq_ring[k].battle == q.battle && g_tq_ring[k].turn == q.turn) slot = &g_tq_ring[k];
         if (!slot) slot = &g_tq_ring[g_tq_next++ % kTqRing];
         *slot = q;
+        g_tq_at[slot - g_tq_ring] = GetTickCount64();
     }
     // The board's frames live in their mailboxes only (the game thread waits on those inside the turn boundary): queuing them as well cost five slots of the 256 per boundary
     // and nothing ever read them.
@@ -572,7 +583,7 @@ void client_store_tiles(const uint8_t* payload, uint32_t plen) {
     memcpy(&b.battle, payload + 1, 8); memcpy(&b.turn, payload + 9, 4);
     b.data = (uint8_t*)malloc(plen);
     if (!b.data) return;
-    memcpy(b.data, payload, plen); b.len = plen;
+    memcpy(b.data, payload, plen); b.len = plen; b.at = GetTickCount64();
     EnterCriticalSection(&g.cs);
     TilesBox* slot = nullptr;
     for (uint32_t k = 0; k < kTilesBox && !slot; ++k) if (g_tiles_box[k].battle == b.battle && g_tiles_box[k].turn == b.turn) slot = &g_tiles_box[k];
@@ -587,7 +598,7 @@ void client_store_actcheck(const uint8_t* payload, uint32_t plen) {
     memcpy(&b.battle, payload + 1, 8); memcpy(&b.turn, payload + 9, 4); memcpy(&b.action, payload + 13, 4);
     b.data = (uint8_t*)malloc(plen);
     if (!b.data) return;
-    memcpy(b.data, payload, plen); b.len = plen;
+    memcpy(b.data, payload, plen); b.len = plen; b.at = GetTickCount64();
     EnterCriticalSection(&g.cs);
     ActBox* slot = nullptr;
     for (uint32_t k = 0; k < kActBox && !slot; ++k) if (g_act_box[k].data && g_act_box[k].battle == b.battle && g_act_box[k].turn == b.turn && g_act_box[k].action == b.action) slot = &g_act_box[k];
@@ -604,6 +615,8 @@ void client_store_ustate(const uint8_t* payload, uint32_t plen) {
     if (!b.data) return;
     memcpy(b.data, payload, plen); b.len = plen;
     EnterCriticalSection(&g.cs);
+    b.seq = g_us_box_next + 1;          // 0.1.239: the newest of several records of one unit and boundary is the one read
+    b.at = GetTickCount64();
     UstateBox& slot = g_us_box[g_us_box_next++ % kUsBox];
     free(slot.data);
     slot = b;
@@ -705,6 +718,10 @@ bool relayed(uint8_t type) {
         // DEBUGHIT (developer tools): authored by whichever peer clicks, and every peer must write the same hp or the next turn's hash halts. Without this a client's hit reached the host only,
         // and the second client fought on against enemies the other two had already struck down (2026-10-05, three players).
         case MSG_DEBUGHIT:
+        // HOUSECOOP (0.1.237): every player authors its own status, ask, vote and cancel for every other player. Not relayed, a client never heard the other
+        // clients in a room of three or four: room KD8E (11-16 21:08) -- MetLouis had the house boss today and waited for "peer 2: no recent status" while that
+        // player stood in its warehouse; nobody was ever asked, and both boss days were fought alone.
+        case MSG_HOUSECOOP:
             return true;
         default:
             return false;
@@ -1704,8 +1721,38 @@ void net_clear_battle_caches() {
     g_ucat_box_next = 0;
     for (uint32_t k = 0; k < kUcatKeep; ++k) { free(g_ucat_kept[k].data); g_ucat_kept[k] = UcatFrame{}; }
     g_ucat_kept_next = 0;
+    // 0.1.241 (room KD8E 11-19 22:36, battle fa48c212 entered twice after a restore): the unit records were the one store this left out -- the host answered turn 0 of
+    // the second entry with the first entry's records (other units at the same index: 0.1.239's check refused all 13, the halt followed at turn 6). Both are by battle and turn only.
+    for (uint32_t k = 0; k < kUsKeep; ++k) { for (uint32_t i = 0; i < kBoardMax; ++i) { free(g_us_kept[k].blob[i]); } g_us_kept[k] = KeptUstate{}; }
+    g_us_kept_next = 0;
+    for (uint32_t k = 0; k < kUsBox; ++k) { free(g_us_box[k].data); g_us_box[k] = UstateBox{}; }
+    g_us_box_next = 0;
     LeaveCriticalSection(&g.cs);
 }
+// 0.1.246: everything of `battle` that arrived (or was kept) before `before` (GetTickCount64) is let go: boards, digests, turn queues, tiles, the host's
+// hashes and rolls, unit records, action checks. For a mid-battle re-snapshot (the game replaced the battle's character list): the battle id stays, the
+// turns start again at 0, and every store is keyed by battle and turn -- the battle's first turn 0..N answered the new turn 0..N (room XU 11-20 23:59:
+// the stale turn-0 board was applied, its old stream gave an rng mismatch, the stale unit records were refused, the battle halted at turn 2).
+void net_forget_battle_before(uint64_t battle, ULONGLONG before) {
+    if (!g.cs_ready || !battle) return;
+    uint32_t n = 0;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kBoardRing; ++k) if (g_board_ring[k].battle == battle && g_board_at[k] < before) { g_board_ring[k] = BoardAssembled{}; ++n; }
+    for (uint32_t k = 0; k < kSumRing; ++k)   if (g_sum_ring[k].battle == battle && g_sum_at[k] < before) { g_sum_ring[k] = BoardSumMsg{}; ++n; }
+    for (uint32_t k = 0; k < kTqRing; ++k)    if (g_tq_ring[k].battle == battle && g_tq_at[k] < before) { g_tq_ring[k] = TurnQueueMsg{}; ++n; }
+    for (uint32_t k = 0; k < kHashRing; ++k)  if (g_hash_ring[k].battle_id == battle && g_hash_at[k] < before) { g_hash_ring[k] = HashMsg{}; ++n; }
+    for (uint32_t k = 0; k < kRollRing; ++k)  if (g_roll_ring[k].battle == battle && g_roll_at[k] < before) { g_roll_ring[k] = RollMsg{}; ++n; }
+    for (uint32_t k = 0; k < kTilesBox; ++k)  if (g_tiles_box[k].data && g_tiles_box[k].battle == battle && g_tiles_box[k].at < before) { free(g_tiles_box[k].data); g_tiles_box[k] = TilesBox{}; ++n; }
+    for (uint32_t k = 0; k < kUsBox; ++k)     if (g_us_box[k].data && g_us_box[k].battle == battle && g_us_box[k].at < before) { free(g_us_box[k].data); g_us_box[k] = UstateBox{}; ++n; }
+    for (uint32_t k = 0; k < kActBox; ++k)    if (g_act_box[k].data && g_act_box[k].battle == battle && g_act_box[k].at < before) { free(g_act_box[k].data); g_act_box[k] = ActBox{}; ++n; }
+    for (uint32_t k = 0; k < kBoardKeep; ++k) if (g_kept[k].data && g_kept[k].battle == battle && g_kept[k].at < before) { free(g_kept[k].data); g_kept[k] = KeptBoard{}; ++n; }
+    for (uint32_t k = 0; k < kUsKeep; ++k)
+        if (g_us_kept[k].battle == battle && g_us_kept[k].at < before) { for (uint32_t i = 0; i < kBoardMax; ++i) free(g_us_kept[k].blob[i]); g_us_kept[k] = KeptUstate{}; ++n; }
+    if (g_board_latest_battle == battle) { g_board_latest_battle = 0; g_board_latest_turn = 0; }    // "the host is already past turn N" belonged to the old numbering
+    LeaveCriticalSection(&g.cs);
+    log_line("NET", "battle %016llx re-snapshotted: %u stored board/hash/record entr(ies) from before it let go (the turns start again at 0)", (unsigned long long)battle, n);
+}
+
 bool net_host_board(uint64_t battle, uint32_t turn, BoardAssembled& out) {
     if (!g.cs_ready || !battle) return false;
     EnterCriticalSection(&g.cs);
@@ -1735,6 +1782,7 @@ uint32_t net_board_publish(const BoardMsg* chunks, uint32_t n, const BoardSumMsg
     KeptBoard* slot = nullptr;
     for (uint32_t k = 0; k < kBoardKeep && !slot; ++k) if (g_kept[k].data && g_kept[k].battle == battle && g_kept[k].turn == turn) slot = &g_kept[k];
     if (!slot) slot = &g_kept[g_kept_next++ % kBoardKeep];
+    slot->at = GetTickCount64();
     free(slot->data);
     slot->battle = battle; slot->turn = turn; slot->data = data; slot->len = len;
     for (uint32_t p = 0; p < kMaxPeers; ++p) stream[p] = g_board_stream[p] == battle || g_slow_peer[p];     // 0.1.213: a slow link gets every board whole, unasked
@@ -1789,6 +1837,7 @@ void net_ustate_publish(uint64_t battle, uint32_t turn, uint8_t* const* blobs, c
     KeptUstate* s = nullptr;
     for (uint32_t k = 0; k < kUsKeep && !s; ++k) if (g_us_kept[k].battle == battle && g_us_kept[k].turn == turn) s = &g_us_kept[k];
     if (!s) s = &g_us_kept[g_us_kept_next++ % kUsKeep];
+    s->at = GetTickCount64();
     for (uint32_t i = 0; i < kBoardMax; ++i) { free(s->blob[i]); s->blob[i] = nullptr; s->len[i] = 0; }
     s->battle = battle; s->turn = turn;
     for (uint32_t i = 0; i < n && i < kBoardMax; ++i) { s->blob[i] = blobs[i]; s->len[i] = lens[i]; }
@@ -1922,12 +1971,24 @@ uint32_t net_host_ustate(uint64_t battle, uint32_t turn, uint8_t index, uint8_t*
     if (!g.cs_ready || !battle) return 0;
     uint32_t got = 0;
     EnterCriticalSection(&g.cs);
-    for (uint32_t k = 0; k < kUsBox && !got; ++k) {
+    const UstateBox* best = nullptr;
+    for (uint32_t k = 0; k < kUsBox; ++k) {
         const UstateBox& b = g_us_box[k];
-        if (b.data && b.battle == battle && b.turn == turn && b.index == index && b.len <= cap) { memcpy(out, b.data, b.len); got = b.len; }
+        if (b.data && b.battle == battle && b.turn == turn && b.index == index && b.len <= cap && (!best || b.seq > best->seq)) best = &b;
     }
+    if (best) { memcpy(out, best->data, best->len); got = best->len; }
     LeaveCriticalSection(&g.cs);
     return got;
+}
+// 0.1.239: every record of this unit and boundary is let go (one that did not match the host's board row: the next one asked for is read instead)
+void net_drop_ustate(uint64_t battle, uint32_t turn, uint8_t index) {
+    if (!g.cs_ready) return;
+    EnterCriticalSection(&g.cs);
+    for (uint32_t k = 0; k < kUsBox; ++k) {
+        UstateBox& b = g_us_box[k];
+        if (b.data && b.battle == battle && b.turn == turn && b.index == index) { free(b.data); b = UstateBox{}; }
+    }
+    LeaveCriticalSection(&g.cs);
 }
 
 bool net_send_boardreq(const BoardReqMsg& m) { uint8_t p[kSendBoardReq]; const uint32_t n = enc_boardreq(p, sizeof(p), m); return n && net_send(p, n); }

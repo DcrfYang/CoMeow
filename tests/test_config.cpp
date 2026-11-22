@@ -15,6 +15,7 @@
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_addresses.h"   // the Target enum the hook assertions name
+#include "mgmp_impnote.h"     // 0.1.234: which important update notices an update crossed
 
 #include <windows.h>
 #include <cstdio>
@@ -64,12 +65,31 @@ static void test_addr_migration() {
     check(!strcmp(config().signal_addr, "192.168.1.5"), "another address is kept");
 }
 
+// 0.1.234: the important update notice -- shown once when the update since the last start crossed its version (prev < note <= cur)
+static void test_impnote() {
+    printf("-- the important update notice: which updates cross a note --\n");
+    check(impnote_version_cmp("0.1.99", "0.1.234") < 0 && impnote_version_cmp("0.1.234", "0.1.234.0") == 0 && impnote_version_cmp("0.2", "0.1.300") > 0, "versions compare by number, part by part");
+    check(impnote_crosses("0.1.233", "0.1.234", "0.1.234"), "233 -> 234 crosses 234");
+    check(impnote_crosses("0.1.200", "0.1.240", "0.1.234"), "200 -> 240 crosses 234 (a skipped update still shows it)");
+    check(impnote_crosses("", "0.1.234", "0.1.234"), "no ui.last_version (an install from before the key) counts as older");
+    check(!impnote_crosses("0.1.234", "0.1.235", "0.1.234"), "234 -> 235: seen already");
+    check(!impnote_crosses("0.1.230", "0.1.233", "0.1.234"), "230 -> 233: not reached yet");
+    check(!impnote_crosses("0.1.240", "0.1.234", "0.1.234"), "a downgrade shows nothing");
+    check(!impnote_crosses("0.1.234", "0.1.234", "0.1.234"), "the same version again shows nothing");
+    load("{ \"ui\": { \"last_version\": \"0.1.234\" } }");
+    check(!strcmp(config().last_version, "0.1.234"), "ui.last_version is read");
+    load("{ \"ui\": { } }");
+    check(!config().last_version[0], "and is empty when missing");
+    check(config().exp_house_coop, "0.1.234: the house defense co-op is on by default");
+}
+
 int main() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     swprintf_s(g_dir, L"%smgmp_test_config", tmp);
     CreateDirectoryW(g_dir, nullptr);
     test_addr_migration();
+    test_impnote();
 
     printf("-- where the trace log goes: the log folder beside the dll --\n");
     {

@@ -16,6 +16,9 @@ namespace mgmp {
 bool savefile_save_dir(wchar_t* out, size_t cap) { wcsncpy_s(out, cap, g_root.c_str(), _TRUNCATE); return true; }
 void log_line(const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
 void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
+void ui_error_popup(const char*, const char*) {}
+bool checkpoint_import_notes_file(const std::wstring&) { return true; }
+void catsync_drop_swap_notes(const char*) {}   // a restore drops the swap notes of the run: not under test   // the backup page's notes import: not under test     // 0.1.169: the file-problem popup -- not under test
 bool leave_scene_live(const char*) { return false; }
 bool checkpoint_cleanup_due() { return false; }
 void checkpoint_cleanup_deferred(const char*) {}     // the warehouse trigger is not under test: no scene is ever live here
@@ -56,7 +59,10 @@ static bool present(const std::wstring& p) { return GetFileAttributesW(p.c_str()
 
 int main() {
     wchar_t cwd[MAX_PATH]{}; GetCurrentDirectoryW(MAX_PATH, cwd);
-    g_root = std::wstring(cwd) + L"\\_buildcheck\\saveslots-test-" + std::to_wstring(checkpoint_io::nonce());
+    checkpoint_io::g_test_skip_flush = true;
+    const std::wstring tmp = std::wstring(cwd) + L"\\_buildcheck\\tmp-tests";   // 2026-11-15: emptied by the script before each run
+    CreateDirectoryW(tmp.c_str(), nullptr);
+    g_root = tmp + L"\\saveslots-test-" + std::to_wstring(checkpoint_io::nonce());
     CHECK(CreateDirectoryW(g_root.c_str(), nullptr));
     for (int s = 0; s < kGameSlots; ++s)
         sql_exec(g_root + L"\\" + kGameFile[s], "CREATE TABLE properties(key TEXT PRIMARY KEY,data ANY); INSERT INTO properties VALUES('v',1);");

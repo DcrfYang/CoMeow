@@ -74,6 +74,8 @@ bool session_block_new_cats();
 // Is an experimental feature on? The host's setting, whichever peer is asking; false on a client until the host's HELLO.
 // The room's enemy health and armor multiplier in halves (2 = x1 .. 16 = x8): the host's ui.enemy_scale, whichever peer is asking.
 uint8_t session_enemy_scale_half();
+// 0.1.243: the house boss co-op fight's multiplier in halves (2 = x1 .. 16 = x8): the host's ui.house_boss_scale, whichever peer is asking.
+uint8_t session_house_scale_half();
 bool session_exp_treasure();      // ui.exp_treasure: the shared treasure chest (mgmp_treasure)
 bool session_exp_voice();           // ui.exp_voice, the HOST's setting: the room panel gets a microphone and a sound button (mgmp_voice)
 bool session_exp_indep_events();  // ui.exp_indep_events: the random "?" events are each player's own (mgmp_indepevt)

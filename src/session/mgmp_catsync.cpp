@@ -151,6 +151,7 @@ struct State {
         uint64_t id = 0, theirs = 0, mine = 0;
         uint32_t seen = 0, tries = 0;
         bool     said = false;
+        ULONGLONG at = 0;     // 0.1.238: when this difference was last seen (the host's node entry waits on a fresh one)
     };
     Heal     heal[kMaxCats] = {};
     uint32_t heal_count = 0;
@@ -2492,7 +2493,7 @@ unsigned catsync_merge_session_cats(const char* why, bool after_native_settlemen
 // WHO IS NOT A SQUATTER: a retired slot (flags 0), a clone this peer made (it has a recorded origin), a clone the other peer sent (it has an OWNER NOTE -- the roster install notes every session cat),
 // and a cat the merge adopted. NOT the "out on adventure" flag: the game sets it on every cat that leaves, so a real cat that has just been chosen for the run carries it too (2026-10-03: the
 // first version skipped on it and never touched the host's cat, which was already in the party). This is only called on the pages BEFORE the clones exist.
-unsigned catsync_relocate_squatters(const char* why) {
+unsigned catsync_relocate_squatters(const char* why, uint64_t* moved_from, uint64_t* moved_to, unsigned moved_cap) {
     ensure_state();
     if (!g.on || g.settling || !g.director_slot || my_session_pos() >= kMaxPeers) return 0;
     static ULONGLONG s_retry_after = 0;                                      // a move that failed is not retried every scan (and not logged every scan)
@@ -2576,6 +2577,7 @@ unsigned catsync_relocate_squatters(const char* why) {
         }
     }
     if (!moved) return 0;
+    for (unsigned k = 0; k < moved && k < 16 && k < moved_cap && moved_from && moved_to; ++k) { moved_from[k] = from_id[k]; moved_to[k] = to_id[k]; }
 
     // The run's lists still name the old ids.
     uint64_t ids[16] = {}; uint32_t n = 0;
@@ -2730,7 +2732,10 @@ void catsync_log_snapshot(const char* stage) {
 // session range (the host's save held 71000001-3 and 71000004-6; the client's 70000001-4). Nobody can pick them, but they sit on the ids the next run's clones need, and the "real cat on a reserved id"
 // scare came from exactly such leftovers. Once the run is over a peer's copy has no purpose: it is retired the way this player's own clones are (flags 0; the next run's import rewrites it whole).
 // Not touched: anything in the run's lists, anything that is not flagged out on adventure, and this peer's own namespace.
-unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions) {
+// A HOUSE BOSS CO-OP (2026-11-16 11:36): the fight is fought in the House, without set_party_and_go, so nothing marks the cats "out on adventure" -- the other players' copies
+// came through the settlement alive (flags 3/7) and were kept: the census found each one beside its original ("2 DUPLICATED: 'Calcetin' 'Fangs'" with two instances on one save),
+// and on separate machines they stayed in the save as live cats on the session ids. unmarked_too retires them without the mark (same exclusions otherwise).
+unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions, bool unmarked_too) {
     ensure_state();
     if (!g.resolved || !g.director_slot) return 0;      // not g.on: also after the session is gone (leaving a room)
     const uint8_t* dir = nullptr; const void* registry = nullptr;
@@ -2753,7 +2758,8 @@ unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions) {
             bool in_lists = false;
             for (uint32_t b = 0; b < nbusy; ++b) if (busy[b] == id) in_lists = true;
             void* cat = nullptr; uint64_t fl = 0;
-            if (in_lists || !safe_by_id((void*)registry, id, &cat) || !cat || !mem_read((uint8_t*)cat + kCatData_Flags, &fl, sizeof(fl)) || !(fl & kCatFlag_OnAdventure)) continue;
+            if (in_lists || !safe_by_id((void*)registry, id, &cat) || !cat || !mem_read((uint8_t*)cat + kCatData_Flags, &fl, sizeof(fl)) || !fl) continue;
+            if (!(fl & kCatFlag_OnAdventure) && !unmarked_too) continue;
             if (adopted_has(id)) continue;
             // 0.1.185: a copy the House names is a cat of this House now -- retired (flags 0) it could no longer be loaded and the House scene crashed on it
             // at the return home (11-04 18:27, two players). Kept as it is; the line says so.
@@ -2786,6 +2792,27 @@ unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions) {
 //   - on the HOST, a copy that stays home "away on the adventure" -- exactly an original of a clone. The settlement merge (recorded origin)
 //     swaps the two back, and the cat comes home as a real cat of the host's House, under the id the game gave it;
 //   - on a CLIENT, a retired copy (flags 0): it was never the client's cat. Its run copy is retired with the other copies after the run.
+// 0.1.238: one cat on a reserved id moved to the next ordinary id, the way catsync_relocate_squatters moves one: a copy under the new id, the two identities
+// swapped (the real object keeps its address and takes the new id), its family moved with it, the reserved id left holding a retired copy (flags 0).
+static bool move_reserved_off(const void* registry, uint64_t id, void* cat, uint64_t flags, uint64_t& target) {
+    target = 0;
+    repair_id_counter(registry);
+    uint8_t* image = nullptr;
+    const uint32_t size = serialize_cat(cat, &image);
+    const bool adopted_ok = size && image && adopt_as_new_cat(registry, image, size, target, cat);
+    free(image);
+    void* adopted = nullptr;
+    if (!adopted_ok || !safe_by_id((void*)registry, target, &adopted) || !adopted || !swap_identity(registry, id, cat, target, adopted)) {
+        log_line_lvl(LogLevel::Error, "CATSYNC", "!! the cat on the reserved id %016llx (flags %llx) could not be moved to an ordinary id", (unsigned long long)id, (unsigned long long)flags);
+        return false;
+    }
+    if (!(flags & (kCatFlag_Perished | 0x30ull))) swap_note(id, target, house_names_id(id) == 1);     // a dead cat has no House entity
+    pedigree_move(registry, id, target);
+    const uint64_t retired = 0;
+    mem_write((uint8_t*)adopted + kCatData_Flags, &retired, sizeof(retired));
+    return true;
+}
+
 bool catsync_on_gained_cat(uint64_t counter_before, const char* why) {
     ensure_state();
     if (!g.on || !g.id_counter || !g.director_slot || !net_active()) return false;
@@ -2826,9 +2853,16 @@ bool catsync_on_gained_cat(uint64_t counter_before, const char* why) {
             if (!mem_read(dir + lists[l].at + 4, &cnt, 4) || !mem_read(dir + lists[l].at + 8, &data, 8) || !data || cnt > 64) continue;
             for (uint32_t i = 0; i < cnt && !in_run; ++i) { uint64_t v = 0; if (mem_read(data + i, &v, 8) && v == s_id) in_run = true; }
         }
+        uint64_t moved_to = 0;
         if (g.is_client && seat == 0 && !in_run) {
             log_line_lvl(LogLevel::Warn, "CATSYNC", "gained cat (%s): the host's slot %llx holds a stale copy here (flags %llx, in no list of this run) -- reused for the cat this event made",
                          why, (unsigned long long)s_id, (unsigned long long)slot_flags);
+        } else if (!in_run && move_reserved_off(registry, s_id, slot_cat, slot_flags, moved_to) && safe_by_id((void*)registry, s_id, &slot_cat) && slot_cat) {
+            // 0.1.238 (room XNAE 11-17 21:18): the host's 70000019 held a gained cat of an earlier run that had died there (flags 40020, in no list of this run). It was
+            // taken for a live cat, the new one stayed on the game's id b8 while the client moved its copy to 70000019 -- two ids for one cat, and every battle after
+            // halted at its first turn ("cat 7 is human but claimed by no player", seven in a row). The old cat goes to an ordinary id the way a squatter does.
+            log_line_lvl(LogLevel::Warn, "CATSYNC", "gained cat (%s): the shared id %llx held a cat of an earlier run (flags %llx, in no list of this run) -- moved to %llx; the slot takes the cat this event made",
+                         why, (unsigned long long)s_id, (unsigned long long)slot_flags, (unsigned long long)moved_to);
         } else {
             log_line_lvl(LogLevel::Error, "CATSYNC", "!! gained cat (%s): the shared id %llx holds a live cat (flags %llx%s) on this peer -- %llx left as the game made it",
                          why, (unsigned long long)s_id, (unsigned long long)slot_flags, in_run ? ", named by this run's lists" : "", (unsigned long long)n_id);
@@ -4125,13 +4159,15 @@ static void drop_absent_seats() {
 // THE GAME'S ID COUNTER, KEPT OUT OF THE CLONE RANGE (2026-10-05). It was put back only when a run was merged or a clone adopted, and the game made a cat in between -- the day turning at the departure box
 // brought a kitten whose id was 0x71000013 (counter 0x71000012 after a settlement that did not move it). Here it is looked at about once a second, wherever this peer is, and moved back to the highest
 // ordinary id the moment it is inside the range. Cheap when it is not: one read.
+// 0.1.239: NOT ONLY ON THE MAP, AND NOT ONLY IN A ROOM (bibi 11-18: the save's counter sat at 72000008 and the House's kittens were 72000004/5/8 -- this ran from the map
+// tick of a session only, never in the House where the cats are born). It is called from the frame hook now.
 static void counter_tick() {
     static ULONGLONG s_next = 0, s_logged = 0;
     const ULONGLONG t = GetTickCount64();
     if (t < s_next) return;
     s_next = t + 1000;
     ensure_state();
-    if (!g.on || !g.id_counter || !g.director_slot || *g.id_counter < 0x70000000ull) return;
+    if (!tune::kCatSync || !g.resolved || !g.id_counter || !g.director_slot || *g.id_counter < 0x70000000ull) return;
     const uint8_t* dir = nullptr;
     const void* registry = nullptr;
     if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir || !mem_read(dir + kDir_CatRegistry, &registry, sizeof(registry)) || !registry) return;
@@ -4142,6 +4178,8 @@ static void counter_tick() {
         log_line_lvl(LogLevel::Warn, "CATSYNC", "!! the cat id counter is %llx (inside the clone range) and could not be put back: no ordinary cat id was found in the registry", (unsigned long long)before);
     }
 }
+
+void catsync_counter_tick() { counter_tick(); }
 
 void catsync_leave_tick() {
     counter_tick();
@@ -4764,6 +4802,7 @@ bool compare_digest(uint8_t from, const RunCats& rc, const CatDigestMsg& mine) {
 
         State::Heal* h = heal_find(from, id, true);
         if (!h) continue;
+        h->at = GetTickCount64();
         if (h->theirs == theirs.hashes[i] && h->mine == mine.hashes[j]) {
             ++h->seen;
         } else {
@@ -4851,6 +4890,55 @@ void digest_cycle() {
 }
 
 } // namespace
+
+// 0.1.238 (room EMQ3 11-17 20:20): the host held two clients' pushes on the post-battle screens ("holding cat pushes while a battle is in progress"),
+// a player dropped, every player restored handshake save 9 -- and the map tick after the load applied the held pushes: the clients' cats as they were
+// AFTER save 9 (a level-up, a full water bottle) written into the run that had just gone back to it. The clients rebuilt their own cats from save 9, the
+// first battle's audit found four cats differing, and a passive the repair cannot make by name halted it at turn 1 (four times that evening).
+// A push held from before a load belongs to the registry the load replaced.
+void catsync_on_save_loaded() {
+    ensure_state();
+    if (!g.pend_count) return;
+    char ids[200] = {}; int w = 0;
+    for (uint32_t i = 0; i < g.pend_count; ++i)
+        if (w >= 0 && (size_t)w < sizeof(ids) - 20) w += _snprintf_s(ids + w, sizeof(ids) - w, _TRUNCATE, " %llx", (unsigned long long)g.pend_id[i]);
+    log_line_lvl(LogLevel::Warn, "CATSYNC", "a save was loaded: %u cat push(es) held from before it dropped (they describe the cats before the load; the owners' digests heal what differs) --%s",
+                 g.pend_count, ids);
+    free_pending();
+}
+
+// 0.1.238: THE HOST DOES NOT ENTER A NODE WHILE A PLAYER'S CAT DIFFERS FROM ITS OWNER'S COPY (room EMQ3: the digest said so 26 lines before the node was entered,
+// the owner's resend comes after two digests, about two seconds, and the battle was already built from the stale copy). Up to kHoldMs, then on as before.
+bool catsync_hold_node() {
+    ensure_state();
+    if (!g.on || g.is_client || !net_active() || net_peer_count() < 2) return false;
+    constexpr ULONGLONG kFreshMs = 4000, kHoldMs = 10000, kToastAfterMs = 1500;
+    static ULONGLONG since = 0, last_toast = 0;
+    static bool valve_said = false;
+    const ULONGLONG now = GetTickCount64();
+    const uint8_t me = net_peer_pos();
+    char waiting[160] = {}; int w = 0;
+    for (uint32_t i = 0; i < g.heal_count; ++i) {
+        const State::Heal& h = g.heal[i];
+        if (!h.said || !h.at || now - h.at > kFreshMs || h.peer == me || authority_of(h.id) != h.peer) continue;
+        if (w >= 0 && (size_t)w < sizeof(waiting) - 30) w += _snprintf_s(waiting + w, sizeof(waiting) - w, _TRUNCATE, " %llx(peer %u)", (unsigned long long)h.id, (unsigned)h.peer);
+    }
+    if (!w) {
+        if (since) log_line("CATSYNC", "node entry: every player's cats agree with their owners' copies again after %llu ms", (unsigned long long)(now - since));
+        since = 0; valve_said = false;
+        return false;
+    }
+    if (!since) {
+        since = now;
+        log_line_lvl(LogLevel::Warn, "CATSYNC", "node entry HELD: cats differ from their owners' copies --%s -- waiting for the owners' resends (at most %llu s)", waiting, (unsigned long long)(kHoldMs / 1000));
+    }
+    if (now - since >= kHoldMs) {
+        if (!valve_said) { valve_said = true; log_line_lvl(LogLevel::Error, "CATSYNC", "!! node entry: the cats still differ after %llu s --%s -- the host goes on", (unsigned long long)(kHoldMs / 1000), waiting); }
+        return false;
+    }
+    if (now - since >= kToastAfterMs && now - last_toast >= 3000) { last_toast = now; room_toast(tr(Tx::CS_WAIT_CATS)); }
+    return true;
+}
 
 void catsync_on_digest(uint8_t from, const CatDigestMsg& m) {
     ensure_state();

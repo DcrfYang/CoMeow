@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <cstdio>
 #include "mgmp_net.h"
+#include "mgmp_log.h"    // LogLevel, for the log stubs
 
 #pragma comment(lib, "ws2_32.lib")
 using namespace mgmp;
@@ -82,4 +83,8 @@ int main() {
     return fails ? 1 : 0;
 }
 
-namespace mgmp { void log_line(const char* tag, const char* fmt, ...) { (void)tag; (void)fmt; } }
+namespace mgmp { void log_line(const char* tag, const char* fmt, ...) { (void)tag; (void)fmt; }
+void log_line_lvl(LogLevel, const char*, const char*, ...) {}
+void perf_on_ping(uint8_t, const PingMsg&) {}                                     // 0.1.68 ping/RTT: not under test
+uint32_t perf_make_reply(uint8_t*, uint32_t, const PingMsg&) { return 0; }
+}

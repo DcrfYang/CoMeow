@@ -125,6 +125,7 @@
 
 #include "json.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -395,7 +396,8 @@ constexpr uint32_t kUpTotalMax = 32u << 20;   // per upload
 constexpr size_t   kUpChunkMax = 2600;        // raw bytes in one chunk
 constexpr size_t   kUpTextMax  = 1500;        // the description's cap, UTF-8 bytes
 constexpr int      kUpPerHour  = 12;          // uploads one address may make per hour
-constexpr int      kUpStoreMax = 3000;        // stored uploads before the server refuses more
+constexpr int      kUpStoreMax = 5000;        // stored uploads; at the cap the oldest are deleted (2026-11-14: 3000 -> 5000, and pruning instead of refusing)
+constexpr int      kUpPruneTo  = 4900;        // a prune deletes the oldest uploads down to this many
 constexpr uint64_t kHeartbeatLostMs = 75000;   // a connection that heartbeats (a mod from 0.1.57 on pings every 20 s) and is silent this long is dropped
 constexpr uint64_t kUpIdleMs  = 60000;       // a stalled upload is dropped (and its partial files deleted)
 constexpr size_t   kPwMax      = 64;      // the longest password digest accepted
@@ -985,6 +987,25 @@ void handle_logbegin(Client& c, const json& j) {
         if (now - rec->at[i] > 3600000ull) rec->at.erase(rec->at.begin() + (long)i); else ++i;
     }
     if ((int)rec->at.size() >= kUpPerHour) { send_error(c.sock, "too many uploads from this address -- try again later", "limit"); return; }
+    // The count is taken at startup and only goes up here; uploads deleted from outside (the admin page, by hand) are seen only by a recount -- at the cap, at most once
+    // a minute (2026-11-14: ~1000 deleted through the admin page, the server still said "full" with 1934 stored).
+    static uint64_t s_recounted = 0;
+    if (g_stored >= kUpStoreMax && (s_recounted == 0 || now - s_recounted > 60000ull)) {
+        const int was = g_stored;
+        count_stored();
+        s_recounted = now;
+        if (g_stored != was) logf("log storage recounted at the cap: %d -> %d upload(s)", was, g_stored);
+    }
+    if (g_stored >= kUpStoreMax) {
+        // Still full: the oldest uploads go (a folder's name starts with its time, YYYYMMDD-HHMMSS, so the name order is the age order).
+        std::vector<std::string> dirs;
+        each_entry(g_logdir, [&](const std::string& name, bool dir) { if (dir) dirs.push_back(name); });
+        std::sort(dirs.begin(), dirs.end());
+        int removed = 0;
+        for (size_t i = 0; i < dirs.size() && (int)dirs.size() - removed > kUpPruneTo; ++i) { remove_tree(g_logdir + kSep + dirs[i]); ++removed; }
+        count_stored();
+        logf("log storage full: the %d oldest upload(s) deleted (%s .. %s), %d left", removed, removed ? dirs[0].c_str() : "-", removed ? dirs[removed - 1].c_str() : "-", g_stored);
+    }
     if (g_stored >= kUpStoreMax) { send_error(c.sock, "the server's log storage is full", "full"); return; }
 
     auto fit = j.find("files");

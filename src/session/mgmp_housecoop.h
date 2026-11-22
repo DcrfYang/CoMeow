@@ -1,4 +1,4 @@
-// mgmp_housecoop.h -- EXPERIMENTAL (ui.exp_house_coop, the HOST's setting): helping the one player whose house boss is today (2026-10-18).
+// mgmp_housecoop.h -- ui.exp_house_coop (the HOST's setting; experimental until 0.1.234, on by default since): helping the one player whose house boss is today (2026-10-18).
 //
 // Without it a house boss is played alone (mgmp_room: the player marks itself away and leaves the session). With it on, in a room:
 //
@@ -46,9 +46,17 @@ void housecoop_hold_reason(char* out, size_t cap);
 bool housecoop_skip_countdown();                              // T_HouseCountdown: true = skip it (an inserted day)
 bool housecoop_overnight(void* out_vec);                      // T_HouseOvernight: true = skipped (out_vec emptied, PX's boss put in)
 bool housecoop_skip_strays();                                 // T_HouseStrays: true = skip it
+// T_HouseGearDone (2026-11-16): the house boss gear screen's lock in a co-op. true = held: this player is READY and the departure waits for every player
+// (`replay` runs the closure the game's way then); a second lock while ready only says so.
+bool housecoop_on_gear_lock(void* closure, void (*replay)(void*));
 bool housecoop_on_fight_start(void* data, void (*original)(void*));   // T_HouseFight: true = held (the caller returns)
 bool housecoop_skip_beat_boss();                              // T_BeatHouseBoss: true = skip (a helper)
 bool housecoop_refuse_depart(uint32_t cats);                  // T_TryDepart with the cats in the box: true = refused (a helper must end its day first)
+// 0.1.236: a house boss fight is being played here (set when the game starts one, kept to the end of its settlement, whatever the co-op's state): no enemy
+// multiplier for its units, and run_settled retires the other players' copies, which no departure marked.
+bool housecoop_house_fight();
+void housecoop_note_house_fight();                            // T_HouseFight goes on (the game starts a house boss fight)
+void housecoop_on_departure();                                // T_HouseGearDone reached: a replayed lock passed the game's own checks
 void housecoop_settlement_begin();                            // the start of the native end of a run
 void housecoop_after_settlement();                            // run_settled, at the end
 

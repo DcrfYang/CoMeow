@@ -69,8 +69,16 @@ bool     unitstate_decode(const uint8_t* p, uint32_t n, uint64_t& battle, uint32
 // spell names are its save's and are not written).
 // 0.1.192 `own_cat`: this player's own cat (an item of another name is swapped with this player's backpack).
 uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const UnitDeep& mine, bool player_cat, bool own_cat = false);
+// 0.1.238 (sim 62), GAME THREAD: every ReplaceBasicAttackWhenCastable of `chr` runs its check now (the game's per-frame check, vtable slot 11) -- called at every boundary
+// on every peer before the hash, and by the repair after the board. Returns how many swaps changed.
+uint32_t unitstate_settle_castable(void* chr, const char* why);
+// 0.1.247, GAME THREAD: `chr` carries a live passive of the game class `name` (its own or an item's; destroyed, removed and ending ones do not count).
+bool unitstate_has_passive(const void* chr, const char* name);
+// 0.1.242 (sim 64), GAME THREAD: every XIs* passive of `chr` writes its X into its ability now (vtable slot 83) -- before the unit acts and at every boundary, on every peer.
+uint32_t unitstate_settle_xvalues(void* chr);
 // The log of what differs, without changing anything (used for the units a repair could not settle).
-void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& mine, const char* when);
+// `cols` names the two sides in the line (0.1.233: the failed-resync diagnosis also compares two readings of this game).
+void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& mine, const char* when, const char* cols = "host|here");
 
 // The hooks (mgmp_hooks): what the game gave or took, for the log. `name` is the factory's name argument (read before the call), `ra` the caller's rva.
 void unitstate_note_apply(bool status, const char* name, const void* target, int32_t stacks, const void* source, uint32_t ra, const void* made);

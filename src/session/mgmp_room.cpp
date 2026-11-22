@@ -574,6 +574,15 @@ void room_host_gone_answer(bool end) {
 }
 
 void room_tick() {
+    // 0.1.237: THE LOBBY WENT, THE GAME DID NOT (room 4388, 11-16 15:53): the room vanished from the panel in the middle of a run and the players took it for the end
+    // of the session. They are told the game goes on.
+    if (const uint64_t lost = signal_take_lobby_lost()) {
+        if (net_active() && net_peer_count() >= 2) {
+            log_line_lvl(LogLevel::Warn, "ROOM", "the lobby connection is gone, the game link is up (%u player(s)) -- the players are told to play on", (unsigned)net_peer_count());
+            push_notice(tr(Tx::R_LOBBY_LOST_GAME_ON));
+        }
+        (void)lost;
+    }
     tick_host_gone();
     tick_sysmsg();
     chat_take_lobby_lines();

@@ -592,6 +592,8 @@ struct Hello {
     uint8_t  rules      = 0;
     // The HOST's enemy health and armor multiplier in halves (proto 95: 4 = x2, the old fixed rule, .. 16 = x8). A client fights by it.
     uint8_t  enemy_scale_half = 4;
+    // 0.1.243: the HOST's house boss co-op multiplier in halves (2 = x1 .. 16 = x8), after enemy_scale_half; absent (an older peer) = x1.
+    uint8_t  house_scale_half = 2;
 };
 
 // Host -> client, after a HELLO it accepts. `cats` is the set of cat indices
@@ -1772,7 +1774,7 @@ inline bool dec_statedump(Reader& r, StateDumpMsg& m) {
 inline uint32_t enc_hello(uint8_t* p, uint32_t cap, const Hello& h) {
     Writer w(p, cap);
     w.u8v(MSG_HELLO);
-    w.u32v(h.proto); w.u64v(h.gpak_hash); w.u64v(h.build_hash); w.str(h.name); w.u8v(h.rules); w.u8v(h.enemy_scale_half);
+    w.u32v(h.proto); w.u64v(h.gpak_hash); w.u64v(h.build_hash); w.str(h.name); w.u8v(h.rules); w.u8v(h.enemy_scale_half); w.u8v(h.house_scale_half);
     return w.ok ? w.len : 0;
 }
 
@@ -2917,6 +2919,8 @@ inline bool dec_hello(Reader& r, Hello& h) {
     // proto 95's multiplier; an older peer's HELLO ends here and still decodes (its protocol number is what refuses it)
     h.enemy_scale_half = 4;
     if (r.ok && r.pos < r.len) h.enemy_scale_half = r.u8v();
+    h.house_scale_half = 2;
+    if (r.ok && r.pos < r.len) h.house_scale_half = r.u8v();     // 0.1.243
     return r.ok;
 }
 

@@ -40,6 +40,8 @@
     // The "test release -- back up your saves" dialog shown at startup. Its "do not show again" box writes false here;
     // set it back to true to see the dialog again.
     "beta_notice": true,
+    // The mod version that last started here (the important update notice after an update is shown once, then this moves up). Written by the mod.
+    "last_version": "0.0.0",
     // When the game crashes, or an earlier run ended without a clean exit (crash, freeze, killed), send its log (and crash dump) to the server named in "signal" above
     // by itself. false: nothing is sent unless you press "Upload log" (F2).
     "auto_upload_crash_log": true,

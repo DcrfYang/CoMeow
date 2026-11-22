@@ -19,7 +19,8 @@ namespace mgmp {
 
 // The fixed order of the flag set on the wire (bit n = flag n). Never reorder; append only (and bump the protocol).
 constexpr uint32_t kMapFlag_Desert = 1u << 8;    // mapflag_DesertUnlocked -- chapter 2 may be chosen
-constexpr uint32_t kMapFlag_Lab    = 1u << 18;   // mapflag_LabUnlocked    -- the three-chapter page
+constexpr uint32_t kMapFlag_Lab    = 1u << 16;   // mapflag_LabUnlocked    -- the three-chapter page (0.1.228: it was 1u << 18, MeatWorldUnlockedFull -- chapter 3 refused
+                                                 // in every room where a client had the lab but not the full meat world: rooms VELM 11-09, NFRB 11-14). kFlagNames checks both.
 
 // THIS player's flags, read live from the running game. All bits when the game's debug unlock-everything byte is set, and all bits when
 // nothing can be read: an unreadable state must never lock anybody out (and is neutral in the AND).

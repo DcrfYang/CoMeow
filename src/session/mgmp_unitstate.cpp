@@ -13,6 +13,7 @@
 #include "mgmp_spawntest.h"      // 0.1.190: unit_set_ability / unit_trim_spells
 #include "mgmp_tilesync.h"       // 0.1.195: usdev tile / tiledump
 #include "mgmp_catsync.h"        // 0.1.213: usdev famdrop
+#include "mgmp_param_passives.generated.h"   // 0.1.237: the passives the game data gives parameters (scratch/gen_param_passives.py)
 
 #include <windows.h>
 #include <cstdio>
@@ -44,6 +45,9 @@ constexpr uintptr_t kComp_Enabled  = 0x0E, kComp_Destroyed = 0x0F, kComp_Alive =
 constexpr uintptr_t kPas_Owner     = 0x38;
 constexpr uintptr_t kPas_Stacks    = 0x5C;
 constexpr uintptr_t kPas_Removed   = 0x75;
+constexpr uintptr_t kPas_Ending    = 0x76;    // 0.1.238: set by the removal callbacks (vtable slot 110, 0x140768520) before Passive::Remove runs -- the status is on its way out
+constexpr uintptr_t kPas_SwapAbility = 0xC8;  // ReplaceBasicAttackWhenCastable: the ability it swaps in
+constexpr uintptr_t kPas_SwapOn    = 0xD0;    // ... and whether it was castable at the last check (its check, vtable slot 11 = 0x1408F7BB0, compares and rebuilds)
 constexpr int32_t   kTypePassive   = 1414, kTypeStatus = 1838;
 constexpr uintptr_t kPas_Data      = 0x68;    // GonObject*: the passive's node in its owner's definition (ReplaceBasicAttack 0x140148790 reads its value)
 constexpr uintptr_t kGon_Value     = 0x68;    // std::string: a node's value (GonObject::String 0x140940D30, kinds 1, 2 and 5)
@@ -142,6 +146,37 @@ const uint8_t* find_gon_node(const uint8_t* root, const char* name, const char* 
     }
     return nullptr;
 }
+// 0.1.237: the node of a passive named `name` in a unit's definition -- a plain value equal to `value` (any value when `value` is ""), or a block / list when
+// `value` is "". Where a passive made by name takes its parameters from.
+const uint8_t* find_gon_named(const uint8_t* root, const char* name, const char* value, int depth, uint32_t& budget) {
+    if (!root || depth > 12 || budget == 0) return nullptr;
+    const uint8_t* b = nullptr; const uint8_t* e = nullptr;
+    if (!mem_read(root + kGon_Children, &b, 8) || !mem_read(root + kGon_Children + 8, &e, 8) || !b || e < b || (uint64_t)(e - b) > 4096ull * kGon_NodeSize) return nullptr;
+    for (const uint8_t* n = b; n < e && budget; n += kGon_NodeSize) {
+        --budget;
+        int32_t kind = 0;
+        if (!mem_read(n + kGon_NodeKind, &kind, 4)) continue;
+        char nm[kUsNameLen] = {};
+        const bool named = mem_read_std_string(n + kGon_NodeName, nm, sizeof(nm)) && strcmp(nm, name) == 0;
+        if (kind == 1 || kind == 2 || kind == 5) {
+            if (!named) continue;
+            if (!value[0]) return n;
+            char v[kUsNameLen] = {};
+            if (mem_read_std_string(n + kGon_Value, v, sizeof(v)) && strcmp(v, value) == 0) return n;
+        } else if (kind == 3 || kind == 4) {
+            if (named && !value[0]) return n;
+            if (const uint8_t* f = find_gon_named(n, name, value, depth + 1, budget)) return f;
+        }
+    }
+    return nullptr;
+}
+const uint8_t* def_passive_node(const void* chr, const char* name, const char* value) {
+    const uint8_t* def = nullptr;
+    if (!mem_read((const uint8_t*)chr + kChar_DefNode, &def, 8) || !def) return nullptr;
+    uint32_t budget = 20000;
+    return find_gon_named(def, name, value ? value : "", 0, budget);
+}
+
 // Two passives' data agree unless BOTH have one and they differ (one made by name has none: not a difference).
 bool data_alike(const UsPassive& a, const UsPassive& b) { return !a.data[0] || !b.data[0] || strcmp(a.data, b.data) == 0; }
 // The passive takes the host's data: the node of the same name with the host's value, from this unit's own definition. False when there is none.
@@ -177,6 +212,9 @@ void read_passives(const void* chr, UnitDeep& d) {
         const VtInfo* v = class_of(c);
         if (!v || v->kind < 1) continue;
         if (mem_read(c + kPas_Removed, &removed, 1) && removed) continue;
+        // 0.1.242: A STATUS MARKED +0x76 (ON ITS WAY OUT) IS STILL IN THE RECORD AGAIN. 0.1.238 left it out (room 6LLW: the host's such Bleed/Thorns gave no element); in room
+        // KLGL 11-19 (battle 2c08f895, turn 13) the host's +0x76 Bleed still gave the blood element while the client's Bleed was gone -- the records agreed, nothing was
+        // repaired, the boundary halted. With it in the record the repair applies the host's Bleed here, as before 0.1.238.
         if (cosmetic_passive(v->name)) continue;
         UsPassive& p = d.p[d.np++];
         p.type = (uint16_t)v->type; p.status = v->kind == 2 ? 1 : 0;
@@ -356,7 +394,7 @@ bool unitstate_decode(const uint8_t* buf, uint32_t n, uint64_t& battle, uint32_t
     return r.ok && r.pos == r.len;
 }
 
-void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& mine, const char* when) {
+void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& mine, const char* when, const char* cols) {
     char line[900]; int w = 0;
     auto put = [&](const char* fmt, auto... a) { if (w < (int)sizeof(line) - 80) w += _snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, fmt, a...); };
     line[0] = 0;
@@ -393,11 +431,114 @@ void unitstate_log_diff(uint8_t index, const UnitDeep& host, const UnitDeep& min
         else if (a.dur != b.dur || a.aux != b.aux) put(" item %u %s durability %d|%d aux %d|%d", k, a.name, a.dur, b.dur, a.aux, b.aux);
     }
     for (uint32_t k = 0; k < kUsCharInts; ++k) if (host.c[k] != mine.c[k]) put(" +%X %d|%d", (unsigned)kUsCharOff[k], host.c[k], mine.c[k]);
-    log_line_lvl(LogLevel::Warn, "USYNC", "!! unit %u %s (host|here):%s", (unsigned)index, when, w ? line : " (the digests differ, no field does -- the reading itself)");
+    log_line_lvl(LogLevel::Warn, "USYNC", "!! unit %u %s (%s):%s", (unsigned)index, when, cols ? cols : "host|here", w ? line : " (the digests differ, no field does -- the reading itself)");
 }
 
-uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const UnitDeep& mine_in, bool player_cat, bool own_cat) {
+// 0.1.238 (sim 62): A BASIC ATTACK THAT SWAPS WHEN SOMETHING IS CASTABLE IS CHECKED AT EVERY BOUNDARY, ON EVERY PEER. Wrestlemaniac's ReplaceBasicAttackWhenCastable
+// (BasicSuplex in slot 1 while the Suplex has a displaceable target next to the cat) is a per-frame check (vtable slot 11) the game runs when it runs it -- the two
+// games ran it at other moments (room B67Q 11-17 00:50, battle 6978f609: a coin next to the tank on the client only, then taken off by the host's board; the
+// client's bar stayed BasicSuplex, the host's BasicTankMelee, two resyncs, a halt). Run here on both sides at the same point, it depends on the board alone.
+// Returns how many swaps changed; the check's own draws are fenced (mgmp_rngframe).
+static bool is_castable_swap(const void* comp, const VtInfo*& v) {
+    v = class_of(comp);
+    return v && v->kind == 1 && strcmp(v->name, "ReplaceBasicAttackWhenCastable") == 0;
+}
+static bool call_vslot(const void* comp, uint32_t slot) {
+    void* const* vt = nullptr; void* fn = nullptr;
+    if (!mem_read(comp, &vt, 8) || !vt || !mem_read(vt + slot, &fn, 8) || !fn) return false;
+    __try { ((void(__fastcall*)(const void*))fn)(comp); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool unitstate_has_passive(const void* chr, const char* name) {
+    const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
+    if (!chr || !name || !mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* c = nullptr;
+        if (!mem_read(data + i, &c, 8) || !c) continue;
+        uint8_t fl[3] = {}, removed = 0, ending = 0;
+        if (!mem_read(c + kComp_Enabled, fl, 3) || fl[1] || !fl[2]) continue;
+        const VtInfo* v = class_of(c);
+        if (!v || v->kind != 1 || strcmp(v->name, name) != 0) continue;
+        if ((mem_read(c + kPas_Removed, &removed, 1) && removed) || (mem_read(c + kPas_Ending, &ending, 1) && ending)) continue;
+        return true;
+    }
+    return false;
+}
+uint32_t unitstate_settle_castable(void* chr, const char* why) {
+    const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
+    if (!chr || !mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return 0;
+    uint32_t flips = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* c = nullptr;
+        if (!mem_read(data + i, &c, 8) || !c) continue;
+        uint8_t fl[3] = {}, removed = 0, ending = 0;
+        const void* owner = nullptr; const void* ability = nullptr;
+        if (!mem_read(c + kComp_Enabled, fl, 3) || fl[1] || !fl[2]) continue;
+        if (!mem_read(c + kPas_Owner, &owner, 8) || owner != chr) continue;
+        if ((mem_read(c + kPas_Removed, &removed, 1) && removed) || (mem_read(c + kPas_Ending, &ending, 1) && ending)) continue;
+        const VtInfo* v = nullptr;
+        if (!is_castable_swap(c, v) || !mem_read(c + kPas_SwapAbility, &ability, 8) || !ability) continue;
+        uint8_t before = 0, after = 0;
+        mem_read(c + kPas_SwapOn, &before, 1);
+        if (!call_vslot(c, 11)) { log_line_lvl(LogLevel::Warn, "USYNC", "!! unit %p: the castable swap's check faulted (%s)", chr, why); continue; }
+        mem_read(c + kPas_SwapOn, &after, 1);
+        if (before != after) {
+            ++flips;
+            char data_s[kUsNameLen] = {};
+            passive_data(c, data_s, sizeof(data_s));
+            log_line("USYNC", "unit %p: ReplaceBasicAttackWhenCastable '%s' checked again (%s) -- castable %u -> %u", chr, data_s, why, (unsigned)before, (unsigned)after);
+        }
+    }
+    return flips;
+}
+// 0.1.242 (sim 64): AN ABILITY'S X IS PUSHED FROM ITS XIs* PASSIVE NOW, ON EVERY PEER. 'X_is custom' abilities read X from Ability+0x6C8, which the bonus passive writes
+// in its vtable slot 83 (XIsFreeArmorSlots 0x140064920: the empty ones of CatData+0x9B0/+0xA10/+0xA70; the counters' 0x1400648F0 copies Passive+0xC8) -- whenever the game
+// happens to call it. Room ZCRD 11-19 21:13, battle a4919bdb: a Monk's UnbridledHits (multihit X+1) hit 3 times on the host and 2 on the client with the same gear (the
+// audit agreed): the client's X was older. Slot 83 only reads and writes that one field, so it is called before the unit acts and at every boundary.
+uint32_t unitstate_settle_xvalues(void* chr) {
+    const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
+    if (!chr || !mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return 0;
+    uint32_t changed = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* c = nullptr; const void* owner = nullptr; const uint8_t* ability = nullptr;
+        uint8_t fl[3] = {}, removed = 0;
+        if (!mem_read(data + i, &c, 8) || !c || !mem_read(c + kComp_Enabled, fl, 3) || fl[1] || !fl[2]) continue;
+        if (!mem_read(c + kPas_Owner, &owner, 8) || owner != chr || (mem_read(c + kPas_Removed, &removed, 1) && removed)) continue;
+        const VtInfo* v = class_of(c);
+        if (!v || v->kind != 1 || strncmp(v->name, "XIs", 3) != 0) continue;
+        if (!mem_read(c + 0x50, &ability, 8) || !ability) continue;
+        int32_t before = 0, after = 0;
+        mem_read(ability + 0x6C8, &before, 4);
+        if (!call_vslot(c, 83)) continue;
+        mem_read(ability + 0x6C8, &after, 4);
+        if (before != after) {
+            ++changed;
+            static uint32_t said = 0;
+            if (said < 60) { ++said; log_line("USYNC", "unit %p: %s pushed X %d -> %d to its ability", chr, v->name, before, after); }
+        }
+    }
+    return changed;
+}
+
+// Does a castable swap of this unit name `a` or `b` (the two names of slot 1)?
+static bool castable_swap_explains(const void* chr, const char* a, const char* b) {
+    const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
+    if (!chr || !mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* c = nullptr; const void* owner = nullptr; const VtInfo* v = nullptr;
+        if (!mem_read(data + i, &c, 8) || !c || !mem_read(c + kPas_Owner, &owner, 8) || owner != chr || !is_castable_swap(c, v)) continue;
+        char d[kUsNameLen] = {};
+        passive_data(c, d, sizeof(d));
+        if (d[0] && (strcmp(d, a) == 0 || strcmp(d, b) == 0)) return true;
+    }
+    return false;
+}
+
+uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const UnitDeep& mine_read, bool player_cat, bool own_cat) {
     if (!chr || !host.ok) return 0;
+    // 0.1.238: the board has just put the units where the host's are -- a castable swap is checked again on that board before anything is compared
+    static UnitDeep reread;
+    const bool resettled = unitstate_settle_castable(chr, "the repair, on the host's board") && unitstate_read(chr, reread);
+    const UnitDeep& mine_in = resettled ? reread : mine_read;
     unitstate_log_diff(index, host, mine_in, "differs from the host's");
     uint64_t* stream = rng_global_stream();
     uint64_t saved[4] = {};
@@ -428,7 +569,10 @@ uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const 
         for (uint32_t i = 0; i < host.na; ++i) if (host.a[i].slot == 1) ha = host.a[i].name;
         for (uint32_t i = 0; i < mine_in.na; ++i) if (mine_in.a[i].slot == 1) ma = mine_in.a[i].name;
         if (ha && ma && ha[0] && ma[0] && strcmp(ha, ma) != 0) {
-            if (_strnicmp(ha, "Basic", 5) == 0 && _strnicmp(ma, "Basic", 5) == 0) {
+            if (castable_swap_explains(chr, ha, ma)) {
+                log_line_lvl(LogLevel::Warn, "USYNC", "unit %u: slot 1 is '%s' here and '%s' on the host -- a castable swap (ReplaceBasicAttackWhenCastable) the board decides: the cat is repaired, slot 1 is left to the swap's check",
+                             (unsigned)index, ma, ha);
+            } else if (_strnicmp(ha, "Basic", 5) == 0 && _strnicmp(ma, "Basic", 5) == 0) {
                 log_line_lvl(LogLevel::Error, "USYNC", "!! unit %u is a player's cat whose basic attack is '%s' here and '%s' on the host -- another cat (the two games hold other cat data, "
                              "or another roster order): NOT repaired, nothing of the cat is changed", (unsigned)index, ma, ha);
                 return 0;
@@ -586,12 +730,21 @@ uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const 
         if (!as_status && !as_passive) { ++failed; put(" !+%s (no factory makes it)", hp.name); continue; }
         if (as_passive && kit_differs) { ++failed; put(" !+%s (a passive, and this unit's kit is not the host's -- not made by name)", hp.name); continue; }
         if (as_passive && needs_game_data(hp.name)) { ++failed; put(" !+%s (a passive that needs its game data -- not made by name)", hp.name); continue; }
+        // 0.1.237: A PASSIVE WITH PARAMETERS (an ability to react with, a list of thresholds ...) made by name alone has none, and the game throws "GON ERROR: Field ...
+        // does not exist" -- the end of the process -- the first time it reads one: rooms of 11-16 20:57 (MoonHand: AbilityReaction / MovementReaction, "ability") and
+        // 22:37 (a BB mutant, "thresholds"). Made only with this unit's own definition node of it; without one it is reported, not made.
+        const uint8_t* pnode = nullptr;
+        if (as_passive && in_sorted(kParamPassiveNames, sizeof(kParamPassiveNames) / sizeof(kParamPassiveNames[0]), hp.name)) {
+            pnode = def_passive_node(chr, hp.name, hp.data);
+            if (!pnode) { ++failed; put(" !+%s (a passive with parameters this unit's definition does not hold -- not made by name)", hp.name); continue; }
+        }
         GameStr s;
         if (!make_str(s, hp.name)) { ++failed; put(" !+%s (string)", hp.name); continue; }
         void* made = as_status ? hooks_call_apply_status(&s, chr, hp.stacks > 0 ? hp.stacks : 1) : hooks_call_add_passive(&s, chr, hp.stacks > 0 ? hp.stacks : 1);
         if (made) {
             int32_t st = 0;
             if (mem_read((uint8_t*)made + kPas_Stacks, &st, 4) && st != hp.stacks) mem_write((uint8_t*)made + kPas_Stacks, &hp.stacks, 4);
+            if (pnode) mem_write((uint8_t*)made + kPas_Data, &pnode, 8);   // 0.1.237: its parameters, from this unit's definition
             ++changed; put(" +%s(%d) via %s", hp.name, hp.stacks, as_status ? "ApplyStatus" : "AddPassive");
         } else { ++failed; put(" !+%s (the factory made nothing)", hp.name); }
     }

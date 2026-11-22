@@ -149,6 +149,8 @@ struct State {
     // Last tick MapScreen::update ran. See follow_on_map: this is what tells
     // the save flush whether the run is between nodes or inside one.
     uint64_t map_tick       = 0;
+    uint64_t map_ready_since = 0;        // 0.1.231: when the map screen last became ready (0 while it is not) -- a special_event entry waits for it to settle
+    uint32_t settle_said    = 0xFFFFFFFF;
 
     // A jump asked for by the debug panel, applied at the tail of the next
     // MapScreen::update -- the same site the follow path enters nodes from.
@@ -993,9 +995,20 @@ void follow_on_message(const EnterNodeMsg& m) {
     // the host's first node. The check still holds for whatever IS on, which is
     // the part that matters: a snapshot missing the cats, or missing a payload
     // that this build does send, is still a fault.
+    // A HOST WITH NO CAT OF ITS OWN LEFT (0.1.229; room WEEH 11-15: both of the host's cats died in a battle the other players won, the game moved
+    // their cats into its party, and its node message carried no cat at all -- the host only sends the cats it edits). That is a complete
+    // snapshot: the party it names is the other players' cats, which this peer holds. Refused, it stopped this peer following for the rest of
+    // the run while the host played the event alone, and the run could not go on. Only when the host's party names no cat of the host's seat.
+    bool host_has_none = false;
+    if (!g.incoming.cat_count && m.party_count) {
+        host_has_none = true;
+        for (uint32_t i = 0; i < m.party_count && i < 16 && host_has_none; ++i) host_has_none = session_cat_owner_any(m.party_ids[i]) > 0;
+        if (host_has_none)
+            log_line_lvl(LogLevel::Warn, "FOLLOW", "node %u: the host's message carries no cat -- its party is %u cat(s) of the other players (the host has none of its own left): followed", m.index, m.party_count);
+    }
     if ((tune::kInvSync  && !g.incoming.have_inventory) ||
         (tune::kRunHist  && !g.incoming.have_history) ||
-        !g.incoming.cat_count) {
+        (!g.incoming.cat_count && !host_has_none)) {
         g.faulted = true;
         log_line_lvl(LogLevel::Error, "FOLLOW", "!! node %u arrived without a complete snapshot -- following stopped", m.index);
         return;
@@ -1881,6 +1894,7 @@ void* follow_map_update(void* map_screen) {
     if (!g.faulted) unlocks_on_map(map_ready(map_screen));   // a battle / event node is over once the map is ready again
     if (g.faulted || !map_ready(map_screen)) {
         g.map_tick = 0;
+        g.map_ready_since = 0;
         if (g.on && pending_any() && !g.transition_logged) {
             g.transition_logged = true;
             log_line("FOLLOW", "holding node %u -- previous node is still transitioning", pending_front().index);
@@ -1927,7 +1941,13 @@ void* follow_map_update(void* map_screen) {
 
     // The map is ticking, so the run is BETWEEN nodes. This is the stamp the
     // save flush reads -- see follow_on_map.
-    g.map_tick = GetTickCount64();
+    // 0.1.237: "up" restarts when the map's updates stopped for a while (a screen over it -- the level-up after a chapter boss): crash 0x9BDA, LAPTOP-L6424L1P
+    // 11-16 21:26, the special_event right after the level-up was entered at once (the map counted as up since before it) with the marker still on node 1
+    {
+        const uint64_t now_t = GetTickCount64();
+        if (!g.map_ready_since || (g.map_tick && now_t - g.map_tick > 250)) g.map_ready_since = now_t;
+        g.map_tick = now_t;
+    }
 
     // ★ AND THE HELD CATS LAND HERE, WHETHER OR NOT A NODE BATCH IS PENDING (2026-09-23).
     //
@@ -2006,6 +2026,7 @@ void* follow_map_update(void* map_screen) {
             // EXPERIMENTAL own random events (mgmp_indepevt): this retry is how the host usually gets into the next node when it clicked while the event screen was
             // closing (the click was held in h_EnterNode, the party icon already stands on the node) -- it waits for the clients' events here too (0.1.65).
             if (indepevt_hold_node()) return nullptr;
+            if (catsync_hold_node()) return nullptr;     // 0.1.238: the same wait as h_EnterNode's
             if (follow_on_enter_node(map_screen, retry, &sent)) {
                 g.host_retry_pending = false;
                 g.host_retry_map = nullptr;
@@ -2161,6 +2182,20 @@ void* follow_map_update(void* map_screen) {
         log_line("FOLLOW", "!! node %u is '%s' here but '%s' on the host --"
                            " entering anyway, the seed matched",
                  p.index, node_type_name(type), node_type_name(p.type));
+
+    // A SPECIAL EVENT IS NOT ENTERED IN THE MAP'S FIRST MOMENTS (0.1.231). Crash Mewgenics.exe+0x9BDA4B/0x9BDABF/0x9BDBA0 -- the game's own frame draw (0x9B7F1A -> the batch
+    // flush 0x140A48350 -> a freed shader), no mod frame on the stack -- in 6 of 313 client entries into a special_event over 11-13..15, and in 5 of the 6 the client had just
+    // come back from the battle screen (the battle's summary on the line before, the party icon still on node 1 of a map screen just made) and entered the event in that
+    // map's first frame or two. Battles, entered the same way thousands of times, do not crash. The entry waits until the map has been up for kSpecialSettleMs: a delay of
+    // well under a second, never a lost entry.
+    if (g.is_client && type == 11 && g.map_ready_since) {
+        constexpr uint64_t kSpecialSettleMs = 600;
+        const uint64_t up = GetTickCount64() - g.map_ready_since;
+        if (up < kSpecialSettleMs) {
+            if (g.settle_said != p.index) { g.settle_said = p.index; log_line("FOLLOW", "node %u (special_event): the map has been up %llu ms -- the entry waits until it has been up %llu ms (crash 0x9BDA)", p.index, (unsigned long long)up, (unsigned long long)kSpecialSettleMs); }
+            return nullptr;
+        }
+    }
 
     // AN INSTANT NODE IS ENTERED WHEN THE PARTY HAS ARRIVED, as the host's is (0.1.120; see kNodeType_FoodBox). Until then the entry stays queued: the marker is sent to the node (the game walks
     // it), and the node's consumed byte is set so that the arrival does not call EnterNode on its own. Whatever the marker does not read as (no marker, no arrival within the time), the old

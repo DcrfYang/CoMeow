@@ -68,6 +68,7 @@ struct State {
     bool     host_exp_indep_events = false; // ... and the host's ui.exp_indep_events (HELLO rules bit 3, proto 102)
     bool     host_exp_voice = false;        // ... and the host's ui.exp_voice (HELLO rules bit 4, proto 107)
     uint8_t  host_enemy_scale_half = 4;     // ... and the host's ui.enemy_scale in halves (HELLO, proto 95)
+    uint8_t  host_house_scale_half = 2;     // ... and the host's ui.house_boss_scale in halves (HELLO, 0.1.243)
     char     req_addr[192] = {};      // one address or a comma-separated list (see net_join)
     uint16_t req_port = 0;
     char     last_action[128] = {};
@@ -181,6 +182,7 @@ Hello our_hello() {
     h.build_hash = g.build_hash;
     h.rules      = (config().exp_treasure ? 2 : 0) | (config().exp_house_coop ? 4 : 0) | (config().exp_indep_events ? 8 : 0) | (config().exp_voice ? 16 : 0);    // meaningful from the host only (bit 0, ui.block_new_cats, is gone: 2026-10-21)
     h.enemy_scale_half = config().enemy_scale_half;
+    h.house_scale_half = config().house_scale_half;
     _snprintf_s(h.name, sizeof(h.name), _TRUNCATE, "%s",
                 net_role() == NetRole::Host ? "host" : "client");
     return h;
@@ -352,6 +354,8 @@ void handle_hello(uint8_t from, const Hello& h) {
         g.host_exp_voice = (h.rules & 16) != 0;
         g.host_enemy_scale_half = h.enemy_scale_half < 2 ? 2 : h.enemy_scale_half > 16 ? 16 : h.enemy_scale_half;   // x1 .. x8 (0.1.179)
         log_line("SESSION", "the host's rule: enemy health and armor x%.1f", g.host_enemy_scale_half / 2.0);
+        g.host_house_scale_half = h.house_scale_half < 2 ? 2 : h.house_scale_half > 16 ? 16 : h.house_scale_half;
+        log_line("SESSION", "the host's rule: house boss co-op enemy health and armor x%.1f", g.host_house_scale_half / 2.0);
         g.host_rules_known = true;
         log_line("SESSION", "the host's rule: \"a new cat joins\" effects are %s", g.host_block_new_cats ? "BLOCKED" : "left as they are");
         log_line("SESSION", "the host's experimental features: shared treasure chests %s, house boss co-op %s, independent random events %s",
@@ -645,6 +649,11 @@ bool session_exp_treasure() {
 uint8_t session_enemy_scale_half() {
     if (net_role() == NetRole::Client && g.host_rules_known) return g.host_enemy_scale_half;
     return config().enemy_scale_half;
+}
+
+uint8_t session_house_scale_half() {
+    if (net_role() == NetRole::Client && g.host_rules_known) return g.host_house_scale_half;
+    return config().house_scale_half;
 }
 
 bool session_exp_house_coop() {

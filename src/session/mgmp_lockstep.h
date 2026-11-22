@@ -397,6 +397,9 @@ bool lockstep_halted();
 // mgmp_catsync and mgmp_invsync gate their apply paths on it. See the note on
 // catsync_on_message for the shield that got through before they did.
 bool lockstep_in_battle();
+// 0.1.247: a unit of the current battle wears HideSomeHudStuff (the side-quest item Redacted, "health bars and status icons are hidden in battle"): the room
+// panel hides the cats' health as the game hides its own bars. Looked at on the game thread at every turn boundary; false outside a battle.
+bool lockstep_hud_hidden();
 // The CURRENT battle (the one lockstep_enter_battle last named) has been built and its roster snapshotted: unlike lockstep_in_battle() this is false
 // again the moment the next battle is entered, until that one is built.
 bool lockstep_battle_ready();

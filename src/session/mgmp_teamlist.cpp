@@ -29,6 +29,10 @@ const Site kSites[] = {
     { 0x3B6F94, TeamUse::All, false, "the battle start's ChanceToAmbush roll" },
     { 0x3B3190, TeamUse::All, true,  "the battle build's global passives of equipped items" },
     { 0x92B48F, TeamUse::Own, false, "level_up all" },
+    // 0.1.246: the adventure start (the chapter map's set-off lambda 0x1403B10B0) gives each party cat's passives' bonus_items (Survivalist: FoodMedium x6 +
+    // WaterBottle_Full / FoodBig x4) through 0x1400D3450. A client's cats are familiars by then: its Survivalist gave nothing, and a host cat's would land in
+    // both backpacks. Own: each player's own cats, into that player's own backpack.
+    { 0x3B1165, TeamUse::Own, false, "the adventure start's bonus_items (Survivalist food and water)" },
     // 0.1.164: The Creator (the Infinite's last boss) clones "the team" at the battle start: TheCreator_SpawnCloneTeam spawns PlayerCat_FinalBossClone on each of the
     // level's 4 FinalBossCloneSpot tiles (shuffled) with `catdata teamclone` -- spawn's handler (sub_1407A2BA0) asks this list at 0x1407A39B9, drops the cats already
     // cloned and draws one of the rest (PickRandom, the battle stream: the battle-start window keeps it the same on every peer). With ALL the draw is from every

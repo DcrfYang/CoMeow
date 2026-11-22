@@ -54,6 +54,7 @@ struct PeerStatus { bool known = false; ULONGLONG at = 0; uint8_t flags = 0; cha
 enum class Role : uint8_t { None, Px, Helper };
 enum class Phase : uint8_t { Idle, Asking, Voted, Accepted, Inserted, Fighting };
 
+const char* role_name(Role r);
 const char* phase_name(Phase p) {
     switch (p) {
         case Phase::Idle: return "idle"; case Phase::Asking: return "asking"; case Phase::Voted: return "voted";
@@ -93,7 +94,26 @@ struct State {
     void   (*fight_orig)(void*) = nullptr;
     void*    fight_dir = nullptr;
     char     fight_boss[64] = {};
-    char     fight_heap[64] = {};
+
+    // THE GEAR SCREEN'S LOCK IS THE READY (2026-11-16): the departure is held at the click, not at the fight's start
+    void   (*lock_replay)(void*) = nullptr; // the gear screen's done-closure, run the game's way once every player is ready
+    bool     lock_released = false;         // that run is under way: the fight its departure ends in is not held again
+    uint64_t lock_id = 0;                   // the battle id, taken when the command was (the stream is the host's seed on every peer then)
+    bool     lock_owed = false;             // the command came while the gear screen was not up: the player's next lock departs at once, with lock_id
+    // 0.1.236 (review 11-16): the gear screen the lock was pressed on. Every lock while ready takes the newest (a player who went back to the warehouse and opened the
+    // gear screen again has a new screen -- the old one is freed, and replaying a click on it crashed in waiting); leaving the gear screen forgets it.
+    void*     lock_closure = nullptr;
+    ULONGLONG gear_gone_at = 0;             // the gear screen has not been seen since then (forgotten after kGearGoneMs)
+    ULONGLONG replay_at = 0;                // the replayed lock: when -- the game's own checks (a quest item popup, a confirmation) may stop it before the departure
+    bool      departed = false;             // ... and the departure was reached (T_HouseGearDone)
+    bool      again_said = false;           // the player was told to press the lock again
+    // 0.1.236: a co-op cancelled before its fight -- the gear screen it was opened for must not start a fight in the room (the room starts a solo house boss
+    // from the warehouse only, and a helper's House still carries the helped player's boss until it is back there). Cleared in the warehouse.
+    bool      gear_refuse = false;
+    // 0.1.236: THIS IS A HOUSE BOSS FIGHT -- set when the game starts one (T_HouseFight goes on), kept to the end of its settlement, whatever the co-op's own state
+    // is by then (a session that ended while the lock was held, a fight resumed after a crash). The enemy multiplier and the retirement of the other players'
+    // copies follow it, so every peer that plays the fight decides alike.
+    bool      house_fight = false;
 
     ULONGLONG autosave_at = 0;
     bool      house_seen = false;           // the recovery check runs once per arrival in the warehouse
@@ -101,6 +121,10 @@ struct State {
 
 bool active_room() { return session_exp_house_coop() && net_active() && net_peer_count() >= 2; }
 bool in_house() { return page_self() == PageState::House; }
+bool gear_live() { return page_button_live("InventoryButton_") || page_button_live("EquippedButton_"); }
+bool lock_phase() { return (g.role == Role::Px && g.phase == Phase::Accepted) || (g.role == Role::Helper && g.phase == Phase::Inserted); }
+constexpr ULONGLONG kGearGoneMs = 1500;      // the gear screen's buttons unseen this long: the player left it
+constexpr ULONGLONG kDepartWaitMs = 6000;    // a replayed lock that has not departed after this long: the game's own check stopped it
 
 uint8_t* director() {
     const uintptr_t at = addr_of_data(D_MewDirectorPtr);
@@ -206,6 +230,15 @@ bool record_read(Record& r) {
     return have_save && have_px;
 }
 
+// 0.1.236 (review H2): the restore record of THIS save, when the House still carries the helped player's boss it names.
+bool record_for_live_boss(Record& r) {
+    if (!record_read(r)) return false;
+    char save[MAX_PATH * 3] = {};
+    if (!live_save(save, sizeof(save)) || _stricmp(save, r.save) != 0) return false;
+    Boss live;
+    return read_boss(live) && strcmp(live.name, r.px.name) == 0 && live.countdown == 0 && live.times == r.px.times && live.diff == r.px.diff;   // the test recover_if_needed makes
+}
+
 int row_of(uint8_t id) {
     const int r = id == net_self() ? room_self_row() : room_row_of_peer(id);
     return r < 0 ? 0 : r + 1;
@@ -238,8 +271,17 @@ bool fresh(uint8_t id) {
 void reset(const char* why) {
     if (g.phase != Phase::Idle || g.role != Role::None)
         log_line("HOUSECOOP", "co-op round %08x ends (%s; was %s, %s)", g.round, why, g.role == Role::Px ? "the helped player" : g.role == Role::Helper ? "a helper" : "-", phase_name(g.phase));
+    // 0.1.236 (review H4): ENDED BEFORE ITS FIGHT. The held lock is dropped -- in a 3-4 player room the others' barrier went on without the co-op and started a fight
+    // with no lockstep battle; with the session gone the held lock departed alone into the helped player's boss -- and the gear screen opened for this co-op
+    // refuses its lock until the player is back in the warehouse.
+    if (g.phase == Phase::Accepted || g.phase == Phase::Inserted) {
+        if (setup_house_pending()) setup_drop_house_hold(why);
+        g.gear_refuse = true;
+    }
     g.role = Role::None; g.phase = Phase::Idle; g.round = 0; g.px = kNoPeer;
     g.member_n = 0; g.inserting = false;
+    g.lock_replay = nullptr; g.lock_released = false; g.lock_id = 0; g.lock_owed = false;
+    g.lock_closure = nullptr; g.gear_gone_at = 0; g.replay_at = 0; g.departed = false; g.again_said = false;
     memset(g.vote_in, 0, sizeof(g.vote_in)); memset(g.vote_yes, 0, sizeof(g.vote_yes));
 }
 
@@ -333,24 +375,66 @@ void go() {
 
 // THE FIGHT, on every peer at once (setup_tick runs it once the host's command is in): the battle id from the committed stream, the client's
 // unlock window, then the game's own start with the closure data it would have had.
-void house_go(void*) {
+uint64_t house_battle_id() {
     uint64_t id = 0;
     if (const uint64_t* s = rng_global_stream()) {
         uint64_t x = s[0] ^ (s[1] * 0x9E3779B97F4A7C15ull) ^ 0x484F555345424F53ull;   // 'HOUSEBOS'
         x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
         id = x;
     }
-    if (!id) id = 0x484F555345424F53ull;
+    return id ? id : 0x484F555345424F53ull;
+}
+
+// THE HELD LOCK GOES ON (2026-11-16): every player is ready and the command is taken -- the stream is the host's seed on every peer, so the battle id is taken NOW
+// (the departure's frames come before the fight). The gear screen's own done-closure then runs the game's way: the departure plays, and its end starts the fight
+// (housecoop_on_fight_start lets that one through).
+void house_lock_go(void*) {
+    // 0.1.236 (review H4): the co-op must still be on -- the barrier's start also comes when the session ended while the lock was held
+    if (!active_room() || !lock_phase()) {
+        log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! the held lock's start came, but the co-op is no longer on (%s, %s, room %s) -- no departure; the gear screen refuses its lock until the warehouse",
+                     role_name(g.role), phase_name(g.phase), active_room() ? "yes" : "no");
+        g.gear_refuse = true;
+        room_toast(tr(Tx::HC_BACK_TO_HOUSE));
+        return;
+    }
+    g.lock_id = house_battle_id();
+    // THE GEAR SCREEN BY ITS OWN BUTTONS, NOT BY page_self() (11-16 11:24: while the lock is held the room's page for this player is "ready to start", and that cached
+    // value made both players drop the departure -- they locked again and each started the fight on its own: "cat 0 is claimed by 2 players", a halt at turn 0).
+    // 0.1.236 (review H1): and the lock replayed is the one of the screen that is up now (lock_closure: the newest lock; forgotten when the screen went away) --
+    // the closure the barrier kept is the first lock's, freed if the player left and came back.
+    void* closure = g.lock_closure;
+    if (!closure || !gear_live()) {
+        log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! every player is ready but this player's gear screen is %s -- the departure waits for its next lock (battle id %016llx kept)",
+                     closure ? "not up" : "not the one the lock was pressed on (left since)", (unsigned long long)g.lock_id);
+        g.lock_owed = true;
+        room_toast(tr(Tx::HC_LOCK_AGAIN));     // 0.1.236 (review M1): the others set off -- this player is told to lock again
+        return;
+    }
+    g.lock_released = true;
+    g.replay_at = GetTickCount64(); g.departed = false; g.again_said = false;
+    log_line("HOUSECOOP", "every player is ready -- the departure plays now on this screen; the fight starts when it ends (battle id %016llx)", (unsigned long long)g.lock_id);
+    if (g.lock_replay) g.lock_replay(closure);
+}
+
+void house_go(void*) {
+    const uint64_t id = house_battle_id();
     lockstep_enter_battle(id);
     if (net_role() == NetRole::Client) unlocks_window_open("the house boss co-op fight", false);
     g.phase = Phase::Fighting;
     static FightData data;
     data = FightData{};
     data.director = g.fight_dir;
+    data.boss.cap = 15;                            // an empty string, the game's way (inline, size 0)
     const size_t len = strlen(g.fight_boss);
-    if (len < 16) { memcpy(data.boss.buf, g.fight_boss, len + 1); data.boss.cap = 15; }
-    else { memcpy(g.fight_heap, g.fight_boss, len + 1); data.boss.ptr = g.fight_heap; data.boss.cap = len; }
-    data.boss.size = len;
+    // 0.1.236 (review L1): a name of 16 characters or more is put in by the game's own assign, on the game's heap -- the mod's buffer was handed over before, and a
+    // game that frees or moves the closure's string would have freed the mod's memory (pyrophina_vs_zaratana has 21)
+    const auto assign = (fn_str_assign)addr_of_call(C_StrAssign);
+    if (len < 16) { memcpy(data.boss.buf, g.fight_boss, len + 1); data.boss.size = len; }
+    else if (!assign || !call_assign(assign, &data.boss, g.fight_boss, len)) {
+        log_line_lvl(LogLevel::Error, "HOUSECOOP", "!! the boss name '%s' could not be made for the fight's start -- the fight is not started here", g.fight_boss);
+        return;
+    }
+    g.house_fight = true;
     log_line("HOUSECOOP", "the co-op house boss fight '%s' starts on this screen (battle id %016llx)", g.fight_boss, (unsigned long long)id);
     if (g.fight_orig) g.fight_orig(&data);
 }
@@ -361,6 +445,28 @@ void house_go(void*) {
 
 void housecoop_tick() {
     const ULONGLONG t = GetTickCount64();
+    {
+        const PageState pg = page_self();
+        if (pg == PageState::House) g.gear_refuse = false;
+        if (pg == PageState::MainMenu || pg == PageState::SaveSlots) { g.house_fight = false; g.gear_refuse = false; }   // left to the menu: no fight of this run goes on
+    }
+    // 0.1.236 (review H1): a player who is ready and leaves the gear screen -- its lock is forgotten (the screen is freed); a new lock on a new screen takes its place
+    if (setup_house_pending() && g.lock_closure) {
+        if (gear_live()) g.gear_gone_at = 0;
+        else if (!g.gear_gone_at) g.gear_gone_at = t;
+        else if (t - g.gear_gone_at > kGearGoneMs) {
+            g.lock_closure = nullptr; g.gear_gone_at = 0;
+            log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! this player left the gear screen while ready -- that screen's lock is forgotten; the departure needs a lock on the gear screen again");
+        }
+    }
+    // 0.1.236 (review M2): the replayed lock runs the game's own checks first (a quest item that is not equipped, a confirmation) -- one that stopped it leaves the
+    // others waiting in the fight: the player is told to lock again (the next lock departs at once)
+    if (g.lock_released && g.replay_at && !g.departed && !g.again_said && t - g.replay_at > kDepartWaitMs) {
+        g.again_said = true;
+        log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! the replayed lock has not departed after %llu s (the game's own check stopped it?) -- the player is told to lock again",
+                     (unsigned long long)((t - g.replay_at) / 1000));
+        room_toast(tr(Tx::HC_LOCK_AGAIN));
+    }
     if (in_house()) {
         if (!g.house_seen) { g.house_seen = true; housecoop_log_boss("arrived in the warehouse"); if (g.phase == Phase::Idle) recover_if_needed(); }
     } else {
@@ -568,10 +674,61 @@ bool housecoop_skip_strays() {
     return true;
 }
 
+bool housecoop_on_gear_lock(void* closure, void (*replay)(void*)) {
+    if (!closure || !replay) return false;
+    const bool mine = lock_phase();
+    if (g.gear_refuse && !mine) {
+        // 0.1.236 (review H4): the co-op this gear screen was opened for is over -- no fight from it (the warehouse decides what comes next)
+        log_line_lvl(LogLevel::Warn, "HOUSECOOP", "the gear screen's lock is refused: the house boss co-op it was opened for was cancelled -- back to the warehouse first");
+        room_toast(tr(Tx::HC_BACK_TO_HOUSE));
+        return true;
+    }
+    if (!active_room()) return false;
+    if (!mine || g.lock_released) return false;     // not this co-op's fight, or the replay of a released lock: the game goes on
+    if (g.lock_owed) {
+        // every player was ready already and the command was taken: this lock departs at once, into the battle id taken then
+        g.lock_owed = false; g.lock_released = true;
+        g.replay_at = GetTickCount64(); g.departed = false; g.again_said = false;
+        log_line("HOUSECOOP", "the gear screen's lock after every player was ready -- the departure plays now (battle id %016llx)", (unsigned long long)g.lock_id);
+        return false;
+    }
+    if (setup_house_pending()) {
+        // 0.1.236 (review H1): the newest screen's lock is the one replayed (a player who left and came back has a new gear screen)
+        g.lock_closure = closure; g.lock_replay = replay; g.gear_gone_at = 0;
+        log_line("HOUSECOOP", "the gear screen's lock again while this player is ready -- still waiting for the others (this screen's lock is the one replayed)");
+        room_toast(tr(Tx::HC_LOCK_WAITING));
+        return true;
+    }
+    g.lock_replay = replay;
+    g.lock_closure = closure; g.gear_gone_at = 0;
+    if (!setup_on_house_gear_done(closure, house_lock_go)) {
+        log_line_lvl(LogLevel::Error, "HOUSECOOP", "!! the setup barrier did not take the gear screen's lock (no session setup, or a run already committed) -- the game departs on its own");
+        g.lock_replay = nullptr;
+        return false;
+    }
+    log_line("HOUSECOOP", "the gear screen's lock is this player's READY -- no departure until every player has locked");
+    room_toast(tr(Tx::HC_LOCK_READY));
+    return true;
+}
+
 bool housecoop_on_fight_start(void* data, void (*original)(void*)) {
     if (!active_room() || !data) return false;
     const bool mine = (g.role == Role::Px && g.phase == Phase::Accepted) || (g.role == Role::Helper && g.phase == Phase::Inserted);
     if (!mine) return false;
+    if (g.lock_released) {
+        // the departure of a lock every player made is over: the game's own fight start, with the battle id taken at the command
+        g.lock_released = false; g.replay_at = 0;
+        // THE SHARED ROSTER AGAIN (11-16 11:36: "cat 0 is claimed by 2 players" at turn 0 -- the departure wrote each player's OWN gear-screen cats into the party, so
+        // index 0 was the host's first cat on the host and the helped player's on the helped player)
+        setup_reinstall_shared("the house boss departure is over -- its gear screen wrote this player's own selection into the party");
+        lockstep_enter_battle(g.lock_id);
+        if (net_role() == NetRole::Client) unlocks_window_open("the house boss co-op fight", false);
+        g.phase = Phase::Fighting;
+        char name[64] = {};
+        mem_read_std_string((const uint8_t*)data + 8, name, sizeof(name));
+        log_line("HOUSECOOP", "the co-op house boss fight '%s' starts on this screen after the departure (battle id %016llx)", name, (unsigned long long)g.lock_id);
+        return false;
+    }
     if (setup_house_pending()) { log_line("HOUSECOOP", "the gear screen's done again while the fight is held -- ignored"); return true; }
     void* dir = nullptr;
     char name[64] = {};
@@ -592,6 +749,17 @@ bool housecoop_on_fight_start(void* data, void (*original)(void*)) {
 }
 
 bool housecoop_skip_beat_boss() {
+    // 0.1.236 (review H2): A HELPER WHOSE GAME DID NOT COME BACK. The game saves at the fight's start and a restarted game goes on in that fight -- with the co-op's state
+    // gone. The record beside the saves still names the helped player's boss in this House: the story is not this save's (its own boss would have been scheduled
+    // from the helped player's, and the record then dropped as stale -- the helper's own house boss lost). Taken as the co-op's snapshot: put back after the settlement.
+    if (!g.snap && g.role != Role::Px) {
+        Record r;
+        if (record_for_live_boss(r)) {
+            g.orig = r.own; g.snap = true;
+            log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! a house boss '%s' is won with no co-op on, but this save's restore record says it is another player's boss (a co-op fight resumed after the game ended) -- "
+                         "the story is skipped and this House's own boss ('%s', countdown %d) is put back after the settlement", r.px.name, r.own.name, r.own.countdown);
+        }
+    }
     if (g.role == Role::Helper || g.snap) {
         log_line("HOUSECOOP", "BeatHouseBoss skipped: this player helped, the story is the helped player's");
         log_line("HOUSEBOSS", "BeatHouseBoss SKIPPED by the co-op (role %s, phase %s, carries a co-op boss %s, in a room %s) -- this save's next house boss is not scheduled by it",
@@ -609,6 +777,15 @@ bool housecoop_refuse_depart(uint32_t cats) {
     return false;
 }
 
+bool housecoop_house_fight() { return g.house_fight; }
+void housecoop_note_house_fight() {
+    if (!g.house_fight) log_line("HOUSECOOP", "a house boss fight starts on this screen -- no enemy multiplier, and the other players' copies are retired at its settlement");
+    g.house_fight = true;
+}
+void housecoop_on_departure() {
+    if (g.lock_released && !g.departed) { g.departed = true; log_line("HOUSECOOP", "the replayed lock reached the departure (the game's own checks passed)"); }
+}
+
 void housecoop_settlement_begin() {
     if (g.phase != Phase::Fighting) return;
     unlocks_window_close("the house boss co-op fight is over");
@@ -616,9 +793,13 @@ void housecoop_settlement_begin() {
 }
 
 void housecoop_after_settlement() {
+    g.house_fight = false;   // 0.1.236: the run is settled (retire and the enemy multiplier were decided by it before)
     if (g.phase != Phase::Fighting && !g.snap) return;
     const bool helper = g.role == Role::Helper || g.snap;
-    if (g.snap) restore("after the co-op house boss fight");
+    if (g.snap) {
+        restore("after the co-op house boss fight");
+        housecoop_log_boss("after the co-op fight's restore");   // 0.1.236 (review M3): the rematch list after a lost fight -- does the helped player's boss stay in it?
+    }
     reset("the fight is over");
     g.autosave_at = GetTickCount64() + kAutoSaveAfterMs;
     room_push_notice(tr(helper ? Tx::HC_RESTORED : Tx::HC_DONE_PX));

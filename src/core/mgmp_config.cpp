@@ -406,6 +406,7 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*ui, "test_harness", g_cfg.ui_test);
         read_bool(*ui, "dev_tools", g_cfg.dev_tools);
         read_bool(*ui, "beta_notice", g_cfg.beta_notice);
+        read_str (*ui, "last_version", g_cfg.last_version, sizeof(g_cfg.last_version));
         read_bool(*ui, "block_new_cats", g_cfg.block_new_cats);
         read_bool(*ui, "exp_treasure", g_cfg.exp_treasure);
         if (const json* v = member(*ui, "enemy_scale")) {
@@ -415,6 +416,14 @@ void config_load(const wchar_t* dll_dir) {
                 d = d < 1.0 ? 1.0 : d > 8.0 ? 8.0 : d;
                 g_cfg.enemy_scale_half = (uint8_t)(d * 2.0 + 0.5);
             } else warn("ui.enemy_scale is not a number, kept %g", g_cfg.enemy_scale_half / 2.0);
+        }
+        if (const json* v = member(*ui, "house_boss_scale")) {
+            if (v->is_number()) {
+                double d = v->get<double>();
+                if (d < 1.0 || d > 8.0) warn("ui.house_boss_scale = %g is outside 1..8, clamped", d);
+                d = d < 1.0 ? 1.0 : d > 8.0 ? 8.0 : d;
+                g_cfg.house_scale_half = (uint8_t)(d * 2.0 + 0.5);
+            } else warn("ui.house_boss_scale is not a number, kept %g", g_cfg.house_scale_half / 2.0);
         }
         read_bool(*ui, "exp_house_coop", g_cfg.exp_house_coop);
         read_bool(*ui, "exp_indep_events", g_cfg.exp_indep_events);
@@ -707,6 +716,10 @@ bool config_set_exp_house_coop(bool on) { g_cfg.exp_house_coop = on; return writ
 
 bool config_set_exp_indep_events(bool on) { g_cfg.exp_indep_events = on; return write_ui_bool("exp_indep_events", on); }
 bool config_set_exp_voice(bool on) { g_cfg.exp_voice = on; return write_ui_bool("exp_voice", on); }
+bool config_set_last_version(const char* version) {
+    strncpy_s(g_cfg.last_version, sizeof(g_cfg.last_version), version ? version : "", _TRUNCATE);
+    return write_ui_value("last_version", config_json_string(g_cfg.last_version).c_str());
+}
 bool config_set_voice_volume(int pct, bool persist) {
     pct = pct < 0 ? 0 : pct > 200 ? 200 : pct;
     g_cfg.voice_volume = (uint16_t)pct;
@@ -742,6 +755,16 @@ bool config_set_enemy_scale_half(uint8_t half, bool persist) {
     char val[16];
     _snprintf_s(val, sizeof(val), _TRUNCATE, half % 2 ? "%u.5" : "%u", (unsigned)(half / 2));
     return write_ui_value("enemy_scale", val);
+}
+
+bool config_set_house_scale_half(uint8_t half, bool persist) {
+    if (half < 2) half = 2;
+    if (half > 16) half = 16;
+    g_cfg.house_scale_half = half;
+    if (!persist) return true;
+    char val[16];
+    _snprintf_s(val, sizeof(val), _TRUNCATE, half % 2 ? "%u.5" : "%u", (unsigned)(half / 2));
+    return write_ui_value("house_boss_scale", val);
 }
 
 } // namespace mgmp

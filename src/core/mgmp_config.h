@@ -162,12 +162,18 @@ struct Config {
     // ui.beta_notice: show the "this is a test release, back up your saves" dialog at startup. The dialog's "do not show
     // again" box writes false back into mgmp.json (config_set_beta_notice); set it to true there to see it again.
     bool     beta_notice = true;
+    // ui.last_version (0.1.234): the mod version that last started here and showed its important update notices (mgmp_impnote.h). Empty = an install
+    // from before the key existed. The shipped mgmp.json carries the release's own version (make_folder), so a fresh install starts with no notice.
+    char     last_version[24] = {};
     // ui.block_new_cats: the event effect "a new cat joins the run" does nothing. Off by default (the game as it is); set from the main menu's
     // mod settings. Part of the handshake's ruleset: both players must agree.
     bool     block_new_cats = false;
     // ui.enemy_scale: the room's enemy health and armor multiplier, 1.0 .. 8.0 in steps of 0.5 (2026-10-19; down to x1 since 0.1.179), kept here in HALVES (2 .. 16). Default x2.
     // Set from the mod settings' slider; in a room the HOST's counts (its HELLO carries it).
     uint8_t  enemy_scale_half = 4;
+    // ui.house_boss_scale (0.1.243, user request 2026-11-20): the house boss co-op fight's own health and armor multiplier, 1.0 .. 8.0 in steps of 0.5, in HALVES (2 .. 16).
+    // Default x1 (the game's own numbers). The room's ui.enemy_scale does not reach that fight; in a room the HOST's counts (its HELLO carries it).
+    uint8_t  house_scale_half = 2;
     // THE EXPERIMENTAL FEATURES (2026-10-18): each one switched on and off on its own in the mod settings, all off by default. In a room the HOST's settings
     // count (its HELLO carries them). The old single ui.experimental is no longer read.
     // 0.1.106 (2026-10-25): exp_treasure and exp_indep_events are well tested now -- ON by default (a file that says false keeps false), listed ahead of the
@@ -175,8 +181,10 @@ struct Config {
     // experimental.
     // ui.exp_treasure: a treasure node's chest holds one item per player, the same on every screen, each player takes one, first come first served (mgmp_treasure).
     bool     exp_treasure = true;
-    // ui.exp_house_coop: when exactly one player has the house boss today, the others may help them fight it (mgmp_housecoop). Still experimental: off.
-    bool     exp_house_coop = false;
+    // ui.exp_house_coop: when exactly one player has the house boss today, the others may help them fight it (mgmp_housecoop).
+    // 0.1.234 (2026-11-16): out of the experimental section and ON by default; the update to 0.1.234 switches it on once in every mgmp.json (the
+    // important update notice, mgmp_impnote.h, says so) -- the player can switch it off again in the mod settings.
+    bool     exp_house_coop = true;
     // ui.exp_indep_events: the random "?" events are each player's own -- own cats, own choice; the draw follows the host (mgmp_indepevt).
     bool     exp_indep_events = true;
     // ui.exp_voice (0.1.118): voice chat in the room -- the room panel gets a microphone and a sound button (mgmp_voice). The HOST's setting counts. Experimental: off.
@@ -265,6 +273,8 @@ bool        config_set_exp_treasure(bool on);
 bool        config_set_exp_house_coop(bool on);
 bool        config_set_exp_indep_events(bool on);
 bool        config_set_exp_voice(bool on);
+// ui.last_version, in memory and in mgmp.json (the important update notices up to this version were shown). False when the file could not be written.
+bool        config_set_last_version(const char* version);
 // ui.voice_volume in percent (clamped 0 .. 200). `persist` false changes only the live value (the slider while it is dragged).
 bool        config_set_voice_volume(int pct, bool persist);
 // ui.player_name: remembered in mgmp.json when it changed (true = written). config_json_string: a JSON string literal, quotes included.
@@ -272,6 +282,8 @@ bool        config_set_player_name(const char* name);
 std::string config_json_string(const char* s);
 // ui.enemy_scale in halves (2 = x1 .. 16 = x8; clamped). `persist` false changes only the live value (the slider while it is dragged).
 bool        config_set_enemy_scale_half(uint8_t half, bool persist);
+// ui.house_boss_scale in halves (2 = x1 .. 16 = x8; clamped). `persist` false changes only the live value (the slider while it is dragged).
+bool        config_set_house_scale_half(uint8_t half, bool persist);
 // The text rewrite of any ui.<key> with a literal JSON value (a number, true/false), as config_rewrite_ui_bool does it.
 std::string config_rewrite_ui_value(const std::string& text, const char* key, const char* value);
 // The text rewrite behind both: `text` with ui.<key> set to `on` (added when absent), or an empty string for a file that is not an object.

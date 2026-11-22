@@ -24,7 +24,11 @@ bool setup_on_equip_done(void* director, void (*go)(void*));
 // player READY, the host commits the stream (and its unlock answers) and every peer then runs `go` at once. Nothing of a chapter is left behind
 // (no map flags override, no armed map seed). True: taken over, the caller must NOT start the fight.
 bool setup_on_house_gear_done(void* director, void (*go)(void*));
-bool setup_house_pending();   // a house boss gear lock is waiting for the others
+bool setup_house_pending();
+// 2026-11-16: the round's shared roster installed again (a house boss co-op's departure wrote this player's own gear-screen selection over it). false = nothing kept.
+bool setup_reinstall_shared(const char* why);
+// 0.1.236: a house boss co-op ended before its fight while this player's gear screen lock is held -- the hold is dropped (no start) and the barrier reset.
+void setup_drop_house_hold(const char* why);   // a house boss gear lock is waiting for the others
 // Every frame: drives a taken-over lock (the export, the host's commit, the client's wait for the host's command).
 void setup_tick();
 // A taken-over lock is waiting: the player is, for the room, on the chapter page.

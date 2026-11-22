@@ -341,6 +341,7 @@ void* __fastcall h_GetChoice(void* self, void* out) {
 // not known yet; such a call now logs the return addresses of its stack (image-relative), so the next log names the caller.
 static thread_local int t_apply_depth = 0;
 void __fastcall h_DoAction(void* self, void* ta, unsigned char flag) {
+    if (lockstep_active() && self) unitstate_settle_xvalues(self);     // 0.1.242 (sim 64): the actor's X values are its state now, on every peer (room ZCRD)
     Who    w(self, "char");
     TaDump d(ta);
     log_line("DOACTION", "%s flag=%u %s", w.text, (unsigned)flag, d.text);
@@ -824,7 +825,15 @@ void* __fastcall h_LoadChar(void* chr, void* name, uint8_t a, uint8_t b) {
     int32_t hp_before = 0;
     mem_read((const uint8_t*)chr + kChr_Hp, &hp_before, sizeof(hp_before));
     void* r = o_LoadChar(chr, name, a, b);
-    if (!balance_exempt_definition(nm)) balance_scale_enemy(chr, hp_before, session_enemy_scale_half());
+    // 0.1.235 (user request 2026-11-16): a house boss co-op fight keeps the game's own numbers -- the boss and everything in that fight. Every peer is in the
+    // fight's phase before the game loads its units (housecoop_on_fight_start / house_go), so all of them leave it alone alike.
+    // 0.1.243 (user request 2026-11-20): that fight has a multiplier of its own, ui.house_boss_scale (default x1 = the game's numbers), the host's on every peer.
+    if (housecoop_house_fight()) {
+        const uint8_t hs = session_house_scale_half();
+        if (hs > 2 && !balance_exempt_definition(nm)) balance_scale_enemy(chr, hp_before, hs);
+        else log_line("BALANCE", "'%s' keeps the game's own health and armor (a house boss fight, its multiplier x%.1f)", nm, hs / 2.0);
+    }
+    else if (!balance_exempt_definition(nm)) balance_scale_enemy(chr, hp_before, session_enemy_scale_half());
     else log_line("BALANCE", "'%s' keeps the game's own health and armor (The Creator's clone of a player's cat: no enemy multiplier)", nm);
     unlocks_build_load_done();   // ...and again when it is over: what the definition drew (a random cat's name) must not reach the next roll
     unlocks_midbattle_load_done();
@@ -851,6 +860,36 @@ static bool cat_carries_story_item(uint64_t id, char* item, size_t cap) {
     }
 }
 
+// 0.1.239: THE HOUSE'S STORAGE GRID CRASHED THE GAME WHEN IT GREW (WIN-RT5CT5J90GB 11-18 17:26; Zeroink and caulicap 11-16 -- C0000005 at 0x140DABB86/9E, memmove,
+// from 0x1401A6DFE). 0x1401A6BE0 drops the dragged items into the grid (count +0x4C, capacity +0x48, data +0x50, 8-byte entries): it takes the insertion point
+// as a POINTER into the old buffer, THEN reallocates when the room is short (realloc, the call at +0x1DE) and moves the tail from that stale pointer -- a length
+// computed against the new buffer, a read past the old one. A game bug, not the mod's; it fires only when realloc has to move the block. The room is made
+// here first, with the game's own realloc, so the game's growth never runs. Reads rcx (the grid) and rdx (the list: count +4, data +8) only.
+typedef void (__fastcall* fn_grid_insert)(void* grid, void* list);
+fn_grid_insert o_GridInsert = nullptr;
+void __fastcall h_GridInsert(void* grid, void* list) {
+    uint32_t cap = 0, cnt = 0, n = 0; void* data = nullptr;
+    if (grid && list && mem_read((uint8_t*)grid + 0x48, &cap, 4) && mem_read((uint8_t*)grid + 0x4C, &cnt, 4) && mem_read((uint8_t*)grid + 0x50, &data, 8) &&
+        mem_read((uint8_t*)list + 4, &n, 4) && n && n <= 4096 && cnt <= 1000000 && (uint64_t)cnt + n > cap) {
+        const uint8_t* fn = (const uint8_t*)addr_of(T_GridInsert);
+        uint8_t op = 0; int32_t rel = 0;
+        if (fn && mem_read(fn + 0x1DE, &op, 1) && op == 0xE8 && mem_read(fn + 0x1DF, &rel, 4)) {
+            auto game_realloc = (void* (__cdecl*)(void*, size_t))(fn + 0x1DE + 5 + rel);
+            uint32_t want = (cnt + n) * 2; if (want < 16) want = 16;
+            void* p = nullptr;
+            __try { p = game_realloc(data, (size_t)want * 8); } __except (EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
+            if (p && mem_write((uint8_t*)grid + 0x50, &p, 8) && mem_write((uint8_t*)grid + 0x48, &want, 4)) {
+                static uint32_t said = 0;
+                if (said < 20) { ++said; log_line("HOUSE", "item grid %p: %u item(s) dropped into %u of %u -- its room made first (%u), the game's own growth would have read a freed buffer", grid, n, cnt, cap, want); }
+            }
+        } else {
+            static bool said = false;
+            if (!said) { said = true; log_line_lvl(LogLevel::Warn, "HOUSE", "!! item grid: the game's realloc call was not where it was expected -- the drop is left to the game"); }
+        }
+    }
+    o_GridInsert(grid, list);
+}
+
 bool __fastcall h_TryDepart(void* box) {
     uint32_t n = 0;
     uint64_t ids[kDepart_SlotCnt] = {};
@@ -874,6 +913,20 @@ bool __fastcall h_TryDepart(void* box) {
     }
     if (!room_depart_allowed(n)) { log_line("DEPART", "refused by the room (party size rule)"); return true; }
     if (housecoop_refuse_depart(n)) { log_line("DEPART", "refused: the house boss co-op is being decided, or this helper has not had its inserted day yet"); return true; }
+    // 0.1.239 (bibi, room KD8E 11-18 20:34): a real cat on a reserved id (born while the game's counter sat in the session range) was moved on the collar page --
+    // after that page had taken the box's ids: the Mage collar went to the retired copy the id was left with, and "the switch was gone" when the page came back.
+    // Moved here instead, before the game sets off, and the box's slots are pointed at the new ids, so every page after this one only ever sees the new ones.
+    if (slots) {
+        uint64_t from[16] = {}, to[16] = {};
+        const unsigned moved = catsync_relocate_squatters("departure box", from, to, 16);
+        for (unsigned k = 0; k < moved && k < 16; ++k)
+            for (uint32_t i = 0; i < kDepart_SlotCnt; ++i) {
+                void* slot = nullptr; uint64_t id = 0;
+                if (!mem_read(slots + i * sizeof(void*), &slot, sizeof(slot)) || !slot || !mem_read((const uint8_t*)slot + 0x80, &id, sizeof(id)) || id != from[k]) continue;
+                if (mem_write((uint8_t*)slot + 0x80, &to[k], sizeof(to[k]))) log_line("DEPART", "box slot %u: cat %llx is %llx now (moved off a reserved id)", i, (unsigned long long)from[k], (unsigned long long)to[k]);
+                for (uint32_t j = 0; j < n && j < kDepart_SlotCnt; ++j) if (ids[j] == from[k]) ids[j] = to[k];
+            }
+    }
     catsync_log_snapshot("departure (the box is accepted)");
     catsync_census_take(ids, n);
     catsync_log_audit("departure (the box is accepted)");
@@ -895,6 +948,8 @@ void __fastcall h_EnterNode(void* self, void* node) {
     if (areagate_hold_node(self, node)) return;
     // experimental (mgmp_indepevt): the host does not leave an event node while a client is still on its own event there
     if (indepevt_hold_node()) return;
+    // 0.1.238: nor while a player's cat differs from its owner's copy (the owner's resend is about two seconds away)
+    if (catsync_hold_node()) return;
     log_stage_quiet("map: a node is being entered");
     lockstep_log_battle_summary("the next node is entered");
     // The client's own clicks are swallowed here; the host's are published.
@@ -1093,6 +1148,13 @@ EquipmentGate checked_equipment_gate(void* self) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return EquipmentGate::Unreadable; }
 }
 void __fastcall h_EquipmentClick(void* self) {
+    // 0.1.237: THE LOCK IS HELD AS THE READY (a house boss co-op, or a player with no chapter page): the cats were exported at the lock, so gear changed on the gear
+    // screen while waiting never reached the others -- rooms ZSE6 (LargeMeteor) and 93VB (FrankBolts, RailSpikes, HumanBrain) halted at turn 2 on it.
+    if (net_active() && net_peer_count() >= 2 && setup_no_chapter_pending()) {
+        room_toast(tr(Tx::R_GEAR_READY_LOCKED));
+        log_line_lvl(LogLevel::Warn, "SETUP", "gear click refused: this player's lock is held as the READY -- its cats went out with the gear they had then");
+        return;
+    }
     // 0.1.192: THE HOST IS ALREADY IN THE NEXT NODE (yuge 11-05: a swap on the gear page after the host had built the battle with the old gear -- an item of
     // another name in a slot, a halt at turn 1). The gear this battle is built with is the gear the host has; a change now would only split the two games.
     if (net_active() && net_peer_count() >= 2 && net_role() == NetRole::Client && follow_host_ahead()) {
@@ -1128,7 +1190,7 @@ static void run_settled(const char* how, bool was_shared) {
     if (was_shared) {
         const unsigned merged = catsync_merge_session_cats(how, true);   // the game has just settled the party: a clone still out on adventure was not in it
         catsync_release_stuck_cats(how);
-        const unsigned retired = catsync_retire_peer_copies(how);
+        const unsigned retired = catsync_retire_peer_copies(how, 0xFFFFFFFFu, housecoop_house_fight());   // a house boss fight: no departure marked the copies
         catsync_log_snapshot("after the merge");
         catsync_log_audit("after the merge");
         // the settlement saved BEFORE the merge: write the merged state to disk too, so a reload finds it (and the other players' leftover copies, now retired, are not kept out on adventure)
@@ -1574,8 +1636,10 @@ static void* party_cats_inner(void* director, void* out, uintptr_t ret) {
     }
     char line[400] = {}; int w = 0;
     for (uint32_t i = 0; i < n && w >= 0 && (size_t)w < sizeof(line) - 20; ++i) w += _snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, " %llx", (unsigned long long)team[i]);
-    log_line("TEAMLIST", "%s: %s %u cat(s) [%s ] instead of the party list's %u (familiars %u)", what ? what : "?",
-             use == TeamUse::Own ? "this player's own" : "every player's", n, line, pn, fn);
+    uint64_t s0 = 0;
+    if (const uint64_t* s = rng_global_stream()) mem_read(s, &s0, sizeof(s0));
+    log_line("TEAMLIST", "%s: %s %u cat(s) [%s ] instead of the party list's %u (familiars %u) | stream %016llx", what ? what : "?",
+             use == TeamUse::Own ? "this player's own" : "every player's", n, line, pn, fn, (unsigned long long)s0);
     uint64_t* team_ptr = team;
     mem_write(d + kDir_CatIdCount, &n, 4);
     mem_write(d + kDir_CatIdData, &team_ptr, 8);
@@ -1584,6 +1648,37 @@ static void* party_cats_inner(void* director, void* out, uintptr_t ret) {
     mem_write(d + kDir_CatIdCount, &pn, 4);
     return r;
 }
+// 0.1.240 (sim 63): SCHADENFREUDE COUNTS EVERY PLAYER'S CATS (player report 11-18: "幸灾乐祸 does not count the other players' cats"). Its scaled stats are hard-coded
+// (CatData::get_bonus_stats 0x140C0FDA, Character::recompute 0x1400FEC09) on 0x1403BE0E0 (rcx MewDirector, rdx CatData; returns the count): a cat in the party list counts
+// the disorders (+0x960, +0x988, "None" = none) of the party's cats (0x1403B2F30), any other cat only its own. In a room the party list holds the host's cats and the
+// others' are familiars -- a host's Butcher counted the host's cats only, a client's counted itself. For this call the party list is the whole team (party and familiars,
+// sorted by id, the same on every peer), then put back. Reads rcx and rdx only.
+typedef int (__fastcall* fn_team_disorders)(void* director, void* cat);
+fn_team_disorders o_TeamDisorders = nullptr;
+int __fastcall h_TeamDisorders(void* director, void* cat) {
+    if (!director || !cat || !net_active() || net_peer_count() < 2) return o_TeamDisorders(director, cat);
+    uint8_t* d = (uint8_t*)director;
+    uint32_t pn = 0, fn = 0; uint64_t* pd = nullptr; uint64_t* fd = nullptr;
+    if (!mem_read(d + kDir_CatIdCount, &pn, 4) || !mem_read(d + kDir_CatIdData, &pd, 8) ||
+        !mem_read(d + kDir_CatFamiliars + 4, &fn, 4) || !mem_read(d + kDir_CatFamiliars + 8, &fd, 8) || pn > 32 || fn > 32 || (pn && !pd) || (fn && !fd) || !fn)
+        return o_TeamDisorders(director, cat);
+    uint64_t party[32] = {}, fam[32] = {};
+    if ((pn && !mem_read(pd, party, pn * 8)) || !mem_read(fd, fam, fn * 8)) return o_TeamDisorders(director, cat);
+    static uint64_t team[64];
+    const uint32_t n = teamlist_compose(TeamUse::All, party, pn, fam, fn, net_peer_pos(), &lockstep_owner_pos, team, 64);
+    if (!n) return o_TeamDisorders(director, cat);
+    uint64_t* team_ptr = team;
+    mem_write(d + kDir_CatIdCount, &n, 4);
+    mem_write(d + kDir_CatIdData, &team_ptr, 8);
+    int r = 0;
+    __try { r = o_TeamDisorders(director, cat); } __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
+    mem_write(d + kDir_CatIdData, &pd, 8);                      // the party list as it was, before anything else reads it
+    mem_write(d + kDir_CatIdCount, &pn, 4);
+    static int s_last = -1; static uint32_t s_said = 0;
+    if (r != s_last && s_said < 40) { ++s_said; s_last = r; log_line("TEAMLIST", "Schadenfreude: the team's disorders counted over every player's %u cat(s) (party %u, familiars %u): %d", n, pn, fn, r); }
+    return r;
+}
+
 // "A random element of this vector" (sub_1400AB770, 41 callers). Only the call that picks an event's SUBJECT cat is taken over (the instruction after that call is kRet_EventSubject): the
 // candidates are sorted by cat id and the draw indexes the sorted list, so both peers name the same cat even when their party lists are in another order (the client's own cats come first).
 typedef void* (__fastcall* fn_pick_random)(void* vec, void* stream);
@@ -1897,7 +1992,45 @@ void __fastcall h_HouseFight(void* data) {
         housecoop_log_boss("at the house boss fight's start");
     }
     if (housecoop_on_fight_start(data, house_fight_original)) { log_line("HOUSEBOSS", "   the fight's start is HELD by the house boss co-op (it starts when every player is ready)"); return; }
+    housecoop_note_house_fight();   // 0.1.236: before the game loads the fight's units (the enemy multiplier reads it)
     o_HouseFight(data);
+}
+// 2026-11-16: the gear screen's departure (T_HouseGearDone, 0x14034D9B0) -- reached from its lock after the game's own party check and confirmation. In a house
+// boss co-op it is the player's READY: held here, before the departure plays, and replayed the game's way once every player is ready (housecoop -> the setup
+// barrier). rcx points at a pointer to the gear screen (a stack slot or a lambda's capture), so the replay goes through a copy of that pointer kept here.
+typedef void (__fastcall* fn_gear_depart)(void* gear_ref, void* b, void* c, void* d);
+fn_gear_depart o_HouseGearDone = nullptr;
+static void* s_gear_ref[1] = {};
+static void house_gear_depart_original(void* ref) { o_HouseGearDone(ref, nullptr, nullptr, nullptr); }
+void __fastcall h_HouseGearDone(void* gear_ref, void* b, void* c, void* d) {
+    housecoop_on_departure();   // 0.1.236: a replayed lock got past the game's own checks
+    void* gear = nullptr;
+    if (gear_ref && mem_read(gear_ref, &gear, sizeof(gear)) && gear) {
+        s_gear_ref[0] = gear;
+        if (housecoop_on_gear_lock(s_gear_ref, house_gear_depart_original)) return;
+    }
+    o_HouseGearDone(gear_ref, b, c, d);
+}
+// 2026-11-16: Button::Click (T_ButtonClick). The gear screen's lock in a house boss co-op is held here -- before the button's own animation -- as the READY,
+// and clicked again the game's way once every player is ready. The lock button is known by its callback: Button+0xF0 -> the std::function's impl, whose _Do_call
+// (vtable +0x10) is the stub "mov rcx,[rcx+8]; jmp rel32" into the lock handler, 0x140 bytes before the gear screen's departure (T_HouseGearDone). Any other
+// button, or a build where that shape is not found, clicks as it always did.
+typedef void (__fastcall* fn_btn_click)(void* button, uint64_t force, void* c, void* d);
+fn_btn_click o_ButtonClick = nullptr;
+static bool gear_lock_button(void* button) {
+    const uintptr_t depart = addr_of(T_HouseGearDone);
+    if (!depart || !button) return false;
+    void* impl = nullptr; void* const* vt = nullptr; const uint8_t* call = nullptr; uint8_t code[9] = {};
+    if (!mem_read((const uint8_t*)button + 0xF0, &impl, sizeof(impl)) || !impl) return false;
+    if (!mem_read(impl, &vt, sizeof(vt)) || !vt || !mem_read(vt + 2, &call, sizeof(call)) || !call || !mem_read(call, code, sizeof(code))) return false;
+    if (code[0] != 0x48 || code[1] != 0x8B || code[2] != 0x49 || code[3] != 0x08 || code[4] != 0xE9) return false;
+    int32_t rel = 0; memcpy(&rel, code + 5, 4);
+    return (uintptr_t)call + 9 + (intptr_t)rel == depart - 0x140;
+}
+static void button_click_original(void* button) { o_ButtonClick(button, 0, nullptr, nullptr); }
+void __fastcall h_ButtonClick(void* button, uint64_t force, void* c, void* d) {
+    if (gear_lock_button(button) && housecoop_on_gear_lock(button, button_click_original)) return;
+    o_ButtonClick(button, force, c, d);
 }
 fn_one_ptr o_BeatHouseBoss = nullptr;
 // THE KAIJU FIGHT WITH NO WINNER (0.1.197; LAPTOP-KM5VGMBP 11-06 20:54, 20:55, 21:00, solo): GlobalProgressionData::BeatHouseBoss opens with "the next house boss is
@@ -2526,6 +2659,7 @@ void* __fastcall h_MewDirInit(void* self, void* name) {
     storage_diag_save_loaded();
     catsync_log_audit("a save is loaded (MewDirector::init)");     // who the run's lists hold right after a load, in a room or alone
     catsync_census_on_save_loaded();                                // a census taken before the load describes another registry (0.1.51)
+    catsync_on_save_loaded();                                       // pushes held from before the load are another registry's (0.1.238)
     return r;
 }
 
@@ -2572,6 +2706,7 @@ void __fastcall h_FrameBegin(void* self) {
     checkpoint_tick();
     setup_tick();
     unlocks_tick();
+    catsync_counter_tick();      // 0.1.239: the game's cat id counter kept out of the session range on every screen, in a room or not (a kitten got 72000004 at home)
     progressguard_tick();        // 0.1.130: the save file's progress floored against what this player had when the room began (PROGRESS)
     choice_story_guard_tick();   // a client's House surviving kaiju, kept through the host's story event
     treasure_tick();             // the experimental shared chest: the item granted to this player is taken
@@ -2731,6 +2866,10 @@ const Binding kBindings[] = {
     { T_CatSelectorInit, (void*)&h_CatSelectorInit, (void**)&o_CatSelectorInit },
     { T_ChapterDiffSet, (void*)&h_ChapterDiffSet, (void**)&o_ChapterDiffSet },
     { T_StrayGen,       (void*)&h_StrayGen,       (void**)&o_StrayGen },
+    { T_HouseGearDone,  (void*)&h_HouseGearDone,  (void**)&o_HouseGearDone },
+    { T_ButtonClick,    (void*)&h_ButtonClick,    (void**)&o_ButtonClick },
+    { T_GridInsert,     (void*)&h_GridInsert,     (void**)&o_GridInsert },
+    { T_TeamDisorders,  (void*)&h_TeamDisorders,  (void**)&o_TeamDisorders },
     { T_ResDejaVu, (void*)&h_ResDejaVu, (void**)&o_ResDejaVu },
     { T_HouseSave, (void*)&h_HouseSave, (void**)&o_HouseSave },
     { T_EvItemPick, (void*)&h_EvItemPick, (void**)&o_EvItemPick },

@@ -54,6 +54,7 @@
 #include "mgmp_steambridge.h"
 #include "mgmp_logupload.h"
 #include "mgmp_urgent.h"      // 0.1.186: the server's urgent fix notice
+#include "mgmp_impnote.h"     // 0.1.234: the important update notice
 #include "mgmp_prevrun.h"
 #include "mgmp_treasure.h"
 #include "mgmp_housecoop.h"
@@ -246,6 +247,9 @@ struct Menu {
     // The first-run beta notice.
     bool     beta_closed = false;     // dismissed for this run
     bool     beta_dont   = false;     // its "do not show again" box
+    bool     imp_checked = false;     // 0.1.234: the important update notices were looked for (once per start)
+    bool     imp_closed  = false;     // ... and the dialog was put away
+    unsigned imp_mask    = 0;         // which of kImportantNotes this update crossed (bit i = note i)
     bool     ag_dont     = false;     // the area question's "do not ask again in this game" box
     bool inited    = false;
     double next_list = 0;
@@ -1357,7 +1361,8 @@ void draw_cat_card(ImDrawList* dl, ImVec2 p, float k, float w, const CatBrief& c
     text_at(d, ImVec2(tx, p.y + 20 * k), 18 * k, kInkSoft, lv);
     d->PopClipRect();
 
-    // health
+    // health -- 0.1.247: hidden while a unit of the battle wears Redacted (HideSomeHudStuff), as the game hides its own bars: an empty bar, no number
+    const bool hide_hp = lockstep_hud_hidden();
     const bool full = cat.hp >= kBriefFullHp;
     int maxhp = cat.maxhp > 0 ? cat.maxhp : (full ? 1 : cat.hp);
     if (!full && cat.hp > maxhp) maxhp = cat.hp;          // the estimate is a floor
@@ -1365,7 +1370,7 @@ void draw_cat_card(ImDrawList* dl, ImVec2 p, float k, float w, const CatBrief& c
     frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
     const ImVec2 b0(p.x + 2 * k, p.y + 46 * k), b1(p.x + w - 2 * k, p.y + 57 * k);
     dl->AddRectFilled(b0, b1, IM_COL32(70, 64, 60, 200), 3.0f);
-    if (frac > 0.0f)
+    if (frac > 0.0f && !hide_hp)
         dl->AddRectFilled(b0, ImVec2(b0.x + (b1.x - b0.x) * frac, b1.y),
                           frac > 0.5f ? kGreen : (frac > 0.25f ? kAmber : kRed), 3.0f);
     dl->AddRect(b0, b1, kInk, 3.0f, 0, 1.6f);
@@ -1389,7 +1394,10 @@ void draw_cat_card(ImDrawList* dl, ImVec2 p, float k, float w, const CatBrief& c
     dl->AddCircle(ImVec2(p.x + 8 * k, cy + 9 * k), 6.0f * k, kInk, 12, 1.4f);
     const char* class_name = gametext_class_name(cat.klass);                 // the game's own word for the class, in the language / language pack the player runs (0.1.117)
     text_at(dl, ImVec2(p.x + 18 * k, cy), 17 * k, kInk, class_name ? class_name : tr_class(cat.klass));
-    if (!full) {
+    if (hide_hp) {
+        const float hw = text_size(16 * k, "?").x;
+        text_at(dl, ImVec2(p.x + w - hw - 2 * k, cy + 1 * k), 16 * k, kInkSoft, "?");
+    } else if (!full) {
         char hp[16];
         _snprintf_s(hp, sizeof(hp), _TRUNCATE, "%d", cat.hp);
         const float hw = text_size(16 * k, hp).x;
@@ -3579,6 +3587,42 @@ void draw_settings_window(const View& v) {
                    locked ? kGrey : kInk, 2.4f, 359, 1.2f);
         y = stage_y(wrap_text(dl, X(70), Y(ty + 50), (W - 140) * k, 22 * k, 29 * k, kInkSoft, tr(Tx::SET_ENEMY_SCALE_NOTE))) + 18;
     }
+    {   // 0.1.243: THE HOUSE BOSS CO-OP MULTIPLIER, x1 .. x8 in steps of 0.5, default x1 -- the same slider as the enemy multiplier's
+        static bool s_drag = false;
+        const uint8_t cur = config().house_scale_half;
+        char head[160];
+        _snprintf_s(head, sizeof(head), _TRUNCATE, "%s:  x%g", tr(Tx::SET_HOUSE_SCALE), cur / 2.0);
+        text_at(dl, ImVec2(X(70), Y(y + 4)), 30 * k, locked ? kGrey : kInk, head);
+        const float tx0 = 100, tx1 = W - 100, ty = y + 70;
+        const int steps = 14;
+        dl->AddLine(ImVec2(X(tx0), Y(ty)), ImVec2(X(tx1), Y(ty)), locked ? kGrey : kInk, 3 * k);
+        for (int i = 0; i <= steps; ++i) {
+            const float x = tx0 + (tx1 - tx0) * i / steps;
+            const bool whole = i % 2 == 0;
+            dl->AddLine(ImVec2(X(x), Y(ty - (whole ? 10 : 6))), ImVec2(X(x), Y(ty + (whole ? 10 : 6))), locked ? kGrey : kInkSoft, 2 * k);
+            if (whole) { char t[8]; _snprintf_s(t, sizeof(t), _TRUNCATE, "%d", 1 + i / 2); text_c(dl, X(x), Y(ty + 28), 20 * k, kInkSoft, t); }
+        }
+        ImGui::SetCursorScreenPos(ImVec2(X(tx0 - 20), Y(ty - 24)));
+        ImGui::InvisibleButton("##house_scale", ImVec2((tx1 - tx0 + 40) * k, 48 * k));
+        const bool hov = ImGui::IsItemHovered() && !locked;
+        if (hov) g.hovering_button = true;
+        if (ImGui::IsItemActive() && !locked && k > 0) {
+            float f = (ImGui::GetIO().MousePos.x - X(tx0)) / ((tx1 - tx0) * k);
+            f = f < 0 ? 0 : f > 1 ? 1 : f;
+            const uint8_t want = (uint8_t)(2 + (int)(f * steps + 0.5f));
+            if (want != config().house_scale_half) config_set_house_scale_half(want, false);
+            s_drag = true;
+        } else if (s_drag) {
+            s_drag = false;
+            const bool saved = config_set_house_scale_half(config().house_scale_half, true);
+            log_line("MENU", "ui.house_boss_scale = %.1f (%s)", config().house_scale_half / 2.0, saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
+        const uint8_t now_half = config().house_scale_half;
+        const float kx = tx0 + (tx1 - tx0) * ((int)now_half - 2) / (float)steps;
+        rough_rect(dl, ImVec2(X(kx - 12), Y(ty - 18)), ImVec2(X(kx + 12), Y(ty + 18)), hov || s_drag ? kPaperHi : IM_COL32(255, 255, 250, locked ? 120 : 230),
+                   locked ? kGrey : kInk, 2.4f, 361, 1.2f);
+        y = stage_y(wrap_text(dl, X(70), Y(ty + 50), (W - 140) * k, 22 * k, 29 * k, kInkSoft, tr(Tx::SET_HOUSE_SCALE_NOTE))) + 18;
+    }
     // THE SETTINGS RUN FROM VERIFIED TO EXPERIMENTAL (the rule since 0.1.106): a feature that has been tested enough is listed here, ahead of the experimental section,
     // with no warning (and usually on by default); the experimental section holds only what is still being tried out. A feature that is verified later moves up.
     {   // the shared treasure chest (mgmp_treasure)
@@ -3597,6 +3641,14 @@ void draw_settings_window(const View& v) {
             log_line("MENU", "ui.exp_indep_events = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
         }
     }
+    {   // helping the one player whose house boss is today (mgmp_housecoop) -- 0.1.234: out of the experimental section, on by default
+        const bool on = config().exp_house_coop;
+        y = box("set_exp_house_coop", y, on, tr(Tx::SET_EXP_HOUSE_COOP), tr(Tx::SET_EXP_HOUSE_COOP_NOTE), 353, 0);
+        if (clicked) {
+            const bool saved = config_set_exp_house_coop(!on);
+            log_line("MENU", "ui.exp_house_coop = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+        }
+    }
     // THE EXPERIMENTAL FEATURES (2026-10-18): a section of their own, one box each, all off by default. A new experimental feature gets its
     // own box here (and its own ui.exp_* key and HELLO rules bit).
     {
@@ -3611,14 +3663,6 @@ void draw_settings_window(const View& v) {
         if (clicked) {
             const bool saved = config_set_exp_voice(!on);
             log_line("MENU", "ui.exp_voice = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
-        }
-    }
-    {   // helping the one player whose house boss is today (mgmp_housecoop) -- never verified in a live game
-        const bool on = config().exp_house_coop;
-        y = box("set_exp_house_coop", y, on, tr(Tx::SET_EXP_HOUSE_COOP), tr(Tx::SET_EXP_HOUSE_COOP_NOTE), 353, 2);
-        if (clicked) {
-            const bool saved = config_set_exp_house_coop(!on);
-            log_line("MENU", "ui.exp_house_coop = %s (%s)", !on ? "true" : "false", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
         }
     }
     s_content = y;
@@ -3879,6 +3923,80 @@ void draw_beta_notice(const View& v) {
         } else {
             log_line("MENU", "beta notice dismissed");
         }
+    }
+    ImGui::End();
+}
+
+// THE IMPORTANT UPDATE NOTICES (0.1.234, mgmp_impnote.h): one entry per update that changes what a player meets, oldest first. A new one is appended
+// here (its text in i18n_src.py); a one-time change of a setting that goes with it is made in impnote_check, under the same version.
+struct ImportantNote { const char* version; Tx text; };
+const ImportantNote kImportantNotes[] = {
+    { "0.1.234", Tx::IMP_0234 },      // the house defense co-op is out of the experimental section and switched on
+};
+constexpr unsigned kImportantNoteCount = sizeof(kImportantNotes) / sizeof(kImportantNotes[0]);
+static_assert(kImportantNoteCount <= 32, "imp_mask holds 32 notes");
+
+// Once per start, on the title screen: which notes the update since the last start crossed, and the one-time setting changes that go with them.
+// Nothing crossed: ui.last_version moves up to this version at once. Something crossed: the dialog shows it, and its OK moves the key up.
+void impnote_check() {
+    if (g.imp_checked) return;
+    g.imp_checked = true;
+    const char* cur = urgent_own_version();
+    const char* prev = config().last_version;
+    if (impnote_version_cmp(cur, "0.0.1") < 0) {
+        log_line_lvl(LogLevel::Warn, "IMPNOTE", "!! this mod's own version cannot be read ('%s') -- no important update notice is looked for", cur);
+        return;
+    }
+    if (prev[0] && impnote_version_cmp(cur, prev) <= 0) {
+        log_line("IMPNOTE", "this mod %s, the last start here %s -- not an update, no important update notice", cur, prev);
+        return;
+    }
+    // THE ONE-TIME SETTING CHANGES OF AN UPDATE (made whether or not the dialog is put away; the key is written by the dialog's OK)
+    if (impnote_crosses(prev, cur, "0.1.234") && !config().exp_house_coop) {
+        const bool saved = config_set_exp_house_coop(true);
+        log_line("IMPNOTE", "the update to 0.1.234 switches the house defense co-op on (ui.exp_house_coop = true, %s)", saved ? "mgmp.json updated" : "could NOT write mgmp.json -- only for this run");
+    }
+    unsigned crossed = 0;
+    for (unsigned i = 0; i < kImportantNoteCount; ++i)
+        if (impnote_crosses(prev, cur, kImportantNotes[i].version)) { g.imp_mask |= 1u << i; ++crossed; }
+    if (!g.imp_mask) {
+        const bool saved = config_set_last_version(cur);
+        log_line("IMPNOTE", "updated from %s to %s: no important update notice in between (ui.last_version %s)", prev[0] ? prev : "(none)", cur, saved ? "written" : "could NOT be written");
+        return;
+    }
+    log_line("IMPNOTE", "updated from %s to %s: %u important update notice(s) to show", prev[0] ? prev : "(none: an install from before 0.1.234)", cur, crossed);
+}
+
+void draw_impnote(const View& v) {
+    std::string body;
+    for (unsigned i = 0; i < kImportantNoteCount; ++i) {
+        if (!(g.imp_mask & (1u << i))) continue;
+        if (!body.empty()) body += "\n--------\n";
+        body += tr(kImportantNotes[i].text);
+    }
+    const float k = v.k;
+    const float W = 900;
+    // the height follows the text (measured without drawing); a long list gets a smaller font before it may run off the stage
+    float fs = 26, lh = 37;
+    float text_h = (wrap_text(nullptr, 0, 0, (W - 140) * k, fs * k, lh * k, kInk, body.c_str())) / (k > 0 ? k : 1);
+    if (text_h > kStageH - 330) { fs = 21; lh = 29; text_h = wrap_text(nullptr, 0, 0, (W - 140) * k, fs * k, lh * k, kInk, body.c_str()) / (k > 0 ? k : 1); }
+    float H = 112 + text_h + 130;
+    if (H < 420) H = 420;
+    if (H > kStageH - 40) H = kStageH - 40;
+    const ImVec2 a = P(v, (kStageW - W) * 0.5f, (kStageH - H) * 0.5f);
+    const ImVec2 sz(W * k, H * k);
+    if (!modal_begin("##mgmp_impnote")) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    paper(dl, v, a, ImVec2(a.x + sz.x, a.y + sz.y));
+    auto X = [&](float x) { return a.x + x * k; };
+    auto Y = [&](float y) { return a.y + y * k; };
+    text_c(dl, X(W / 2), Y(40), 44 * k, kInk, tr(Tx::IMP_TITLE));
+    wrap_text(dl, X(70), Y(112), (W - 140) * k, fs * k, lh * k, kInk, body.c_str());
+    if (paper_button("imp_ok", ImVec2(X(W / 2 - 130), Y(H - 84)), ImVec2(X(W / 2 + 130), Y(H - 24)), tr(Tx::OK), 30 * k, true, Tone::Good)) {
+        g.imp_closed = true;
+        const char* cur = urgent_own_version();
+        const bool saved = config_set_last_version(cur);
+        log_line("IMPNOTE", "the important update notice was read -- not shown again (ui.last_version = %s, %s)", cur, saved ? "mgmp.json updated" : "could NOT write mgmp.json -- it shows again next start");
     }
     ImGui::End();
 }
@@ -4344,8 +4462,12 @@ void menu_draw() {
         if (g.relay_warn) draw_relay_warn(v);
     }
 
-    // The first-run notice, once the title screen is up.
-    if (title && g.title_a > 0.001f && config().beta_notice && !g.beta_closed) draw_beta_notice(v);
+    // The first-run notice, once the title screen is up; then the important update notice (0.1.234), once, after an update that crossed one.
+    if (title && g.title_a > 0.001f) {
+        impnote_check();
+        if (config().beta_notice && !g.beta_closed) draw_beta_notice(v);
+        else if (g.imp_mask && !g.imp_closed) draw_impnote(v);
+    }
     // WHICH ACCOUNT'S SAVES (2026-10-15): several account folders and neither Steam nor the player has named one -- ask, on the title screen, after a few
     // seconds (Steam's id usually arrives by then and settles it without a question).
     if (title) { if (g.title_since <= 0) g.title_since = now(); } else g.title_since = 0;

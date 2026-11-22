@@ -35,7 +35,7 @@ namespace {
 
 // Every flag a map's `flags {}` block or the progression file names (the generator's own `GenFlag_*` markers are set by the generation itself
 // and are left out). The ORDER IS THE WIRE FORMAT.
-const char* const kFlagNames[] = {
+constexpr const char* kFlagNames[] = {
     "BoneyardUnlocked", "BothObelisksUnlocked", "BunkerUnlocked", "CavesUnlocked", "ChaosAntennaAttached", "CoreObeliskUnlocked",
     "CoreUnlocked", "CraterUnlocked", "DesertUnlocked", "DimensionXUnlocked", "EndOfTimeUnlocked", "FutureUnlocked",
     "HardPathUnlocked", "IceAgeUnlocked", "JunkyardUnlocked", "JurassicUnlocked", "LabUnlocked", "MeatWorldUnlocked",
@@ -44,6 +44,10 @@ const char* const kFlagNames[] = {
 };
 constexpr int kFlagCount = (int)(sizeof(kFlagNames) / sizeof(kFlagNames[0]));
 static_assert(kFlagCount <= 32, "the flag set travels in a u32");
+constexpr bool same_text(const char* a, const char* b) { return *a == *b && (*a == 0 || same_text(a + 1, b + 1)); }
+constexpr int bit_index(uint32_t one_bit) { return one_bit == 1u ? 0 : 1 + bit_index(one_bit >> 1); }
+static_assert(same_text(kFlagNames[bit_index(kMapFlag_Desert)], "DesertUnlocked"), "kMapFlag_Desert must be the bit of DesertUnlocked in kFlagNames");
+static_assert(same_text(kFlagNames[bit_index(kMapFlag_Lab)], "LabUnlocked"), "kMapFlag_Lab must be the bit of LabUnlocked in kFlagNames");
 
 // The game's std::string, MSVC layout: 16 bytes of buffer or a heap pointer, size, capacity.
 struct GameStr {
@@ -1440,6 +1444,24 @@ static bool replace_game_string(void* out, const char* text) {
     return true;
 }
 
+// THE STREAM AFTER THE PICK (0.1.227, sim 59; room KD8E 11-13, Tony / CENIDEMA on a virtual LAN, battle 77635237): the two games picked different levels from the
+// same stream ('s1-24' on the host, 's1-82' here, forced to the host's), so the stream left by the pick differed (5f1e7c9b.. / 969683f7..). The battle start's
+// ChanceToAmbush roll (0x1403B6D10, a CamoHat cat) draws from it before the build reseeds it: an ambush on the client only -- its first round held the 7 player-side
+// units and no enemy, every decision then came one turn early, and the battle halted at turn 7. Both peers now set the stream from the node seed once the pick is
+// made (whatever level it drew), so everything between the pick and the build draws the same numbers.
+static void reseed_after_pick(uint64_t* s, void* node, const char* what, uint64_t now) {
+    uint64_t seed[4] = {};
+    const bool from_node = node && mem_read((const uint8_t*)node + 0x118, seed, sizeof(seed)) && (seed[0] | seed[1] | seed[2] | seed[3]);
+    uint64_t x = from_node ? (seed[0] ^ (seed[1] * 0x9E3779B97F4A7C15ull) ^ (seed[2] << 1) ^ (seed[3] >> 1)) : lockstep_battle_id();
+    if (!x) return;
+    x ^= 0x6D676D706C766C32ull;
+    uint64_t st[4];
+    for (int i = 0; i < 4; ++i) st[i] = splitmix64(x);
+    if (!mem_write(s, st, sizeof(st))) { log_line_lvl(LogLevel::Error, "SPAWN", "!! level pick (%s): the shared stream could not be set after the pick", what); return; }
+    log_line("SPAWN", "level pick (%s): the stream after the pick %016llx -> %016llx, set from %s (the same on every peer, whatever level each game drew)", what,
+             (unsigned long long)now, (unsigned long long)st[0], from_node ? "the node seed" : "the battle id");
+}
+
 void unlocks_level_pick(void* kind, void* node, void* out, bool picked) {
     if (!net_active() || net_peer_count() < 2) return;
     uint64_t* s = rng_global_stream();
@@ -1452,6 +1474,7 @@ void unlocks_level_pick(void* kind, void* node, void* out, bool picked) {
         char level[96] = "?";
         if (out) mem_read_std_string(out, level, sizeof(level));
         log_line("SPAWN", "level pick (%s): '%s' -- stream after %016llx", what, level, (unsigned long long)now);
+        reseed_after_pick(s, node, what, now);
         const uint64_t id = lockstep_battle_id();
         if (!node || !out || !id || level[0] == '?') return;
         if (net_role() == NetRole::Host) { publish_impl(level, id); return; }

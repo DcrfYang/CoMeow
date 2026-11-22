@@ -13,6 +13,7 @@
 
 namespace {
 using namespace mgmp;
+bool g_host_cats_perished = false;   // 0.1.229: the host's session cats (0x70......) died
 Config cfg;
 uint8_t director[0x800]{};
 void* director_ptr = director;
@@ -377,11 +378,43 @@ void variable_parties(){
      CHECK(roster_party_swap_release());
      memcpy(&pn,director+kDir_CatIdCount,4);memcpy(&fn,director+kDir_CatFamiliars+4,4);memcpy(&p,director+kDir_CatIdData,8);
      CHECK(pn==sizes[0]&&fn==fcount&&!memcmp(p,ids,pn*8));
+     // 0.1.229 (room WEEH): every host cat died and the game filled the host's party with the other players' cats -- taken as the host has it.
+     if(fcount&&fcount<=4){
+      g_host_cats_perished=true;
+      CHECK(roster_adopt_host_shared(fam,fcount,nullptr,0,"the host has none left"));
+      memcpy(&pn,director+kDir_CatIdCount,4);memcpy(&fn,director+kDir_CatFamiliars+4,4);memcpy(&p,director+kDir_CatIdData,8);
+      CHECK(pn==fcount&&fn==0&&!memcmp(p,fam,fcount*8));
+      g_host_cats_perished=false;
+     }
     }
    }
    // A second noncombat return must restore this peer again with unequal lengths.
    roster_party_swap_after_node(12);roster_party_swap_on_map();
    memcpy(&pn,director+kDir_CatIdCount,4);CHECK(pn==sizes[owner]);
+   // 0.1.247 (room KD8E 11-21): every host cat died in a battle and their corpses left the run; the game's lists are the others' cats, the first
+   // four in the party. The frozen layout follows, and the next node's restore writes it (it was "roster write failed -- node 1 NOT entered").
+   if(owner!=0&&total>sizes[0]){
+    CHECK(roster_party_swap_release());
+    roster_party_swap_after_node(5);
+    uint64_t rest[16]{};unsigned rn=0;
+    for(unsigned j=sizes[0];j<total;++j)rest[rn++]=ids[j];
+    const unsigned k=rn<4?rn:4;
+    auto* q=(uint64_t*)calloc(16,8);auto* gf=(uint64_t*)calloc(16,8);
+    memcpy(q,rest,k*8);memcpy(gf,rest+k,(rn-k)*8);
+    put(kDir_CatIdCap,uint32_t(16));put(kDir_CatIdCount,uint32_t(k));put(kDir_CatIdData,q);
+    put(kDir_CatFamiliars,uint32_t(16));put(kDir_CatFamiliars+4,uint32_t(rn-k));put(kDir_CatFamiliars+8,gf);
+    g_host_cats_perished=true;
+    roster_party_swap_on_map();
+    CHECK(roster_party_swap_release());
+    memcpy(&pn,director+kDir_CatIdCount,4);memcpy(&fn,director+kDir_CatFamiliars+4,4);memcpy(&p,director+kDir_CatIdData,8);
+    CHECK(pn==k&&fn==rn-k&&!memcmp(p,rest,k*8));
+    // the host's node message: its party is the others' cats -- taken as it is, the next restore writes the same
+    CHECK(roster_adopt_host_shared(rest,k,rest+k,rn-k,"KD8E: the host has none left"));
+    CHECK(roster_party_swap_release());
+    memcpy(&pn,director+kDir_CatIdCount,4);memcpy(&p,director+kDir_CatIdData,8);
+    CHECK(pn==k&&!memcmp(p,rest,k*8));
+    g_host_cats_perished=false;
+   }
    for(auto o:off){uint64_t* data=nullptr;memcpy(&data,director+o+8,8);free(data);}
    roster_party_swap_reset();grow_vectors=false;
   }
@@ -418,7 +451,7 @@ bool lockstep_cat_is_mine(uint64_t id, bool& mine) {
     for (auto v : hosts) if (v == id) { mine = peer == 0; return true; }
     return false;
 }
-bool catsync_cat_perished(uint64_t) { return false; }   // the roster asks whether a cat that left the lists is dead for good
+bool catsync_cat_perished(uint64_t id) { return g_host_cats_perished && (id >> 24) == 0x70; }   // the roster asks whether a cat that left the lists is dead for good
 bool catsync_cat_exists(uint64_t) { return false; }     // ... and whether an unknown id in them is a real cat
 void catsync_gained_seen(uint64_t) {}
 void catsync_note_departure(const uint64_t*, uint32_t) {}   // 0.1.147: who brought what, for the class marks                    // a resumed run's gained cats advance their seat's next slot (0.1.146)

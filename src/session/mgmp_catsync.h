@@ -196,7 +196,10 @@ unsigned catsync_merge_session_cats(const char* why, bool after_native_settlemen
 void catsync_log_cat_parts(const void* cat, const char* what);
 // Real cats whose ids fall among the ids reserved for clones (older builds left such cats in saves) are moved to ordinary ids, and the run's party list is re-pointed. Returns how many were moved.
 // Cheap when there is nothing to do; called from the collar/gear pages and before the party exchange.
-unsigned catsync_relocate_squatters(const char* why);
+// 0.1.239: the moved pairs (old id, new id), at most `moved_cap`, when the caller has ids to point at the new ones (the departure box).
+unsigned catsync_relocate_squatters(const char* why, uint64_t* moved_from = nullptr, uint64_t* moved_to = nullptr, unsigned moved_cap = 0);
+// 0.1.239: the game's cat id counter put back below the session range when it is inside it -- every frame (about once a second), any screen, in a room or not.
+void catsync_counter_tick();
 // WHETHER THIS ID IS A SESSION CLONE'S (2026-10-05): the ids reserved for clones are 0x70000000 + (the player's position << 24) + a slot 1..4. A cat the GAME made while its id counter sat inside that range
 // (the counter follows the highest id in the save, and a save that held a retired clone started it there) has an id in the range too -- a newborn kitten got 0x71000013 -- but it is no clone: the slot is
 // above 4. The kitten rule answered "never a kitten" for everything in the range, so a newborn in the warehouse was an adult until the room was left.
@@ -223,7 +226,8 @@ void catsync_log_audit(const char* stage);
 // registry and logs what it did. A new session cancels it. No "play alone" click is involved.
 void catsync_leave_tick();
 // After a settlement: the other players' leftover copies (flagged out on adventure, not in the run's lists) are retired so the save does not keep them. Returns how many.
-unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions = 0xFFFFFFFFu);   // only_positions: bit p = position p (a player that dropped out)
+// unmarked_too (2026-11-16, a house boss co-op): the fight starts without a departure, so the other players' copies never got the "out on adventure" mark -- retired all the same
+unsigned catsync_retire_peer_copies(const char* why, uint32_t only_positions = 0xFFFFFFFFu, bool unmarked_too = false);   // only_positions: bit p = position p (a player that dropped out)
 
 // The House is about to write its state (T_HouseSave; `house` = the writer's first argument). Every House cat entity whose id is a clone's that the merge swapped into its original
 // gets the ORIGINAL's id, so `house_state` names the cats that came home -- see swap_identity.
@@ -233,6 +237,10 @@ void catsync_census_take(const uint64_t* box, uint32_t nbox);
 void catsync_census_check(const char* stage);
 // A save was loaded: an earlier census is dropped; a save already on an adventure is counted again as loaded (0.1.51).
 void catsync_census_on_save_loaded();
+// 0.1.238: a save was loaded -- cat pushes held from before it are dropped (they describe the registry the load replaced).
+void catsync_on_save_loaded();
+// 0.1.238, HOST: true while a node entry should wait -- a player's cat differs from its owner's copy (a fresh digest difference); at most 10 s.
+bool catsync_hold_node();
 
 // THE SAVE THE NATIVE SETTLEMENT WRITES IS NOT THE ONE THAT COUNTS (2026-10-03). MewDirector::SaveGame is the settlement's own last step, and it runs BEFORE the clone merge: the file on disk then
 // holds the settled CLONES under their session ids, the originals still "on adventure", and a house_state naming the clones. A player who reloads before anything saves again got the

@@ -1,5 +1,6 @@
 // mgmp_sigscan.cpp -- see mgmp_sigscan.h for the design and the reasoning.
 #include "mgmp_sigscan.h"
+#include "mgmp_foreign_hook.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -275,6 +276,25 @@ SigResolution sig_resolve(uintptr_t module_base, const SigRegion& region,
         res.from_hint = true;
         res.ok        = true;
         return res;
+    }
+
+    // 1b. 0.1.244: the pinned address whose first bytes another mod loader replaced with a jump to its own hook (Mewjector: the Combat
+    //     Roster Panel hooks FrameBegin / NextTurn / StatusMenu with these very signatures, before we are injected). The rest of the
+    //     pattern still has to match; MinHook then chains on top of that jump.
+    if (hint >= lo && hint + (size_t)pat.len <= hi && pat.len >= 16) {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)module_base;
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(module_base + dos->e_lfanew);
+        const uintptr_t img_hi = module_base + nt->OptionalHeader.SizeOfImage;
+        if (foreign_hook_matches((const uint8_t*)hint, hint, module_base, img_hi, pat.bytes, pat.mask, pat.len)) {
+            res.addr      = hint;
+            res.rva       = target.rva_hint;
+            res.drift     = 0;
+            res.matches   = 1;
+            res.from_hint = true;
+            res.foreign   = true;
+            res.ok        = true;
+            return res;
+        }
     }
 
     // 2. The hint failed, so this is not the pinned build (or that function

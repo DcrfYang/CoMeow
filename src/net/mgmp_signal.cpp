@@ -56,6 +56,7 @@ std::deque<std::string> g_sysmsg;
 std::deque<std::pair<std::string, std::string>> g_chat_out, g_chat_in;
 // 0.1.203: when the lobby closed this peer's room while the game link was still up (the host left the lobby); 0 = not so. A new room clears it.
 volatile ULONGLONG g_room_closed_at = 0;
+volatile LONG64 g_lobby_lost_at = 0;    // 0.1.237: the lobby connection closed without being asked to (worker thread) -- the room tick tells the player when the game link is still up
 
 // Lines the worker may run ahead of the game thread before it starts dropping.
 // The lobby is a handful of messages a second, so overflow means the game
@@ -416,6 +417,7 @@ DWORD WINAPI worker(LPVOID) {
     // routers -- and a host's room stayed in the list for all of it. A ping every 20 s lets the server tell a dead peer from a quiet one (it answers with
     // "pong", which is ignored below; a server that does not know "ping" answers with an error line, which is too).
     ULONGLONG last_beat = GetTickCount64();
+    ULONGLONG last_rx = GetTickCount64();    // 0.1.237: the server answers every ping -- 90 s of nothing at all is a dead link, whatever recv says
 
     while (!InterlockedCompareExchange(&g.stop, 0, 0)) {
         if (GetTickCount64() - last_beat >= 20000) { last_beat = GetTickCount64(); send_cmd("ping"); }
@@ -423,12 +425,23 @@ DWORD WINAPI worker(LPVOID) {
         if (n == 0) { closed_by_peer = true; break; }
         if (n < 0) {
             const int e = WSAGetLastError();
-            if (e == WSAEINTR || e == WSAETIMEDOUT) continue;   // the poll above
+            // 0.1.237: WSA_IO_PENDING (997) is how a receive timeout comes back on some machines (a network filter driver -- accelerators -- under the socket):
+            // the host of room 4388 (11-16 15:53) lost the lobby to it in the middle of a run, its room vanished from the panel, the players went back to the
+            // main menu to "join again" and broke their run. The link is judged by its own traffic instead (the server answers every ping).
+            if (e == WSAEINTR || e == WSAETIMEDOUT || e == WSA_IO_PENDING) {
+                if (GetTickCount64() - last_rx > 90000) {
+                    log_line_lvl(LogLevel::Warn, "SIGNAL", "!! nothing from the server for 90 s (the last receive said WSA %d) -- the link is taken as dead", e);
+                    closed_by_peer = true;
+                    break;
+                }
+                continue;   // the poll above
+            }
             log_line_lvl(LogLevel::Warn, "SIGNAL", "!! recv failed (WSA %d)", e);
             closed_by_peer = true;
             break;
         }
         buf.append(tmp, (size_t)n);
+        last_rx = GetTickCount64();
 
         size_t start = 0;
         for (;;) {
@@ -465,6 +478,7 @@ DWORD WINAPI worker(LPVOID) {
     if (closed_by_peer) {
         set_status("the server closed the connection");
         log_line_lvl(LogLevel::Warn, "SIGNAL", "!! the server closed the connection");
+        InterlockedExchange64(&g_lobby_lost_at, (LONG64)GetTickCount64());
     }
     return 0;
 }
@@ -1067,6 +1081,7 @@ void apply_request() {
 } // namespace
 
 uint64_t signal_room_closed_at() { return g_room_closed_at; }
+uint64_t signal_take_lobby_lost() { return (uint64_t)InterlockedExchange64(&g_lobby_lost_at, 0); }
 void signal_room_closed_clear() { g_room_closed_at = 0; }
 
 bool signal_chat_possible() { return g.server_chat && state() == SignalState::Connected && g.room[0] && g.peer_count >= 2; }

@@ -12,6 +12,11 @@ constexpr uint32_t kMaxLocalSaveBytes = 64u << 20;
 // The default fits a journal entry: a whole save plus its certificate and notes.
 bool read(const std::wstring& path, Bytes& out, uint32_t limit = kMaxLocalSaveBytes + (1u << 20));
 bool atomic_write(const std::wstring& path, const Bytes& bytes);
+// TESTS ONLY (2026-11-15): true skips FlushFileBuffers and MOVEFILE_WRITE_THROUGH, so the regression tests do not wait on the disk for every write (test_checkpoint
+// spent ~33 s in flushes). The game never sets it; every write the game makes is flushed as before.
+extern bool g_test_skip_flush;
+// The MoveFileExW flags of a replace: write-through unless a test switched flushing off.
+inline unsigned long move_flags(unsigned long base) { return g_test_skip_flush ? base : (base | 0x8 /* MOVEFILE_WRITE_THROUGH */); }
 bool snapshot(const std::wstring& source, Bytes& out);
 // What the last snapshot() did when it failed, or how it succeeded if it had to take the file as it is (empty after a plain backup). For a caller's log line.
 const char* snapshot_why();

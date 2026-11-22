@@ -1,0 +1,56 @@
+#pragma once
+#include <cstdint>
+#include <string>
+#include <vector>
+namespace mgmp { namespace checkpoint_io {
+using Bytes = std::vector<uint8_t>;
+// THE SIZE OF A SAVE ON THIS MACHINE (2026-10-10): snapshots, journal entries, backups, restores. Not the wire's kMaxSaveBytes (4 MiB, a bound on what a peer may make
+// us allocate): a long-played campaign save passes 4 MiB -- YUEMO's steamcampaign01.sav did, and with the wire bound here every snapshot of it failed ("the copy could
+// not be read back" right after a backup that passed its integrity check), the room was held at the first node on 2026-10-04, and the player moved to an older save.
+// No save travels whole with kLocalSetup, so the local bound only has to stop a runaway file.
+constexpr uint32_t kMaxLocalSaveBytes = 64u << 20;
+// The default fits a journal entry: a whole save plus its certificate and notes.
+bool read(const std::wstring& path, Bytes& out, uint32_t limit = kMaxLocalSaveBytes + (1u << 20));
+bool atomic_write(const std::wstring& path, const Bytes& bytes);
+bool snapshot(const std::wstring& source, Bytes& out);
+// What the last snapshot() did when it failed, or how it succeeded if it had to take the file as it is (empty after a plain backup). For a caller's log line.
+const char* snapshot_why();
+// Whether a file is a SQLite database the game can be given: it has the SQLite header and opens and answers a query -- WITHOUT sqlite's full integrity check, which snapshot() applies and which a save the game
+// itself loads happily can still fail. Fills `out` with the bytes. For restoring a backup, where refusing a save the game would have opened is worse than handing it over.
+bool loadable(const std::wstring& source, Bytes& out);
+// loadable() AND sqlite's quick_check. For MAKING a backup when snapshot() failed: a new backup is only worth keeping when it is sound, while an
+// old one is still handed over by loadable() (2026-10-10: 0.1.2 put the check into loadable() itself, which also refused existing backups).
+bool verified(const std::wstring& source, Bytes& out);
+const char* sql_last_error();   // why the last in_run failed (SQLite's own words), "" when it worked
+bool in_run(const std::wstring& source, bool& running);
+// True when this save's adventure has already ENTERED the map: files.trollengine_state's event count is
+// nonzero, OR properties.adventure_started is 1 (the count stays 0 until the first node resolves, so on
+// its own it called a fresh map save "preparation"). Both are 0 in a save written during departure
+// preparation -- cat, gear and chapter screens. A false RETURN means the question could not be answered
+// from this file (caller decides the fallback).
+bool on_map(const std::wstring& source, bool& started);
+// Fresh-session map pre-sync. read_file_row pulls one `files` row as raw
+// bytes (have=false when the table or the row is absent -- a clean save; a
+// false return means the database itself is unreadable). write_file_row is
+// the pre-load overwrite of the receiving peer's own row, shipped as an SQL
+// blob literal so no new sqlite entry points are needed.
+bool read_file_row(const std::wstring& source, const char* key, int& have, Bytes& out);
+bool write_file_row(const std::wstring& target, const char* key, const Bytes& in);
+// require_run: the database must be a save that is in a run (on_adventure) -- every node save is. The two saves from before the map (mgmp_checkpoint kStagePrep / kStageReady) are not necessarily.
+bool restore(const std::wstring& target, const Bytes& bytes, bool require_run = true);
+const char* restore_note();     // what the last restore did to the progress properties (raised, added, refused) -- for the log
+// One `properties` row as text (integers and reals arrive as their decimal
+// spelling). have=false when the row is absent; a false RETURN means the
+// database itself could not be opened or read. Read-only, so it is safe on a
+// file the game has open. Used by the save-backup list to show progress.
+bool read_property(const std::wstring& source, const char* key, bool& have, std::string& out);
+// Every row of `properties` (key, data as text), read-only. Used to hand a client the host's WHOLE property table (mgmp_unlocks): the game's own in-memory table is only a cache of the keys read so far.
+bool read_all_properties(const std::wstring& source, std::vector<std::pair<std::string, std::string>>& out);
+uint64_t nonce();
+// The player's persistent identity: a random id kept in mgmp-peer-id.bin NEXT TO THE DLL. If that file is missing (a fresh folder -- the mod was updated by deleting the old folder and
+// unpacking the new zip) and `adopt_root` (the mgmp_handshake folder of the save directory, one sub-folder per identity) holds exactly ONE earlier identity, that one is taken over
+// (*adopted = true) so the recovery records of the run in progress are still found; with several (two instances on one machine) a new id is made, as before.
+bool identity(uint64_t& id, const wchar_t* adopt_root = nullptr, bool* adopted = nullptr);
+// The SteamID64 that appears as a folder of the game's save directory (...\Mewgenics\7656119xxxxxxxxxx\saves), or 0 when there is none.
+uint64_t steam_id_from_dir(const wchar_t* dir);
+} }

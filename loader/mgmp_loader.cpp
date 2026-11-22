@@ -35,6 +35,7 @@
 //                    is what you want when you are trying to see the relaunch
 //                    itself rather than work around it.
 #include "mgmp_addresses.h"
+#include "mgmp_foreign_hook.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -143,6 +144,22 @@ bool entry_point_of(HANDLE proc, uintptr_t image_base, uintptr_t* out) {
 
     *out = image_base + nt.OptionalHeader.AddressOfEntryPoint;
     return true;
+}
+
+// 0.1.244: the park point is FrameBegin as the pinned build has it -- or with another loader's hook (Mewjector, loaded with the process) on its
+// first bytes: FrameBegin still, and parking on that jump works the same (the jmp $ goes over it and comes off again).
+bool park_point_ok(HANDLE proc, uintptr_t image_base, uintptr_t park_at, bool* foreign) {
+    *foreign = false;
+    unsigned char b[sizeof(mgmp::kParkSigLong)] = {};
+    if (!ReadProcessMemory(proc, (void*)park_at, b, sizeof(b), nullptr)) return false;
+    if (memcmp(b, mgmp::kParkSig, sizeof(mgmp::kParkSig)) == 0) return true;
+    IMAGE_DOS_HEADER dos = {};
+    IMAGE_NT_HEADERS64 nt = {};
+    if (!ReadProcessMemory(proc, (void*)image_base, &dos, sizeof(dos), nullptr) ||
+        !ReadProcessMemory(proc, (BYTE*)image_base + dos.e_lfanew, &nt, sizeof(nt), nullptr)) return false;
+    *foreign = mgmp::foreign_hook_matches(b, park_at, image_base, image_base + nt.OptionalHeader.SizeOfImage,
+                                          mgmp::kParkSigLong, nullptr, (int)sizeof(mgmp::kParkSigLong));
+    return *foreign;
 }
 
 bool write_code(HANDLE proc, uintptr_t addr, const void* bytes, size_t n) {
@@ -582,11 +599,13 @@ int attach_early(DWORD pid, const wchar_t* dll) {
         Sleep(25);
     }
     if (!read_ok) { fwprintf(stderr, L"[!] could not read pid %lu's park point\n", pid); CloseHandle(proc); return 1; }
-    if (memcmp(sig, mgmp::kParkSig, sizeof(sig)) != 0) {
+    bool foreign_park = false;
+    if (!park_point_ok(proc, image_base, park_at, &foreign_park)) {
         fwprintf(stderr, L"[!] pid %lu is not the game build this mod is made for (the park point differs) -- not injected\n", pid);
         CloseHandle(proc);
         return 2;
     }
+    if (foreign_park) wprintf(L"[*] pid %lu: another mod loader (e.g. Mewjector) has hooked FrameBegin -- parking on its jump, our hooks chain on top\n", pid);
 
     const unsigned char park_insn[2] = { 0xEB, 0xFE };   // jmp $
     const unsigned char saved_park[2] = { sig[0], sig[1] };
@@ -762,9 +781,11 @@ int wmain(int argc, wchar_t** argv) {
         unsigned char actual_sig[16] = {};
         if (!ReadProcessMemory(pi.hProcess, (void*)park_at, actual_sig, sizeof(actual_sig), nullptr))
             return abort_launch(L"could not read the park point");
-        if (memcmp(actual_sig, mgmp::kParkSig, sizeof(actual_sig)) != 0)
+        bool foreign_park = false;
+        if (!park_point_ok(pi.hProcess, image_base, park_at, &foreign_park))
             return abort_launch(L"park point prologue does not match the pinned build "
                                 L"-- refusing to patch (re-derive kParkRva)");
+        if (foreign_park) wprintf(L"[*] another mod loader (e.g. Mewjector) has hooked FrameBegin -- parking on its jump, our hooks chain on top\n");
 
         unsigned char saved_park[2] = { actual_sig[0], actual_sig[1] };
         if (!write_code(pi.hProcess, park_at, park_insn, sizeof(park_insn)))
@@ -799,6 +820,23 @@ int wmain(int argc, wchar_t** argv) {
             // the game is visibly fine and the loader is visibly stuck.
             DWORD code = 0;
             GetExitCodeProcess(pi.hProcess, &code);
+            // 0.1.245 (player report 2026-11-20): only exit(0) is the restart. A startup CRASH used to get the same words -- "Steam is re-launching
+            // the game" and "put a steam_appid.txt next to it" -- for an exit code 0xE06D7363 (a C++ exception the game threw: after a reinstall
+            // its settings.txt asked for a language that build lacked). Nothing of the mod has run at this point; the game itself failed.
+            if (code != 0) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                const wchar_t* kind = code == 0xE06D7363 ? L"an error the game itself raised (C++ exception)"
+                                    : code == 0xC0000005 ? L"an access violation"
+                                    : (code & 0xF0000000) == 0xC0000000 ? L"a Windows exception" : L"an error exit";
+                fwprintf(stderr,
+                    L"[!] the game CRASHED during its own startup (exit code 0x%08lX: %s) before its first frame.\n"
+                    L"    The mod had not been loaded yet, so this is the game failing on its own. Start the game once\n"
+                    L"    from Steam WITHOUT CoMeow: if it fails there too, check the game files in Steam, the game's\n"
+                    L"    beta branch (the mod needs 1.1.21239), and settings.txt beside the saves folder\n"
+                    L"    (%%APPDATA%%\\Glaiel Games\\Mewgenics) -- e.g. a language line this build does not have.\n", code, kind);
+                return 1;
+            }
             wprintf(L"[*] the target exited during startup (code %lu) before reaching frame 1 "
                     L"-- this is SteamAPI_RestartAppIfNecessary; Steam is re-launching the "
                     L"game as a new process.\n", code);

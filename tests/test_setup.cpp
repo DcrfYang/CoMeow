@@ -39,6 +39,7 @@ void prepare(bool resume=false){tick(0,resume);for(unsigned p=1;p+1<npeers;++p){
 namespace mgmp {
 const Config& config(){return cfg;}bool net_active(){return online;}
 uint8_t net_peer_count(){return (uint8_t)live;}uint8_t net_peer_pos(){return (uint8_t)current;}
+NetRole net_role(){return current==0?NetRole::Host:NetRole::Client;}void catsync_host_listfix(uint8_t,uint64_t){}   // 0.1.213 stubs (the test did not link since)
 bool net_peer_ids(uint8_t* out,uint8_t cap){if(cap<live)return false;for(unsigned i=0;i<live;++i)out[i]=transport[i];return true;}
 void log_line(const char*,const char*,...){}void log_line_lvl(LogLevel,const char*,const char*,...){}
 bool catsync_prepare_party_setup(SetupMsg& m,uint8_t owner){if(!capture_ok)return false;m.count=(uint8_t)counts[owner];
@@ -208,10 +209,15 @@ void test_chapter_unlocks(){
  const uint32_t kBoth=kMapFlag_Desert|kMapFlag_Lab;
  for(unsigned n=2;n<=4;++n)for(unsigned who=0;who<n;++who)for(uint32_t lacking:{0u,(uint32_t)kMapFlag_Desert,kBoth})for(int act=2;act<=3;++act){   // flags: none / chapter 2 only / both
   reset(n,0);for(auto& u:test_flags)u=~0u;test_flags[who]=lacking;say_lock2=say_lock3=0;prepare();
-  const bool no2=lacking==0,no3=lacking!=kBoth,allowed=act==2?!no2:(!no2&&!no3);
+  // 0.1.216: the host's own save is not asked (its game only offers what it has unlocked) -- a lack at seat 0 never refuses
+  const bool no2=who!=0&&lacking==0,no3=who!=0&&lacking!=kBoth,allowed=act==2?!no2:(!no2&&!no3);
   at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,act,&d,native);CHECK(setup_on_select_act(act)==allowed);});
   CHECK(say_lock2==((!allowed&&no2)?1:0)&&say_lock3==((!allowed&&!no2)?1:0));
  }
+ // 0.1.228 (room NFRB): the real progress of a client that has the lab -- 045151cd, LabUnlocked set and MeatWorldUnlockedFull not -- allows chapter 3.
+ reset(3,0);for(auto& u:test_flags)u=~0u;test_flags[1]=test_flags[2]=0x045151cdu;say_lock2=say_lock3=0;prepare();
+ at(0,[&]{int32_t d=7;int screen=1;setup_on_chapter_control(&screen,3,&d,native);CHECK(setup_on_select_act(3));});
+ CHECK(say_lock2==0&&say_lock3==0);
  for(auto& u:test_flags)u=~0u;
  // The map is generated from the flags EVERY player has: the host sets that AND when it commits, every client sets what the host sent.
  reset(3,0);const uint32_t hard=1u<<12,sew=1u<<22;

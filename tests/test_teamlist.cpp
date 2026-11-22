@@ -20,6 +20,7 @@ int main() {
     CHECK(teamlist_use(0x92F0CD, false, &what) == TeamUse::All && what && strstr(what, "party_heal"));
     CHECK(teamlist_use(0x923862, false, nullptr) == TeamUse::All);
     CHECK(teamlist_use(0x92B48F, false, &what) == TeamUse::Own && strstr(what, "level_up"));
+    CHECK(teamlist_use(0x3B1165, false, &what) == TeamUse::Own && strstr(what, "bonus_items"));   // 0.1.246: Survivalist at the adventure start
     CHECK(teamlist_use(0x3B6F94, false, nullptr) == TeamUse::All);              // the ambush roll, at any node entry
     CHECK(teamlist_use(0x3B3190, true, nullptr) == TeamUse::All);               // the global passives -- inside the battle build
     CHECK(teamlist_use(0x3B3190, false, &what) == TeamUse::Off && !what);       // ... and the same function elsewhere (shop, settlement): left alone

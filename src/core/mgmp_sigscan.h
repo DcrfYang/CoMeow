@@ -185,6 +185,7 @@ struct SigResolution {
     int32_t   drift;       // resolved_rva - rva_hint; 0 when the hint held
     int       matches;     // what the scan saw (1 on the hint path)
     bool      from_hint;   // true = pinned build, no scan happened
+    bool      foreign;     // 0.1.244: the pinned address, its first bytes another loader's jump (mgmp_foreign_hook.h)
     bool      ok;
     char      why[128];    // set when !ok, and when drift != 0
 };

@@ -508,7 +508,8 @@ void unlocks_on_map(bool) {}
 bool solo_run_session = true;
 uint32_t catsync_run_cat_list(uint64_t* out, uint32_t cap) { if (!out || !cap) return 0; out[0] = solo_run_session ? 0x70000001ull : 0x1234ull; return 1; }
 bool session_exp_treasure() { return false; }   // the shared treasure chest (mgmp_treasure): off here
-bool indepevt_hold_node() { return false; }     // own random events (mgmp_indepevt): the host never waits for a client here
+bool indepevt_hold_node() { return false; }
+bool catsync_hold_node() { return false; }          // 0.1.238: the host's wait for cats that differ from their owners' copies     // own random events (mgmp_indepevt): the host never waits for a client here
 void treasure_publish_luck(uint64_t) {}         // the host's party luck for the shared chest (mgmp_treasure, proto 101): off here
 bool net_send_mapseeds(const MapSeedsMsg&) { ++seeds_published; return true; }
 int room_troubles = 0;

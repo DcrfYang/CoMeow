@@ -144,6 +144,11 @@ DWORD WINAPI worker(void*) {
 
 } // namespace
 
+const char* urgent_own_version() {
+    if (!g_mine[0]) read_own_version();
+    return g_mine;
+}
+
 int urgent_version_cmp(const char* a, const char* b) {
     for (int part = 0; part < 4; ++part) {
         char* ea = nullptr; char* eb = nullptr;

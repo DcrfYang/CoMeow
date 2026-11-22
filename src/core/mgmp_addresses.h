@@ -261,6 +261,18 @@ enum Target : int {
     // caller is the House cat entity for an id of -1, 0x1401F9482). With the stat "GayStrayChance" (= the length of GlobalProgressionData+0x780, the cats of the
     // night's same-sex pairings) the stray takes a listed cat's gender and a sexuality in [0.9, 1) -- the STRAYS log names each one (a player saw only gay toms)
     T_StrayGen,
+    // 2026-11-16: the gear screen's DEPARTURE (0x14034D9B0, rcx = a pointer to the gear screen object; reads rcx only). The lock button's handler 0x14034D870
+    // (the lambda _Do_call 0x140351300 -> it) checks the party (0x14034DCD0, a message and no departure), asks to confirm when +0x120 is set (the confirm's lambda
+    // calls this too), else calls this at once: the departure plays and its end runs the callback the gear screen holds at +0x68 -- for a house boss fight that is
+    // 0x1403CBD40 -> T_HouseFight. In a house boss co-op the departure is held HERE -- after the game's own checks, before anything plays -- as the READY.
+    // (The first try, 0x1403CC9A0, is the House's 防御 sign: it OPENS the gear screen. Held there, the players never reached the gear screen -- 11-16 11:12.)
+    T_HouseGearDone,
+    // 2026-11-16: glaiel::Button::Click (0x14097E8E0, rcx = the button, dl = force; the same function as C_ButtonClick). It plays "<name>_Click" first and then
+    // calls the callback at Button+0xF0. The gear screen's LOCK is the button whose callback is the lambda 0x140351300 (a stub "mov rcx,[rcx+8]; jmp 0x14034D870",
+    // the lock handler -- 0x140 bytes before T_HouseGearDone). In a house boss co-op that click is held here, before the button's own animation, as the READY.
+    T_ButtonClick,
+    T_GridInsert,
+    T_TeamDisorders,
     T_COUNT
 };
 
@@ -843,6 +855,10 @@ static const TargetDesc kTargets[T_COUNT] = {
     { 0x000DE040, "CATSELECT", "CatSelector::init: the party's ids the save does not hold are taken out of the list first (a null cat crashed it)" },
     { 0x000689E0, "DIFFSET", "chapter page: the difficulty setter -- in a room every difficulty can be chosen, unlocked or not" },
     { 0x000AA1E0, "STRAYGEN", "House: a stray cat generated (logged: its gender, sexuality and the day's stray stats)" },
+    { 0x0034D9B0, "GEARDEPART", "gear screen lock: the departure (held in a house boss co-op until every player has locked)" },
+    { 0x0097E8E0, "BUTTONCLICK", "Button::Click: the gear screen's lock in a house boss co-op is held here, before its animation, as the READY" },
+    { 0x001A6BE0, "GRIDINSERT", "item grid: the dragged items dropped in (the House's storage) -- its room is made first, the game's own growth reads a freed buffer" },
+    { 0x003BE0E0, "TEAMDISORDERS", "the disorders of the cat's team (Schadenfreude's scaled stats) -- in a room the team is every player's cats" },
 };
 
 // Coarse module guard, checked before the per-target signatures.
@@ -868,6 +884,10 @@ static const uint32_t kExpectedTimeStamp = 0x6A9C51E5;
 static const uint32_t kParkRva = 0x009B7870;   // glaiel::ApplicationBase::FrameBegin
 static const uint8_t  kParkSig[16] = {
     0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,0x48,0x89,0x70,0x18,0x48,0x89,0x78,0x20,0x55
+};
+// 0.1.244: the same prologue, longer (the FRAME signature): what is left of it after another loader's jump (up to 14 bytes) is still enough to tell the build.
+static const uint8_t  kParkSigLong[20] = {
+    0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,0x48,0x89,0x70,0x18,0x48,0x89,0x78,0x20,0x55,0x48,0x8D,0x68,0xA1
 };
 
 // ---------------------------------------------------------------------------
