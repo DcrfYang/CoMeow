@@ -44,6 +44,7 @@
 // integrity check. Nothing here touches the game's memory.
 #pragma once
 
+#include "mgmp_saveplace.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -60,6 +61,7 @@ struct SaveSlotInfo {
     int      percent = -1;      // properties.save_file_percent; -1 = unreadable
     int      day     = -1;      // properties.current_day
     int64_t  timer   = -1;      // properties.savefile_timer, in 1/60 s
+    SavePlaceInfo place;        // 0.1.249: where loading it puts the player (mgmp_saveplace); read from the .sav, not kept in meta.json
 };
 
 struct SaveBackup {
@@ -120,6 +122,8 @@ struct SyncSave {
     bool     after_boss = false;
     uint8_t  stage = 0;                                // 1 / 2: one of the two saves from before the map (mgmp_checkpoint kStagePrep / kStageReady), whose seq is not a node count; 0 = a node's save
     int      day = -1, percent = -1;                   // what the game's save screen would show; -1 = unreadable
+    bool     place_read = false;                       // 0.1.249: `place` was read from the save (the newest 30 per slot, like day / percent)
+    SavePlaceInfo place;
 };
 void saveslots_sync_refresh();                         // rescans the folders (reads every save; call it when the page opens and after an action, not every frame)
 int  saveslots_sync_count(int slot);                   // slot 0..2

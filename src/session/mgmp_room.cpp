@@ -339,7 +339,7 @@ void tick_notices() {
     if (!self_game) { memset(g.said, 0, sizeof(g.said)); g.broken = false; }
     const bool watch = self_game && in_room() && g.solo == Solo::None;
 
-    auto announce = [&](int row, bool away) {
+    auto announce = [&](int row, bool away, bool host = false) {
         if (row < 0 || row >= (int)kRows || g.said[row]) return;
         g.said[row] = true;
         g.broken = true;
@@ -347,7 +347,9 @@ void tick_notices() {
         if (away)
             _snprintf_s(text, sizeof(text), _TRUNCATE,
                         tr(Tx::R_PEER_AWAY_BOSS), row + 1, row + 1);
-        else
+        else if (host)      // 0.1.251: without the host nobody leads -- the saves are picked again
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "%s", tr(Tx::R_HOST_DROPPED));
+        else                // 0.1.251: the others may play on; the player's cats stay as helpers until the settlement
             _snprintf_s(text, sizeof(text), _TRUNCATE,
                         tr(Tx::R_PEER_DROPPED), row + 1);
         // Dropped in the middle of a fight: say that the boss that would have ended the run is taken care of.
@@ -366,7 +368,7 @@ void tick_notices() {
         bool still = false;
         for (uint8_t k = 0; k < n; ++k) if (ids[k] == id) still = true;
         if (still) continue;
-        if (watch) announce(g.prev_row[id], g.prev_away[id]);
+        if (watch) announce(g.prev_row[id], g.prev_away[id], id == kHostPeer);
         g.have_name[id] = false;
         g.prev_page[id] = PageState::Unknown;
     }
@@ -376,7 +378,7 @@ void tick_notices() {
         if (id == me || id >= kMaxPeers) continue;
         const PageState pg = page_of(id);
         if (watch && !g.broken && in_game(g.prev_page[id]) && pg == PageState::MainMenu)
-            announce(room_row_of_peer(id), false);
+            announce(room_row_of_peer(id), false, id == kHostPeer);
         if (pg != PageState::Unknown) g.prev_page[id] = pg;
     }
 

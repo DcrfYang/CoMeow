@@ -448,6 +448,12 @@ static bool call_vslot(const void* comp, uint32_t slot) {
     if (!mem_read(comp, &vt, 8) || !vt || !mem_read(vt + slot, &fn, 8) || !fn) return false;
     __try { ((void(__fastcall*)(const void*))fn)(comp); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// 0.1.250 (sim 66, room KD8E 11-22, battle fb1eb4eb turn 19): AN ABILITY'S RANGE IS A CACHE. +0xDC is the ability's max_range, worked out from its gon
+// expression and the unit's numbers when the game recomputes the unit (vtable slot 1, from Character::items_changed) -- and a game recomputes a unit when
+// IT has a reason to: the aim preview of another player's move (mgmp_aim), its own AI's look at the board. The host's squirrels had DefaultMove+DC 16, both
+// clients' 10 (BasicJump 17|11): repaired at every boundary, a state-only mismatch on the client whose board came late (a resync, the desync notice). The
+// summoned Mini Me's random buffs (Flourish, RandomStatusFromPool) were the same on every game -- they were only the turn it showed on.
+bool unitstate_refresh(void* chr) { return chr && call_recompute(chr); }
 bool unitstate_has_passive(const void* chr, const char* name) {
     const uint8_t* ent = nullptr; uint32_t n = 0; const void* const* data = nullptr;
     if (!chr || !name || !mem_read((const uint8_t*)chr + kChar_Entity, &ent, 8) || !ent || !mem_read(ent + kEnt_CompCount, &n, 4) || !mem_read(ent + kEnt_CompData, &data, 8) || !data || n > kMaxComps) return false;

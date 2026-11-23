@@ -2,6 +2,8 @@
 #include "mgmp_housecoop.h"
 
 #include <windows.h>
+#include <algorithm>
+#include <intrin.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -778,6 +780,48 @@ bool housecoop_refuse_depart(uint32_t cats) {
 }
 
 bool housecoop_house_fight() { return g.house_fight; }
+
+// 0.1.250 (room KD8E 11-22, "家园守卫战打 C1000 时开局立刻不同步"): THE CO-OP HOUSE BOSS FIGHT AGAIN AFTER A SAVE LOAD. The host quit the co-op fight (terminator_2) in its
+// third turn to load again; the room picked the saves again and every game went straight back into the fight its save was written at -- the game's own resume,
+// past the house boss fight's start (T_HouseFight) and with the co-op's state gone: no battle id ("battle build without a battle id"), each game's own stream,
+// the room's enemy multiplier (x2.5) on a house boss, 18 units on one game and 14 on another, a halt at turn 0. The saves still hold the co-op's roster, so every
+// game can name the same fight: the boss and the session cats of its party and familiars.
+uint64_t housecoop_resume_fight() {
+    if (!active_room() || g.phase == Phase::Fighting) return 0;
+    const uintptr_t at = addr_of_data(D_MewDirectorPtr);
+    const uint8_t* dir = nullptr;
+    uint8_t house = 0;
+    if (!at || !mem_read((const void*)at, &dir, sizeof(dir)) || !dir || !mem_read(dir + 0x70C, &house, 1) || !house) return 0;   // +0x70C: a house boss fight
+    uint32_t pn = 0, fn = 0; const uint64_t* pd = nullptr; const uint64_t* fd = nullptr;
+    if (!mem_read(dir + kDir_CatIdCount, &pn, 4) || !mem_read(dir + kDir_CatIdData, &pd, 8) || !mem_read(dir + kDir_CatFamiliars + 4, &fn, 4) ||
+        !mem_read(dir + kDir_CatFamiliars + 8, &fd, 8) || pn > 32 || fn > 32 || (pn && !pd) || (fn && !fd)) return 0;
+    uint64_t ids[64] = {}; uint32_t n = 0;
+    if ((pn && !mem_read(pd, ids, pn * 8)) || (fn && !mem_read(fd, ids + pn, fn * 8))) return 0;
+    n = pn + fn;
+    std::sort(ids, ids + n);
+    n = (uint32_t)(std::unique(ids, ids + n) - ids);
+    uint32_t seats = 0;                                   // the seats whose session cats (0x70000000 + seat << 24) are in it
+    for (uint32_t i = 0; i < n; ++i) if (ids[i] >= 0x70000000ull && ids[i] < 0x78000000ull) seats |= 1u << ((ids[i] >> 24) - 0x70);
+    if (__popcnt(seats) < 2) {
+        log_line("HOUSECOOP", "a house boss fight is built with no battle id, its party is one player's (seats %02x, %u cat(s)) -- not a co-op fight, left alone", seats, n);
+        return 0;
+    }
+    Boss b; read_boss(b);
+    uint64_t x = 0x4842524553554D45ull;                   // 'HBRESUME'
+    auto mix = [&](uint64_t v) { x ^= v + 0x9E3779B97F4A7C15ull + (x << 6) + (x >> 2); x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29; };
+    for (uint32_t i = 0; i < n; ++i) mix(ids[i]);
+    for (const char* c = b.name; *c; ++c) mix((uint8_t)*c);
+    const uint64_t id = x ? x : 0x4842524553554D45ull;
+    char list[400] = {}; int w = 0;
+    for (uint32_t i = 0; i < n && w >= 0 && w < (int)sizeof(list) - 20; ++i) w += _snprintf_s(list + w, sizeof(list) - w, _TRUNCATE, " %llx", (unsigned long long)ids[i]);
+    log_line_lvl(LogLevel::Warn, "HOUSECOOP", "!! a co-op house boss fight is resumed from a save ('%s', seats %02x, cats [%s ]) -- battle id %016llx, the same on every player's game; "
+                 "the house boss scale, and the host's unlock answers on a client", b.name[0] ? b.name : "?", seats, list, (unsigned long long)id);
+    lockstep_enter_battle(id);
+    if (net_role() == NetRole::Client) unlocks_window_open("a co-op house boss fight resumed from a save", false);
+    housecoop_note_house_fight();
+    g.phase = Phase::Fighting;
+    return id;
+}
 void housecoop_note_house_fight() {
     if (!g.house_fight) log_line("HOUSECOOP", "a house boss fight starts on this screen -- no enemy multiplier, and the other players' copies are retired at its settlement");
     g.house_fight = true;

@@ -171,7 +171,8 @@ uint8_t net_peer_pos();
 uint8_t net_peer_rank();    // the place among the players present (0..count-1); net_peer_pos is the SEAT and does not move when somebody leaves
 uint8_t net_seat_span();    // seats of the session (or the players present when there is no seat order)
 bool    net_seat_peer(uint8_t pos, uint8_t& id);   // the peer id holding seat `pos`; false when there is no such seat or its player is not in the room
-uint32_t net_absent_seats();                       // bit s: seat s belongs to the session's seat order and its player is no longer in the room (0 without a seat order)
+uint32_t net_absent_seats();
+bool    net_seat_id(uint8_t pos, uint8_t& id);      // 0.1.251: the peer id the seat order names for seat `pos`, present or not (false: no seat order, no such seat)                       // bit s: seat s belongs to the session's seat order and its player is no longer in the room (0 without a seat order)
 
 // Copy the member ids out, in that same order. False before the first PEERS.
 bool net_peer_ids(uint8_t* out, uint8_t cap);

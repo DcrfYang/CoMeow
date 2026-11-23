@@ -1443,6 +1443,12 @@ bool net_seat_peer(uint8_t pos, uint8_t& id) {
     return true;
 }
 
+bool net_seat_id(uint8_t pos, uint8_t& id) {
+    if (!g.seat_count || pos >= g.seat_count || pos >= kMaxPeers) return false;
+    id = g.seat_ids[pos];
+    return id != kNoPeer;
+}
+
 // The seats whose player has left the room. Level, not edge: it needs no memory of who was here when, so a player who left before anybody looked is found just the same.
 uint32_t net_absent_seats() {
     if (!g.roster_valid || !g.seat_count) return 0;

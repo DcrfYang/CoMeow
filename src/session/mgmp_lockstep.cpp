@@ -1608,6 +1608,15 @@ void snapshot_cats(void* turn_control) {
                     }
                 }
                 const uint32_t unknown = n - noted;
+                if (const uint32_t gone = net_absent_seats()) {     // 0.1.251: a player who left the run -- the host drives its cats
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const uint32_t idx = order[k];
+                        if (has_note[idx] && note[idx] < 32 && ((gone >> note[idx]) & 1u)) {
+                            log_line("LOCKSTEP", "cat %u belongs to seat %u, whose player left the run -- the host drives it", idx, (unsigned)note[idx]);
+                            note[idx] = 0;
+                        }
+                    }
+                }
                 by_owner = split_by_owner(g.human_cat, note, has_note,
                                           g.cat_count, pos, g.local_cat);
                 if (by_owner) {
@@ -1946,6 +1955,50 @@ void snapshot_cats(void* turn_control) {
 // turn boundary whenever it does: CONTROL can land before this side has a
 // roster to compare it against, and a check that silently does not run is worse
 // than no check at all.
+// 0.1.251: unit i is a cat of a seat whose player has left the run (its owner note names an absent seat).
+static bool absent_owned(uint32_t i) {
+    const uint32_t gone = net_absent_seats();
+    if (!gone || i >= g.cat_count || !g.cats[i]) return false;
+    const void* data = nullptr; uint64_t id = 0; uint8_t pos = 0xFF;
+    if (!mem_read((const uint8_t*)g.cats[i] + kChar_CatData, &data, sizeof(data)) || !data || !mem_read((const uint8_t*)data + kCatData_SaveId, &id, 8)) return false;
+    return lockstep_owner_pos(id, pos) && pos < 32 && ((gone >> pos) & 1u);
+}
+
+// 0.1.251 (the user's rule): A PLAYER LEAVES IN THE MIDDLE OF A BATTLE -- the others play on, and the host drives what that player drove: its cats and the units
+// that followed them (its claims). Every peer sees the same seats go, so local_cat ends up the same everywhere; a turn already waiting for the gone player's
+// decision is taken by the host at its next decision poll (local_actor is read from local_cat there).
+static uint32_t s_absent_seen = 0;
+static void control_follow_absent() {
+    if (!g.active || !g.snapped || g.halted) { if (!g.active) s_absent_seen = 0; return; }
+    const uint32_t gone = net_absent_seats();
+    const uint32_t newly = gone & ~s_absent_seen;
+    s_absent_seen = gone;
+    if (!newly) return;
+    uint8_t ids[kMaxPeers] = {};
+    const bool host = net_active() && net_peer_ids(ids, kMaxPeers) && net_self() == ids[0];
+    uint32_t moved = 0;
+    for (uint8_t seat = 0; seat < 32; ++seat) {
+        if (!((newly >> seat) & 1u)) continue;
+        uint8_t pid = kNoPeer;
+        const bool have_pid = net_seat_id(seat, pid) && pid < kMaxPeers;
+        for (uint32_t i = 0; i < g.cat_count && i < kMaxCats; ++i) {
+            bool theirs = false;
+            if (have_pid && g.have_peer_control[pid]) for (uint8_t j = 0; j < g.peer_control[pid].count; ++j) if (g.peer_control[pid].cats[j] == i) theirs = true;
+            if (!theirs && g.human_cat[i]) {
+                const void* data = nullptr; uint64_t id = 0; uint8_t pos = 0xFF;
+                theirs = mem_read((const uint8_t*)g.cats[i] + kChar_CatData, &data, sizeof(data)) && data && mem_read((const uint8_t*)data + kCatData_SaveId, &id, 8) &&
+                         lockstep_owner_pos(id, pos) && pos == seat;
+            }
+            if (!theirs) continue;
+            g.local_cat[i] = host;
+            ++moved;
+        }
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP", "!! the player of seat %u (peer %u) left in the middle of battle %016llx -- its units go to the host (%s)",
+                     (unsigned)seat, (unsigned)pid, (unsigned long long)g.battles.current, host ? "this peer drives them now" : "their moves come from the host");
+    }
+    if (moved) log_line("LOCKSTEP", "%u unit(s) of the player(s) who left are driven by the host from now on", moved);
+}
+
 void verify_control() {
     if (g.control_checked || !g.snapped) return;
 
@@ -2065,6 +2118,15 @@ void verify_control() {
                         " brain desyncs on its first turn", i, (unsigned)claims[i]);
             halt(why);
             return;
+        }
+        if (claims[i] == 0 && absent_owned(i)) {             // 0.1.251: its player left the run -- it goes to the host, on every peer alike
+            const uint8_t heir = ids[0];
+            ControlMsg& c = g.peer_control[heir];
+            if (c.count < 32) { uint8_t at = c.count; while (at > 0 && c.cats[at - 1] > i) { c.cats[at] = c.cats[at - 1]; c.fp[at] = c.fp[at - 1]; --at; } c.cats[at] = (uint8_t)i; c.fp[at] = g.cat_fp[i]; ++c.count; }
+            claims[i] = 1; owner[i] = heir;
+            g.local_cat[i] = net_self() == heir;
+            log_line("LOCKSTEP", "cat %u was claimed by nobody: its player left the run -- it goes to the host (peer %u)", i, (unsigned)heir);
+            continue;
         }
         if (claims[i] == 0) {
             char why[192];
@@ -3706,6 +3768,7 @@ static void halt_finish_pump();
 
 void lockstep_pump() {
     if (!g.active) return;
+    control_follow_absent();      // 0.1.251: a player who left -- the host drives its units
     debug_hits_pump();
     halt_finish_pump();
 
@@ -7648,6 +7711,7 @@ void lockstep_turn_boundary(void* turn_control) {
     for (uint32_t i = 0; i < g.cat_count && i < kMaxCats; ++i) {
         CatState st{};
         if (!g.cats[i] || !read_cat_state(g.cats[i], st, false) || !st.readable || !st.in_battle || st.dead) continue;
+        unitstate_refresh(const_cast<void*>(g.cats[i]));            // 0.1.250 (sim 66): every ability's cached numbers (max_range) from the board as it is, on every peer
         unitstate_settle_castable(const_cast<void*>(g.cats[i]), "the turn boundary");
         unitstate_settle_xvalues(const_cast<void*>(g.cats[i]));      // 0.1.242
         if (!hud_hidden && unitstate_has_passive(g.cats[i], "HideSomeHudStuff")) hud_hidden = true;   // 0.1.247: the room panel hides health too

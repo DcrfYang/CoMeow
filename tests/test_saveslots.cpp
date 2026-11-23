@@ -18,6 +18,7 @@ void log_line(const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); 
 void log_line_lvl(LogLevel, const char*, const char* fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); putchar('\n'); }
 void ui_error_popup(const char*, const char*) {}
 bool checkpoint_import_notes_file(const std::wstring&) { return true; }
+bool checkpoint_relive_run(const std::wstring&) { return true; }
 void catsync_drop_swap_notes(const char*) {}   // a restore drops the swap notes of the run: not under test   // the backup page's notes import: not under test     // 0.1.169: the file-problem popup -- not under test
 bool leave_scene_live(const char*) { return false; }
 bool checkpoint_cleanup_due() { return false; }

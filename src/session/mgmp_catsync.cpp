@@ -4118,6 +4118,7 @@ static uint32_t s_gone_retired = 0;   // seats whose registry copies were retire
 static ULONGLONG s_gone_fail_log = 0;
 static unsigned s_gone_fails = 0;
 
+constexpr bool kKeepAbsentCats = true;   // 0.1.251: see drop_absent_seats
 static void drop_absent_seats() {
     uint32_t absent = net_absent_seats();
     if (!absent) { s_gone_logged = s_gone_retired = 0; s_gone_fails = 0; return; }
@@ -4135,8 +4136,13 @@ static void drop_absent_seats() {
     }
     if (absent & ~s_gone_logged) {
         s_gone_logged |= absent;
-        log_line("CATSYNC", "player(s) of seat mask %#x are no longer in the room (%u present): their cats leave this run at the next map update", absent, (unsigned)net_peer_count());
+        log_line("CATSYNC", "player(s) of seat mask %#x are no longer in the room (%u present): their cats stay in the run as helpers (in the familiar list, driven by the host in battle) "
+                            "and leave it at the settlement", absent, (unsigned)net_peer_count());
     }
+    // 0.1.251 (the user's rule): A PLAYER WHO LEFT DOES NOT TAKE ITS CATS ALONG. The others play on; the cats stay in the familiar list for the battles (the host drives
+    // them, mgmp_lockstep), take no part in level-ups (each player levels its own) or events (mgmp_teamlist, the event's subject), and the settlement's ownership filter
+    // (catsync_prepare_settlement) takes them out before the run is settled. Nothing is removed here any more.
+    if (kKeepAbsentCats) return;
     const int removed = roster_drop_positions(absent, "a player left the room");
     if (removed < 0) {
         ++s_gone_fails;

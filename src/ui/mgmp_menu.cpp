@@ -22,6 +22,7 @@
 
 #include "mgmp_config.h"
 #include "mgmp_leave.h"
+#include "mgmp_saveplace.h"     // 0.1.249: where a save stands
 #include "mgmp_lockstep.h"
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"     // addr_of_call: TempHideMouseCursor (the drawing board's pointer)
@@ -1818,6 +1819,19 @@ void fmt_slots(const SaveBackup& b, char* out, size_t cap) {
     }
 }
 
+// 0.1.249: where each slot of a backup stands (mgmp_saveplace) -- "栏位1：下水道 · 普通战斗   栏位2：仓库"; an empty slot is left out.
+void fmt_places(const SaveBackup& b, char* out, size_t cap) {
+    out[0] = 0;
+    for (int s = 0; s < kGameSlots; ++s) {
+        if (!b.slot[s].present) continue;
+        char where[96], part[128];
+        saveplace_text(b.slot[s].place, where, sizeof(where));
+        _snprintf_s(part, sizeof(part), _TRUNCATE, tr(Tx::SLOT_PLACE), s + 1, where);
+        if (out[0]) strncat_s(out, cap, "   ", _TRUNCATE);
+        strncat_s(out, cap, part, _TRUNCATE);
+    }
+}
+
 // THE FILE DIALOG RUNS ON ITS OWN THREAD. The menu draws from inside the game's buffer swap; a modal
 // dialog there would stop the game's frame (and, in a room, its network pump) for as long as the player
 // browses. The worker owns the dialog; the backup window picks the answer up on a later frame.
@@ -2054,7 +2068,7 @@ void draw_sync_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H, b
         char cid[24]; _snprintf_s(cid, sizeof(cid), _TRUNCATE, "##sync%d", s);
         ImGui::BeginChild(cid, ImVec2((colw - 8) * k, (bot - top) * k - 8 * k), false, ImGuiWindowFlags_NoBackground);
         ImDrawList* cdl = ImGui::GetWindowDrawList();
-        const float rowh = 112 * k, rw = (colw - 8) * k;
+        const float rowh = 136 * k, rw = (colw - 8) * k;   // 0.1.249: one more line, where the save stands
         const int n = saveslots_sync_count(s);
         if (!n) {
             const ImVec2 rp = ImGui::GetCursorScreenPos();
@@ -2070,7 +2084,12 @@ void draw_sync_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H, b
             char d1[96];
             if (e.stage) _snprintf_s(d1, sizeof(d1), _TRUNCATE, "%s", tr(e.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
             else         _snprintf_s(d1, sizeof(d1), _TRUNCATE, tr(Tx::SYNC_DETAIL), (unsigned)e.seq, (unsigned)e.players);
-            text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 44 * k), 20 * k, kInkSoft, d1);
+            char where[96];
+            if (e.place_read) saveplace_text(e.place, where, sizeof(where)); else _snprintf_s(where, sizeof(where), _TRUNCATE, "%s", "...");
+            cdl->PushClipRect(ImVec2(rp.x, rp.y), ImVec2(rp.x + rw - 124 * k, rp.y + rowh), true);
+            text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 42 * k), 21 * k, kInk, where);
+            cdl->PopClipRect();
+            text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 70 * k), 20 * k, kInkSoft, d1);
             char d2[128] = {};
             if (e.after_boss) strncat_s(d2, sizeof(d2), tr(Tx::SYNC_BOSS), _TRUNCATE);
             if (e.day >= 0) {
@@ -2083,9 +2102,9 @@ void draw_sync_page(ImDrawList* dl, const View& v, ImVec2 a, float W, float H, b
                 if (d2[0]) strncat_s(d2, sizeof(d2), " | ", _TRUNCATE);
                 strncat_s(d2, sizeof(d2), part, _TRUNCATE);
             }
-            if (d2[0]) text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 72 * k), 20 * k, kInkSoft, d2);
+            if (d2[0]) text_at(cdl, ImVec2(rp.x + 14 * k, rp.y + 98 * k), 20 * k, kInkSoft, d2);
             char id[32]; _snprintf_s(id, sizeof(id), _TRUNCATE, "syr%d_%d", s, i);
-            if (paper_button(id, ImVec2(rp.x + rw - 118 * k, rp.y + 24 * k), ImVec2(rp.x + rw - 14 * k, rp.y + 80 * k), tr(Tx::SYNC_DO), 24 * k, !locked, Tone::Good)) {
+            if (paper_button(id, ImVec2(rp.x + rw - 118 * k, rp.y + 36 * k), ImVec2(rp.x + rw - 14 * k, rp.y + 92 * k), tr(Tx::SYNC_DO), 24 * k, !locked, Tone::Good)) {
                 g.sync_slot = s; g.sync_idx = i;
             }
             ImGui::SetCursorScreenPos(rp);
@@ -2129,7 +2148,10 @@ void draw_sync_confirm(const View& v) {
     char d1[96];
     if (e.stage) _snprintf_s(d1, sizeof(d1), _TRUNCATE, "%s", tr(e.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
     else         _snprintf_s(d1, sizeof(d1), _TRUNCATE, tr(Tx::SYNC_DETAIL), (unsigned)e.seq, (unsigned)e.players);
-    wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, d1);
+    char d0[200] = {};
+    if (e.place_read) { char where[96]; saveplace_text(e.place, where, sizeof(where)); _snprintf_s(d0, sizeof(d0), _TRUNCATE, "%s   ·   %s", where, d1); }   // 0.1.249
+    else _snprintf_s(d0, sizeof(d0), _TRUNCATE, "%s", d1);
+    wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, d0);
 
     const float by0 = H - 120, by1 = H - 44;
     bool done = false;
@@ -2173,7 +2195,9 @@ void draw_backup_window(const View& v) {
     {
         char cur[256]; SaveBackup tmp; for (int s = 0; s < kGameSlots; ++s) tmp.slot[s] = g.current[s];
         fmt_slots(tmp, cur, sizeof(cur));
-        text_at(dl, ImVec2(X(190), Y(108)), 26 * k, kInk, cur);
+        text_at(dl, ImVec2(X(190), Y(104)), 24 * k, kInk, cur);
+        char where[320]; fmt_places(tmp, where, sizeof(where));          // 0.1.249
+        text_at(dl, ImVec2(X(190), Y(132)), 20 * k, kInkSoft, where);
     }
 
     // Name box + global actions.
@@ -2212,7 +2236,7 @@ void draw_backup_window(const View& v) {
     ImGui::SetCursorScreenPos(ImVec2(X(56), ly0 + 4 * k));
     ImGui::BeginChild("##list", ImVec2((W - 112) * k, ly1 - ly0 - 8 * k), false, ImGuiWindowFlags_NoBackground);
     ImDrawList* cdl = ImGui::GetWindowDrawList();
-    const float rowh = 80 * k;
+    const float rowh = 100 * k;   // 0.1.249: a second line, where each slot stands
     const float rx = X(56), rw = (W - 112) * k;
     // THE AUTO SAVE QUEUE, ABOVE THE TWENTY: the newest first, taken each time the player is back in the warehouse after a settled run; the oldest is replaced by the next one. Load and export only -- an
     // auto save can be neither overwritten nor deleted by the player.
@@ -2230,7 +2254,11 @@ void draw_backup_window(const View& v) {
             if (b.used) {
                 text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 5 * k), 30 * k, kInk, b.name);
                 char sl[256]; fmt_slots(b, sl, sizeof(sl));
-                text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 46 * k), 20 * k, kInkSoft, sl);
+                text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 42 * k), 20 * k, kInkSoft, sl);
+                char where[320]; fmt_places(b, where, sizeof(where));   // 0.1.249: where each slot stands
+                cdl->PushClipRect(ImVec2(rp.x + 92 * k, rp.y), ImVec2(rp.x + 900 * k, rp.y + rowh), true);
+                text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 68 * k), 19 * k, kInk, where);
+                cdl->PopClipRect();
             } else {
                 text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 22 * k), 28 * k, kGrey, tr(Tx::EMPTY_POS));
             }
@@ -2270,7 +2298,11 @@ void draw_backup_window(const View& v) {
             }
             text_r(cdl, rp.x + 784 * k, rp.y + 9 * k, 22 * k, kGrey, when);   // the text column ends where the buttons begin (x 794)
             char sl[256]; fmt_slots(b, sl, sizeof(sl));
-            text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 46 * k), 20 * k, kInkSoft, sl);
+            text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 42 * k), 20 * k, kInkSoft, sl);
+            char where[320]; fmt_places(b, where, sizeof(where));       // 0.1.249: where each slot stands
+            cdl->PushClipRect(ImVec2(rp.x + 92 * k, rp.y), ImVec2(rp.x + 784 * k, rp.y + rowh), true);
+            text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 68 * k), 19 * k, kInk, where);
+            cdl->PopClipRect();
         } else {
             text_at(cdl, ImVec2(rp.x + 92 * k, rp.y + 22 * k), 28 * k, kGrey, tr(Tx::EMPTY_POS));
         }
@@ -2357,7 +2389,9 @@ void draw_backup_confirm(const View& v) {
     const float ey = wrap_text(dl, X(60), Y(140), (W - 120) * k, 30 * k, 42 * k, kInk, line);
     // what the backup holds, so the right one is certain
     char sl[256]; fmt_slots(*b, sl, sizeof(sl));
-    const float sy = wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, sl);
+    float sy = wrap_text(dl, X(60), ey + 14 * k, (W - 120) * k, 22 * k, 30 * k, kInkSoft, sl);
+    char where[320]; fmt_places(*b, where, sizeof(where));            // 0.1.249
+    if (where[0]) sy = wrap_text(dl, X(60), sy + 6 * k, (W - 120) * k, 22 * k, 30 * k, kInk, where);
 
     // Overwrite: the name the backup will carry, starting from the one it has (Enter confirms, like the button).
     bool enter = false;
@@ -3100,14 +3134,26 @@ void draw_save_sync(const View& v) {
             return hit;
         };
         if (sv.prep && row("hs_prep", tr(Tx::PREP_STAGE), Tone::Good, false)) checkpoint_host_pick(-1);
+        int place_budget = 1;     // 0.1.249: saves read for the place column this frame
         for (uint32_t i = 0; i < sv.n && i < kCheckpointCandidates; ++i) {
-            char when[40], label[220], id[24], tail[160];
+            char when[40], label[320], id[24], tail[160];
             format_filetime(sv.entry[i].stamp, when, sizeof(when));
             const bool boss = (sv.entry[i].flags & kCheckpointAfterBoss) != 0;      // right after the chapter boss: next floor or home from here
             _snprintf_s(tail, sizeof(tail), _TRUNCATE, "%s%s", i == 0 ? tr(Tx::LATEST) : "", boss ? tr(Tx::SYNC_AFTER_BOSS) : "");
             const uint8_t stage = checkpoint_stage_of_seq(sv.entry[i].seq);       // one of the two saves from before the map: the run starts over from that page
             if (stage) _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY_STAGE), i + 1, tr(stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY), when, tail);
             else       _snprintf_s(label, sizeof(label), _TRUNCATE, tr(Tx::SYNC_ENTRY), i + 1, (unsigned long long)sv.entry[i].seq, when, tail);
+            {   // 0.1.249: where it stands -- a row on screen reads its save (one per frame), the others wait for their turn
+                const ImVec2 rp = ImGui::GetCursorScreenPos();
+                const bool visible = ImGui::IsRectVisible(rp, ImVec2(rp.x + lw, rp.y + 66 * k));
+                SavePlaceInfo pl;
+                if (checkpoint_list_place(i, pl, visible && place_budget > 0)) {
+                    if (visible) --place_budget;
+                    char where[96]; saveplace_text(pl, where, sizeof(where));
+                    char full[320]; _snprintf_s(full, sizeof(full), _TRUNCATE, "%s   ·   %s", label, where);
+                    strncpy_s(label, sizeof(label), full, _TRUNCATE);
+                }
+            }
             _snprintf_s(id, sizeof(id), _TRUNCATE, "hs_%u", i);
             if (row(id, label, Tone::Normal, boss)) checkpoint_host_pick((int)i);
         }

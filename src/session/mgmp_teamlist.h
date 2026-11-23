@@ -31,7 +31,10 @@ TeamUse teamlist_use(uint32_t rva, bool in_build, const char** what);
 // sorted by id. Returns the count written to `out` (at most `cap`); 0 = nothing usable (the caller then leaves the game's list alone).
 using TeamOwnerFn = bool (*)(uint64_t id, uint8_t& pos);
 uint32_t teamlist_compose(TeamUse use, const uint64_t* party, uint32_t party_n, const uint64_t* fam, uint32_t fam_n,
-                          uint8_t self, TeamOwnerFn owner, uint64_t* out, uint32_t cap);
+                          uint8_t self, TeamOwnerFn owner, uint64_t* out, uint32_t cap, uint32_t skip_seats = 0);
+// 0.1.251: the site is an event's effect on the team (party_*, make_old): a player who left the run takes no part in those -- its cats stay as helpers for the
+// battles only (the caller passes net_absent_seats() as skip_seats for these).
+bool teamlist_is_event(uint32_t rva);
 
 // Inventory::insert_item in a room. Returns false: the game's own way. True: `skip` -- put nothing into this inventory; otherwise insert at `new_loc`.
 bool teamlist_insert(int32_t loc, int64_t arg, uint8_t self, TeamOwnerFn owner, int32_t& new_loc, bool& skip);

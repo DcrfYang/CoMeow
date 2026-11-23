@@ -58,8 +58,10 @@ TeamUse teamlist_use(uint32_t rva, bool in_build, const char** what) {
     return TeamUse::Off;
 }
 
+bool teamlist_is_event(uint32_t rva) { return rva >= 0x923000 && rva < 0x935000; }   // the event-effect handlers (party_*, make_old all, level_up all)
+
 uint32_t teamlist_compose(TeamUse use, const uint64_t* party, uint32_t party_n, const uint64_t* fam, uint32_t fam_n,
-                          uint8_t self, TeamOwnerFn owner, uint64_t* out, uint32_t cap) {
+                          uint8_t self, TeamOwnerFn owner, uint64_t* out, uint32_t cap, uint32_t skip_seats) {
     if (use == TeamUse::Off || !out || !cap) return 0;
     if (use == TeamUse::Own && !owner) return 0;
     uint32_t n = 0;
@@ -69,6 +71,10 @@ uint32_t teamlist_compose(TeamUse use, const uint64_t* party, uint32_t party_n, 
         for (uint32_t i = 0; src && i < cnt && n < cap; ++i) {
             const uint64_t id = src[i];
             if (!id || has(out, n, id)) continue;
+            if (skip_seats && owner) {                                   // 0.1.251: a player who left the run: its cats are only helpers in battle
+                uint8_t pos = 0xFF;
+                if (owner(id, pos) && pos < 32 && ((skip_seats >> pos) & 1u)) continue;
+            }
             if (use == TeamUse::Own) {
                 uint8_t pos = 0xFF;
                 if (!owner(id, pos) || pos != self) continue;

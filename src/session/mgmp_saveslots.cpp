@@ -154,7 +154,7 @@ bool read_int(const std::wstring& file, const char* key, int64_t& out) {
     return true;
 }
 
-SaveSlotInfo describe(const std::wstring& file) {
+SaveSlotInfo describe(const std::wstring& file, bool cache_place = true) {
     SaveSlotInfo s;
     if (!exists(file)) return s;
     s.present = true;
@@ -162,6 +162,7 @@ SaveSlotInfo describe(const std::wstring& file) {
     if (read_int(file, "save_file_percent", v)) s.percent = (int)v;
     if (read_int(file, "current_day", v))       s.day     = (int)v;
     if (read_int(file, "savefile_timer", v))    s.timer   = v;
+    s.place = saveplace_read(file, cache_place);     // 0.1.249
     return s;
 }
 
@@ -494,7 +495,11 @@ bool install_from(const std::wstring& game, const std::wstring& dir, const SaveB
 
 bool load_meta(const std::wstring& dir, SaveBackup& out) {
     std::string text;
-    return read_text(dir + L"\\meta.json", text) && meta_from_json(text, out);
+    if (!read_text(dir + L"\\meta.json", text) || !meta_from_json(text, out)) return false;
+    // 0.1.249: where each slot of the backup stands, read from its own .sav (cached while the file is unchanged)
+    for (int s = 0; s < kGameSlots; ++s)
+        if (out.slot[s].present) out.slot[s].place = saveplace_read(dir + L"\\" + kGameFile[s]);
+    return true;
 }
 
 // --- the one-file package -------------------------------------------------------------------------------
@@ -884,7 +889,7 @@ bool sync_probe(const std::wstring& game, const Bytes& db, SaveSlotInfo& info) {
     const std::wstring f = sync_probe_path(game);
     sync_probe_drop(f);
     if (!checkpoint_io::atomic_write(f, db)) return false;
-    info = describe(f);
+    info = describe(f, false);      // the probe is rewritten with every save: never cached
     sync_probe_drop(f);
     return true;
 }
@@ -938,7 +943,12 @@ void saveslots_sync_refresh() {
     for (Found& f : all) {
         if ((int)g.sync[f.slot].size() >= kSyncMax) continue;
         HandshakeSaveInfo hi; Bytes db; SaveSlotInfo si;
-        if (g.sync[f.slot].size() < 30 && checkpoint_peek_file(f.ref.path, f.ref.folder, hi, &db) && sync_probe(game, db, si)) { f.info.day = si.day; f.info.percent = si.percent; }   // the day / percent of the newest 30 only: each needs a database opened
+        if (g.sync[f.slot].size() < 30 && checkpoint_peek_file(f.ref.path, f.ref.folder, hi, &db) && sync_probe(game, db, si)) {   // the day / percent of the newest 30 only: each needs a database opened
+            f.info.day = si.day; f.info.percent = si.percent; f.info.place = si.place; f.info.place_read = true;
+        }
+        // 0.1.249: the save taken on the chapter page is the chapter page, whatever the game had written by then (it is restored as a fresh start from that page)
+        if (f.info.stage == kStageReady) { f.info.place = SavePlaceInfo{}; f.info.place.place = SavePlace::Chapter; f.info.place_read = true; }
+        else if (f.info.stage == kStagePrep) { f.info.place = SavePlaceInfo{}; f.info.place.place = SavePlace::House; f.info.place_read = true; }
         g.sync[f.slot].push_back(f.info);
         g.syncref[f.slot].push_back(std::move(f.ref));
     }
@@ -1006,6 +1016,7 @@ bool saveslots_sync_restore(int slot, int index) {
     // back into their originals; and the swap notes of the save this one replaces are dropped (they would name the wrong cats in the House).
     catsync_drop_swap_notes("a handshake save was restored on the backup page");
     if (!checkpoint_import_notes_file(ref.path)) log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! the restored handshake save's owner / clone-origin notes could not be read");
+    if (!checkpoint_relive_run(ref.path)) log_line_lvl(LogLevel::Warn, "SAVESLOTS", "!! the restored handshake save's run could not be made the journal's run again -- a room may not recover it");   // 0.1.248
     if (want.stage) say(tr(Tx::SS_SYNC_DONE_STAGE), slot + 1, tr(want.stage == kStagePrep ? Tx::SYNC_STAGE_PREP : Tx::SYNC_STAGE_READY));
     else            say(tr(Tx::SS_SYNC_DONE), slot + 1, (unsigned)want.seq);
     g.msg_load = true;

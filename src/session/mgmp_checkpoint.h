@@ -49,6 +49,10 @@ struct HandshakeSaveInfo { uint8_t slot = 255, players = 0, stage = 0; bool afte
 bool checkpoint_peek_file(const std::wstring& path, uint64_t folder_id, HandshakeSaveInfo& info, std::vector<uint8_t>* database);
 // 0.1.170: the owner and clone-origin notes of the handshake save at `path`, imported (the backup page's restore). False: the file could not be read.
 bool checkpoint_import_notes_file(const std::wstring& path);
+// 0.1.248 (room T5KM 11-22): the backup page put the handshake save at `path` over a slot -- the run it belongs to becomes the journal's unfinished run again: its saves up to that
+// one come back from the archive into the live queue, another run's live saves go to the archive, and the pairing state says "run R, unfinished". A room then recovers
+// the run from there with the other players. False: the file could not be read or the folders could not be put in order (the slot is restored either way).
+bool checkpoint_relive_run(const std::wstring& path);
 // THE QUEUE OF HANDSHAKE SAVES IS 100 LONG AND IS NOT CLEARED (2026-10-26): what leaves a run's live queue (<pairing>.N) -- the run's settlement, another run's commit, a restore, a backup load -- is moved to
 // <save dir>\mgmp_handshake_old\<id>\<pairing>-old.N (same file format, read by checkpoint_peek_file), and only the oldest beyond 100 per pairing are dropped.
 // This one is for a caller that is about to take a live file away (the backup load): a save is archived, anything else deleted. False: it could not be done.
@@ -103,6 +107,10 @@ struct SaveSyncView {
     SaveSyncEntry entry[96];        // = kCheckpointCandidates (mgmp_proto.h), newest first
 };
 bool checkpoint_sync_view(SaveSyncView& out);
+// 0.1.249: where the host's list entry `index` stands (mgmp_saveplace), read from the host's own handshake save of it. False when it is not known yet and
+// `compute` is false; with `compute` one entry's save is read (a few MB) -- the panel asks for the rows it shows, one per frame.
+struct SavePlaceInfo;
+bool checkpoint_list_place(unsigned index, SavePlaceInfo& out, bool compute);
 // Host: -1 = the preparation stage, 0..n-1 = that handshake save. False when nothing is being chosen.
 bool checkpoint_host_pick(int index);
 // Put the "invalid" panel away; the next slot click starts a fresh round.

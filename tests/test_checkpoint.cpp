@@ -281,8 +281,9 @@ int main() {
     drain(); at(1,[]{CHECK(disk_exists(file(L".0")));}); // remote finish cannot erase local pending settlement
     restart(); CHECK(states[0].failed && states[1].failed);
 
-    reset(L"play alone invalidation survives process restart"); start(); boundary(4000);
-    at(1,[]{CHECK(checkpoint_on_alone());}); restart(); CHECK(states[0].failed && states[1].failed);
+    // 0.1.232 (the user's rule): going on alone leaves no mark -- the next room resumes the run from its last handshake save (the case used to expect a refusal).
+    reset(L"play alone leaves the run resumable from its last handshake save"); start(); boundary(4000);
+    at(1,[]{CHECK(checkpoint_on_alone());}); restart(); CHECK(states[0].released && states[1].released && !states[0].failed && !states[1].failed);
 
     // 0.1.230 (rooms 95LJ -> 7J9P): a run left to play alone that never settled -- the player's save is in the warehouse again. The same players pair
     // again: its play-alone mark retires that run and a fresh start is offered, instead of "recovery refused: a participant chose play alone" at every round.
@@ -345,6 +346,22 @@ int main() {
     }
     participants=live=2;
 
+    // 0.1.251 (the user's rule): a player who leaves in the middle of the run is not waited for -- its seat turns absent, and the two who stay go on certifying
+    // node saves (its slot in the certificate is the stand-in hash). Without this the next node was held for good ("a participant disconnected").
+    {
+        reset(L"a player who leaves mid-run is not waited for",3); start(); boundary(8900); certified(1);
+        live=2;                                                     // seat 2 is gone: nothing more from it, nothing sent to it
+        for(unsigned r=0;r<2;++r) {
+            for(unsigned i=0;i<2;++i) at(i,[]{checkpoint_on_node(123,1,0);});
+            for(int pass=0;pass<2;++pass) { for(unsigned i=0;i<2;++i) at(i,[&]{checkpoint_on_map(8901+r);}); drain(); }
+            for(unsigned i=0;i<2;++i) at(i,[&]{
+                CHECK(!g.failed); CHECK(g.absent==4); CHECK(g.seq==2+r); CHECK(checkpoint_can_enter());
+                Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.certificate.seq==2+r && e.certificate.count==3 && e.certificate.hashes[2]!=0);
+            });
+        }
+        participants=live=2;
+    }
+
     reset(L"a roster-only mismatch skips ONE node's checkpoint and never latches"); start(); boundary(7500); certified(1);
     // The client's NODEHASH reports before its checkpoint_on_node, the host's after it.
     at(1,[]{checkpoint_soft_fault(123,"roster differs");});
@@ -384,6 +401,26 @@ int main() {
         CHECK(checkpoint_io::atomic_write(file(L".torn.0"),torn)); CHECK(!checkpoint_peek_file(file(L".torn.0"),g.identity,none,nullptr));   // a damaged file is refused
         CHECK(!checkpoint_peek_file(file(L".absent.0"),g.identity,none,nullptr));
     });
+
+    // 0.1.248 (room T5KM 11-22): the host loaded an older automatic backup -- its handshake queue replaced the live one (another run's tombstone; this run's saves went to the
+    // archive) -- then restored this run's handshake save from the backup page. The run must be the journal's again, or every round is "no common confirmed save".
+    reset(L"a handshake save restored from the archive makes its run the journal's again"); start(); boundary(7800); certified(1);
+    at(0,[]{
+        for(unsigned k:queue_indices()) CHECK(checkpoint_archive_handshake_file(qfile(k)));
+        Entry st{}; st.certificate=g.config; st.certificate.kind=kCheckpointOffer; st.certificate.mode=3; st.certificate.run=0xE7484FB2A19D9673ull;
+        CHECK(checkpoint_io::atomic_write(file(L".state"),encode_entry(st)));
+        CHECK(!disk_exists(file(L".0")));
+    });
+    restart(); CHECK(states[0].failed || states[1].failed);
+    at(0,[]{
+        const std::wstring arch=archive_root(g.root);
+        const std::vector<unsigned> nums=numbered_files(arch,g.key+L"-old.");
+        CHECK(!nums.empty());
+        if(!nums.empty()) CHECK(checkpoint_relive_run(arch+L"\\"+g.key+L"-old."+std::to_wstring(nums.back())));
+        Entry e{}; CHECK(read_entry(file(L".0"),e,true)); CHECK(e.certificate.seq==1);
+        Entry st{}; CHECK(read_entry(file(L".state"),st,false)); CHECK(st.certificate.mode==1 && st.certificate.run==e.certificate.run);
+    });
+    restart(); CHECK(states[0].released && states[1].released && !states[0].failed && !states[1].failed);
 
     reset(L"SQLite snapshot failure preserves confirmed queue"); start();boundary(8000); capture_ok=false;next(8001);
     at(0,[]{Entry e{};CHECK(read_entry(file(L".0"),e,true));CHECK(e.certificate.seq==1);CHECK(!checkpoint_can_enter());});

@@ -55,6 +55,10 @@ bool housecoop_refuse_depart(uint32_t cats);                  // T_TryDepart wit
 // 0.1.236: a house boss fight is being played here (set when the game starts one, kept to the end of its settlement, whatever the co-op's state): no enemy
 // multiplier for its units, and run_settled retires the other players' copies, which no departure marked.
 bool housecoop_house_fight();
+// 0.1.250: a house boss fight is being built with no battle id in a room (unlocks_battle_build). When it is a co-op fight a save load resumed -- MewDirector+0x70C
+// says a house boss fight, and the party and familiars hold the session cats of two seats or more -- it becomes the co-op fight again: a battle id every
+// player derives alike (the boss and the sorted cat ids), the host's unlock answers on a client, the house boss scale. Returns that id, 0 when it is not one.
+uint64_t housecoop_resume_fight();
 void housecoop_note_house_fight();                            // T_HouseFight goes on (the game starts a house boss fight)
 void housecoop_on_departure();                                // T_HouseGearDone reached: a replayed lock passed the game's own checks
 void housecoop_settlement_begin();                            // the start of the native end of a run

@@ -15,6 +15,7 @@
 #include "mgmp_catsync.h"
 #include "mgmp_rng.h"
 #include "mgmp_log.h"
+#include "mgmp_housecoop.h"   // 0.1.250: a resumed co-op house boss fight
 #include "mgmp_lockstep.h"
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
@@ -1040,6 +1041,21 @@ bool unlocks_event_subject(void* vec, void* stream, void* pick, void** out) {
     uint64_t ids[32] = {};
     uint32_t order[32] = {};
     for (uint32_t i = 0; i < n; ++i) { ids[i] = cat_id(cats[i]); if (!ids[i]) return false; order[i] = i; }
+    // 0.1.251: a player who left the run takes no part in events -- its cats are taken out of the candidates (unless they are all there is)
+    if (const uint32_t gone = net_absent_seats()) {
+        uint32_t k = 0;
+        void* kc[32] = {}; uint64_t ki[32] = {};
+        for (uint32_t i = 0; i < n; ++i) {
+            uint8_t pos = 0xFF;
+            if (lockstep_owner_pos(ids[i], pos) && pos < 32 && ((gone >> pos) & 1u)) continue;
+            kc[k] = cats[i]; ki[k] = ids[i]; ++k;
+        }
+        if (k && k < n) {
+            log_line("EVENT", "the event's subject cat: %u of %u candidate(s) belong to a player who left the run (seat mask %#x) -- left out", n - k, n, gone);
+            n = k;
+            for (uint32_t i = 0; i < n; ++i) { cats[i] = kc[i]; ids[i] = ki[i]; order[i] = i; }
+        }
+    }
     std::sort(order, order + n, [&](uint32_t a, uint32_t b) { return ids[a] < ids[b]; });
     // the draw: the game's own helper over a stand-in vector of the indices 0..n-1 (it reads the count at +4 and the elements at +8 and returns one of them)
     void* idx[32] = {};
@@ -1394,6 +1410,7 @@ int32_t unlocks_difficulty(uint32_t ra, int32_t own) {
 void unlocks_battle_build() {
     g_in_build = false;
     if (!net_active() || net_peer_count() < 2) return;
+    if (!lockstep_battle_id()) housecoop_resume_fight();   // 0.1.250: a co-op house boss fight a save load resumed gets its battle id here (mgmp_housecoop)
     lockstep_battle_build_begin();
     uint64_t* s = rng_global_stream();
     const uint64_t id = lockstep_battle_id();

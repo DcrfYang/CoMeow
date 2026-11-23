@@ -1,5 +1,6 @@
 #include "mgmp_checkpoint.h"
 #include "sqlite/sqlite3.h"
+#include "mgmp_saveplace.h"   // 0.1.249: where the host's list entries stand
 #include "mgmp_checkpoint_io.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
@@ -127,7 +128,26 @@ int position(uint8_t peer) {
     for(unsigned i=0;i<g.config.count;++i) if(g.config.peers[i]==peer) return int(i);
     return -1;
 }
+// 0.1.251 (the user's rule): A PLAYER WHO LEAVES THE RUN IS NOT WAITED FOR. Its seat is absent from then on, as a seat of a run resumed without it (0.1.206): nothing
+// is asked of it, its certificate slot is the stand-in hash, the others' node saves go on. The host's seat is never let go here (without the host nobody leads).
+void note_departed() {
+    if(!g.configured || !net_active()) return;
+    uint8_t ids[kMaxPeers]{};
+    const uint8_t n=net_peer_count();
+    if(n<2 || !net_peer_ids(ids,kMaxPeers)) return;          // two or more play on (one alone: checkpoint_can_enter lets it go on without marking anyone)
+    for(unsigned i=1;i<g.config.count;++i) {
+        if(absent_at(i) || g.config.peers[i]==kNoPeer) continue;
+        bool here=false; for(unsigned j=0;j<n;++j) if(ids[j]==g.config.peers[i]) here=true;
+        if(here) continue;
+        bool host_here=false; for(unsigned j=0;j<n;++j) if(ids[j]==g.config.peers[0]) host_here=true;
+        if(!host_here) return;
+        g.absent|=(uint8_t)(1u<<i);
+        log_line_lvl(LogLevel::Warn,"CHECKPOINT","!! the player of seat %u (peer %u) left the run -- it is not waited for from now on (seat mask %#x); the others' node saves go on without it",
+                     i,(unsigned)g.config.peers[i],(unsigned)g.absent);
+    }
+}
 bool membership() {   // the same members as the configuration, in any order (the order is the configuration's: net_set_seat_order)
+    note_departed();
     uint8_t ids[kMaxPeers]{};
     if(!net_active() || net_peer_count()!=present_count() || !net_peer_ids(ids,kMaxPeers)) return false;
     for(unsigned i=0;i<g.config.count;++i) {
@@ -1257,6 +1277,8 @@ bool checkpoint_stage_holding() {
     return t-s_since<kStageHoldMs;
 }
 bool checkpoint_can_enter() {
+    // 0.1.251: the others all left the run and this player plays on alone -- there is nobody to confirm a node save with, so nothing is held for one
+    if(g.on && g.configured && g.released && !g.failed && !g.finished && net_active() && net_peer_count()==1) return true;
     return !g.on || (!g.failed && !g.finished && !lockstep_halted() && g.released && (!g.dirty || g.skip) && membership());
 }
 void checkpoint_on_message(uint8_t from,const CheckpointMsg& m) {
@@ -1435,6 +1457,82 @@ bool checkpoint_archive_handshake_file(const std::wstring& path) {
     }
     return DeleteFileW(path.c_str()) || GetLastError()==ERROR_FILE_NOT_FOUND;
 }
+// THE RUN OF A HANDSHAKE SAVE RESTORED FROM THE BACKUP PAGE IS THE JOURNAL'S RUN AGAIN (0.1.248, room T5KM 11-22). The host quit a battle to "SL", loaded the mod's automatic
+// backup of the day before (A1) -- a backup load puts its own handshake queue back, so the journal became the previous day's settled run e7484fb2, and run 5dbe3955's 30 saves
+// went to the archive -- and then restored run 5dbe3955's handshake save from the backup page. The slot was right, the journal was not: "on the map but its journal holds nothing
+// to recover (mode 3)", and every round was refused with "no common confirmed save" while the client still held the run's 30 saves.
+static uint64_t relive_order(uint64_t seq) { const uint8_t st=checkpoint_stage_of_seq(seq); return st ? st : 0x100+seq; }   // the two saves before the map, then the nodes
+bool checkpoint_relive_run(const std::wstring& path) {
+    Bytes bytes; Entry want{};
+    if(!checkpoint_io::read(path,bytes) || !parse_entry(bytes,want,false,true)) return false;
+    const uint64_t run=want.certificate.run, upto=relive_order(want.certificate.seq);
+    if(want.certificate.kind!=kCheckpointCommit || !run || !want.certificate.seq) return false;
+    const size_t bs=path.find_last_of(L'\\'); if(bs==std::wstring::npos) return false;
+    const std::wstring dir=path.substr(0,bs), name=path.substr(bs+1);
+    std::wstring key, live=dir;
+    const size_t old=name.rfind(L"-old.");
+    if(old!=std::wstring::npos) {                                          // <save dir>\mgmp_handshake_old\<id>\<key>-old.N
+        key=name.substr(0,old);
+        const size_t cut=dir.find_last_of(L'\\'); if(cut==std::wstring::npos) return false;
+        const std::wstring parent=dir.substr(0,cut);
+        if(parent.size()<4 || _wcsicmp(parent.c_str()+parent.size()-4,L"_old")!=0) return false;
+        live=parent.substr(0,parent.size()-4)+L"\\"+dir.substr(cut+1);
+    } else {                                                               // <save dir>\mgmp_handshake\<id>\<key>.N
+        const size_t dot=name.find_last_of(L'.'); if(dot==std::wstring::npos) return false;
+        key=name.substr(0,dot);
+    }
+    if(key.empty()) return false;
+    CreateDirectoryW(live.substr(0,live.find_last_of(L'\\')).c_str(),nullptr);
+    if(!CreateDirectoryW(live.c_str(),nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS) return false;
+    struct Got { uint64_t order; std::wstring from; };
+    std::vector<Got> keep;
+    unsigned out=0, back=0;
+    bool ok=true;
+    auto same_run=[&](const std::wstring& f,uint64_t& order)->bool {
+        Bytes b; Entry e{};
+        if(!checkpoint_io::read(f,b) || !parse_entry(b,e,false,true) || e.certificate.kind!=kCheckpointCommit || e.certificate.run!=run) return false;
+        order=relive_order(e.certificate.seq); return true;
+    };
+    for(unsigned k:numbered_files(live,key+L".")) {                       // the live queue: this run's saves stay, another run's go to the archive
+        const std::wstring f=live+L"\\"+key+L"."+std::to_wstring(k);
+        uint64_t order=0;
+        if(same_run(f,order)) { keep.push_back({order,f}); continue; }
+        if(archivable(f) ? archive_path(live,key,f) : (DeleteFileW(f.c_str())!=0)) ++out; else ok=false;
+    }
+    const std::wstring arch=archive_root(live);
+    std::vector<unsigned> nums=numbered_files(arch,key+L"-old.");
+    for(size_t i=nums.size();i-- > 0 && keep.size()<kCheckpointCandidates;) {   // the archive, newest first: this run's saves up to the restored one come back
+        const std::wstring f=arch+L"\\"+key+L"-old."+std::to_wstring(nums[i]);
+        uint64_t order=0;
+        if(!same_run(f,order) || order>upto) continue;
+        bool dup=false; for(const Got& g2:keep) dup=dup || g2.order==order;
+        if(dup) continue;
+        keep.push_back({order,f}); ++back;
+    }
+    // newest first as <key>.0, .1 ... (the order the offer reads them in): through temporary names, so no rename lands on a file still to be moved
+    std::sort(keep.begin(),keep.end(),[](const Got& a,const Got& b){ return a.order>b.order; });
+    std::vector<std::wstring> tmp;
+    for(size_t i=0;i<keep.size();++i) {
+        const std::wstring t=live+L"\\"+key+L".relive"+std::to_wstring(i);
+        if(!MoveFileExW(keep[i].from.c_str(),t.c_str(),checkpoint_io::move_flags(MOVEFILE_REPLACE_EXISTING))) { ok=false; tmp.push_back(keep[i].from); continue; }
+        tmp.push_back(t);
+    }
+    for(size_t i=0;i<tmp.size();++i) {
+        const std::wstring to=live+L"\\"+key+L"."+std::to_wstring(i);
+        if(tmp[i]!=to && !MoveFileExW(tmp[i].c_str(),to.c_str(),checkpoint_io::move_flags(MOVEFILE_REPLACE_EXISTING))) ok=false;
+    }
+    {   // a staged save of another run is not this run's
+        const std::wstring p=live+L"\\"+key+L".pending";
+        Bytes b; Entry e{};
+        if(disk_exists(p) && (!checkpoint_io::read(p,b) || !parse_entry(b,e,false,true) || e.certificate.run!=run)) DeleteFileW(p.c_str());
+    }
+    Entry st{}; st.certificate=want.certificate; st.certificate.kind=kCheckpointOffer; st.certificate.mode=1; st.certificate.run=run;
+    if(!checkpoint_io::atomic_write(live+L"\\"+key+L".state",encode_entry(st))) ok=false;
+    trim_archive(live,key);
+    log_line_lvl(ok?LogLevel::Info:LogLevel::Warn,"CHECKPOINT","backup page restore: run %016llx is the journal's unfinished run again -- %u of its save(s) in the live queue (%u back from the archive), %u other file(s) archived%s",
+             (unsigned long long)run,(unsigned)keep.size(),back,out,ok?"":" -- NOT every file could be moved");
+    return ok;
+}
 bool checkpoint_on_alone() {
     if(!g.configured || !g.run) return true;
     // 0.1.232 (the user's rule): NO TOMBSTONE. Going on alone does not end the run for the room -- the next room resumes it from the run's last handshake save and what was
@@ -1548,6 +1646,52 @@ bool checkpoint_sync_view(SaveSyncView& v) {
     return true;
 }
 
+// 0.1.249: WHERE EACH SAVE OF THE HOST'S LIST STANDS. Its database is the host's own handshake save of that entry; it is written to a throw-away file and read
+// like any save (mgmp_saveplace). A queue file is read once: what it holds is remembered by its reference, so the rows the panel shows cost a file each.
+namespace {
+struct ListPlace { uint64_t run=0, seq=0, stamp=0; SavePlaceInfo p; };
+std::vector<ListPlace> g_list_place;
+struct QueueRef { unsigned k=0; uint64_t run=0, seq=0, stamp=0; };
+std::vector<QueueRef> g_queue_seen;
+std::wstring g_queue_seen_root;
+}
+bool checkpoint_list_place(unsigned index, SavePlaceInfo& out, bool compute) {
+    if(!g.on || !g.host || !g.choosing || index>=g.listN || index>=kCheckpointCandidates) return false;
+    const CheckpointRef& ref=g.list[index];
+    for(const ListPlace& c:g_list_place) if(c.run==ref.run && c.seq==ref.seq && c.stamp==ref.stamp) { out=c.p; return true; }
+    if(!compute) return false;
+    ListPlace lp; lp.run=ref.run; lp.seq=ref.seq; lp.stamp=ref.stamp;
+    const uint8_t stage=checkpoint_stage_of_seq(ref.seq);
+    if(stage) lp.p.place=stage==kStageReady ? SavePlace::Chapter : SavePlace::House;     // the two saves before the map are restored as a fresh start from that page
+    else {
+        if(g_queue_seen_root!=g.root+L"\\"+g.key) { g_queue_seen.clear(); g_queue_seen_root=g.root+L"\\"+g.key; }
+        bool got=false;
+        for(unsigned k:queue_indices()) {
+            bool seen=false, match=false;
+            for(const QueueRef& q:g_queue_seen) if(q.k==k) { seen=true; match=q.run==ref.run && q.seq==ref.seq && q.stamp==ref.stamp; break; }
+            if(seen && !match) continue;
+            Entry e{};
+            if(!read_entry(qfile(k),e,true)) continue;
+            const CheckpointRef r=reference(e);
+            if(!seen) { QueueRef q; q.k=k; q.run=r.run; q.seq=r.seq; q.stamp=r.stamp; g_queue_seen.push_back(q); }
+            if(!(r.run==ref.run && r.seq==ref.seq && r.stamp==ref.stamp)) continue;
+            const std::wstring probe=g.root+L"\\_place_probe.sav";
+            for(const wchar_t* sfx:{L"",L"-wal",L"-shm",L"-journal"}) DeleteFileW((probe+sfx).c_str());
+            if(checkpoint_io::atomic_write(probe,e.database)) { lp.p=saveplace_read(probe,false); got=true; }
+            for(const wchar_t* sfx:{L"",L"-wal",L"-shm",L"-journal"}) DeleteFileW((probe+sfx).c_str());
+            break;
+        }
+        if(!got) {
+            lp.p=SavePlaceInfo{};
+            _snprintf_s(lp.p.why,sizeof(lp.p.why),_TRUNCATE,"the host's handshake save of run %016llx node %llu was not found in its queue",(unsigned long long)ref.run,(unsigned long long)ref.seq);
+            log_line_lvl(LogLevel::Warn,"SAVEPLACE","!! %s -- shown as unknown",lp.p.why);
+        }
+    }
+    if(g_list_place.size()>256) g_list_place.clear();
+    g_list_place.push_back(lp);
+    out=lp.p;
+    return true;
+}
 bool checkpoint_host_pick(int index) {
     if(!g.on || !g.host || !g_manual || !g.choosing || g.failed || g.invalid) return false;
     CheckpointMsg m=g.config; m.kind=kCheckpointSelect;

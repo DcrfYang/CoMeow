@@ -74,6 +74,9 @@ uint32_t unitstate_repair(uint8_t index, void* chr, const UnitDeep& host, const 
 uint32_t unitstate_settle_castable(void* chr, const char* why);
 // 0.1.247, GAME THREAD: `chr` carries a live passive of the game class `name` (its own or an item's; destroyed, removed and ending ones do not count).
 bool unitstate_has_passive(const void* chr, const char* name);
+// 0.1.250 (sim 66), GAME THREAD: the game's own recompute of `chr` (Character::recompute_stats 0x140102520 -> items_changed 0x1400FE980 -> every ability's
+// gon fields again, max_range +0xDC among them) -- called at every boundary on every peer, so an ability's cached range is the one of the board as it is.
+bool unitstate_refresh(void* chr);
 // 0.1.242 (sim 64), GAME THREAD: every XIs* passive of `chr` writes its X into its ability now (vtable slot 83) -- before the unit acts and at every boundary, on every peer.
 uint32_t unitstate_settle_xvalues(void* chr);
 // The log of what differs, without changing anything (used for the units a repair could not settle).

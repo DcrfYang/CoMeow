@@ -1629,7 +1629,8 @@ static void* party_cats_inner(void* director, void* out, uintptr_t ret) {
     uint64_t party[32] = {}, fam[32] = {};
     if ((pn && !mem_read(pd, party, pn * 8)) || (fn && !mem_read(fd, fam, fn * 8))) return o_PartyCats(director, out);
     static uint64_t team[64];
-    const uint32_t n = teamlist_compose(use, party, pn, fam, fn, net_peer_pos(), &lockstep_owner_pos, team, 64);
+    const uint32_t skip = teamlist_is_event((uint32_t)(ret - base)) ? net_absent_seats() : 0u;   // 0.1.251: a player who left takes no part in events
+    const uint32_t n = teamlist_compose(use, party, pn, fam, fn, net_peer_pos(), &lockstep_owner_pos, team, 64, skip);
     if (!n) {
         log_line("TEAMLIST", "%s: no cat for the %s list (party %u, familiars %u) -- the game's own party list is used", what ? what : "?", use == TeamUse::Own ? "own" : "whole-team", pn, fn);
         return o_PartyCats(director, out);

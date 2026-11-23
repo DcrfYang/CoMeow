@@ -614,10 +614,11 @@ void a_player_who_drops_out_loses_their_cats_for_everyone_else() {
     CHECK(drop_calls == 0);
     peer_count = 2; absent_seats = 1u << 1;                  // seat 1 left; this peer is seat 2, which is now ABOVE the count of the players present
     catsync_leave_tick();
-    CHECK(drop_calls == 1 && drop_mask == (1u << 1));        // seat 1's cats, not seat 2's
-    drop_calls = 0; drop_mask = 0;
+    // 0.1.251 (the user's rule): the cats of a player who left STAY in the run as helpers until the settlement's ownership filter -- nothing is dropped here
+    CHECK(drop_calls == 0);
     catsync_leave_tick();
-    CHECK(drop_calls == 1 && drop_mask == (1u << 1));        // asked again at every update (cheap when the lists are clean)
+    CHECK(drop_calls == 0);
+    entries.clear(); peer_position = 0; peer_count = 2; net_active_flag = true; absent_seats = 0; return;   // the rest of this case (removal retries) no longer applies
     // a removal that fails is retried, never given up: far more than the 120 tries the old watch allowed
     drop_result = -1; drop_calls = 0;
     for (int i = 0; i < 500; ++i) catsync_leave_tick();
